@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -32,6 +32,10 @@ enum Command {
     Get(GetArgs),
     /// Print the canonical topology as JSON.
     Topology(ClientArgs),
+    /// Persist a pending target topology and its moving-range plan.
+    BeginChange(ChangeArgs),
+    /// Print the active topology change, if any.
+    ChangeStatus(ClientArgs),
 }
 
 #[derive(Args)]
@@ -98,6 +102,15 @@ struct GetArgs {
     hex: bool,
 }
 
+#[derive(Args)]
+struct ChangeArgs {
+    #[command(flatten)]
+    client: ClientArgs,
+    /// Complete target membership in NODE_ID=HTTP_ENDPOINT form.
+    #[arg(long = "member", required = true)]
+    members: Vec<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -110,12 +123,16 @@ async fn main() -> Result<()> {
         Command::Put(args) => run_put(args).await,
         Command::Get(args) => run_get(args).await,
         Command::Topology(args) => run_topology(args).await,
+        Command::BeginChange(args) => run_begin_change(args).await,
+        Command::ChangeStatus(args) => run_change_status(args).await,
     }
 }
 
 async fn run_coordinator(args: CoordinatorArgs) -> Result<()> {
-    let repository = RedbTopologyRepository::open(&args.state)
-        .with_context(|| format!("opening {}", args.state.display()))?;
+    let repository = Arc::new(
+        RedbTopologyRepository::open(&args.state)
+            .with_context(|| format!("opening {}", args.state.display()))?,
+    );
     let bootstrap = if args.members.is_empty() {
         None
     } else {
@@ -129,16 +146,19 @@ async fn run_coordinator(args: CoordinatorArgs) -> Result<()> {
                 .collect::<Result<Vec<_>>>()?,
         )?)
     };
-    let topology = load_or_initialize(&repository, bootstrap)?;
+    let state = load_or_initialize(repository.as_ref(), bootstrap)?;
     info!(
         listen = %args.listen,
-        epoch = topology.epoch,
-        digest = %topology.digest,
-        members = topology.members.len(),
+        epoch = state.committed.epoch,
+        digest = %state.committed.digest,
+        members = state.committed.members.len(),
+        active_change = state.active_change.is_some(),
         "coordinator ready"
     );
     Server::builder()
-        .add_service(CoordinatorServer::new(CoordinatorService::new(topology)))
+        .add_service(CoordinatorServer::new(CoordinatorService::new(
+            state, repository,
+        )))
         .serve_with_shutdown(args.listen, shutdown_signal())
         .await?;
     Ok(())
@@ -193,6 +213,27 @@ async fn run_topology(args: ClientArgs) -> Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&client.topology().await)?
+    );
+    Ok(())
+}
+
+async fn run_begin_change(args: ChangeArgs) -> Result<()> {
+    let client = connect_client(&args.client).await?;
+    let members = args
+        .members
+        .iter()
+        .map(|member| parse_member(member))
+        .collect::<Result<Vec<_>>>()?;
+    let change = client.begin_topology_change(members).await?;
+    println!("{}", serde_json::to_string_pretty(&change)?);
+    Ok(())
+}
+
+async fn run_change_status(args: ClientArgs) -> Result<()> {
+    let client = connect_client(&args).await?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&client.topology_change().await?)?
     );
     Ok(())
 }

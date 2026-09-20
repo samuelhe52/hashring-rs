@@ -143,7 +143,10 @@ impl TopologySnapshot {
     }
 
     pub fn owner(&self, key: &[u8]) -> Result<&Member, TopologyError> {
-        let token = self.key_token(key);
+        self.owner_for_token(self.key_token(key))
+    }
+
+    pub fn owner_for_token(&self, token: u64) -> Result<&Member, TopologyError> {
         let index = self
             .assignments
             .partition_point(|assignment| assignment.token < token);

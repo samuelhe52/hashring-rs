@@ -5,14 +5,15 @@ use tokio::{sync::RwLock, time::Instant};
 use tonic::Code;
 
 use crate::{
+    migration::TopologyChange,
     node::{
         DEFAULT_MAX_KEY_BYTES, DEFAULT_MAX_VALUE_BYTES, MAX_DATA_MESSAGE_BYTES, fetch_topology,
     },
     proto::{
-        ErrorCode, GetRequest, OperationError, PutRequest, RecordVersion,
-        data_node_client::DataNodeClient,
+        BeginTopologyChangeRequest, ErrorCode, GetRequest, OperationError, PutRequest,
+        RecordVersion, coordinator_client::CoordinatorClient, data_node_client::DataNodeClient,
     },
-    topology::TopologySnapshot,
+    topology::{Member, TopologySnapshot},
 };
 
 #[derive(Clone, Debug)]
@@ -101,6 +102,73 @@ impl HashringClient {
     pub async fn refresh_topology(&self) -> Result<TopologySnapshot, ClientError> {
         self.refresh_topology_for(self.operation_timeout, false)
             .await
+    }
+
+    pub async fn begin_topology_change(
+        &self,
+        target_members: Vec<Member>,
+    ) -> Result<TopologyChange, ClientError> {
+        let deadline = Instant::now() + self.operation_timeout;
+        let mut client = match tokio::time::timeout(
+            remaining(deadline, false)?,
+            CoordinatorClient::connect(self.coordinator_endpoint.clone()),
+        )
+        .await
+        {
+            Ok(Ok(client)) => client,
+            Ok(Err(error)) => return Err(ClientError::Topology(error.into())),
+            Err(_) => {
+                return Err(ClientError::DeadlineExceeded {
+                    unknown_write_outcome: false,
+                });
+            }
+        };
+        let request = BeginTopologyChangeRequest {
+            target_members: target_members
+                .iter()
+                .map(crate::proto::Member::from)
+                .collect(),
+        };
+        let response = match tokio::time::timeout(
+            remaining(deadline, false)?,
+            client.begin_topology_change(request),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response.into_inner(),
+            Ok(Err(status)) => {
+                let unknown_write_outcome = status_may_have_applied(&status);
+                return Err(rpc_error(status, unknown_write_outcome));
+            }
+            Err(_) => {
+                return Err(ClientError::DeadlineExceeded {
+                    unknown_write_outcome: true,
+                });
+            }
+        };
+        Ok(response.try_into().map_err(anyhow::Error::from)?)
+    }
+
+    pub async fn topology_change(&self) -> Result<Option<TopologyChange>, ClientError> {
+        let endpoint = self.coordinator_endpoint.clone();
+        let response = tokio::time::timeout(self.operation_timeout, async move {
+            let mut client = CoordinatorClient::connect(endpoint).await?;
+            let response = client
+                .get_topology_change(crate::proto::Empty {})
+                .await?
+                .into_inner();
+            Ok::<_, anyhow::Error>(response)
+        })
+        .await
+        .map_err(|_| ClientError::DeadlineExceeded {
+            unknown_write_outcome: false,
+        })??;
+        response
+            .change
+            .map(TryInto::try_into)
+            .transpose()
+            .map_err(anyhow::Error::from)
+            .map_err(ClientError::from)
     }
 
     pub async fn get(&self, key: Vec<u8>) -> Result<GetOutput, ClientError> {

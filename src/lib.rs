@@ -4,6 +4,7 @@
 
 pub mod client;
 pub mod coordinator;
+pub mod migration;
 pub mod node;
 pub mod topology;
 

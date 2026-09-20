@@ -6,6 +6,7 @@ use std::{
 };
 
 use hashring_rs::client::{ClientError, HashringClient};
+use hashring_rs::{migration::MigrationPhase, topology::Member};
 use tonic::Code;
 
 struct Process(Child);
@@ -168,6 +169,60 @@ async fn permanent_grpc_status_is_returned_without_deadline_retry() {
             ..
         }
     ));
+
+    coordinator.stop();
+}
+
+#[tokio::test]
+async fn topology_change_plan_is_exclusive_durable_and_not_published() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("coordinator.redb");
+    let ports = unused_ports(3);
+    let coordinator_port = ports[0];
+    let coordinator_endpoint = format!("http://127.0.0.1:{coordinator_port}");
+    let initial_members = vec![("node-1".to_owned(), ports[1])];
+    let mut coordinator = spawn_process(&coordinator_arguments(
+        coordinator_port,
+        &state,
+        &initial_members,
+    ));
+    let client = connect_eventually(&coordinator_endpoint).await;
+    let target_members = vec![
+        Member {
+            node_id: "node-1".into(),
+            endpoint: format!("http://127.0.0.1:{}", ports[1]),
+        },
+        Member {
+            node_id: "node-2".into(),
+            endpoint: format!("http://127.0.0.1:{}", ports[2]),
+        },
+    ];
+
+    let change = client
+        .begin_topology_change(target_members.clone())
+        .await
+        .unwrap();
+    assert_eq!(change.base_epoch, 1);
+    assert_eq!(change.target_topology.epoch, 2);
+    assert_eq!(change.phase, MigrationPhase::Planned);
+    assert!(!change.ranges.is_empty());
+    assert!(client.begin_topology_change(target_members).await.is_err());
+    assert_eq!(
+        connect_eventually(&coordinator_endpoint)
+            .await
+            .topology()
+            .await
+            .epoch,
+        1
+    );
+
+    coordinator.stop();
+    coordinator = spawn_process(&coordinator_arguments(coordinator_port, &state, &[]));
+    let restarted = connect_eventually(&coordinator_endpoint).await;
+    let recovered = restarted.topology_change().await.unwrap().unwrap();
+    assert_eq!(recovered.change_id, change.change_id);
+    assert_eq!(recovered.ranges, change.ranges);
+    assert_eq!(restarted.topology().await.epoch, 1);
 
     coordinator.stop();
 }
