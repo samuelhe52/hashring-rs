@@ -112,19 +112,21 @@ cargo run -- change-status
 
 The source remains authoritative while a point-in-time snapshot is copied and
 concurrent puts and deletes are replayed from a bounded changelog. Cutover briefly
-returns retryable `RangeBusy` responses for affected reads and writes, verifies
-the live-record count, contiguous watermark, and a BLAKE3 digest, then publishes
-the new epoch. Deleted values are not retained as permanent tombstones. Removed
-cooperative nodes are stopped only after source cleanup, using the process-instance
-identity captured during migration. A node acknowledges a prepared stop before
-that acknowledgement is persisted as an instance-specific stop confirmation and
-final shutdown is requested. The confirmation remains durable after the active
-change completes, so a node that temporarily loses coordinator connectivity still
-shuts down when it reconnects; a lost final response is recoverable without treating
-a transient outage as a successful stop. Interrupted coordinator work resumes
-automatically. Pre-publication cleanup has its own deadline and remains in a
-recoverable `Aborting` state until authoritative sources acknowledge it; a
-post-publication failure never rolls the epoch back.
+returns retryable `RangeBusy` responses for affected writes while reads continue,
+verifies the live-record count, contiguous watermark, and a BLAKE3 digest, then
+publishes the new epoch. During the read handoff, the frozen source and committed
+destination contain the same data; destination writes remain fenced until every
+source has installed the new topology. Deleted values are not retained as permanent
+tombstones. Removed cooperative nodes are stopped only after source cleanup, using
+the process-instance identity captured during migration. A node acknowledges a
+prepared stop before that acknowledgement is persisted as an instance-specific stop
+confirmation and final shutdown is requested. The confirmation remains durable
+after the active change completes, so a node that temporarily loses coordinator
+connectivity still shuts down when it reconnects; a lost final response is
+recoverable without treating a transient outage as a successful stop. Interrupted
+coordinator work resumes automatically. Pre-publication cleanup has its own deadline
+and remains in a recoverable `Aborting` state until authoritative sources acknowledge
+it; a post-publication failure never rolls the epoch back.
 
 ## Request and error semantics
 

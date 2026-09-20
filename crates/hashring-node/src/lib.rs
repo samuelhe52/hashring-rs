@@ -95,7 +95,7 @@ struct SourceMigration {
     journal: Vec<JournalRecord>,
     journal_bytes: usize,
     watermark: u64,
-    paused: bool,
+    writes_paused: bool,
 }
 
 struct DestinationMigration {
@@ -103,6 +103,7 @@ struct DestinationMigration {
     records: HashMap<Vec<u8>, Record>,
     watermark: u64,
     committed: bool,
+    writes_activated: bool,
 }
 
 struct NodeState {
@@ -301,25 +302,6 @@ impl DataNode for DataNodeService {
                 ..Default::default()
             }));
         }
-        let token = state.topology.key_token(&request.key);
-        if state
-            .sources
-            .values()
-            .any(|source| source.paused && source.range.contains(token))
-        {
-            return Ok(Response::new(GetResponse {
-                current_epoch: state.topology.epoch,
-                error: Some(OperationError {
-                    current_epoch: state.topology.epoch,
-                    ..operation_error(
-                        ErrorCode::RangeBusy,
-                        "range is paused for topology cutover",
-                        true,
-                    )
-                }),
-                ..Default::default()
-            }));
-        }
         let Some(record) = state.records.get(&request.key) else {
             return Ok(Response::new(GetResponse {
                 current_epoch: state.topology.epoch,
@@ -378,20 +360,38 @@ impl DataNode for DataNodeService {
             .values()
             .filter(|source| source.range.contains(token))
         {
-            if source.paused {
+            if source.writes_paused {
                 return Ok(Response::new(PutResponse {
                     current_epoch: state.topology.epoch,
                     error: Some(OperationError {
                         current_epoch: state.topology.epoch,
                         ..operation_error(
                             ErrorCode::RangeBusy,
-                            "range is paused for topology cutover",
+                            "range writes are fenced for topology cutover",
                             true,
                         )
                     }),
                     ..Default::default()
                 }));
             }
+        }
+        if state
+            .destinations
+            .values()
+            .any(|destination| !destination.writes_activated && destination.range.contains(token))
+        {
+            return Ok(Response::new(PutResponse {
+                current_epoch: state.topology.epoch,
+                error: Some(OperationError {
+                    current_epoch: state.topology.epoch,
+                    ..operation_error(
+                        ErrorCode::RangeBusy,
+                        "range writes are fenced for topology cutover",
+                        true,
+                    )
+                }),
+                ..Default::default()
+            }));
         }
         let journal_growth = journal_record_bytes.saturating_mul(matching_sources);
         if state.journal_bytes_total.saturating_add(journal_growth) > self.max_journal_bytes {
@@ -471,19 +471,36 @@ impl DataNode for DataNodeService {
             .values()
             .filter(|source| source.range.contains(token))
         {
-            if source.paused {
+            if source.writes_paused {
                 return Ok(Response::new(DeleteResponse {
                     current_epoch: state.topology.epoch,
                     error: Some(OperationError {
                         current_epoch: state.topology.epoch,
                         ..operation_error(
                             ErrorCode::RangeBusy,
-                            "range is paused for topology cutover",
+                            "range writes are fenced for topology cutover",
                             true,
                         )
                     }),
                 }));
             }
+        }
+        if state
+            .destinations
+            .values()
+            .any(|destination| !destination.writes_activated && destination.range.contains(token))
+        {
+            return Ok(Response::new(DeleteResponse {
+                current_epoch: state.topology.epoch,
+                error: Some(OperationError {
+                    current_epoch: state.topology.epoch,
+                    ..operation_error(
+                        ErrorCode::RangeBusy,
+                        "range writes are fenced for topology cutover",
+                        true,
+                    )
+                }),
+            }));
         }
 
         if !state.records.contains_key(&request.key) {
@@ -591,7 +608,7 @@ impl DataNode for DataNodeService {
                     journal: Vec::new(),
                     journal_bytes: 0,
                     watermark: 0,
-                    paused: false,
+                    writes_paused: false,
                 },
             );
             (all_keys, topology, ready)
@@ -656,6 +673,7 @@ impl DataNode for DataNodeService {
                     records: HashMap::new(),
                     watermark: 0,
                     committed: false,
+                    writes_activated: false,
                 },
             );
         }
@@ -823,7 +841,7 @@ impl DataNode for DataNodeService {
             .sources
             .get_mut(&(request.change_id, request.range_id))
             .ok_or_else(|| Status::not_found("source migration not prepared"))?;
-        source.paused = true;
+        source.writes_paused = true;
         Ok(Response::new(PauseRangeResponse {
             final_watermark: source.watermark,
         }))
@@ -878,6 +896,9 @@ impl DataNode for DataNodeService {
                 .destinations
                 .get_mut(&key)
                 .ok_or_else(|| Status::not_found("destination migration not prepared"))?;
+            if destination.committed {
+                return Ok(Response::new(proto::Empty {}));
+            }
             destination.committed = true;
             (destination.range.clone(), destination.records.clone())
         };
@@ -888,6 +909,25 @@ impl DataNode for DataNodeService {
         for (key, record) in records {
             apply_internal_record(&mut state.records, key, record);
         }
+        Ok(Response::new(proto::Empty {}))
+    }
+
+    async fn activate_destination_range(
+        &self,
+        request: Request<RangeControlRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        let request = request.into_inner();
+        let mut state = self.state.write().await;
+        let destination = state
+            .destinations
+            .get_mut(&(request.change_id, request.range_id))
+            .ok_or_else(|| Status::not_found("destination migration not prepared"))?;
+        if !destination.committed {
+            return Err(Status::failed_precondition(
+                "destination range is not committed",
+            ));
+        }
+        destination.writes_activated = true;
         Ok(Response::new(proto::Empty {}))
     }
 
@@ -1250,7 +1290,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paused_source_range_blocks_reads_until_abort() {
+    async fn paused_source_range_keeps_reads_available_and_blocks_writes() {
         let service = service();
         service
             .put(Request::new(PutRequest {
@@ -1275,7 +1315,7 @@ mod tests {
             .pause_range_writes(Request::new(control.clone()))
             .await
             .unwrap();
-        let paused = service
+        let readable = service
             .get(Request::new(GetRequest {
                 key: b"key".to_vec(),
                 topology_epoch: 1,
@@ -1284,7 +1324,19 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(paused.error.unwrap().code, ErrorCode::RangeBusy as i32);
+        assert!(readable.error.is_none());
+        assert_eq!(readable.value, b"value");
+        let paused_put = service
+            .put(Request::new(PutRequest {
+                key: b"key".to_vec(),
+                value: b"replacement".to_vec(),
+                topology_epoch: 1,
+                request_id: "put-2".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(paused_put.error.unwrap().code, ErrorCode::RangeBusy as i32);
         let paused_delete = service
             .delete(Request::new(DeleteRequest {
                 key: b"key".to_vec(),
@@ -1303,15 +1355,166 @@ mod tests {
             .await
             .unwrap();
         let resumed = service
+            .put(Request::new(PutRequest {
+                key: b"key".to_vec(),
+                value: b"replacement".to_vec(),
+                topology_epoch: 1,
+                request_id: "put-3".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resumed.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn committed_destination_fences_writes_until_idempotent_activation() {
+        let mut destination = service();
+        destination.node_id = "node-2".into();
+        destination
+            .prepare_destination_range(Request::new(PrepareRangeRequest {
+                range: Some(range(0)),
+            }))
+            .await
+            .unwrap();
+        destination
+            .apply_migration_batch(Request::new(ApplyMigrationBatchRequest {
+                change_id: "change-1".into(),
+                range_id: "range-1".into(),
+                snapshot_records: vec![MigrationRecord {
+                    key: b"key".to_vec(),
+                    value: b"migrated".to_vec(),
+                    version: Some(RecordVersion {
+                        topology_epoch: 1,
+                        owner_sequence: 1,
+                        owner_node_id: "node-1".into(),
+                    }),
+                    deleted: false,
+                }],
+                journal_records: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        let control = RangeControlRequest {
+            change_id: "change-1".into(),
+            range_id: "range-1".into(),
+        };
+        let error = destination
+            .activate_destination_range(Request::new(control.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        let error = destination
+            .activate_destination_range(Request::new(RangeControlRequest {
+                change_id: "change-1".into(),
+                range_id: "unknown".into(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::NotFound);
+
+        destination
+            .commit_destination_range(Request::new(control.clone()))
+            .await
+            .unwrap();
+        destination
+            .commit_destination_range(Request::new(control.clone()))
+            .await
+            .unwrap();
+        let topology = TopologySnapshot::new(
+            2,
+            42,
+            8,
+            vec![Member {
+                node_id: "node-2".into(),
+                endpoint: "http://127.0.0.1:5002".into(),
+            }],
+        )
+        .unwrap();
+        destination
+            .install_topology(Request::new(InstallTopologyRequest {
+                topology: Some((&topology).into()),
+            }))
+            .await
+            .unwrap();
+
+        let readable = destination
             .get(Request::new(GetRequest {
                 key: b"key".to_vec(),
-                topology_epoch: 1,
+                topology_epoch: 2,
+                request_id: "get-1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(readable.error.is_none());
+        assert_eq!(readable.value, b"migrated");
+        let fenced_put = destination
+            .put(Request::new(PutRequest {
+                key: b"key".to_vec(),
+                value: b"new".to_vec(),
+                topology_epoch: 2,
+                request_id: "put-1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(fenced_put.error.unwrap().code, ErrorCode::RangeBusy as i32);
+        let fenced_delete = destination
+            .delete(Request::new(DeleteRequest {
+                key: b"key".to_vec(),
+                topology_epoch: 2,
+                request_id: "delete-1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            fenced_delete.error.unwrap().code,
+            ErrorCode::RangeBusy as i32
+        );
+
+        destination
+            .activate_destination_range(Request::new(control.clone()))
+            .await
+            .unwrap();
+        destination
+            .activate_destination_range(Request::new(control.clone()))
+            .await
+            .unwrap();
+        destination
+            .put(Request::new(PutRequest {
+                key: b"key".to_vec(),
+                value: b"new".to_vec(),
+                topology_epoch: 2,
+                request_id: "put-2".into(),
+            }))
+            .await
+            .unwrap();
+        destination
+            .commit_destination_range(Request::new(control))
+            .await
+            .unwrap();
+        let after_retry = destination
+            .get(Request::new(GetRequest {
+                key: b"key".to_vec(),
+                topology_epoch: 2,
                 request_id: "get-2".into(),
             }))
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(resumed.value, b"value");
+        assert_eq!(after_retry.value, b"new");
+        let deleted = destination
+            .delete(Request::new(DeleteRequest {
+                key: b"key".to_vec(),
+                topology_epoch: 2,
+                request_id: "delete-2".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(deleted.error.is_none());
     }
 
     #[tokio::test]

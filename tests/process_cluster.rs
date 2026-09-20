@@ -9,7 +9,7 @@ use std::{
 use hashring_rs::client::{ClientConfig, ClientError, HashringClient};
 use hashring_rs::{
     migration::{MigrationPhase, RangeMigration, TopologyChange},
-    proto::ErrorCode,
+    proto::{ErrorCode, GetRequest, data_node_client::DataNodeClient},
     topology::{Member, TopologySnapshot},
 };
 use tonic::Code;
@@ -150,6 +150,17 @@ async fn execute_while_writing_moving_keys(
     let old_topology = observer.topology().await;
     let indexes = moving_key_indexes(&old_topology, keys, &plan.ranges);
     assert!(!indexes.is_empty(), "test has no keys in moving ranges");
+    let read_index = indexes[0];
+    let read_key = keys[read_index].clone();
+    let read_token = old_topology.key_token(&read_key);
+    let read_source_endpoint = plan
+        .ranges
+        .iter()
+        .find(|range| token_in_range(read_token, range))
+        .unwrap()
+        .source_endpoint
+        .clone();
+    let read_epoch = plan.base_epoch;
     let identity = (
         plan.change_id.clone(),
         plan.base_epoch,
@@ -181,6 +192,37 @@ async fn execute_while_writing_moving_keys(
     }
     assert!(observed_copy, "{label} never entered its online copy phase");
 
+    let direct_reader = tokio::spawn(async move {
+        let mut source = DataNodeClient::connect(read_source_endpoint).await.unwrap();
+        let mut successful_reads = 0_u64;
+        for attempt in 0_u64..10_000 {
+            let response = source
+                .get(GetRequest {
+                    key: read_key.clone(),
+                    topology_epoch: read_epoch,
+                    request_id: format!("direct-migration-read-{attempt}"),
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            match response.error {
+                None => successful_reads += 1,
+                Some(error) if error.code == ErrorCode::Moved as i32 => {
+                    return (successful_reads, true);
+                }
+                Some(error) if error.code == ErrorCode::RangeBusy as i32 => {
+                    panic!("source GET was fenced with RangeBusy during migration");
+                }
+                Some(error) => panic!(
+                    "source GET failed during migration: {:?}",
+                    ErrorCode::try_from(error.code)
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        (successful_reads, false)
+    });
+
     let mut writes_during_migration = 0_usize;
     while !execution.is_finished() {
         let index = indexes[writes_during_migration % indexes.len()];
@@ -196,7 +238,14 @@ async fn execute_while_writing_moving_keys(
         writes_during_migration > 0,
         "{label} had no write overlapping migration"
     );
-    execution.await.unwrap()
+    let completed = execution.await.unwrap();
+    let (direct_reads, saw_moved) = tokio::time::timeout(Duration::from_secs(2), direct_reader)
+        .await
+        .expect("direct source reader did not observe the ownership handoff")
+        .unwrap();
+    assert!(direct_reads > 0, "{label} had no direct source reads");
+    assert!(saw_moved, "{label} source never redirected after cutover");
+    completed
 }
 
 #[tokio::test]
@@ -578,11 +627,9 @@ async fn online_scale_out_and_scale_in_preserve_concurrent_writes() {
     let node_1_endpoint = format!("http://127.0.0.1:{}", ports[1]);
     let node_2_endpoint = format!("http://127.0.0.1:{}", ports[2]);
     let initial_members = vec![("node-1".to_owned(), ports[1])];
-    let mut coordinator = spawn_process(&coordinator_arguments(
-        coordinator_port,
-        &state,
-        &initial_members,
-    ));
+    let mut coordinator_args = coordinator_arguments(coordinator_port, &state, &initial_members);
+    coordinator_args.extend(["--pre-publish-delay-ms".into(), "200".into()]);
+    let mut coordinator = spawn_process(&coordinator_args);
     let client = connect_eventually(&coordinator_endpoint).await;
     let mut node_1 = spawn_process(&[
         "node".into(),

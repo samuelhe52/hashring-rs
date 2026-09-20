@@ -697,6 +697,17 @@ impl CoordinatorService {
             .collect();
         self.install_on_members(&change.target_topology, &removed_members, deadline)
             .await?;
+        for range in &change.ranges {
+            let mut destination = connect_node(&range.destination_endpoint, deadline).await?;
+            rpc_before(
+                deadline,
+                destination.activate_destination_range(RangeControlRequest {
+                    change_id: change.change_id.clone(),
+                    range_id: range.range_id.clone(),
+                }),
+            )
+            .await?;
+        }
         self.set_phase(MigrationPhase::CleaningUp).await?;
         change.phase = MigrationPhase::CleaningUp;
         for range in change.ranges.clone() {

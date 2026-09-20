@@ -277,6 +277,7 @@ service DataNode {
   rpc SourceRangeDigest(RangeControlRequest) returns (RangeDigestResponse);
   rpc DestinationRangeDigest(RangeControlRequest) returns (RangeDigestResponse);
   rpc CommitDestinationRange(RangeControlRequest) returns (Empty);
+  rpc ActivateDestinationRange(RangeControlRequest) returns (Empty);
   rpc CleanupSourceRange(RangeControlRequest) returns (Empty);
   rpc AbortRangeMigration(RangeControlRequest) returns (Empty);
   rpc InstallTopology(InstallTopologyRequest) returns (Empty);
