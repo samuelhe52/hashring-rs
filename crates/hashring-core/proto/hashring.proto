@@ -27,11 +27,16 @@ message TopologySnapshot {
 
 service Coordinator {
   rpc GetTopology(Empty) returns (TopologySnapshot);
+  rpc GetCurrentEpoch(Empty) returns (CurrentEpochResponse);
   rpc BeginTopologyChange(BeginTopologyChangeRequest) returns (TopologyChangeSnapshot);
   rpc GetTopologyChange(Empty) returns (GetTopologyChangeResponse);
   rpc ExecuteTopologyChange(ExecuteTopologyChangeRequest) returns (TopologyChangeSnapshot);
   rpc RegisterNode(RegisterNodeRequest) returns (Empty);
   rpc IsStopConfirmed(StopRequest) returns (StopConfirmationResponse);
+}
+
+message CurrentEpochResponse {
+  uint64 epoch = 1;
 }
 
 enum MigrationPhase {

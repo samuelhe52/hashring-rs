@@ -13,4 +13,5 @@ tonic = { version = "0.12", features = ["transport"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["macros", "net", "rt"] }
+tokio-stream = { version = "0.1", features = ["net"] }

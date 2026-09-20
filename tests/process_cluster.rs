@@ -6,7 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use hashring_rs::client::{ClientError, HashringClient};
+use hashring_rs::client::{ClientConfig, ClientError, HashringClient};
 use hashring_rs::{
     migration::{MigrationPhase, RangeMigration, TopologyChange},
     proto::ErrorCode,
@@ -102,6 +102,14 @@ async fn connect_eventually(endpoint: &str) -> HashringClient {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("coordinator did not become ready at {endpoint}");
+}
+
+async fn connect_without_polling(endpoint: &str, timeout: Duration) -> HashringClient {
+    let mut config = ClientConfig::new(timeout);
+    config.topology_poll_interval = None;
+    HashringClient::connect_with_config(endpoint, config)
+        .await
+        .unwrap()
 }
 
 fn token_in_range(token: u64, range: &RangeMigration) -> bool {
@@ -349,11 +357,15 @@ async fn moved_request_retries_a_transient_coordinator_outage_until_deadline() {
     let mut coordinator = spawn_process(&coordinator_arguments(coordinator_port, &state, &members));
     let admin = connect_eventually(&coordinator_endpoint).await;
     let recovery_client =
-        HashringClient::connect(coordinator_endpoint.clone(), Duration::from_secs(2))
-            .await
-            .unwrap();
+        connect_without_polling(&coordinator_endpoint, Duration::from_secs(2)).await;
+    let moved_recovery_client =
+        connect_without_polling(&coordinator_endpoint, Duration::from_secs(2)).await;
     let deadline_client =
-        HashringClient::connect(coordinator_endpoint.clone(), Duration::from_millis(250))
+        connect_without_polling(&coordinator_endpoint, Duration::from_millis(250)).await;
+    let mut polling_config = ClientConfig::new(Duration::from_secs(2));
+    polling_config.topology_poll_interval = Some(Duration::from_millis(50));
+    let polling_client =
+        HashringClient::connect_with_config(coordinator_endpoint.clone(), polling_config)
             .await
             .unwrap();
     let mut node_1 = spawn_process(&[
@@ -386,8 +398,19 @@ async fn moved_request_retries_a_transient_coordinator_outage_until_deadline() {
             plan.ranges.iter().any(|range| token_in_range(token, range))
         })
         .unwrap();
+    let stationary_key = (0_u64..10_000)
+        .map(|candidate| candidate.to_be_bytes().to_vec())
+        .find(|key| {
+            let token = old_topology.key_token(key);
+            !plan.ranges.iter().any(|range| token_in_range(token, range))
+        })
+        .unwrap();
     recovery_client
         .put(moved_key.clone(), b"moved-value".to_vec())
+        .await
+        .unwrap();
+    recovery_client
+        .put(stationary_key.clone(), b"stationary-value".to_vec())
         .await
         .unwrap();
     let mut node_2 = spawn_process(&[
@@ -409,11 +432,39 @@ async fn moved_request_retries_a_transient_coordinator_outage_until_deadline() {
         .unwrap();
     assert_eq!(completed.phase, MigrationPhase::Complete);
     assert_eq!(recovery_client.topology().await.epoch, 1);
+    assert_eq!(moved_recovery_client.topology().await.epoch, 1);
     assert_eq!(deadline_client.topology().await.epoch, 1);
+    for _ in 0..100 {
+        if polling_client.topology().await.epoch == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(polling_client.topology().await.epoch, 2);
+
+    coordinator.stop();
+    let started = Instant::now();
+    assert_eq!(
+        recovery_client.get(stationary_key).await.unwrap().value,
+        b"stationary-value"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "a successful response waited for its background topology refresh"
+    );
+    coordinator = spawn_process(&coordinator_arguments(coordinator_port, &state, &[]));
+    wait_for_listener(coordinator_port);
+    for _ in 0..100 {
+        if recovery_client.topology().await.epoch == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(recovery_client.topology().await.epoch, 2);
 
     coordinator.stop();
     let request = tokio::spawn({
-        let client = recovery_client.clone();
+        let client = moved_recovery_client.clone();
         let key = moved_key.clone();
         async move { client.get(key).await }
     });
@@ -421,7 +472,7 @@ async fn moved_request_retries_a_transient_coordinator_outage_until_deadline() {
     coordinator = spawn_process(&coordinator_arguments(coordinator_port, &state, &[]));
     wait_for_listener(coordinator_port);
     assert_eq!(request.await.unwrap().unwrap().value, b"moved-value");
-    assert_eq!(recovery_client.topology().await.epoch, 2);
+    assert_eq!(moved_recovery_client.topology().await.epoch, 2);
 
     coordinator.stop();
     let started = Instant::now();
@@ -585,6 +636,9 @@ async fn online_scale_out_and_scale_in_preserve_concurrent_writes() {
         .begin_topology_change(vec![two_members[1].clone()])
         .await
         .unwrap();
+    let stale_client = connect_without_polling(&coordinator_endpoint, Duration::from_secs(2)).await;
+    let stale_key =
+        moving_key_indexes(&stale_client.topology().await, &keys, &scale_in_plan.ranges)[0];
     let executor = HashringClient::connect(coordinator_endpoint.clone(), Duration::from_secs(60))
         .await
         .unwrap();
@@ -617,6 +671,15 @@ async fn online_scale_out_and_scale_in_preserve_concurrent_writes() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(node_1.has_exited());
+    assert_eq!(
+        stale_client
+            .get(keys[stale_key].clone())
+            .await
+            .unwrap()
+            .value,
+        expected_values[stale_key]
+    );
+    assert_eq!(stale_client.topology().await.epoch, 3);
 
     node_2.stop();
     coordinator.stop();

@@ -1052,6 +1052,14 @@ impl Coordinator for CoordinatorService {
         Ok(Response::new((&state.committed).into()))
     }
 
+    async fn get_current_epoch(
+        &self,
+        _request: Request<proto::Empty>,
+    ) -> Result<Response<proto::CurrentEpochResponse>, Status> {
+        let epoch = self.state.read().await.committed.epoch;
+        Ok(Response::new(proto::CurrentEpochResponse { epoch }))
+    }
+
     async fn begin_topology_change(
         &self,
         request: Request<proto::BeginTopologyChangeRequest>,

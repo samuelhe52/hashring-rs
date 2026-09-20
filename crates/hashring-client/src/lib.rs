@@ -1,7 +1,17 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use thiserror::Error;
-use tokio::{sync::RwLock, time::Instant};
+use tokio::{
+    sync::{Mutex, RwLock},
+    time::Instant,
+};
 use tonic::Code;
 use tonic::transport::{Channel, Endpoint};
 
@@ -54,6 +64,11 @@ impl From<OperationError> for OperationFailure {
 pub enum ClientError {
     #[error("failed to fetch or validate topology: {0}")]
     Topology(#[from] anyhow::Error),
+    #[error("topology refresh failed: {source} (unknown_write_outcome={unknown_write_outcome})")]
+    TopologyRefresh {
+        source: anyhow::Error,
+        unknown_write_outcome: bool,
+    },
     #[error(transparent)]
     Operation(#[from] OperationFailure),
     #[error("logical operation deadline exceeded (unknown_write_outcome={unknown_write_outcome})")]
@@ -78,6 +93,14 @@ enum TopologyRefreshError {
     Rpc(Box<tonic::Status>),
     #[error("coordinator returned an invalid topology: {0}")]
     InvalidTopology(#[from] TopologyError),
+    #[error(
+        "coordinator returned conflicting topology digests for epoch {epoch}: cached={cached_digest}, fetched={fetched_digest}"
+    )]
+    ConflictingEpoch {
+        epoch: u64,
+        cached_digest: String,
+        fetched_digest: String,
+    },
 }
 
 impl TopologyRefreshError {
@@ -87,12 +110,42 @@ impl TopologyRefreshError {
     }
 }
 
+const DEFAULT_TOPOLOGY_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const POLL_JITTER_PERCENT: u32 = 20;
+
+#[derive(Clone, Debug)]
+pub struct ClientConfig {
+    pub operation_timeout: Duration,
+    pub topology_refresh_timeout: Duration,
+    pub topology_poll_interval: Option<Duration>,
+}
+
+impl ClientConfig {
+    pub fn new(operation_timeout: Duration) -> Self {
+        Self {
+            operation_timeout,
+            topology_refresh_timeout: operation_timeout,
+            topology_poll_interval: Some(DEFAULT_TOPOLOGY_POLL_INTERVAL),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct HashringClient {
+    inner: Arc<ClientInner>,
+}
+
+struct ClientInner {
     coordinator_endpoint: String,
-    topology: Arc<RwLock<TopologySnapshot>>,
-    channels: Arc<RwLock<HashMap<String, Channel>>>,
+    topology: RwLock<TopologySnapshot>,
+    channels: RwLock<HashMap<String, Channel>>,
     operation_timeout: Duration,
+    topology_refresh_timeout: Duration,
+    refresh_lock: Mutex<()>,
+    refresh_generation: AtomicU64,
+    background_refresh_running: AtomicBool,
+    background_minimum_epoch: AtomicU64,
+    background_trigger_generation: AtomicU64,
 }
 
 impl HashringClient {
@@ -100,27 +153,49 @@ impl HashringClient {
         coordinator_endpoint: impl Into<String>,
         operation_timeout: Duration,
     ) -> Result<Self, ClientError> {
+        Self::connect_with_config(coordinator_endpoint, ClientConfig::new(operation_timeout)).await
+    }
+
+    pub async fn connect_with_config(
+        coordinator_endpoint: impl Into<String>,
+        config: ClientConfig,
+    ) -> Result<Self, ClientError> {
         let coordinator_endpoint = coordinator_endpoint.into();
-        let topology =
-            tokio::time::timeout(operation_timeout, fetch_topology(&coordinator_endpoint))
-                .await
-                .map_err(|_| ClientError::DeadlineExceeded {
-                    unknown_write_outcome: false,
-                })??;
-        Ok(Self {
+        let topology = tokio::time::timeout(
+            config.operation_timeout,
+            fetch_topology(&coordinator_endpoint),
+        )
+        .await
+        .map_err(|_| ClientError::DeadlineExceeded {
+            unknown_write_outcome: false,
+        })??;
+        let inner = Arc::new(ClientInner {
             coordinator_endpoint,
-            topology: Arc::new(RwLock::new(topology)),
-            channels: Arc::new(RwLock::new(HashMap::new())),
-            operation_timeout,
-        })
+            topology: RwLock::new(topology),
+            channels: RwLock::new(HashMap::new()),
+            operation_timeout: config.operation_timeout,
+            topology_refresh_timeout: config.topology_refresh_timeout,
+            refresh_lock: Mutex::new(()),
+            refresh_generation: AtomicU64::new(0),
+            background_refresh_running: AtomicBool::new(false),
+            background_minimum_epoch: AtomicU64::new(0),
+            background_trigger_generation: AtomicU64::new(0),
+        });
+        if let Some(interval) = config
+            .topology_poll_interval
+            .filter(|value| !value.is_zero())
+        {
+            tokio::spawn(poll_for_topology_changes(Arc::downgrade(&inner), interval));
+        }
+        Ok(Self { inner })
     }
 
     pub async fn topology(&self) -> TopologySnapshot {
-        self.topology.read().await.clone()
+        self.inner.topology.read().await.clone()
     }
 
     pub async fn refresh_topology(&self) -> Result<TopologySnapshot, ClientError> {
-        self.refresh_topology_for(self.operation_timeout, false)
+        self.refresh_topology_for(self.inner.operation_timeout, false, None)
             .await
     }
 
@@ -128,10 +203,10 @@ impl HashringClient {
         &self,
         target_members: Vec<Member>,
     ) -> Result<TopologyChange, ClientError> {
-        let deadline = Instant::now() + self.operation_timeout;
+        let deadline = Instant::now() + self.inner.operation_timeout;
         let mut client = match tokio::time::timeout(
             remaining(deadline, false)?,
-            CoordinatorClient::connect(self.coordinator_endpoint.clone()),
+            CoordinatorClient::connect(self.inner.coordinator_endpoint.clone()),
         )
         .await
         {
@@ -167,8 +242,8 @@ impl HashringClient {
     }
 
     pub async fn topology_change(&self) -> Result<Option<TopologyChange>, ClientError> {
-        let endpoint = self.coordinator_endpoint.clone();
-        let response = tokio::time::timeout(self.operation_timeout, async move {
+        let endpoint = self.inner.coordinator_endpoint.clone();
+        let response = tokio::time::timeout(self.inner.operation_timeout, async move {
             let mut client =
                 configure_coordinator_client(CoordinatorClient::connect(endpoint).await?);
             let response = client
@@ -195,10 +270,10 @@ impl HashringClient {
         base_epoch: u64,
         target_epoch: u64,
     ) -> Result<TopologyChange, ClientError> {
-        let deadline = Instant::now() + self.operation_timeout;
+        let deadline = Instant::now() + self.inner.operation_timeout;
         let mut client = match tokio::time::timeout(
             remaining(deadline, false)?,
-            CoordinatorClient::connect(self.coordinator_endpoint.clone()),
+            CoordinatorClient::connect(self.inner.coordinator_endpoint.clone()),
         )
         .await
         {
@@ -236,7 +311,7 @@ impl HashringClient {
 
     pub async fn get(&self, key: Vec<u8>) -> Result<GetOutput, ClientError> {
         validate_key_size(&key)?;
-        let deadline = Instant::now() + self.operation_timeout;
+        let deadline = Instant::now() + self.inner.operation_timeout;
         let request_id = uuid::Uuid::new_v4().to_string();
         let mut attempt = 0_u32;
 
@@ -251,6 +326,8 @@ impl HashringClient {
                     });
                 }
                 Err(_) => {
+                    self.refresh_after_unavailable(topology.epoch, deadline, false)
+                        .await?;
                     self.retry_delay(deadline, &mut attempt, false).await?;
                     continue;
                 }
@@ -270,6 +347,8 @@ impl HashringClient {
                 Ok(Ok(response)) => response.into_inner(),
                 Ok(Err(status)) => {
                     if retryable_status(&status) {
+                        self.refresh_after_unavailable(topology.epoch, deadline, false)
+                            .await?;
                         self.retry_delay(deadline, &mut attempt, false).await?;
                         continue;
                     }
@@ -284,21 +363,22 @@ impl HashringClient {
 
             if let Some(error) = response.error {
                 if self
-                    .handle_retryable(error.clone(), deadline, &mut attempt, false)
+                    .handle_retryable(error.clone(), topology.epoch, deadline, &mut attempt, false)
                     .await?
                 {
                     continue;
                 }
                 return Err(OperationFailure::from(error).into());
             }
-            if response.current_epoch > topology.epoch {
-                let _ = self.refresh_topology_before(deadline, false).await;
-            }
-            return Ok(GetOutput {
+            let output = GetOutput {
                 value: response.value,
                 version: response.version.ok_or(ClientError::MissingVersion)?,
                 topology_epoch: response.current_epoch,
-            });
+            };
+            if response.current_epoch > topology.epoch {
+                self.trigger_background_refresh(response.current_epoch);
+            }
+            return Ok(output);
         }
     }
 
@@ -309,7 +389,7 @@ impl HashringClient {
                 "value exceeds {DEFAULT_MAX_VALUE_BYTES} bytes"
             )));
         }
-        let deadline = Instant::now() + self.operation_timeout;
+        let deadline = Instant::now() + self.inner.operation_timeout;
         let request_id = uuid::Uuid::new_v4().to_string();
         let mut attempt = 0_u32;
         let mut unknown_write_outcome = false;
@@ -325,6 +405,8 @@ impl HashringClient {
                     });
                 }
                 Err(_) => {
+                    self.refresh_after_unavailable(topology.epoch, deadline, unknown_write_outcome)
+                        .await?;
                     self.retry_delay(deadline, &mut attempt, unknown_write_outcome)
                         .await?;
                     continue;
@@ -348,6 +430,12 @@ impl HashringClient {
                     unknown_write_outcome =
                         accumulated_write_ambiguity(unknown_write_outcome, &status);
                     if retryable_status(&status) {
+                        self.refresh_after_unavailable(
+                            topology.epoch,
+                            deadline,
+                            unknown_write_outcome,
+                        )
+                        .await?;
                         self.retry_delay(deadline, &mut attempt, unknown_write_outcome)
                             .await?;
                         continue;
@@ -367,6 +455,7 @@ impl HashringClient {
                 if self
                     .handle_retryable(
                         error.clone(),
+                        topology.epoch,
                         deadline,
                         &mut attempt,
                         error_unknown_write_outcome,
@@ -379,19 +468,21 @@ impl HashringClient {
                 failure.unknown_write_outcome = error_unknown_write_outcome;
                 return Err(failure.into());
             }
-            if response.current_epoch > topology.epoch {
-                let _ = self.refresh_topology_before(deadline, false).await;
-            }
-            return Ok(PutOutput {
+            let output = PutOutput {
                 version: response.version.ok_or(ClientError::MissingVersion)?,
                 topology_epoch: response.current_epoch,
-            });
+            };
+            if response.current_epoch > topology.epoch {
+                self.trigger_background_refresh(response.current_epoch);
+            }
+            return Ok(output);
         }
     }
 
     async fn handle_retryable(
         &self,
         error: OperationError,
+        attempted_epoch: u64,
         deadline: Instant,
         attempt: &mut u32,
         unknown_write_outcome: bool,
@@ -399,15 +490,21 @@ impl HashringClient {
         let code = ErrorCode::try_from(error.code).unwrap_or(ErrorCode::Unspecified);
         match code {
             ErrorCode::Moved => {
-                self.refresh_topology_before(deadline, unknown_write_outcome)
+                let required_epoch = error.current_epoch.max(attempted_epoch.saturating_add(1));
+                self.refresh_topology_before(deadline, unknown_write_outcome, Some(required_epoch))
                     .await?;
                 self.retry_delay(deadline, attempt, unknown_write_outcome)
                     .await?;
                 Ok(true)
             }
-            ErrorCode::RangeBusy | ErrorCode::Unavailable | ErrorCode::ResourceExhausted
-                if error.retryable =>
-            {
+            ErrorCode::Unavailable if error.retryable => {
+                self.refresh_after_unavailable(attempted_epoch, deadline, unknown_write_outcome)
+                    .await?;
+                self.retry_delay(deadline, attempt, unknown_write_outcome)
+                    .await?;
+                Ok(true)
+            }
+            ErrorCode::RangeBusy | ErrorCode::ResourceExhausted if error.retryable => {
                 self.retry_delay(deadline, attempt, unknown_write_outcome)
                     .await?;
                 Ok(true)
@@ -420,9 +517,10 @@ impl HashringClient {
         &self,
         deadline: Instant,
         unknown_write_outcome: bool,
+        minimum_epoch: Option<u64>,
     ) -> Result<TopologySnapshot, ClientError> {
         let available = remaining(deadline, unknown_write_outcome)?;
-        self.refresh_topology_for(available, unknown_write_outcome)
+        self.refresh_topology_for(available, unknown_write_outcome, minimum_epoch)
             .await
     }
 
@@ -430,35 +528,84 @@ impl HashringClient {
         &self,
         timeout: Duration,
         unknown_write_outcome: bool,
+        minimum_epoch: Option<u64>,
     ) -> Result<TopologySnapshot, ClientError> {
-        let deadline = Instant::now() + timeout;
-        let mut attempt = 0_u32;
-        loop {
-            let fetched = tokio::time::timeout(
-                remaining(deadline, unknown_write_outcome)?,
-                fetch_topology_for_refresh(&self.coordinator_endpoint),
-            )
-            .await;
-            match fetched {
-                Ok(Ok(topology)) => {
-                    let mut current = self.topology.write().await;
-                    if topology.epoch >= current.epoch {
-                        *current = topology;
-                    }
-                    return Ok(current.clone());
-                }
-                Ok(Err(error)) if error.is_retryable() => {
-                    self.retry_delay(deadline, &mut attempt, unknown_write_outcome)
-                        .await?;
-                }
-                Ok(Err(error)) => return Err(ClientError::Topology(error.into())),
-                Err(_) => {
-                    return Err(ClientError::DeadlineExceeded {
+        refresh_topology_for_inner(&self.inner, timeout, unknown_write_outcome, minimum_epoch).await
+    }
+
+    async fn refresh_after_unavailable(
+        &self,
+        observed_epoch: u64,
+        deadline: Instant,
+        unknown_write_outcome: bool,
+    ) -> Result<(), ClientError> {
+        if self.inner.topology.read().await.epoch > observed_epoch {
+            return Ok(());
+        }
+        let generation = self.inner.refresh_generation.load(Ordering::SeqCst);
+        let _guard = tokio::time::timeout(
+            remaining(deadline, unknown_write_outcome)?,
+            self.inner.refresh_lock.lock(),
+        )
+        .await
+        .map_err(|_| ClientError::DeadlineExceeded {
+            unknown_write_outcome,
+        })?;
+        if self.inner.topology.read().await.epoch > observed_epoch
+            || self.inner.refresh_generation.load(Ordering::SeqCst) != generation
+        {
+            return Ok(());
+        }
+        match tokio::time::timeout(
+            remaining(deadline, unknown_write_outcome)?,
+            fetch_topology_for_refresh(&self.inner.coordinator_endpoint),
+        )
+        .await
+        {
+            Ok(Ok(topology)) => {
+                let mut current = self.inner.topology.write().await;
+                if topology.epoch > current.epoch {
+                    *current = topology;
+                } else if topology.epoch == current.epoch && topology != *current {
+                    return Err(ClientError::TopologyRefresh {
+                        source: TopologyRefreshError::ConflictingEpoch {
+                            epoch: topology.epoch,
+                            cached_digest: current.digest.clone(),
+                            fetched_digest: topology.digest,
+                        }
+                        .into(),
                         unknown_write_outcome,
                     });
                 }
+                self.inner.refresh_generation.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(Err(_)) => {}
+            Err(_) => {
+                return Err(ClientError::DeadlineExceeded {
+                    unknown_write_outcome,
+                });
             }
         }
+        Ok(())
+    }
+
+    fn trigger_background_refresh(&self, minimum_epoch: u64) {
+        self.inner
+            .background_minimum_epoch
+            .fetch_max(minimum_epoch, Ordering::SeqCst);
+        self.inner
+            .background_trigger_generation
+            .fetch_add(1, Ordering::SeqCst);
+        if self
+            .inner
+            .background_refresh_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let inner = Arc::clone(&self.inner);
+        tokio::spawn(run_background_refresh(inner));
     }
 
     async fn retry_delay(
@@ -467,19 +614,7 @@ impl HashringClient {
         attempt: &mut u32,
         unknown_write_outcome: bool,
     ) -> Result<(), ClientError> {
-        let base_ms = 5_u64.saturating_mul(1_u64 << (*attempt).min(5));
-        let jitter_ms = rand::random::<u64>() % (base_ms + 1);
-        *attempt = attempt.saturating_add(1);
-        let delay = Duration::from_millis((base_ms + jitter_ms).min(200));
-        let available = remaining(deadline, unknown_write_outcome)?;
-        if delay >= available {
-            tokio::time::sleep(available).await;
-            return Err(ClientError::DeadlineExceeded {
-                unknown_write_outcome,
-            });
-        }
-        tokio::time::sleep(delay).await;
-        Ok(())
+        retry_delay(deadline, attempt, unknown_write_outcome).await
     }
 
     async fn data_node_client(
@@ -487,7 +622,7 @@ impl HashringClient {
         endpoint: &str,
         deadline: Instant,
     ) -> Result<DataNodeClient<Channel>, ClientError> {
-        if let Some(channel) = self.channels.read().await.get(endpoint).cloned() {
+        if let Some(channel) = self.inner.channels.read().await.get(endpoint).cloned() {
             return Ok(configure_data_client(DataNodeClient::new(channel)));
         }
         let transport = Endpoint::from_shared(endpoint.to_owned())
@@ -500,12 +635,106 @@ impl HashringClient {
             })?
             .map_err(anyhow::Error::from)
             .map_err(ClientError::from)?;
-        self.channels
+        self.inner
+            .channels
             .write()
             .await
             .insert(endpoint.to_owned(), channel.clone());
         Ok(configure_data_client(DataNodeClient::new(channel)))
     }
+}
+
+async fn refresh_topology_for_inner(
+    inner: &Arc<ClientInner>,
+    timeout: Duration,
+    unknown_write_outcome: bool,
+    minimum_epoch: Option<u64>,
+) -> Result<TopologySnapshot, ClientError> {
+    let deadline = Instant::now() + timeout;
+    if let Some(minimum_epoch) = minimum_epoch
+        && inner.topology.read().await.epoch >= minimum_epoch
+    {
+        return Ok(inner.topology.read().await.clone());
+    }
+    let _refresh = tokio::time::timeout(
+        remaining(deadline, unknown_write_outcome)?,
+        inner.refresh_lock.lock(),
+    )
+    .await
+    .map_err(|_| ClientError::DeadlineExceeded {
+        unknown_write_outcome,
+    })?;
+    if let Some(minimum_epoch) = minimum_epoch
+        && inner.topology.read().await.epoch >= minimum_epoch
+    {
+        return Ok(inner.topology.read().await.clone());
+    }
+    let mut attempt = 0_u32;
+    loop {
+        let fetched = tokio::time::timeout(
+            remaining(deadline, unknown_write_outcome)?,
+            fetch_topology_for_refresh(&inner.coordinator_endpoint),
+        )
+        .await;
+        match fetched {
+            Ok(Ok(topology)) => {
+                let mut current = inner.topology.write().await;
+                if topology.epoch > current.epoch {
+                    *current = topology;
+                } else if topology.epoch == current.epoch && topology != *current {
+                    return Err(ClientError::TopologyRefresh {
+                        source: TopologyRefreshError::ConflictingEpoch {
+                            epoch: topology.epoch,
+                            cached_digest: current.digest.clone(),
+                            fetched_digest: topology.digest,
+                        }
+                        .into(),
+                        unknown_write_outcome,
+                    });
+                }
+                inner.refresh_generation.fetch_add(1, Ordering::SeqCst);
+                if minimum_epoch.is_none_or(|minimum| current.epoch >= minimum) {
+                    return Ok(current.clone());
+                }
+                drop(current);
+                retry_delay(deadline, &mut attempt, unknown_write_outcome).await?;
+            }
+            Ok(Err(error)) if error.is_retryable() => {
+                retry_delay(deadline, &mut attempt, unknown_write_outcome).await?;
+            }
+            Ok(Err(error)) => {
+                return Err(ClientError::TopologyRefresh {
+                    source: error.into(),
+                    unknown_write_outcome,
+                });
+            }
+            Err(_) => {
+                return Err(ClientError::DeadlineExceeded {
+                    unknown_write_outcome,
+                });
+            }
+        }
+    }
+}
+
+async fn retry_delay(
+    deadline: Instant,
+    attempt: &mut u32,
+    unknown_write_outcome: bool,
+) -> Result<(), ClientError> {
+    let base_ms = 5_u64.saturating_mul(1_u64 << (*attempt).min(5));
+    let jitter_ms = rand::random::<u64>() % (base_ms + 1);
+    *attempt = attempt.saturating_add(1);
+    let delay = Duration::from_millis((base_ms + jitter_ms).min(200));
+    let available = remaining(deadline, unknown_write_outcome)?;
+    if delay >= available {
+        tokio::time::sleep(available).await;
+        return Err(ClientError::DeadlineExceeded {
+            unknown_write_outcome,
+        });
+    }
+    tokio::time::sleep(delay).await;
+    Ok(())
 }
 
 fn configure_data_client(
@@ -518,6 +747,81 @@ fn configure_data_client(
 
 fn retryable_status(status: &tonic::Status) -> bool {
     status.code() == Code::Unavailable
+}
+
+async fn poll_for_topology_changes(inner: Weak<ClientInner>, interval: Duration) {
+    loop {
+        tokio::time::sleep(jittered_poll_delay(interval)).await;
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
+        let refresh_timeout = inner.topology_refresh_timeout;
+        let observed_epoch = match tokio::time::timeout(
+            refresh_timeout,
+            fetch_current_epoch(&inner.coordinator_endpoint),
+        )
+        .await
+        {
+            Ok(Ok(epoch)) => epoch,
+            Ok(Err(_)) | Err(_) => continue,
+        };
+        if inner.topology.read().await.epoch < observed_epoch {
+            let _ =
+                refresh_topology_for_inner(&inner, refresh_timeout, false, Some(observed_epoch))
+                    .await;
+        }
+    }
+}
+
+async fn run_background_refresh(inner: Arc<ClientInner>) {
+    loop {
+        let handled_generation = inner.background_trigger_generation.load(Ordering::SeqCst);
+        let requested_epoch = inner.background_minimum_epoch.load(Ordering::SeqCst);
+        let _ = refresh_topology_for_inner(
+            &inner,
+            inner.topology_refresh_timeout,
+            false,
+            Some(requested_epoch),
+        )
+        .await;
+
+        let newest_generation = inner.background_trigger_generation.load(Ordering::SeqCst);
+        if newest_generation > handled_generation {
+            continue;
+        }
+        inner
+            .background_refresh_running
+            .store(false, Ordering::SeqCst);
+        let raced_generation = inner.background_trigger_generation.load(Ordering::SeqCst);
+        if raced_generation > newest_generation
+            && inner
+                .background_refresh_running
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            continue;
+        }
+        return;
+    }
+}
+
+fn jittered_poll_delay(interval: Duration) -> Duration {
+    let jitter_steps = POLL_JITTER_PERCENT.saturating_mul(2).saturating_add(1);
+    let percent = 100_u32
+        .saturating_sub(POLL_JITTER_PERCENT)
+        .saturating_add(rand::random::<u32>() % jitter_steps);
+    interval.mul_f64(f64::from(percent) / 100.0)
+}
+
+async fn fetch_current_epoch(endpoint: &str) -> Result<u64, TopologyRefreshError> {
+    let mut client =
+        configure_coordinator_client(CoordinatorClient::connect(endpoint.to_owned()).await?);
+    Ok(client
+        .get_current_epoch(proto::Empty {})
+        .await
+        .map_err(|status| TopologyRefreshError::Rpc(Box::new(status)))?
+        .into_inner()
+        .epoch)
 }
 
 async fn fetch_topology_for_refresh(
@@ -587,7 +891,128 @@ fn remaining(deadline: Instant, unknown_write_outcome: bool) -> Result<Duration,
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use hashring_core::proto::coordinator_server::{Coordinator, CoordinatorServer};
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::{Request, Response, Status};
+
     use super::*;
+
+    #[derive(Clone)]
+    struct FakeCoordinator {
+        topology: Arc<RwLock<TopologySnapshot>>,
+        topology_calls: Arc<AtomicUsize>,
+        epoch_calls: Arc<AtomicUsize>,
+        topology_delay: Duration,
+        topology_error: Arc<std::sync::Mutex<Option<Code>>>,
+        topology_failures_remaining: Arc<AtomicUsize>,
+    }
+
+    #[tonic::async_trait]
+    impl Coordinator for FakeCoordinator {
+        async fn get_topology(
+            &self,
+            _request: Request<proto::Empty>,
+        ) -> Result<Response<proto::TopologySnapshot>, Status> {
+            self.topology_calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.topology_delay).await;
+            if self
+                .topology_failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                let code = self.topology_error.lock().unwrap().unwrap();
+                return Err(Status::new(code, "injected topology failure"));
+            }
+            Ok(Response::new((&*self.topology.read().await).into()))
+        }
+
+        async fn get_current_epoch(
+            &self,
+            _request: Request<proto::Empty>,
+        ) -> Result<Response<proto::CurrentEpochResponse>, Status> {
+            self.epoch_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Response::new(proto::CurrentEpochResponse {
+                epoch: self.topology.read().await.epoch,
+            }))
+        }
+
+        async fn begin_topology_change(
+            &self,
+            _request: Request<proto::BeginTopologyChangeRequest>,
+        ) -> Result<Response<proto::TopologyChangeSnapshot>, Status> {
+            Err(Status::unimplemented("unused by client tests"))
+        }
+
+        async fn get_topology_change(
+            &self,
+            _request: Request<proto::Empty>,
+        ) -> Result<Response<proto::GetTopologyChangeResponse>, Status> {
+            Err(Status::unimplemented("unused by client tests"))
+        }
+
+        async fn execute_topology_change(
+            &self,
+            _request: Request<proto::ExecuteTopologyChangeRequest>,
+        ) -> Result<Response<proto::TopologyChangeSnapshot>, Status> {
+            Err(Status::unimplemented("unused by client tests"))
+        }
+
+        async fn register_node(
+            &self,
+            _request: Request<proto::RegisterNodeRequest>,
+        ) -> Result<Response<proto::Empty>, Status> {
+            Err(Status::unimplemented("unused by client tests"))
+        }
+
+        async fn is_stop_confirmed(
+            &self,
+            _request: Request<proto::StopRequest>,
+        ) -> Result<Response<proto::StopConfirmationResponse>, Status> {
+            Err(Status::unimplemented("unused by client tests"))
+        }
+    }
+
+    fn test_topology(epoch: u64) -> TopologySnapshot {
+        TopologySnapshot::new(
+            epoch,
+            1,
+            1,
+            vec![Member {
+                node_id: "node-1".into(),
+                endpoint: "http://127.0.0.1:1".into(),
+            }],
+        )
+        .unwrap()
+    }
+
+    async fn start_fake_coordinator(
+        topology_delay: Duration,
+    ) -> (String, FakeCoordinator, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = FakeCoordinator {
+            topology: Arc::new(RwLock::new(test_topology(1))),
+            topology_calls: Arc::new(AtomicUsize::new(0)),
+            epoch_calls: Arc::new(AtomicUsize::new(0)),
+            topology_delay,
+            topology_error: Arc::new(std::sync::Mutex::new(None)),
+            topology_failures_remaining: Arc::new(AtomicUsize::new(0)),
+        };
+        let server_service = service.clone();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(CoordinatorServer::new(server_service))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let endpoint = format!("http://{address}");
+        (endpoint, service, server)
+    }
 
     #[test]
     fn write_ambiguity_is_sticky_across_later_permanent_errors() {
@@ -618,6 +1043,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idle_polling_fetches_topology_only_after_the_epoch_advances() {
+        let (endpoint, service, server) = start_fake_coordinator(Duration::ZERO).await;
+        let mut config = ClientConfig::new(Duration::from_secs(1));
+        config.topology_poll_interval = Some(Duration::from_millis(20));
+        let client = HashringClient::connect_with_config(endpoint, config)
+            .await
+            .unwrap();
+
+        for _ in 0..50 {
+            if service.epoch_calls.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(service.epoch_calls.load(Ordering::SeqCst) >= 2);
+        assert_eq!(service.topology_calls.load(Ordering::SeqCst), 1);
+        *service.topology.write().await = test_topology(2);
+        for _ in 0..50 {
+            if client.topology().await.epoch == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(client.topology().await.epoch, 2);
+        assert_eq!(service.topology_calls.load(Ordering::SeqCst), 2);
+
+        *service.topology.write().await = test_topology(1);
+        assert_eq!(client.refresh_topology().await.unwrap().epoch, 2);
+        assert_eq!(client.topology().await.epoch, 2);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn background_refresh_triggers_are_task_and_network_single_flight() {
+        let (endpoint, service, server) = start_fake_coordinator(Duration::from_millis(50)).await;
+        let mut config = ClientConfig::new(Duration::from_secs(1));
+        config.topology_poll_interval = None;
+        let client = HashringClient::connect_with_config(endpoint, config)
+            .await
+            .unwrap();
+        *service.topology.write().await = test_topology(2);
+        *service.topology_error.lock().unwrap() = Some(Code::InvalidArgument);
+        service
+            .topology_failures_remaining
+            .store(1, Ordering::SeqCst);
+
+        client.trigger_background_refresh(2);
+        for _ in 0..100 {
+            if service.topology_calls.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(service.topology_calls.load(Ordering::SeqCst), 2);
+        *service.topology.write().await = test_topology(3);
+        for _ in 0..1_000 {
+            client.trigger_background_refresh(3);
+        }
+        for _ in 0..100 {
+            if client.topology().await.epoch == 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(client.topology().await.epoch, 3);
+        assert_eq!(service.topology_calls.load(Ordering::SeqCst), 3);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unavailable_refresh_rejects_a_conflicting_equal_epoch() {
+        let (endpoint, service, server) = start_fake_coordinator(Duration::ZERO).await;
+        let mut config = ClientConfig::new(Duration::from_secs(1));
+        config.topology_poll_interval = None;
+        let client = HashringClient::connect_with_config(endpoint, config)
+            .await
+            .unwrap();
+        *service.topology.write().await = TopologySnapshot::new(
+            1,
+            1,
+            1,
+            vec![Member {
+                node_id: "node-2".into(),
+                endpoint: "http://127.0.0.1:2".into(),
+            }],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            client
+                .refresh_after_unavailable(1, Instant::now() + Duration::from_secs(1), true)
+                .await,
+            Err(ClientError::TopologyRefresh {
+                unknown_write_outcome: true,
+                ..
+            })
+        ));
+        assert_eq!(client.topology().await, test_topology(1));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn permanent_moved_refresh_failure_preserves_unknown_write_outcome() {
+        let (endpoint, service, server) = start_fake_coordinator(Duration::ZERO).await;
+        let mut config = ClientConfig::new(Duration::from_secs(1));
+        config.topology_poll_interval = None;
+        let client = HashringClient::connect_with_config(endpoint, config)
+            .await
+            .unwrap();
+        *service.topology_error.lock().unwrap() = Some(Code::InvalidArgument);
+        service
+            .topology_failures_remaining
+            .store(1, Ordering::SeqCst);
+
+        let error = client
+            .handle_retryable(
+                OperationError {
+                    code: ErrorCode::Moved.into(),
+                    current_epoch: 2,
+                    retryable: true,
+                    ..Default::default()
+                },
+                1,
+                Instant::now() + Duration::from_secs(1),
+                &mut 0,
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::TopologyRefresh {
+                unknown_write_outcome: true,
+                ..
+            }
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn moved_refresh_preserves_an_unknown_write_outcome_through_its_deadline() {
         let topology = TopologySnapshot::new(
             1,
@@ -630,12 +1196,20 @@ mod tests {
         )
         .unwrap();
         let client = HashringClient {
-            coordinator_endpoint: "http://127.0.0.1:1".into(),
-            topology: Arc::new(RwLock::new(topology)),
-            channels: Arc::new(RwLock::new(HashMap::new())),
-            operation_timeout: Duration::from_millis(100),
+            inner: Arc::new(ClientInner {
+                coordinator_endpoint: "http://127.0.0.1:1".into(),
+                topology: RwLock::new(topology),
+                channels: RwLock::new(HashMap::new()),
+                operation_timeout: Duration::from_millis(100),
+                topology_refresh_timeout: Duration::from_millis(100),
+                refresh_lock: Mutex::new(()),
+                refresh_generation: AtomicU64::new(0),
+                background_refresh_running: AtomicBool::new(false),
+                background_minimum_epoch: AtomicU64::new(0),
+                background_trigger_generation: AtomicU64::new(0),
+            }),
         };
-        let deadline = Instant::now() + client.operation_timeout;
+        let deadline = Instant::now() + client.inner.operation_timeout;
         let error = client
             .handle_retryable(
                 OperationError {
@@ -643,6 +1217,7 @@ mod tests {
                     retryable: true,
                     ..Default::default()
                 },
+                1,
                 deadline,
                 &mut 0,
                 true,

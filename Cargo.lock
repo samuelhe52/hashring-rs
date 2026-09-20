@@ -475,6 +475,7 @@ dependencies = [
  "rand",
  "thiserror",
  "tokio",
+ "tokio-stream",
  "tonic",
  "uuid",
 ]
