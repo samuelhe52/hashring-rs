@@ -5,7 +5,8 @@ use clap::{Args, Parser, Subcommand};
 use hashring_rs::{
     client::HashringClient,
     coordinator::{CoordinatorService, RedbTopologyRepository, load_or_initialize},
-    node::{DataNodeService, MAX_CONTROL_MESSAGE_BYTES},
+    limits::MAX_CONTROL_MESSAGE_BYTES,
+    node::DataNodeService,
     proto::{coordinator_server::CoordinatorServer, data_node_server::DataNodeServer},
     topology::{Member, TopologySnapshot},
 };

@@ -3,27 +3,35 @@ name = "hashring-rs"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = [
+    "crates/hashring-client",
+    "crates/hashring-coordinator",
+    "crates/hashring-core",
+    "crates/hashring-node",
+]
+default-members = [
+    ".",
+    "crates/hashring-client",
+    "crates/hashring-coordinator",
+    "crates/hashring-core",
+    "crates/hashring-node",
+]
+resolver = "2"
+
 [dependencies]
 anyhow = "1"
-blake3 = "1"
 clap = { version = "4", features = ["derive"] }
+hashring-client = { version = "0.1.0", path = "crates/hashring-client" }
+hashring-coordinator = { version = "0.1.0", path = "crates/hashring-coordinator" }
+hashring-core = { version = "0.1.0", path = "crates/hashring-core" }
+hashring-node = { version = "0.1.0", path = "crates/hashring-node" }
 hex = "0.4"
-prost = "0.13"
-rand = "0.8"
-redb = "2"
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tonic = { version = "0.12", features = ["transport"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1", features = ["v4"] }
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
-
-[build-dependencies]
-protoc-bin-vendored = "3"
-tonic-build = "0.12"
 
 [dev-dependencies]
 tempfile = "3"

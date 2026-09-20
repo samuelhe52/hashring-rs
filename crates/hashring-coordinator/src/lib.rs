@@ -1,3 +1,7 @@
+// Public tonic and redb APIs use concrete error types whose context is more
+// useful here than erasing or boxing them solely to reduce enum size.
+#![allow(clippy::result_large_err)]
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
@@ -15,11 +19,11 @@ use tokio::{
 };
 use tonic::{Request, Response, Status};
 
-use crate::{
+use hashring_core::{
+    limits::{MAX_CONTROL_MESSAGE_BYTES, MAX_MIGRATION_PAGE_BYTES},
     migration::{
         MAX_MIGRATION_RANGES, MigrationError, MigrationPhase, RangeMigration, TopologyChange,
     },
-    node::{MAX_CONTROL_MESSAGE_BYTES, MAX_MIGRATION_PAGE_BYTES},
     proto::{
         self, ApplyMigrationBatchRequest, ChangelogPageRequest, InstallTopologyRequest,
         PrepareRangeRequest, RangeControlRequest, SnapshotPageRequest, StopRequest,
@@ -111,7 +115,7 @@ pub enum RepositoryError {
     #[error("invalid persisted topology: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("invalid topology: {0}")]
-    Topology(#[from] crate::topology::TopologyError),
+    Topology(#[from] hashring_core::topology::TopologyError),
     #[error("invalid migration: {0}")]
     Migration(#[from] MigrationError),
     #[error("invalid coordinator state: {0}")]
@@ -1322,7 +1326,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::topology::Member;
+    use hashring_core::topology::Member;
 
     #[derive(Default)]
     struct MemoryRepository(Mutex<Option<ClusterState>>);

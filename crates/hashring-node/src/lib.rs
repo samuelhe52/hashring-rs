@@ -1,3 +1,6 @@
+// tonic service signatures intentionally return its concrete Status type.
+#![allow(clippy::result_large_err)]
+
 use std::{
     cmp::Ordering,
     collections::HashMap,
@@ -10,7 +13,13 @@ use std::{
 use tokio::sync::{Mutex, RwLock, watch};
 use tonic::{Request, Response, Status};
 
-use crate::{
+pub use hashring_core::limits::{
+    DEFAULT_MAX_KEY_BYTES, DEFAULT_MAX_VALUE_BYTES, MAX_CONTROL_MESSAGE_BYTES,
+    MAX_DATA_MESSAGE_BYTES, MAX_MIGRATION_PAGE_BYTES,
+};
+pub use hashring_core::transport::{configure_coordinator_client, fetch_topology};
+
+use hashring_core::{
     proto::{
         self, ApplyMigrationBatchRequest, ChangelogPageRequest, ChangelogPageResponse, ErrorCode,
         GetRequest, GetResponse, InstallTopologyRequest, JournalRecord, MigrationRecord,
@@ -23,14 +32,7 @@ use crate::{
     topology::TopologySnapshot,
 };
 
-pub const DEFAULT_MAX_KEY_BYTES: usize = 64 * 1024;
-pub const DEFAULT_MAX_VALUE_BYTES: usize = 8 * 1024 * 1024;
 pub const DEFAULT_MAX_MIGRATION_JOURNAL_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_MIGRATION_PAGE_BYTES: usize = 8 * 1024 * 1024;
-/// Accommodates the maximum key and value plus protobuf framing and metadata.
-pub const MAX_DATA_MESSAGE_BYTES: usize = 9 * 1024 * 1024;
-/// Supports the largest legal canonical topology without constraining data values.
-pub const MAX_CONTROL_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone)]
 struct Record {
@@ -835,7 +837,7 @@ impl DataNode for DataNodeService {
             .topology
             .ok_or_else(|| Status::invalid_argument("missing topology"))?
             .try_into()
-            .map_err(|error: crate::topology::TopologyError| {
+            .map_err(|error: hashring_core::topology::TopologyError| {
                 Status::invalid_argument(error.to_string())
             })?;
         let mut state = self.state.write().await;
@@ -988,13 +990,6 @@ fn range_digest(records: &HashMap<Vec<u8>, Record>, watermark: u64) -> RangeDige
     }
 }
 
-pub async fn fetch_topology(endpoint: &str) -> anyhow::Result<TopologySnapshot> {
-    let mut client =
-        configure_coordinator_client(CoordinatorClient::connect(endpoint.to_owned()).await?);
-    let response = client.get_topology(proto::Empty {}).await?.into_inner();
-    Ok(response.try_into()?)
-}
-
 async fn fetch_pending_topology(endpoint: &str) -> anyhow::Result<Option<TopologySnapshot>> {
     let mut client =
         configure_coordinator_client(CoordinatorClient::connect(endpoint.to_owned()).await?);
@@ -1065,18 +1060,10 @@ async fn wait_for_durable_stop_confirmation(
     }
 }
 
-pub fn configure_coordinator_client(
-    client: CoordinatorClient<tonic::transport::Channel>,
-) -> CoordinatorClient<tonic::transport::Channel> {
-    client
-        .max_decoding_message_size(MAX_CONTROL_MESSAGE_BYTES)
-        .max_encoding_message_size(MAX_CONTROL_MESSAGE_BYTES)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::topology::Member;
+    use hashring_core::topology::Member;
 
     fn service() -> DataNodeService {
         let topology = TopologySnapshot::new(

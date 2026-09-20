@@ -31,6 +31,23 @@ cargo run -- topology
 
 `--key-hex`, `--value-hex`, and `get --hex` support arbitrary bytes.
 
+## Workspace architecture
+
+The root package contains the operational binary and a compatibility facade for
+the original public module paths. Implementation responsibilities are separated
+into four workspace crates:
+
+- `hashring-core` owns the protobuf contract, topology and migration domain
+  types, shared protocol limits, and coordinator transport configuration;
+- `hashring-client` owns routing, deadlines, retries, and public client errors;
+- `hashring-coordinator` owns durable cluster state and migration orchestration;
+- `hashring-node` owns in-memory records, migration staging, and the data-node
+  service.
+
+The client, coordinator, and node depend on `hashring-core`, but not on one
+another. This keeps the wire/domain boundary reusable without coupling clients
+to either server implementation.
+
 ## Change membership
 
 `begin-change` receives the complete target membership. Existing node IDs must
@@ -97,6 +114,6 @@ out of scope. Unexpected owner loss makes that owner's data unavailable.
 ## Tests
 
 ```sh
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
+cargo test --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
 ```

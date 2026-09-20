@@ -347,7 +347,7 @@ mod tests {
         let topology = TopologySnapshot::new(1, 42, MAX_VIRTUAL_NODES, members).unwrap();
         assert_eq!(topology.assignments.len(), MAX_TOKEN_ASSIGNMENTS);
         let wire = crate::proto::TopologySnapshot::from(&topology);
-        assert!(wire.encoded_len() <= crate::node::MAX_CONTROL_MESSAGE_BYTES);
+        assert!(wire.encoded_len() <= crate::limits::MAX_CONTROL_MESSAGE_BYTES);
 
         let source = &topology.members[0];
         let destination = &topology.members[1];
@@ -377,7 +377,7 @@ mod tests {
             stop_prepared_node_ids: Vec::new(),
         };
         let wire = crate::proto::TopologyChangeSnapshot::from(&change);
-        assert!(wire.encoded_len() <= crate::node::MAX_CONTROL_MESSAGE_BYTES);
+        assert!(wire.encoded_len() <= crate::limits::MAX_CONTROL_MESSAGE_BYTES);
     }
 
     #[test]

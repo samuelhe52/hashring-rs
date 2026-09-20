@@ -2,12 +2,41 @@
 // carries enough context to exceed Clippy's default large-error threshold.
 #![allow(clippy::result_large_err)]
 
-pub mod client;
-pub mod coordinator;
-pub mod migration;
-pub mod node;
-pub mod topology;
+pub mod client {
+    pub use hashring_client::*;
+}
+
+pub mod coordinator {
+    pub use hashring_coordinator::*;
+}
+
+pub mod limits {
+    pub use hashring_core::limits::*;
+}
+
+pub mod migration {
+    pub use hashring_core::migration::*;
+}
+
+pub mod node {
+    pub use hashring_node::*;
+}
 
 pub mod proto {
-    tonic::include_proto!("hashring.v1");
+    pub use hashring_core::proto::*;
+}
+
+pub mod topology {
+    pub use hashring_core::topology::*;
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::node;
+
+    #[test]
+    fn legacy_node_transport_helpers_remain_exported() {
+        let _ = node::fetch_topology;
+        let _ = node::configure_coordinator_client;
+    }
 }

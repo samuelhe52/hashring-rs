@@ -1,0 +1,13 @@
+[package]
+name = "hashring-client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+hashring-core = { version = "0.1.0", path = "../hashring-core" }
+rand = "0.8"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time"] }
+tonic = { version = "0.12", features = ["transport"] }
+uuid = { version = "1", features = ["v4"] }

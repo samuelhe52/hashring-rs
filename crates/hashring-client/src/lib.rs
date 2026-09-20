@@ -5,18 +5,16 @@ use tokio::{sync::RwLock, time::Instant};
 use tonic::Code;
 use tonic::transport::{Channel, Endpoint};
 
-use crate::{
+use hashring_core::{
+    limits::{DEFAULT_MAX_KEY_BYTES, DEFAULT_MAX_VALUE_BYTES, MAX_DATA_MESSAGE_BYTES},
     migration::TopologyChange,
-    node::{
-        DEFAULT_MAX_KEY_BYTES, DEFAULT_MAX_VALUE_BYTES, MAX_DATA_MESSAGE_BYTES,
-        configure_coordinator_client, fetch_topology,
-    },
     proto::{
-        BeginTopologyChangeRequest, ErrorCode, ExecuteTopologyChangeRequest, GetRequest,
+        self, BeginTopologyChangeRequest, ErrorCode, ExecuteTopologyChangeRequest, GetRequest,
         OperationError, PutRequest, RecordVersion, coordinator_client::CoordinatorClient,
         data_node_client::DataNodeClient,
     },
     topology::{Member, TopologySnapshot},
+    transport::{configure_coordinator_client, fetch_topology},
 };
 
 #[derive(Clone, Debug)]
@@ -129,10 +127,7 @@ impl HashringClient {
             }
         };
         let request = BeginTopologyChangeRequest {
-            target_members: target_members
-                .iter()
-                .map(crate::proto::Member::from)
-                .collect(),
+            target_members: target_members.iter().map(proto::Member::from).collect(),
         };
         let response = match tokio::time::timeout(
             remaining(deadline, false)?,
@@ -160,7 +155,7 @@ impl HashringClient {
             let mut client =
                 configure_coordinator_client(CoordinatorClient::connect(endpoint).await?);
             let response = client
-                .get_topology_change(crate::proto::Empty {})
+                .get_topology_change(proto::Empty {})
                 .await?
                 .into_inner();
             Ok::<_, anyhow::Error>(response)
