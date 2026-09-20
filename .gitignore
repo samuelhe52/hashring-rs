@@ -1,2 +1,28 @@
-/target
-/results
+# Rust build artifacts
+/target/
+
+# Local experiment output
+/results/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Coverage output
+/coverage/
+/lcov.info
+
+# Logs
+*.log
+
+# macOS and editor files
+.DS_Store
+.idea/
+*.swp
+*.swo
+*~
+
+# Local planning and scratch files
+/PLAN.md
+/tmp/
