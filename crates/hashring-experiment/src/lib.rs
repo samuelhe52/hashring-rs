@@ -14,10 +14,11 @@ use std::{
 
 use anyhow::{Context, Result, bail, ensure};
 use futures::{StreamExt, TryStreamExt, stream};
-use hashring_client::HashringClient;
+use hashring_client::{ClientError, HashringClient};
 use hashring_core::{
     limits::DEFAULT_MAX_VALUE_BYTES,
     migration::{MigrationPhase, TopologyChange},
+    proto::ErrorCode,
     topology::Member,
 };
 use serde::{Deserialize, Serialize};
@@ -104,10 +105,24 @@ struct Workload {
 
 struct MigrationWorkload {
     dataset: Workload,
-    update_keys: Vec<u64>,
+    put_keys: Vec<u64>,
+    delete_keys: Vec<u64>,
     sentinel_count: usize,
     round: u64,
     label: &'static str,
+}
+
+struct MovingKeyCohorts {
+    all: Vec<u64>,
+    rewrite: Vec<u64>,
+    delete: Vec<u64>,
+    sentinels: Vec<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct MutationCounts {
+    writes: u64,
+    deletes: u64,
 }
 
 #[derive(Clone)]
@@ -240,7 +255,7 @@ pub async fn run_experiment(
         runtime_tree_hash.as_deref(),
     );
     let manifest = ExperimentManifest {
-        schema_version: 2,
+        schema_version: 3,
         started_unix_ms: unix_ms(),
         executable_path: executable.display().to_string(),
         executable_blake3: file_digest(&executable)?,
@@ -407,7 +422,7 @@ async fn run_cluster(
         value_bytes: config.value_bytes,
         concurrency: config.concurrency,
     };
-    let mut expected_rounds = vec![0_u64; config.key_count as usize];
+    let mut expected_rounds = vec![Some(0_u64); config.key_count as usize];
     let put_started = Instant::now();
     write_dataset(&workload_client, workload, 0).await?;
     measurements.insert(
@@ -433,8 +448,7 @@ async fn run_cluster(
     if matches!(config.mode, ExperimentMode::Correctness) {
         let added = &members[config.node_count - 1];
         let scale_out = admin_client.begin_topology_change(members.clone()).await?;
-        let (scale_out_updates, scale_out_sentinels) =
-            moving_key_cohorts(&scale_out, config.key_count, 0)?;
+        let scale_out_cohorts = moving_key_cohorts(&scale_out, config.key_count)?;
         spawn_node(
             &mut processes,
             added.node_id.clone(),
@@ -442,27 +456,32 @@ async fn run_cluster(
             &coordinator_endpoint,
         )?;
         wait_for_listener(ports[config.node_count], &mut processes).await?;
-        let updated = scale_out_updates.len() as u64;
-        let duration = migrate_while_rewriting(
+        let scale_out_mutations =
+            (scale_out_cohorts.rewrite.len() + scale_out_cohorts.delete.len()) as u64;
+        let duration = migrate_while_mutating(
             &workload_client,
             &admin_client,
             scale_out,
             MigrationWorkload {
                 dataset: workload,
-                update_keys: scale_out_updates.clone(),
-                sentinel_count: scale_out_sentinels,
+                put_keys: scale_out_cohorts.rewrite.clone(),
+                delete_keys: scale_out_cohorts.delete.clone(),
+                sentinel_count: scale_out_cohorts.sentinels.len(),
                 round: 1,
                 label: "scale_out",
             },
             events,
         )
         .await?;
-        for key in scale_out_updates {
-            expected_rounds[key as usize] = 1;
+        for &key in &scale_out_cohorts.rewrite {
+            expected_rounds[key as usize] = Some(1);
+        }
+        for &key in &scale_out_cohorts.delete {
+            expected_rounds[key as usize] = None;
         }
         measurements.insert(
-            "scale_out_with_writes".into(),
-            measurement(updated, duration),
+            "scale_out_with_mutations".into(),
+            measurement(scale_out_mutations, duration),
         );
         let verify_started = Instant::now();
         verify_dataset(&workload_client, workload, &expected_rounds).await?;
@@ -476,8 +495,9 @@ async fn run_cluster(
             json!({
                 "label": "scale_out",
                 "keys": config.key_count,
-                "updated_moving_keys": updated,
-                "untouched_moving_sentinels": scale_out_sentinels,
+                "rewritten_moving_keys": scale_out_cohorts.rewrite.len(),
+                "deleted_moving_keys": scale_out_cohorts.delete.len(),
+                "untouched_moving_sentinels": scale_out_cohorts.sentinels.len(),
                 "seconds": verify_duration.as_secs_f64(),
             }),
         )?;
@@ -485,29 +505,36 @@ async fn run_cluster(
         let scale_in = admin_client
             .begin_topology_change(initial_members.to_vec())
             .await?;
-        let (scale_in_updates, scale_in_sentinels) =
-            moving_key_cohorts(&scale_in, config.key_count, 1)?;
-        let updated = scale_in_updates.len() as u64;
-        let duration = migrate_while_rewriting(
+        ensure!(
+            moving_keys(&scale_in, config.key_count) == scale_out_cohorts.all,
+            "reverse migration changed the moving-key cohort"
+        );
+        let scale_in_mutations =
+            (scale_out_cohorts.delete.len() + scale_out_cohorts.rewrite.len()) as u64;
+        let duration = migrate_while_mutating(
             &workload_client,
             &admin_client,
             scale_in,
             MigrationWorkload {
                 dataset: workload,
-                update_keys: scale_in_updates.clone(),
-                sentinel_count: scale_in_sentinels,
+                put_keys: scale_out_cohorts.delete.clone(),
+                delete_keys: scale_out_cohorts.rewrite.clone(),
+                sentinel_count: scale_out_cohorts.sentinels.len(),
                 round: 2,
                 label: "scale_in",
             },
             events,
         )
         .await?;
-        for key in scale_in_updates {
-            expected_rounds[key as usize] = 2;
+        for &key in &scale_out_cohorts.delete {
+            expected_rounds[key as usize] = Some(2);
+        }
+        for &key in &scale_out_cohorts.rewrite {
+            expected_rounds[key as usize] = None;
         }
         measurements.insert(
-            "scale_in_with_writes".into(),
-            measurement(updated, duration),
+            "scale_in_with_mutations".into(),
+            measurement(scale_in_mutations, duration),
         );
         let verify_started = Instant::now();
         verify_dataset(&workload_client, workload, &expected_rounds).await?;
@@ -521,8 +548,9 @@ async fn run_cluster(
             json!({
                 "label": "scale_in",
                 "keys": config.key_count,
-                "updated_moving_keys": updated,
-                "untouched_moving_sentinels": scale_in_sentinels,
+                "restored_moving_keys": scale_out_cohorts.delete.len(),
+                "deleted_moving_keys": scale_out_cohorts.rewrite.len(),
+                "untouched_moving_sentinels": scale_out_cohorts.sentinels.len(),
                 "seconds": verify_duration.as_secs_f64(),
             }),
         )?;
@@ -544,7 +572,7 @@ async fn run_cluster(
     Ok(topology.epoch)
 }
 
-async fn migrate_while_rewriting(
+async fn migrate_while_mutating(
     workload_client: &HashringClient,
     admin_client: &HashringClient,
     change: TopologyChange,
@@ -565,21 +593,22 @@ async fn migrate_while_rewriting(
             .await
     });
     let active_phase = wait_for_migration_activity(admin_client).await?;
-    let completed_writes = Arc::new(AtomicU64::new(0));
+    let completed_mutations = Arc::new(AtomicU64::new(0));
     let writer_client = workload_client.clone();
-    let writer_progress = completed_writes.clone();
+    let writer_progress = completed_mutations.clone();
     let writer = tokio::spawn(async move {
-        write_keys(
+        mutate_keys(
             &writer_client,
-            workload.update_keys,
+            workload.put_keys,
+            workload.delete_keys,
             workload.round,
             workload.dataset,
-            Some(writer_progress),
+            writer_progress,
         )
         .await
     });
-    let (overlap_phase, overlap_writes) =
-        match wait_for_write_overlap(admin_client, &completed_writes, &writer).await {
+    let (overlap_phase, overlap_mutations) =
+        match wait_for_mutation_overlap(admin_client, &completed_mutations, &writer).await {
             Ok(overlap) => overlap,
             Err(error) => {
                 writer.abort();
@@ -588,16 +617,16 @@ async fn migrate_while_rewriting(
             }
         };
     events.record(
-        "migration_write_overlap_observed",
+        "migration_mutation_overlap_observed",
         json!({
             "label": label,
             "initial_phase": format!("{active_phase:?}"),
             "observed_phase": format!("{overlap_phase:?}"),
-            "completed_writes_while_active": overlap_writes,
+            "completed_mutations_while_active": overlap_mutations,
             "untouched_moving_sentinels": workload.sentinel_count,
         }),
     )?;
-    let written = writer.await.context("joining concurrent writer")??;
+    let mutations = writer.await.context("joining concurrent mutator")??;
     let completed = execution.await.context("joining migration execution")??;
     ensure!(
         completed.phase == MigrationPhase::Complete,
@@ -607,7 +636,12 @@ async fn migrate_while_rewriting(
     let duration = started.elapsed();
     events.record(
         "migration_complete",
-        json!({ "label": label, "seconds": duration.as_secs_f64(), "writes": written }),
+        json!({
+            "label": label,
+            "seconds": duration.as_secs_f64(),
+            "writes": mutations.writes,
+            "deletes": mutations.deletes,
+        }),
     )?;
     Ok(duration)
 }
@@ -639,13 +673,13 @@ async fn wait_for_migration_activity(client: &HashringClient) -> Result<Migratio
     bail!("migration did not leave its planned phase")
 }
 
-async fn wait_for_write_overlap(
+async fn wait_for_mutation_overlap(
     client: &HashringClient,
-    completed_writes: &AtomicU64,
-    writer: &tokio::task::JoinHandle<Result<u64>>,
+    completed_mutations: &AtomicU64,
+    writer: &tokio::task::JoinHandle<Result<MutationCounts>>,
 ) -> Result<(MigrationPhase, u64)> {
     for _ in 0..2_000 {
-        let writes = completed_writes.load(AtomicOrdering::Acquire);
+        let mutations = completed_mutations.load(AtomicOrdering::Acquire);
         if let Some(change) = client.topology_change().await? {
             match change.phase {
                 MigrationPhase::CopyingSnapshot
@@ -653,9 +687,9 @@ async fn wait_for_write_overlap(
                 | MigrationPhase::PausingWrites
                 | MigrationPhase::Verifying
                 | MigrationPhase::ReadyToPublish
-                    if writes > 0 =>
+                    if mutations > 0 =>
                 {
-                    return Ok((change.phase, writes));
+                    return Ok((change.phase, mutations));
                 }
                 MigrationPhase::Published
                 | MigrationPhase::CleaningUp
@@ -663,19 +697,34 @@ async fn wait_for_write_overlap(
                 | MigrationPhase::Aborting
                 | MigrationPhase::Aborted => {
                     bail!(
-                        "migration reached {:?} before any concurrent write completed",
+                        "migration reached {:?} before any concurrent mutation completed",
                         change.phase
                     )
                 }
                 _ => {}
             }
         }
-        if writer.is_finished() && writes == 0 {
-            bail!("concurrent writer finished without a successful write");
+        if writer.is_finished() && mutations == 0 {
+            bail!("concurrent mutator finished without a successful mutation");
         }
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
-    bail!("no successful write overlapped the active migration")
+    bail!("no successful mutation overlapped the active migration")
+}
+
+async fn mutate_keys(
+    client: &HashringClient,
+    put_keys: Vec<u64>,
+    keys_to_delete: Vec<u64>,
+    round: u64,
+    workload: Workload,
+    progress: Arc<AtomicU64>,
+) -> Result<MutationCounts> {
+    let (writes, deletes) = tokio::try_join!(
+        write_keys(client, put_keys, round, workload, Some(progress.clone())),
+        delete_keys(client, keys_to_delete, workload.concurrency, progress),
+    )?;
+    Ok(MutationCounts { writes, deletes })
 }
 
 async fn write_dataset(client: &HashringClient, workload: Workload, round: u64) -> Result<()> {
@@ -722,10 +771,36 @@ async fn write_keys(
     Ok(operation_count)
 }
 
+async fn delete_keys(
+    client: &HashringClient,
+    keys: Vec<u64>,
+    concurrency: usize,
+    progress: Arc<AtomicU64>,
+) -> Result<u64> {
+    let operation_count = keys.len() as u64;
+    let client = client.clone();
+    stream::iter(keys)
+        .map(Ok::<_, anyhow::Error>)
+        .try_for_each_concurrent(Some(concurrency), move |key| {
+            let client = client.clone();
+            let progress = progress.clone();
+            async move {
+                client
+                    .delete(key.to_be_bytes().to_vec())
+                    .await
+                    .with_context(|| format!("delete key {key}"))?;
+                progress.fetch_add(1, AtomicOrdering::Release);
+                Ok(())
+            }
+        })
+        .await?;
+    Ok(operation_count)
+}
+
 async fn verify_dataset(
     client: &HashringClient,
     workload: Workload,
-    expected_rounds: &[u64],
+    expected_rounds: &[Option<u64>],
 ) -> Result<()> {
     ensure!(
         expected_rounds.len() == workload.key_count as usize,
@@ -737,29 +812,65 @@ async fn verify_dataset(
         .try_for_each_concurrent(Some(workload.concurrency), move |key| {
             let client = client.clone();
             async move {
-                let round = expected_rounds[key as usize];
-                let output = client
-                    .get(key.to_be_bytes().to_vec())
-                    .await
-                    .with_context(|| format!("get key {key} in round {round}"))?;
-                ensure!(
-                    output.value == deterministic_value(key, round, workload.value_bytes),
-                    "value mismatch for key {key} in round {round}"
-                );
-                Ok(())
+                match expected_rounds[key as usize] {
+                    Some(round) => {
+                        let output = client
+                            .get(key.to_be_bytes().to_vec())
+                            .await
+                            .with_context(|| format!("get key {key} in round {round}"))?;
+                        ensure!(
+                            output.value == deterministic_value(key, round, workload.value_bytes),
+                            "value mismatch for key {key} in round {round}"
+                        );
+                        Ok(())
+                    }
+                    None => match client.get(key.to_be_bytes().to_vec()).await {
+                        Err(ClientError::Operation(failure))
+                            if failure.code == ErrorCode::NotFound =>
+                        {
+                            Ok(())
+                        }
+                        Ok(_) => bail!("deleted key {key} unexpectedly has a value"),
+                        Err(error) => Err(error)
+                            .with_context(|| format!("expected key {key} to remain absent")),
+                    },
+                }
             }
         })
         .await
 }
 
-fn moving_key_cohorts(
-    change: &TopologyChange,
-    key_count: u64,
-    updated_parity: usize,
-) -> Result<(Vec<u64>, usize)> {
-    let mut updates = Vec::new();
-    let mut sentinels = 0_usize;
-    let mut moving_index = 0_usize;
+fn moving_key_cohorts(change: &TopologyChange, key_count: u64) -> Result<MovingKeyCohorts> {
+    let all = moving_keys(change, key_count);
+    let mut rewrite = Vec::new();
+    let mut delete = Vec::new();
+    let mut sentinels = Vec::new();
+    for (moving_index, key) in all.iter().copied().enumerate() {
+        match moving_index % 3 {
+            0 => rewrite.push(key),
+            1 => delete.push(key),
+            _ => sentinels.push(key),
+        }
+    }
+    ensure!(
+        !rewrite.is_empty(),
+        "migration has no moving rewrite cohort"
+    );
+    ensure!(!delete.is_empty(), "migration has no moving delete cohort");
+    ensure!(
+        !sentinels.is_empty(),
+        "migration has no untouched moving sentinel cohort"
+    );
+    Ok(MovingKeyCohorts {
+        all,
+        rewrite,
+        delete,
+        sentinels,
+    })
+}
+
+fn moving_keys(change: &TopologyChange, key_count: u64) -> Vec<u64> {
+    let mut moving = Vec::new();
     for key in 0..key_count {
         let encoded = key.to_be_bytes();
         let token = change.target_topology.key_token(&encoded);
@@ -768,20 +879,10 @@ fn moving_key_cohorts(
             .iter()
             .any(|range| range_contains(range.start_exclusive, range.end_inclusive, token))
         {
-            if moving_index % 2 == updated_parity {
-                updates.push(key);
-            } else {
-                sentinels += 1;
-            }
-            moving_index += 1;
+            moving.push(key);
         }
     }
-    ensure!(!updates.is_empty(), "migration has no moving update cohort");
-    ensure!(
-        sentinels > 0,
-        "migration has no untouched moving sentinel cohort"
-    );
-    Ok((updates, sentinels))
+    moving
 }
 
 fn range_contains(start_exclusive: u64, end_inclusive: u64, token: u64) -> bool {

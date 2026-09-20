@@ -26,10 +26,13 @@ store.
 ```sh
 cargo run -- put --key example --value payload
 cargo run -- get --key example
+cargo run -- delete --key example
 cargo run -- topology
 ```
 
-`--key-hex`, `--value-hex`, and `get --hex` support arbitrary bytes.
+`--key-hex`, `--value-hex`, and `get --hex` support arbitrary bytes. `DELETE`
+is idempotent: success means the key is absent afterward, even if it was already
+absent.
 
 ## Workspace architecture
 
@@ -60,10 +63,10 @@ and JSON summary into a new or empty output directory.
 ```sh
 cargo build --release
 
-# Correctness and migration stress: starts with 9 nodes, scales to 10 while
-# rewriting half of the moving keys, preserves the other moving keys as snapshot
-# sentinels, scales back to 9 under another rewrite, and verifies every key after
-# each stage.
+# Correctness and migration stress: starts with 9 nodes, scales to 10 under
+# concurrent rewrites and deletes, preserves a third moving cohort as snapshot
+# sentinels, scales back to 9 while restoring/deleting the mutation cohorts, and
+# verifies present and absent keys after each stage.
 target/release/hashring-rs experiment \
   --mode correctness --require-clean-source \
   --output results/correctness-10-node
@@ -108,9 +111,10 @@ cargo run -- change-status
 ```
 
 The source remains authoritative while a point-in-time snapshot is copied and
-concurrent writes are replayed from a bounded changelog. Cutover briefly returns
-retryable `RangeBusy` responses for affected reads and writes, verifies record count,
-contiguous watermark, and a BLAKE3 digest, then publishes the new epoch. Removed
+concurrent puts and deletes are replayed from a bounded changelog. Cutover briefly
+returns retryable `RangeBusy` responses for affected reads and writes, verifies
+the live-record count, contiguous watermark, and a BLAKE3 digest, then publishes
+the new epoch. Deleted values are not retained as permanent tombstones. Removed
 cooperative nodes are stopped only after source cleanup, using the process-instance
 identity captured during migration. A node acknowledges a prepared stop before
 that acknowledgement is persisted as an instance-specific stop confirmation and
@@ -124,28 +128,35 @@ post-publication failure never rolls the epoch back.
 
 ## Request and error semantics
 
-- Each key has one owner. `PUT` and `GET` are linearizable per key while the
-  coordinator and owner are available.
+- Each key has one owner. `PUT`, `GET`, and `DELETE` are linearizable per key
+  while the coordinator and owner are available. `DELETE` succeeds when the key
+  is already absent and does not expose a prior-existence flag.
 - Versions are `(topology_epoch, owner_sequence, owner_node_id)` and migration
   preserves them.
-- Logical operations use an overall deadline and bounded jittered retry.
+- Logical operations use an overall deadline and bounded jittered retry. Clients
+  combine periodic epoch polling, mandatory refresh after `Moved`, opportunistic
+  refresh after `Unavailable`, and non-blocking refresh after a successful
+  response reports a newer epoch.
 - `Moved`, `RangeBusy`, retryable `Unavailable`, and retryable
   `ResourceExhausted` may be retried within that deadline.
 - `NotFound`, `TooLarge`, `InvalidArgument`, and permanent gRPC statuses return
   immediately.
-- If a `PUT` or mutating admin RPC was dispatched but its response was lost, the
-  client reports `unknown_write_outcome=true`. Request IDs are correlation IDs,
-  not persistent deduplication receipts; retrying a `PUT` may allocate a newer
-  version for the same value.
+- If a `PUT`, `DELETE`, or mutating admin RPC was dispatched but its response was
+  lost, a final failure reports `unknown_write_outcome=true`. A later successful
+  DELETE confirms that the key is absent. Request IDs are correlation IDs, not
+  persistent deduplication receipts; retrying a `PUT` may allocate a newer version
+  for the same value.
 - Key and value limits are 64 KiB and 8 MiB. A node's aggregate migration-journal
   budget defaults to 16 MiB. A cluster supports at most 1,024 members, 4,096
   virtual nodes per member, and 1,048,576 total assignments. A single membership
   change may move at most 16,384 ranges; these bounds keep topology and change
   snapshots within the 64 MiB control-plane message limit.
 
-Replication, automatic failure recovery, heartbeat eviction, transactions,
-`DELETE`, durable data-node storage, and coordinator consensus are intentionally
-out of scope. Unexpected owner loss makes that owner's data unavailable.
+All data-node binaries must be upgraded before clients issue DELETE: an older
+destination does not understand deletion journal records. Replication, automatic
+failure recovery, heartbeat eviction, transactions, durable data-node storage,
+and coordinator consensus remain intentionally out of scope. Unexpected owner
+loss makes that owner's data unavailable.
 
 ## Tests
 

@@ -21,12 +21,12 @@ pub use hashring_core::transport::{configure_coordinator_client, fetch_topology}
 
 use hashring_core::{
     proto::{
-        self, ApplyMigrationBatchRequest, ChangelogPageRequest, ChangelogPageResponse, ErrorCode,
-        GetRequest, GetResponse, InstallTopologyRequest, JournalRecord, MigrationRecord,
-        NodeInfoResponse, OperationError, PauseRangeResponse, PrepareDestinationRangeResponse,
-        PrepareRangeRequest, PrepareSourceRangeResponse, PutRequest, PutResponse,
-        RangeControlRequest, RangeDigestResponse, RecordVersion, RegisterNodeRequest,
-        SnapshotPageRequest, SnapshotPageResponse, StopRequest,
+        self, ApplyMigrationBatchRequest, ChangelogPageRequest, ChangelogPageResponse,
+        DeleteRequest, DeleteResponse, ErrorCode, GetRequest, GetResponse, InstallTopologyRequest,
+        JournalRecord, MigrationRecord, NodeInfoResponse, OperationError, PauseRangeResponse,
+        PrepareDestinationRangeResponse, PrepareRangeRequest, PrepareSourceRangeResponse,
+        PutRequest, PutResponse, RangeControlRequest, RangeDigestResponse, RecordVersion,
+        RegisterNodeRequest, SnapshotPageRequest, SnapshotPageResponse, StopRequest,
         coordinator_client::CoordinatorClient, data_node_server::DataNode,
     },
     topology::TopologySnapshot,
@@ -433,12 +433,113 @@ impl DataNode for DataNodeService {
                     key: request.key.clone(),
                     value: record.value.to_vec(),
                     version: Some(record.version.clone()),
+                    deleted: false,
                 }),
             });
         }
         state.journal_bytes_total += journal_growth;
         Ok(Response::new(PutResponse {
             version: Some(version),
+            current_epoch: state.topology.epoch,
+            error: None,
+        }))
+    }
+
+    async fn delete(
+        &self,
+        request: Request<DeleteRequest>,
+    ) -> Result<Response<DeleteResponse>, Status> {
+        let request = request.into_inner();
+        if let Some(error) = self.validate_key(&request.key) {
+            return Ok(Response::new(DeleteResponse {
+                error: Some(error),
+                ..Default::default()
+            }));
+        }
+        self.refresh_if_newer(request.topology_epoch).await?;
+        let mut state = self.state.write().await;
+        if let Some(error) = self.owner_error(&state, &request.key)? {
+            return Ok(Response::new(DeleteResponse {
+                current_epoch: error.current_epoch,
+                error: Some(error),
+            }));
+        }
+
+        let token = state.topology.key_token(&request.key);
+        for source in state
+            .sources
+            .values()
+            .filter(|source| source.range.contains(token))
+        {
+            if source.paused {
+                return Ok(Response::new(DeleteResponse {
+                    current_epoch: state.topology.epoch,
+                    error: Some(OperationError {
+                        current_epoch: state.topology.epoch,
+                        ..operation_error(
+                            ErrorCode::RangeBusy,
+                            "range is paused for topology cutover",
+                            true,
+                        )
+                    }),
+                }));
+            }
+        }
+
+        if !state.records.contains_key(&request.key) {
+            return Ok(Response::new(DeleteResponse {
+                current_epoch: state.topology.epoch,
+                error: None,
+            }));
+        }
+
+        let journal_record_bytes = request.key.len() + 128;
+        let matching_sources = state
+            .sources
+            .values()
+            .filter(|source| source.range.contains(token))
+            .count();
+        let journal_growth = journal_record_bytes.saturating_mul(matching_sources);
+        if state.journal_bytes_total.saturating_add(journal_growth) > self.max_journal_bytes {
+            return Ok(Response::new(DeleteResponse {
+                current_epoch: state.topology.epoch,
+                error: Some(OperationError {
+                    current_epoch: state.topology.epoch,
+                    ..operation_error(
+                        ErrorCode::ResourceExhausted,
+                        "node migration journal budget is full; retry with backoff",
+                        true,
+                    )
+                }),
+            }));
+        }
+
+        state.next_sequence += 1;
+        let version = RecordVersion {
+            topology_epoch: state.topology.epoch,
+            owner_sequence: state.next_sequence,
+            owner_node_id: self.node_id.clone(),
+        };
+        state.records.remove(&request.key);
+        for source in state
+            .sources
+            .values_mut()
+            .filter(|source| source.range.contains(token))
+        {
+            source.watermark += 1;
+            source.journal_bytes += journal_record_bytes;
+            source.journal.push(JournalRecord {
+                watermark: source.watermark,
+                record: Some(MigrationRecord {
+                    key: request.key.clone(),
+                    value: Vec::new(),
+                    version: Some(version.clone()),
+                    deleted: true,
+                }),
+            });
+        }
+        state.journal_bytes_total += journal_growth;
+        Ok(Response::new(DeleteResponse {
             current_epoch: state.topology.epoch,
             error: None,
         }))
@@ -595,15 +696,17 @@ impl DataNode for DataNodeService {
         let max_bytes = page_limit(request.max_bytes);
         let mut bytes = 0;
         let mut records = Vec::new();
+        let mut next_cursor = start;
         for key in &snapshot_keys[start..] {
-            let record = state
-                .records
-                .get(key)
-                .ok_or_else(|| Status::data_loss("snapshot key disappeared from source"))?;
+            let Some(record) = state.records.get(key) else {
+                next_cursor += 1;
+                continue;
+            };
             let record = MigrationRecord {
                 key: key.clone(),
                 value: record.value.to_vec(),
                 version: Some(record.version.clone()),
+                deleted: false,
             };
             let size = migration_record_size(&record);
             if !records.is_empty() && bytes + size > max_bytes {
@@ -611,8 +714,8 @@ impl DataNode for DataNodeService {
             }
             bytes += size;
             records.push(record);
+            next_cursor += 1;
         }
-        let next_cursor = start + records.len();
         Ok(Response::new(SnapshotPageResponse {
             records,
             next_cursor: next_cursor as u64,
@@ -673,6 +776,11 @@ impl DataNode for DataNodeService {
             ));
         }
         for record in request.snapshot_records {
+            if record.deleted {
+                return Err(Status::invalid_argument(
+                    "snapshot record must contain a live value",
+                ));
+            }
             if !destination.range.contains(topology.key_token(&record.key)) {
                 return Err(Status::invalid_argument(
                     "snapshot record is outside the prepared range",
@@ -765,14 +873,18 @@ impl DataNode for DataNodeService {
         let request = request.into_inner();
         let mut state = self.state.write().await;
         let key = (request.change_id, request.range_id);
-        let records = {
+        let (range, records) = {
             let destination = state
                 .destinations
                 .get_mut(&key)
                 .ok_or_else(|| Status::not_found("destination migration not prepared"))?;
             destination.committed = true;
-            destination.records.clone()
+            (destination.range.clone(), destination.records.clone())
         };
+        let topology = state.topology.clone();
+        state
+            .records
+            .retain(|record_key, _| !range.contains(topology.key_token(record_key)));
         for (key, record) in records {
             apply_internal_record(&mut state.records, key, record);
         }
@@ -935,6 +1047,15 @@ fn apply_record(
     let version = record
         .version
         .ok_or_else(|| Status::invalid_argument("migration record omitted version"))?;
+    if record.deleted {
+        if !record.value.is_empty() {
+            return Err(Status::invalid_argument(
+                "deleted migration record must omit its value",
+            ));
+        }
+        records.remove(&record.key);
+        return Ok(());
+    }
     apply_internal_record(
         records,
         record.key,
@@ -1164,6 +1285,19 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(paused.error.unwrap().code, ErrorCode::RangeBusy as i32);
+        let paused_delete = service
+            .delete(Request::new(DeleteRequest {
+                key: b"key".to_vec(),
+                topology_epoch: 1,
+                request_id: "delete-1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            paused_delete.error.unwrap().code,
+            ErrorCode::RangeBusy as i32
+        );
         service
             .abort_range_migration(Request::new(control))
             .await
@@ -1178,6 +1312,313 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(resumed.value, b"value");
+    }
+
+    #[tokio::test]
+    async fn delete_is_idempotent_and_put_restores_an_empty_value() {
+        let service = service();
+        service
+            .put(Request::new(PutRequest {
+                key: b"key".to_vec(),
+                value: Vec::new(),
+                topology_epoch: 1,
+                request_id: "put-1".into(),
+            }))
+            .await
+            .unwrap();
+
+        let first = service
+            .delete(Request::new(DeleteRequest {
+                key: b"key".to_vec(),
+                topology_epoch: 1,
+                request_id: "delete-1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(first.error.is_none());
+        assert_eq!(service.state.read().await.next_sequence, 2);
+        assert!(
+            !service
+                .state
+                .read()
+                .await
+                .records
+                .contains_key(b"key".as_slice())
+        );
+
+        let second = service
+            .delete(Request::new(DeleteRequest {
+                key: b"key".to_vec(),
+                topology_epoch: 1,
+                request_id: "delete-2".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(second.error.is_none());
+        assert_eq!(service.state.read().await.next_sequence, 2);
+
+        service
+            .put(Request::new(PutRequest {
+                key: b"key".to_vec(),
+                value: b"restored".to_vec(),
+                topology_epoch: 1,
+                request_id: "put-2".into(),
+            }))
+            .await
+            .unwrap();
+        let restored = service
+            .get(Request::new(GetRequest {
+                key: b"key".to_vec(),
+                topology_epoch: 1,
+                request_id: "get-1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(restored.value, b"restored");
+        assert_eq!(restored.version.unwrap().owner_sequence, 3);
+    }
+
+    #[tokio::test]
+    async fn delete_validates_empty_and_oversized_keys() {
+        let service = service();
+        let empty = service
+            .delete(Request::new(DeleteRequest {
+                key: Vec::new(),
+                topology_epoch: 1,
+                request_id: "delete-empty".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(empty.error.unwrap().code, ErrorCode::InvalidArgument as i32);
+
+        let oversized = service
+            .delete(Request::new(DeleteRequest {
+                key: vec![0; DEFAULT_MAX_KEY_BYTES + 1],
+                topology_epoch: 1,
+                request_id: "delete-oversized".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(oversized.error.unwrap().code, ErrorCode::TooLarge as i32);
+        assert_eq!(service.state.read().await.next_sequence, 0);
+    }
+
+    #[tokio::test]
+    async fn snapshot_skips_a_deleted_key_and_journals_the_deletion() {
+        let service = service();
+        service
+            .put(Request::new(PutRequest {
+                key: b"key".to_vec(),
+                value: b"value".to_vec(),
+                topology_epoch: 1,
+                request_id: "put-1".into(),
+            }))
+            .await
+            .unwrap();
+        service
+            .prepare_source_range(Request::new(PrepareRangeRequest {
+                range: Some(range(0)),
+            }))
+            .await
+            .unwrap();
+        service
+            .delete(Request::new(DeleteRequest {
+                key: b"key".to_vec(),
+                topology_epoch: 1,
+                request_id: "delete-1".into(),
+            }))
+            .await
+            .unwrap();
+
+        let snapshot = service
+            .read_snapshot_page(Request::new(SnapshotPageRequest {
+                change_id: "change-1".into(),
+                range_id: "range-1".into(),
+                cursor: 0,
+                max_bytes: MAX_MIGRATION_PAGE_BYTES as u64,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(snapshot.records.is_empty());
+        assert_eq!(snapshot.next_cursor, 1);
+        assert!(snapshot.done);
+
+        let changelog = service
+            .read_changelog_page(Request::new(ChangelogPageRequest {
+                change_id: "change-1".into(),
+                range_id: "range-1".into(),
+                after_watermark: 0,
+                max_bytes: MAX_MIGRATION_PAGE_BYTES as u64,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(changelog.current_watermark, 1);
+        assert!(changelog.records[0].record.as_ref().unwrap().deleted);
+
+        let digest = service
+            .source_range_digest(Request::new(RangeControlRequest {
+                change_id: "change-1".into(),
+                range_id: "range-1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(digest.record_count, 0);
+        assert_eq!(digest.changelog_watermark, 1);
+    }
+
+    #[tokio::test]
+    async fn deletion_replay_and_commit_remove_stale_destination_data() {
+        let mut destination = service();
+        destination.node_id = "node-2".into();
+        destination.state.write().await.records.insert(
+            b"key".to_vec(),
+            Record {
+                value: Arc::from(b"stale".as_slice()),
+                version: RecordVersion {
+                    topology_epoch: 0,
+                    owner_sequence: 1,
+                    owner_node_id: "node-2".into(),
+                },
+            },
+        );
+        destination
+            .prepare_destination_range(Request::new(PrepareRangeRequest {
+                range: Some(range(0)),
+            }))
+            .await
+            .unwrap();
+        let deletion = JournalRecord {
+            watermark: 1,
+            record: Some(MigrationRecord {
+                key: b"key".to_vec(),
+                value: Vec::new(),
+                version: Some(RecordVersion {
+                    topology_epoch: 1,
+                    owner_sequence: 2,
+                    owner_node_id: "node-1".into(),
+                }),
+                deleted: true,
+            }),
+        };
+        let batch = ApplyMigrationBatchRequest {
+            change_id: "change-1".into(),
+            range_id: "range-1".into(),
+            snapshot_records: Vec::new(),
+            journal_records: vec![deletion],
+        };
+        destination
+            .apply_migration_batch(Request::new(batch.clone()))
+            .await
+            .unwrap();
+        destination
+            .apply_migration_batch(Request::new(batch))
+            .await
+            .unwrap();
+
+        let control = RangeControlRequest {
+            change_id: "change-1".into(),
+            range_id: "range-1".into(),
+        };
+        let digest = destination
+            .destination_range_digest(Request::new(control.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(digest.record_count, 0);
+        assert_eq!(digest.changelog_watermark, 1);
+        destination
+            .commit_destination_range(Request::new(control))
+            .await
+            .unwrap();
+        assert!(destination.state.read().await.records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn migration_replay_preserves_delete_and_put_order() {
+        let mut destination = service();
+        destination.node_id = "node-2".into();
+        let version = |owner_sequence| RecordVersion {
+            topology_epoch: 1,
+            owner_sequence,
+            owner_node_id: "node-1".into(),
+        };
+        let deletion = |watermark, owner_sequence| JournalRecord {
+            watermark,
+            record: Some(MigrationRecord {
+                key: b"key".to_vec(),
+                value: Vec::new(),
+                version: Some(version(owner_sequence)),
+                deleted: true,
+            }),
+        };
+        let put = |watermark, owner_sequence, value: &[u8]| JournalRecord {
+            watermark,
+            record: Some(MigrationRecord {
+                key: b"key".to_vec(),
+                value: value.to_vec(),
+                version: Some(version(owner_sequence)),
+                deleted: false,
+            }),
+        };
+
+        destination
+            .prepare_destination_range(Request::new(PrepareRangeRequest {
+                range: Some(range(0)),
+            }))
+            .await
+            .unwrap();
+        destination
+            .apply_migration_batch(Request::new(ApplyMigrationBatchRequest {
+                change_id: "change-1".into(),
+                range_id: "range-1".into(),
+                snapshot_records: Vec::new(),
+                journal_records: vec![deletion(1, 1), put(2, 2, b"restored")],
+            }))
+            .await
+            .unwrap();
+        let key = ("change-1".to_owned(), "range-1".to_owned());
+        assert_eq!(
+            destination.state.read().await.destinations[&key].records[b"key".as_slice()]
+                .value
+                .as_ref(),
+            b"restored"
+        );
+
+        destination
+            .abort_range_migration(Request::new(RangeControlRequest {
+                change_id: "change-1".into(),
+                range_id: "range-1".into(),
+            }))
+            .await
+            .unwrap();
+        destination
+            .prepare_destination_range(Request::new(PrepareRangeRequest {
+                range: Some(range(0)),
+            }))
+            .await
+            .unwrap();
+        destination
+            .apply_migration_batch(Request::new(ApplyMigrationBatchRequest {
+                change_id: "change-1".into(),
+                range_id: "range-1".into(),
+                snapshot_records: Vec::new(),
+                journal_records: vec![put(1, 3, b"temporary"), deletion(2, 4)],
+            }))
+            .await
+            .unwrap();
+        assert!(
+            destination.state.read().await.destinations[&key]
+                .records
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1245,5 +1686,52 @@ mod tests {
             ErrorCode::ResourceExhausted as i32
         );
         assert_eq!(service.state.read().await.journal_bytes_total, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_leaves_the_value_when_the_journal_budget_is_full() {
+        let mut service = service();
+        service
+            .put(Request::new(PutRequest {
+                key: b"key".to_vec(),
+                value: b"value".to_vec(),
+                topology_epoch: 1,
+                request_id: "put-1".into(),
+            }))
+            .await
+            .unwrap();
+        service.max_journal_bytes = 1;
+        service
+            .prepare_source_range(Request::new(PrepareRangeRequest {
+                range: Some(range(0)),
+            }))
+            .await
+            .unwrap();
+        let response = service
+            .delete(Request::new(DeleteRequest {
+                key: b"key".to_vec(),
+                topology_epoch: 1,
+                request_id: "delete-1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            response.error.unwrap().code,
+            ErrorCode::ResourceExhausted as i32
+        );
+        assert_eq!(
+            service
+                .state
+                .read()
+                .await
+                .records
+                .get(b"key".as_slice())
+                .unwrap()
+                .value
+                .as_ref(),
+            b"value"
+        );
+        assert_eq!(service.state.read().await.next_sequence, 1);
     }
 }

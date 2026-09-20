@@ -118,6 +118,7 @@ message MigrationRecord {
   bytes key = 1;
   bytes value = 2;
   RecordVersion version = 3;
+  bool deleted = 4;
 }
 
 message JournalRecord {
@@ -251,9 +252,21 @@ message PutResponse {
   OperationError error = 3;
 }
 
+message DeleteRequest {
+  bytes key = 1;
+  uint64 topology_epoch = 2;
+  string request_id = 3;
+}
+
+message DeleteResponse {
+  uint64 current_epoch = 1;
+  OperationError error = 2;
+}
+
 service DataNode {
   rpc Get(GetRequest) returns (GetResponse);
   rpc Put(PutRequest) returns (PutResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
   rpc PrepareSourceRange(PrepareRangeRequest) returns (PrepareSourceRangeResponse);
   rpc PrepareDestinationRange(PrepareRangeRequest) returns (PrepareDestinationRangeResponse);
   rpc GetProcessInfo(Empty) returns (NodeInfoResponse);

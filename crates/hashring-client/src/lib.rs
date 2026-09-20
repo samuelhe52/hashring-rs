@@ -19,9 +19,9 @@ use hashring_core::{
     limits::{DEFAULT_MAX_KEY_BYTES, DEFAULT_MAX_VALUE_BYTES, MAX_DATA_MESSAGE_BYTES},
     migration::TopologyChange,
     proto::{
-        self, BeginTopologyChangeRequest, ErrorCode, ExecuteTopologyChangeRequest, GetRequest,
-        OperationError, PutRequest, RecordVersion, coordinator_client::CoordinatorClient,
-        data_node_client::DataNodeClient,
+        self, BeginTopologyChangeRequest, DeleteRequest, ErrorCode, ExecuteTopologyChangeRequest,
+        GetRequest, OperationError, PutRequest, RecordVersion,
+        coordinator_client::CoordinatorClient, data_node_client::DataNodeClient,
     },
     topology::{Member, TopologyError, TopologySnapshot},
     transport::{configure_coordinator_client, fetch_topology},
@@ -37,6 +37,11 @@ pub struct GetOutput {
 #[derive(Clone, Debug)]
 pub struct PutOutput {
     pub version: RecordVersion,
+    pub topology_epoch: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeleteOutput {
     pub topology_epoch: u64,
 }
 
@@ -470,6 +475,96 @@ impl HashringClient {
             }
             let output = PutOutput {
                 version: response.version.ok_or(ClientError::MissingVersion)?,
+                topology_epoch: response.current_epoch,
+            };
+            if response.current_epoch > topology.epoch {
+                self.trigger_background_refresh(response.current_epoch);
+            }
+            return Ok(output);
+        }
+    }
+
+    pub async fn delete(&self, key: Vec<u8>) -> Result<DeleteOutput, ClientError> {
+        validate_key_size(&key)?;
+        let deadline = Instant::now() + self.inner.operation_timeout;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let mut attempt = 0_u32;
+        let mut unknown_write_outcome = false;
+
+        loop {
+            let topology = self.topology().await;
+            let owner = topology.owner(&key).map_err(anyhow::Error::from)?.clone();
+            let mut client = match self.data_node_client(&owner.endpoint, deadline).await {
+                Ok(client) => client,
+                Err(ClientError::DeadlineExceeded { .. }) => {
+                    return Err(ClientError::DeadlineExceeded {
+                        unknown_write_outcome,
+                    });
+                }
+                Err(_) => {
+                    self.refresh_after_unavailable(topology.epoch, deadline, unknown_write_outcome)
+                        .await?;
+                    self.retry_delay(deadline, &mut attempt, unknown_write_outcome)
+                        .await?;
+                    continue;
+                }
+            };
+
+            let request = DeleteRequest {
+                key: key.clone(),
+                topology_epoch: topology.epoch,
+                request_id: request_id.clone(),
+            };
+            let response = match tokio::time::timeout(
+                remaining(deadline, unknown_write_outcome)?,
+                client.delete(request),
+            )
+            .await
+            {
+                Ok(Ok(response)) => response.into_inner(),
+                Ok(Err(status)) => {
+                    unknown_write_outcome =
+                        accumulated_write_ambiguity(unknown_write_outcome, &status);
+                    if retryable_status(&status) {
+                        self.refresh_after_unavailable(
+                            topology.epoch,
+                            deadline,
+                            unknown_write_outcome,
+                        )
+                        .await?;
+                        self.retry_delay(deadline, &mut attempt, unknown_write_outcome)
+                            .await?;
+                        continue;
+                    }
+                    return Err(rpc_error(status, unknown_write_outcome));
+                }
+                Err(_) => {
+                    return Err(ClientError::DeadlineExceeded {
+                        unknown_write_outcome: true,
+                    });
+                }
+            };
+
+            if let Some(error) = response.error {
+                let error_unknown_write_outcome =
+                    unknown_write_outcome || error.unknown_write_outcome;
+                if self
+                    .handle_retryable(
+                        error.clone(),
+                        topology.epoch,
+                        deadline,
+                        &mut attempt,
+                        error_unknown_write_outcome,
+                    )
+                    .await?
+                {
+                    continue;
+                }
+                let mut failure = OperationFailure::from(error);
+                failure.unknown_write_outcome = error_unknown_write_outcome;
+                return Err(failure.into());
+            }
+            let output = DeleteOutput {
                 topology_epoch: response.current_epoch,
             };
             if response.current_epoch > topology.epoch {

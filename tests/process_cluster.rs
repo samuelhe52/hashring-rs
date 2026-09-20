@@ -245,6 +245,18 @@ async fn separate_processes_route_bytes_and_survive_coordinator_restart() {
         client.put(key.clone(), value.clone()).await.unwrap();
         assert_eq!(client.get(key.clone()).await.unwrap().value, value);
     }
+    assert_eq!(
+        client.delete(keys[1].clone()).await.unwrap().topology_epoch,
+        1
+    );
+    assert_eq!(
+        client.delete(keys[1].clone()).await.unwrap().topology_epoch,
+        1
+    );
+    assert!(matches!(
+        client.get(keys[1].clone()).await,
+        Err(ClientError::Operation(ref failure)) if failure.code == ErrorCode::NotFound
+    ));
 
     let large_key = b"large-value".to_vec();
     let large_value = vec![7; 5 * 1024 * 1024];
@@ -261,6 +273,10 @@ async fn separate_processes_route_bytes_and_survive_coordinator_restart() {
         restarted_client.get(keys[0].clone()).await.unwrap().value,
         vec![0, 255, 0, 42]
     );
+    assert!(matches!(
+        restarted_client.get(keys[1].clone()).await,
+        Err(ClientError::Operation(ref failure)) if failure.code == ErrorCode::NotFound
+    ));
 
     coordinator.stop();
     for node in &mut nodes {
@@ -445,8 +461,12 @@ async fn moved_request_retries_a_transient_coordinator_outage_until_deadline() {
     coordinator.stop();
     let started = Instant::now();
     assert_eq!(
-        recovery_client.get(stationary_key).await.unwrap().value,
-        b"stationary-value"
+        recovery_client
+            .delete(stationary_key)
+            .await
+            .unwrap()
+            .topology_epoch,
+        2
     );
     assert!(
         started.elapsed() < Duration::from_millis(500),
@@ -466,13 +486,17 @@ async fn moved_request_retries_a_transient_coordinator_outage_until_deadline() {
     let request = tokio::spawn({
         let client = moved_recovery_client.clone();
         let key = moved_key.clone();
-        async move { client.get(key).await }
+        async move { client.delete(key).await }
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
     coordinator = spawn_process(&coordinator_arguments(coordinator_port, &state, &[]));
     wait_for_listener(coordinator_port);
-    assert_eq!(request.await.unwrap().unwrap().value, b"moved-value");
+    assert_eq!(request.await.unwrap().unwrap().topology_epoch, 2);
     assert_eq!(moved_recovery_client.topology().await.epoch, 2);
+    assert!(matches!(
+        moved_recovery_client.get(moved_key.clone()).await,
+        Err(ClientError::Operation(ref failure)) if failure.code == ErrorCode::NotFound
+    ));
 
     coordinator.stop();
     let started = Instant::now();
@@ -673,12 +697,16 @@ async fn online_scale_out_and_scale_in_preserve_concurrent_writes() {
     assert!(node_1.has_exited());
     assert_eq!(
         stale_client
-            .get(keys[stale_key].clone())
+            .delete(keys[stale_key].clone())
             .await
             .unwrap()
-            .value,
-        expected_values[stale_key]
+            .topology_epoch,
+        3
     );
+    assert!(matches!(
+        stale_client.get(keys[stale_key].clone()).await,
+        Err(ClientError::Operation(ref failure)) if failure.code == ErrorCode::NotFound
+    ));
     assert_eq!(stale_client.topology().await.epoch, 3);
 
     node_2.stop();
@@ -1204,7 +1232,7 @@ async fn experiment_runner_preserves_reproducibility_artifacts() {
             .unwrap();
     assert_eq!(manifest["config"]["node_count"], 3);
     assert_eq!(manifest["config"]["key_count"], 100);
-    assert_eq!(manifest["schema_version"], 2);
+    assert_eq!(manifest["schema_version"], 3);
     assert_eq!(manifest["executable_blake3"].as_str().unwrap().len(), 64);
     assert!(manifest["build"]["git_commit"].is_string());
     assert_eq!(manifest["config"]["pre_publish_delay_ms"], 250);
@@ -1226,15 +1254,21 @@ async fn experiment_runner_preserves_reproducibility_artifacts() {
             .unwrap();
     assert_eq!(summary["success"], true);
     assert_eq!(summary["final_epoch"], 3);
+    assert!(summary["measurements"]["scale_out_with_mutations"].is_object());
+    assert!(summary["measurements"]["scale_in_with_mutations"].is_object());
+    assert!(summary["measurements"]["scale_out_with_writes"].is_null());
+    assert!(summary["measurements"]["scale_in_with_writes"].is_null());
     let events = std::fs::read_to_string(output_directory.join("events.jsonl")).unwrap();
     assert_eq!(
         events
             .lines()
-            .filter(|line| line.contains("migration_write_overlap_observed"))
+            .filter(|line| line.contains("migration_mutation_overlap_observed"))
             .count(),
         2
     );
     assert!(events.contains("untouched_moving_sentinels"));
+    assert!(events.contains("deleted_moving_keys"));
+    assert!(events.contains("restored_moving_keys"));
     assert!(
         output_directory
             .join("process-logs/coordinator.stderr.log")

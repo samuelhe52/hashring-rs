@@ -32,6 +32,8 @@ enum Command {
     Put(PutArgs),
     /// Fetch one key.
     Get(GetArgs),
+    /// Ensure one key is absent.
+    Delete(DeleteArgs),
     /// Print the canonical topology as JSON.
     Topology(ClientArgs),
     /// Persist a pending target topology and its moving-range plan.
@@ -115,6 +117,16 @@ struct GetArgs {
 }
 
 #[derive(Args)]
+struct DeleteArgs {
+    #[command(flatten)]
+    client: ClientArgs,
+    #[arg(long, conflicts_with = "key_hex", required_unless_present = "key_hex")]
+    key: Option<String>,
+    #[arg(long, conflicts_with = "key", required_unless_present = "key")]
+    key_hex: Option<String>,
+}
+
+#[derive(Args)]
 struct ChangeArgs {
     #[command(flatten)]
     client: ClientArgs,
@@ -187,6 +199,7 @@ async fn main() -> Result<()> {
         Command::Node(args) => run_node(args).await,
         Command::Put(args) => run_put(args).await,
         Command::Get(args) => run_get(args).await,
+        Command::Delete(args) => run_delete(args).await,
         Command::Topology(args) => run_topology(args).await,
         Command::BeginChange(args) => run_begin_change(args).await,
         Command::ChangeStatus(args) => run_change_status(args).await,
@@ -340,6 +353,14 @@ async fn run_get(args: GetArgs) -> Result<()> {
             String::from_utf8(output.value).context("value is not valid UTF-8; use --hex")?
         );
     }
+    Ok(())
+}
+
+async fn run_delete(args: DeleteArgs) -> Result<()> {
+    let client = connect_client(&args.client).await?;
+    let key = bytes_arg(args.key, args.key_hex, "key")?;
+    let output = client.delete(key).await?;
+    println!("epoch={} absent=true", output.topology_epoch);
     Ok(())
 }
 
