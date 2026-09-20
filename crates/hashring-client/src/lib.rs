@@ -13,7 +13,7 @@ use hashring_core::{
         OperationError, PutRequest, RecordVersion, coordinator_client::CoordinatorClient,
         data_node_client::DataNodeClient,
     },
-    topology::{Member, TopologySnapshot},
+    topology::{Member, TopologyError, TopologySnapshot},
     transport::{configure_coordinator_client, fetch_topology},
 };
 
@@ -68,6 +68,23 @@ pub enum ClientError {
         message: String,
         unknown_write_outcome: bool,
     },
+}
+
+#[derive(Debug, Error)]
+enum TopologyRefreshError {
+    #[error("coordinator transport failed: {0}")]
+    Transport(#[from] tonic::transport::Error),
+    #[error("coordinator topology RPC failed: {0}")]
+    Rpc(Box<tonic::Status>),
+    #[error("coordinator returned an invalid topology: {0}")]
+    InvalidTopology(#[from] TopologyError),
+}
+
+impl TopologyRefreshError {
+    fn is_retryable(&self) -> bool {
+        matches!(self, Self::Transport(_))
+            || matches!(self, Self::Rpc(status) if retryable_status(status))
+    }
 }
 
 #[derive(Clone)]
@@ -414,16 +431,34 @@ impl HashringClient {
         timeout: Duration,
         unknown_write_outcome: bool,
     ) -> Result<TopologySnapshot, ClientError> {
-        let topology = tokio::time::timeout(timeout, fetch_topology(&self.coordinator_endpoint))
-            .await
-            .map_err(|_| ClientError::DeadlineExceeded {
-                unknown_write_outcome,
-            })??;
-        let mut current = self.topology.write().await;
-        if topology.epoch >= current.epoch {
-            *current = topology.clone();
+        let deadline = Instant::now() + timeout;
+        let mut attempt = 0_u32;
+        loop {
+            let fetched = tokio::time::timeout(
+                remaining(deadline, unknown_write_outcome)?,
+                fetch_topology_for_refresh(&self.coordinator_endpoint),
+            )
+            .await;
+            match fetched {
+                Ok(Ok(topology)) => {
+                    let mut current = self.topology.write().await;
+                    if topology.epoch >= current.epoch {
+                        *current = topology;
+                    }
+                    return Ok(current.clone());
+                }
+                Ok(Err(error)) if error.is_retryable() => {
+                    self.retry_delay(deadline, &mut attempt, unknown_write_outcome)
+                        .await?;
+                }
+                Ok(Err(error)) => return Err(ClientError::Topology(error.into())),
+                Err(_) => {
+                    return Err(ClientError::DeadlineExceeded {
+                        unknown_write_outcome,
+                    });
+                }
+            }
         }
-        Ok(current.clone())
     }
 
     async fn retry_delay(
@@ -438,6 +473,7 @@ impl HashringClient {
         let delay = Duration::from_millis((base_ms + jitter_ms).min(200));
         let available = remaining(deadline, unknown_write_outcome)?;
         if delay >= available {
+            tokio::time::sleep(available).await;
             return Err(ClientError::DeadlineExceeded {
                 unknown_write_outcome,
             });
@@ -482,6 +518,19 @@ fn configure_data_client(
 
 fn retryable_status(status: &tonic::Status) -> bool {
     status.code() == Code::Unavailable
+}
+
+async fn fetch_topology_for_refresh(
+    endpoint: &str,
+) -> Result<TopologySnapshot, TopologyRefreshError> {
+    let mut client =
+        configure_coordinator_client(CoordinatorClient::connect(endpoint.to_owned()).await?);
+    let response = client
+        .get_topology(proto::Empty {})
+        .await
+        .map_err(|status| TopologyRefreshError::Rpc(Box::new(status)))?
+        .into_inner();
+    Ok(response.try_into()?)
 }
 
 fn status_may_have_applied(status: &tonic::Status) -> bool {
@@ -549,5 +598,62 @@ mod tests {
         assert!(unknown);
         assert!(accumulated_write_ambiguity(unknown, &unimplemented));
         assert!(!accumulated_write_ambiguity(false, &unimplemented));
+    }
+
+    #[test]
+    fn topology_refresh_retries_only_transient_rpc_failures() {
+        assert!(
+            TopologyRefreshError::Rpc(Box::new(tonic::Status::unavailable(
+                "coordinator is restarting",
+            )))
+            .is_retryable()
+        );
+        assert!(
+            !TopologyRefreshError::Rpc(Box::new(tonic::Status::invalid_argument(
+                "malformed request",
+            )))
+            .is_retryable()
+        );
+        assert!(!TopologyRefreshError::InvalidTopology(TopologyError::NoMembers).is_retryable());
+    }
+
+    #[tokio::test]
+    async fn moved_refresh_preserves_an_unknown_write_outcome_through_its_deadline() {
+        let topology = TopologySnapshot::new(
+            1,
+            1,
+            1,
+            vec![Member {
+                node_id: "node-1".into(),
+                endpoint: "http://127.0.0.1:1".into(),
+            }],
+        )
+        .unwrap();
+        let client = HashringClient {
+            coordinator_endpoint: "http://127.0.0.1:1".into(),
+            topology: Arc::new(RwLock::new(topology)),
+            channels: Arc::new(RwLock::new(HashMap::new())),
+            operation_timeout: Duration::from_millis(100),
+        };
+        let deadline = Instant::now() + client.operation_timeout;
+        let error = client
+            .handle_retryable(
+                OperationError {
+                    code: ErrorCode::Moved.into(),
+                    retryable: true,
+                    ..Default::default()
+                },
+                deadline,
+                &mut 0,
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::DeadlineExceeded {
+                unknown_write_outcome: true
+            }
+        ));
     }
 }

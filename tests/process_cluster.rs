@@ -338,6 +338,106 @@ async fn permanent_grpc_status_is_returned_without_deadline_retry() {
 }
 
 #[tokio::test]
+async fn moved_request_retries_a_transient_coordinator_outage_until_deadline() {
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("coordinator.redb");
+    let ports = unused_ports(3);
+    let coordinator_port = ports[0];
+    let coordinator_endpoint = format!("http://127.0.0.1:{coordinator_port}");
+    let members = vec![("node-1".to_owned(), ports[1])];
+    let mut coordinator = spawn_process(&coordinator_arguments(coordinator_port, &state, &members));
+    let admin = connect_eventually(&coordinator_endpoint).await;
+    let recovery_client =
+        HashringClient::connect(coordinator_endpoint.clone(), Duration::from_secs(2))
+            .await
+            .unwrap();
+    let deadline_client =
+        HashringClient::connect(coordinator_endpoint.clone(), Duration::from_millis(250))
+            .await
+            .unwrap();
+    let mut node_1 = spawn_process(&[
+        "node".into(),
+        "--id".into(),
+        "node-1".into(),
+        "--listen".into(),
+        format!("127.0.0.1:{}", ports[1]),
+        "--coordinator".into(),
+        coordinator_endpoint.clone(),
+    ]);
+    wait_for_listener(ports[1]);
+
+    let target_members = vec![
+        Member {
+            node_id: "node-1".into(),
+            endpoint: format!("http://127.0.0.1:{}", ports[1]),
+        },
+        Member {
+            node_id: "node-2".into(),
+            endpoint: format!("http://127.0.0.1:{}", ports[2]),
+        },
+    ];
+    let plan = admin.begin_topology_change(target_members).await.unwrap();
+    let old_topology = recovery_client.topology().await;
+    let moved_key = (0_u64..10_000)
+        .map(|candidate| candidate.to_be_bytes().to_vec())
+        .find(|key| {
+            let token = old_topology.key_token(key);
+            plan.ranges.iter().any(|range| token_in_range(token, range))
+        })
+        .unwrap();
+    recovery_client
+        .put(moved_key.clone(), b"moved-value".to_vec())
+        .await
+        .unwrap();
+    let mut node_2 = spawn_process(&[
+        "node".into(),
+        "--id".into(),
+        "node-2".into(),
+        "--listen".into(),
+        format!("127.0.0.1:{}", ports[2]),
+        "--coordinator".into(),
+        coordinator_endpoint.clone(),
+    ]);
+    wait_for_listener(ports[2]);
+    let executor = HashringClient::connect(coordinator_endpoint.clone(), Duration::from_secs(30))
+        .await
+        .unwrap();
+    let completed = executor
+        .execute_topology_change(plan.change_id, plan.base_epoch, plan.target_topology.epoch)
+        .await
+        .unwrap();
+    assert_eq!(completed.phase, MigrationPhase::Complete);
+    assert_eq!(recovery_client.topology().await.epoch, 1);
+    assert_eq!(deadline_client.topology().await.epoch, 1);
+
+    coordinator.stop();
+    let request = tokio::spawn({
+        let client = recovery_client.clone();
+        let key = moved_key.clone();
+        async move { client.get(key).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    coordinator = spawn_process(&coordinator_arguments(coordinator_port, &state, &[]));
+    wait_for_listener(coordinator_port);
+    assert_eq!(request.await.unwrap().unwrap().value, b"moved-value");
+    assert_eq!(recovery_client.topology().await.epoch, 2);
+
+    coordinator.stop();
+    let started = Instant::now();
+    assert!(matches!(
+        deadline_client.get(moved_key).await,
+        Err(ClientError::DeadlineExceeded {
+            unknown_write_outcome: false
+        })
+    ));
+    assert!(started.elapsed() >= Duration::from_millis(200));
+
+    node_1.stop();
+    node_2.stop();
+}
+
+#[tokio::test]
 async fn topology_change_plan_is_exclusive_durable_and_not_published() {
     let _guard = process_test_lock().lock().await;
     let directory = tempfile::tempdir().unwrap();
