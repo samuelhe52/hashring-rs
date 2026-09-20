@@ -1,0 +1,88 @@
+syntax = "proto3";
+
+package hashring.v1;
+
+message Empty {}
+
+message Member {
+  string node_id = 1;
+  string endpoint = 2;
+}
+
+message TokenAssignment {
+  uint64 token = 1;
+  string node_id = 2;
+}
+
+message TopologySnapshot {
+  uint64 epoch = 1;
+  uint64 hash_seed = 2;
+  string hash_algorithm = 3;
+  uint32 encoding_version = 4;
+  uint32 virtual_nodes = 5;
+  repeated Member members = 6;
+  repeated TokenAssignment assignments = 7;
+  string digest = 8;
+}
+
+service Coordinator {
+  rpc GetTopology(Empty) returns (TopologySnapshot);
+}
+
+message RecordVersion {
+  uint64 topology_epoch = 1;
+  uint64 owner_sequence = 2;
+  string owner_node_id = 3;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  NOT_FOUND = 1;
+  MOVED = 2;
+  RANGE_BUSY = 3;
+  UNAVAILABLE = 4;
+  DEADLINE_EXCEEDED = 5;
+  TOO_LARGE = 6;
+  RESOURCE_EXHAUSTED = 7;
+  INVALID_ARGUMENT = 8;
+}
+
+message OperationError {
+  ErrorCode code = 1;
+  string message = 2;
+  uint64 current_epoch = 3;
+  string owner_endpoint = 4;
+  bool retryable = 5;
+  bool unknown_write_outcome = 6;
+}
+
+message GetRequest {
+  bytes key = 1;
+  uint64 topology_epoch = 2;
+  string request_id = 3;
+}
+
+message GetResponse {
+  bytes value = 1;
+  RecordVersion version = 2;
+  uint64 current_epoch = 3;
+  OperationError error = 4;
+}
+
+message PutRequest {
+  bytes key = 1;
+  bytes value = 2;
+  uint64 topology_epoch = 3;
+  string request_id = 4;
+}
+
+message PutResponse {
+  RecordVersion version = 1;
+  uint64 current_epoch = 2;
+  OperationError error = 3;
+}
+
+service DataNode {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+}
