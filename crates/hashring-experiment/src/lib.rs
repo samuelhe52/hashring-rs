@@ -231,10 +231,14 @@ pub async fn run_experiment(
     let runtime_git_status =
         command_output(Some(build_source_root), "git", &["status", "--porcelain"]);
     let runtime_tree_hash = source_tree_digest(build_source_root).ok();
-    let source_reproducible = env!("HASHRING_BUILD_GIT_DIRTY") == "false"
-        && runtime_git_status.as_deref() == Some("")
-        && runtime_git_commit.as_deref() == Some(env!("HASHRING_BUILD_GIT_COMMIT"))
-        && runtime_tree_hash.as_deref() == Some(env!("HASHRING_BUILD_SOURCE_TREE_BLAKE3"));
+    let source_reproducible = source_is_reproducible(
+        env!("HASHRING_BUILD_GIT_DIRTY"),
+        env!("HASHRING_BUILD_GIT_COMMIT"),
+        env!("HASHRING_BUILD_SOURCE_TREE_BLAKE3"),
+        runtime_git_status.as_deref(),
+        runtime_git_commit.as_deref(),
+        runtime_tree_hash.as_deref(),
+    );
     let manifest = ExperimentManifest {
         schema_version: 2,
         started_unix_ms: unix_ms(),
@@ -927,6 +931,20 @@ fn command_output(cwd: Option<&Path>, program: &str, arguments: &[&str]) -> Opti
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+fn source_is_reproducible(
+    build_git_dirty: &str,
+    build_git_commit: &str,
+    build_source_tree_blake3: &str,
+    runtime_git_status: Option<&str>,
+    runtime_git_commit: Option<&str>,
+    runtime_source_tree_blake3: Option<&str>,
+) -> bool {
+    build_git_dirty == "false"
+        && runtime_git_status == Some("")
+        && runtime_git_commit == Some(build_git_commit)
+        && runtime_source_tree_blake3 == Some(build_source_tree_blake3)
+}
+
 fn file_digest(path: &Path) -> Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = blake3::Hasher::new();
@@ -1018,5 +1036,58 @@ mod tests {
         assert!(!restored.success);
         assert!(restored.error.unwrap().contains("injected failure"));
         assert_eq!(restored.measurements["initial_put"].operations, 10);
+    }
+
+    #[test]
+    fn reproducibility_requires_every_clean_matching_source_condition() {
+        let reproducible = |build_dirty, runtime_status, runtime_commit, runtime_tree| {
+            source_is_reproducible(
+                build_dirty,
+                "commit-a",
+                "tree-a",
+                runtime_status,
+                runtime_commit,
+                runtime_tree,
+            )
+        };
+
+        assert!(reproducible(
+            "false",
+            Some(""),
+            Some("commit-a"),
+            Some("tree-a")
+        ));
+        assert!(!reproducible(
+            "true",
+            Some(""),
+            Some("commit-a"),
+            Some("tree-a")
+        ));
+        assert!(!reproducible(
+            "false",
+            Some(" M src/lib.rs"),
+            Some("commit-a"),
+            Some("tree-a")
+        ));
+        assert!(!reproducible(
+            "false",
+            None,
+            Some("commit-a"),
+            Some("tree-a")
+        ));
+        assert!(!reproducible(
+            "false",
+            Some(""),
+            Some("commit-b"),
+            Some("tree-a")
+        ));
+        assert!(!reproducible("false", Some(""), None, Some("tree-a")));
+        assert!(!reproducible(
+            "false",
+            Some(""),
+            Some("commit-a"),
+            Some("tree-b")
+        ));
+        assert!(!reproducible("false", Some(""), Some("commit-a"), None));
     }
 }

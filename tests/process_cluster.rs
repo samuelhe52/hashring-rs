@@ -1045,10 +1045,18 @@ async fn experiment_runner_preserves_reproducibility_artifacts() {
     assert_eq!(manifest["executable_blake3"].as_str().unwrap().len(), 64);
     assert!(manifest["build"]["git_commit"].is_string());
     assert_eq!(manifest["config"]["pre_publish_delay_ms"], 250);
-    assert_eq!(manifest["source_reproducible"], false);
     assert_eq!(
         manifest["build"]["source_tree_blake3"],
         manifest["runtime_source"]["source_tree_blake3"]
+    );
+    let expected_source_reproducible = manifest["build"]["git_dirty"] == "false"
+        && manifest["runtime_source"]["git_dirty"] == false
+        && manifest["build"]["git_commit"] == manifest["runtime_source"]["git_commit"]
+        && manifest["build"]["source_tree_blake3"]
+            == manifest["runtime_source"]["source_tree_blake3"];
+    assert_eq!(
+        manifest["source_reproducible"],
+        expected_source_reproducible
     );
     let summary: serde_json::Value =
         serde_json::from_slice(&std::fs::read(output_directory.join("summary.json")).unwrap())
