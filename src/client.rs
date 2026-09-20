@@ -1,17 +1,20 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use thiserror::Error;
 use tokio::{sync::RwLock, time::Instant};
 use tonic::Code;
+use tonic::transport::{Channel, Endpoint};
 
 use crate::{
     migration::TopologyChange,
     node::{
-        DEFAULT_MAX_KEY_BYTES, DEFAULT_MAX_VALUE_BYTES, MAX_DATA_MESSAGE_BYTES, fetch_topology,
+        DEFAULT_MAX_KEY_BYTES, DEFAULT_MAX_VALUE_BYTES, MAX_DATA_MESSAGE_BYTES,
+        configure_coordinator_client, fetch_topology,
     },
     proto::{
-        BeginTopologyChangeRequest, ErrorCode, GetRequest, OperationError, PutRequest,
-        RecordVersion, coordinator_client::CoordinatorClient, data_node_client::DataNodeClient,
+        BeginTopologyChangeRequest, ErrorCode, ExecuteTopologyChangeRequest, GetRequest,
+        OperationError, PutRequest, RecordVersion, coordinator_client::CoordinatorClient,
+        data_node_client::DataNodeClient,
     },
     topology::{Member, TopologySnapshot},
 };
@@ -73,6 +76,7 @@ pub enum ClientError {
 pub struct HashringClient {
     coordinator_endpoint: String,
     topology: Arc<RwLock<TopologySnapshot>>,
+    channels: Arc<RwLock<HashMap<String, Channel>>>,
     operation_timeout: Duration,
 }
 
@@ -91,6 +95,7 @@ impl HashringClient {
         Ok(Self {
             coordinator_endpoint,
             topology: Arc::new(RwLock::new(topology)),
+            channels: Arc::new(RwLock::new(HashMap::new())),
             operation_timeout,
         })
     }
@@ -115,7 +120,7 @@ impl HashringClient {
         )
         .await
         {
-            Ok(Ok(client)) => client,
+            Ok(Ok(client)) => configure_coordinator_client(client),
             Ok(Err(error)) => return Err(ClientError::Topology(error.into())),
             Err(_) => {
                 return Err(ClientError::DeadlineExceeded {
@@ -152,7 +157,8 @@ impl HashringClient {
     pub async fn topology_change(&self) -> Result<Option<TopologyChange>, ClientError> {
         let endpoint = self.coordinator_endpoint.clone();
         let response = tokio::time::timeout(self.operation_timeout, async move {
-            let mut client = CoordinatorClient::connect(endpoint).await?;
+            let mut client =
+                configure_coordinator_client(CoordinatorClient::connect(endpoint).await?);
             let response = client
                 .get_topology_change(crate::proto::Empty {})
                 .await?
@@ -171,6 +177,51 @@ impl HashringClient {
             .map_err(ClientError::from)
     }
 
+    pub async fn execute_topology_change(
+        &self,
+        change_id: impl Into<String>,
+        base_epoch: u64,
+        target_epoch: u64,
+    ) -> Result<TopologyChange, ClientError> {
+        let deadline = Instant::now() + self.operation_timeout;
+        let mut client = match tokio::time::timeout(
+            remaining(deadline, false)?,
+            CoordinatorClient::connect(self.coordinator_endpoint.clone()),
+        )
+        .await
+        {
+            Ok(Ok(client)) => configure_coordinator_client(client),
+            Ok(Err(error)) => return Err(ClientError::Topology(error.into())),
+            Err(_) => {
+                return Err(ClientError::DeadlineExceeded {
+                    unknown_write_outcome: false,
+                });
+            }
+        };
+        let response = match tokio::time::timeout(
+            remaining(deadline, false)?,
+            client.execute_topology_change(ExecuteTopologyChangeRequest {
+                change_id: change_id.into(),
+                base_epoch,
+                target_epoch,
+            }),
+        )
+        .await
+        {
+            Ok(Ok(response)) => response.into_inner(),
+            Ok(Err(status)) => {
+                let unknown_write_outcome = status_may_have_applied(&status);
+                return Err(rpc_error(status, unknown_write_outcome));
+            }
+            Err(_) => {
+                return Err(ClientError::DeadlineExceeded {
+                    unknown_write_outcome: true,
+                });
+            }
+        };
+        Ok(response.try_into().map_err(anyhow::Error::from)?)
+    }
+
     pub async fn get(&self, key: Vec<u8>) -> Result<GetOutput, ClientError> {
         validate_key_size(&key)?;
         let deadline = Instant::now() + self.operation_timeout;
@@ -180,22 +231,16 @@ impl HashringClient {
         loop {
             let topology = self.topology().await;
             let owner = topology.owner(&key).map_err(anyhow::Error::from)?.clone();
-            let available = remaining(deadline, false)?;
-            let mut client = match tokio::time::timeout(
-                available,
-                DataNodeClient::connect(owner.endpoint.clone()),
-            )
-            .await
-            {
-                Ok(Ok(client)) => configure_data_client(client),
-                Ok(Err(_)) => {
-                    self.retry_delay(deadline, &mut attempt, false).await?;
-                    continue;
-                }
-                Err(_) => {
+            let mut client = match self.data_node_client(&owner.endpoint, deadline).await {
+                Ok(client) => client,
+                Err(ClientError::DeadlineExceeded { .. }) => {
                     return Err(ClientError::DeadlineExceeded {
                         unknown_write_outcome: false,
                     });
+                }
+                Err(_) => {
+                    self.retry_delay(deadline, &mut attempt, false).await?;
+                    continue;
                 }
             };
 
@@ -260,23 +305,17 @@ impl HashringClient {
         loop {
             let topology = self.topology().await;
             let owner = topology.owner(&key).map_err(anyhow::Error::from)?.clone();
-            let available = remaining(deadline, unknown_write_outcome)?;
-            let mut client = match tokio::time::timeout(
-                available,
-                DataNodeClient::connect(owner.endpoint.clone()),
-            )
-            .await
-            {
-                Ok(Ok(client)) => configure_data_client(client),
-                Ok(Err(_)) => {
-                    self.retry_delay(deadline, &mut attempt, unknown_write_outcome)
-                        .await?;
-                    continue;
-                }
-                Err(_) => {
+            let mut client = match self.data_node_client(&owner.endpoint, deadline).await {
+                Ok(client) => client,
+                Err(ClientError::DeadlineExceeded { .. }) => {
                     return Err(ClientError::DeadlineExceeded {
                         unknown_write_outcome,
                     });
+                }
+                Err(_) => {
+                    self.retry_delay(deadline, &mut attempt, unknown_write_outcome)
+                        .await?;
+                    continue;
                 }
             };
 
@@ -354,7 +393,9 @@ impl HashringClient {
                     .await?;
                 Ok(true)
             }
-            ErrorCode::RangeBusy | ErrorCode::Unavailable if error.retryable => {
+            ErrorCode::RangeBusy | ErrorCode::Unavailable | ErrorCode::ResourceExhausted
+                if error.retryable =>
+            {
                 self.retry_delay(deadline, attempt, unknown_write_outcome)
                     .await?;
                 Ok(true)
@@ -408,6 +449,31 @@ impl HashringClient {
         }
         tokio::time::sleep(delay).await;
         Ok(())
+    }
+
+    async fn data_node_client(
+        &self,
+        endpoint: &str,
+        deadline: Instant,
+    ) -> Result<DataNodeClient<Channel>, ClientError> {
+        if let Some(channel) = self.channels.read().await.get(endpoint).cloned() {
+            return Ok(configure_data_client(DataNodeClient::new(channel)));
+        }
+        let transport = Endpoint::from_shared(endpoint.to_owned())
+            .map_err(anyhow::Error::from)
+            .map_err(ClientError::from)?;
+        let channel = tokio::time::timeout(remaining(deadline, false)?, transport.connect())
+            .await
+            .map_err(|_| ClientError::DeadlineExceeded {
+                unknown_write_outcome: false,
+            })?
+            .map_err(anyhow::Error::from)
+            .map_err(ClientError::from)?;
+        self.channels
+            .write()
+            .await
+            .insert(endpoint.to_owned(), channel.clone());
+        Ok(configure_data_client(DataNodeClient::new(channel)))
     }
 }
 

@@ -6,6 +6,11 @@ use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 pub const HASH_ALGORITHM: &str = "xxh3-64";
 pub const ENCODING_VERSION: u32 = 1;
+pub const MAX_MEMBERS: usize = 1_024;
+pub const MAX_VIRTUAL_NODES: u32 = 4_096;
+pub const MAX_TOKEN_ASSIGNMENTS: usize = 1_048_576;
+pub const MAX_NODE_ID_BYTES: usize = 32;
+pub const MAX_ENDPOINT_BYTES: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Member {
@@ -37,10 +42,20 @@ pub enum TopologyError {
     NoMembers,
     #[error("virtual node count must be greater than zero")]
     NoVirtualNodes,
+    #[error("member count exceeds {MAX_MEMBERS}")]
+    TooManyMembers,
+    #[error("virtual node count exceeds {MAX_VIRTUAL_NODES}")]
+    TooManyVirtualNodes,
+    #[error("token assignment count exceeds {MAX_TOKEN_ASSIGNMENTS}")]
+    TooManyAssignments,
     #[error("node id must not be empty")]
     EmptyNodeId,
+    #[error("node id exceeds {MAX_NODE_ID_BYTES} bytes")]
+    NodeIdTooLong,
     #[error("endpoint must not be empty")]
     EmptyEndpoint,
+    #[error("endpoint exceeds {MAX_ENDPOINT_BYTES} bytes")]
+    EndpointTooLong,
     #[error("duplicate node id: {0}")]
     DuplicateNodeId(String),
     #[error("duplicate endpoint: {0}")]
@@ -70,7 +85,11 @@ impl TopologySnapshot {
         validate_members(&members, virtual_nodes)?;
         members.sort_by(|left, right| left.node_id.cmp(&right.node_id));
 
-        let mut assignments = Vec::with_capacity(members.len() * virtual_nodes as usize);
+        let assignment_count = members
+            .len()
+            .checked_mul(virtual_nodes as usize)
+            .ok_or(TopologyError::TooManyAssignments)?;
+        let mut assignments = Vec::with_capacity(assignment_count);
         for member in &members {
             for vnode in 0..virtual_nodes {
                 let mut encoded = Vec::with_capacity(member.node_id.len() + 24);
@@ -173,14 +192,33 @@ fn validate_members(members: &[Member], virtual_nodes: u32) -> Result<(), Topolo
     if virtual_nodes == 0 {
         return Err(TopologyError::NoVirtualNodes);
     }
+    if members.len() > MAX_MEMBERS {
+        return Err(TopologyError::TooManyMembers);
+    }
+    if virtual_nodes > MAX_VIRTUAL_NODES {
+        return Err(TopologyError::TooManyVirtualNodes);
+    }
+    if members
+        .len()
+        .checked_mul(virtual_nodes as usize)
+        .is_none_or(|assignments| assignments > MAX_TOKEN_ASSIGNMENTS)
+    {
+        return Err(TopologyError::TooManyAssignments);
+    }
     let mut node_ids = HashSet::new();
     let mut endpoints = HashSet::new();
     for member in members {
         if member.node_id.is_empty() {
             return Err(TopologyError::EmptyNodeId);
         }
+        if member.node_id.len() > MAX_NODE_ID_BYTES {
+            return Err(TopologyError::NodeIdTooLong);
+        }
         if member.endpoint.is_empty() {
             return Err(TopologyError::EmptyEndpoint);
+        }
+        if member.endpoint.len() > MAX_ENDPOINT_BYTES {
+            return Err(TopologyError::EndpointTooLong);
         }
         if !node_ids.insert(&member.node_id) {
             return Err(TopologyError::DuplicateNodeId(member.node_id.clone()));
@@ -201,15 +239,6 @@ impl From<&Member> for crate::proto::Member {
     }
 }
 
-impl From<&TokenAssignment> for crate::proto::TokenAssignment {
-    fn from(assignment: &TokenAssignment) -> Self {
-        Self {
-            token: assignment.token,
-            node_id: assignment.node_id.clone(),
-        }
-    }
-}
-
 impl From<&TopologySnapshot> for crate::proto::TopologySnapshot {
     fn from(snapshot: &TopologySnapshot) -> Self {
         Self {
@@ -219,7 +248,14 @@ impl From<&TopologySnapshot> for crate::proto::TopologySnapshot {
             encoding_version: snapshot.encoding_version,
             virtual_nodes: snapshot.virtual_nodes,
             members: snapshot.members.iter().map(Into::into).collect(),
-            assignments: snapshot.assignments.iter().map(Into::into).collect(),
+            assignments: snapshot
+                .assignments
+                .iter()
+                .map(|assignment| crate::proto::TokenAssignment {
+                    token: assignment.token,
+                    node_id: assignment.node_id.clone(),
+                })
+                .collect(),
             digest: snapshot.digest.clone(),
         }
     }
@@ -260,6 +296,8 @@ impl TryFrom<crate::proto::TopologySnapshot> for TopologySnapshot {
 
 #[cfg(test)]
 mod tests {
+    use prost::Message;
+
     use super::*;
 
     fn members() -> Vec<Member> {
@@ -293,6 +331,53 @@ mod tests {
             let owner = topology.owner(&key.to_be_bytes()).unwrap();
             assert!(owner.node_id == "node-a" || owner.node_id == "node-b");
         }
+    }
+
+    #[test]
+    fn maximum_assignment_topology_fits_control_plane_limit() {
+        let members = (0..256)
+            .map(|index| Member {
+                node_id: format!("n{index:03}{}", "x".repeat(MAX_NODE_ID_BYTES - 4)),
+                endpoint: format!(
+                    "http://127.0.0.1/{index:03}{}",
+                    "x".repeat(MAX_ENDPOINT_BYTES - 21)
+                ),
+            })
+            .collect();
+        let topology = TopologySnapshot::new(1, 42, MAX_VIRTUAL_NODES, members).unwrap();
+        assert_eq!(topology.assignments.len(), MAX_TOKEN_ASSIGNMENTS);
+        let wire = crate::proto::TopologySnapshot::from(&topology);
+        assert!(wire.encoded_len() <= crate::node::MAX_CONTROL_MESSAGE_BYTES);
+
+        let source = &topology.members[0];
+        let destination = &topology.members[1];
+        let range = crate::migration::RangeMigration {
+            range_id: "f".repeat(64),
+            start_exclusive: u64::MAX - 1,
+            end_inclusive: u64::MAX,
+            source_node_id: source.node_id.clone(),
+            destination_node_id: destination.node_id.clone(),
+            source_endpoint: "s".repeat(MAX_ENDPOINT_BYTES),
+            destination_endpoint: "d".repeat(MAX_ENDPOINT_BYTES),
+            source_process_instance_id: "s".repeat(36),
+            destination_process_instance_id: "d".repeat(36),
+            source_cleaned: false,
+            snapshot_records: u64::MAX,
+            changelog_watermark: u64::MAX,
+            verified: true,
+        };
+        let change = crate::migration::TopologyChange {
+            change_id: "c".repeat(36),
+            base_epoch: 0,
+            target_topology: topology,
+            phase: crate::migration::MigrationPhase::Planned,
+            ranges: vec![range; crate::migration::MAX_MIGRATION_RANGES],
+            stopped_node_ids: Vec::new(),
+            stopping_node_ids: Vec::new(),
+            stop_prepared_node_ids: Vec::new(),
+        };
+        let wire = crate::proto::TopologyChangeSnapshot::from(&change);
+        assert!(wire.encoded_len() <= crate::node::MAX_CONTROL_MESSAGE_BYTES);
     }
 
     #[test]

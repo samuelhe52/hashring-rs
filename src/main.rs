@@ -5,7 +5,7 @@ use clap::{Args, Parser, Subcommand};
 use hashring_rs::{
     client::HashringClient,
     coordinator::{CoordinatorService, RedbTopologyRepository, load_or_initialize},
-    node::{DataNodeService, MAX_DATA_MESSAGE_BYTES},
+    node::{DataNodeService, MAX_CONTROL_MESSAGE_BYTES},
     proto::{coordinator_server::CoordinatorServer, data_node_server::DataNodeServer},
     topology::{Member, TopologySnapshot},
 };
@@ -36,6 +36,8 @@ enum Command {
     BeginChange(ChangeArgs),
     /// Print the active topology change, if any.
     ChangeStatus(ClientArgs),
+    /// Execute the active migration through publication and cleanup.
+    ExecuteChange(ExecuteChangeArgs),
 }
 
 #[derive(Args)]
@@ -48,6 +50,10 @@ struct CoordinatorArgs {
     seed: u64,
     #[arg(long, default_value_t = 128)]
     virtual_nodes: u32,
+    #[arg(long, default_value_t = 120_000)]
+    migration_timeout_ms: u64,
+    #[arg(long, default_value_t = 0, hide = true)]
+    pre_publish_delay_ms: u64,
     /// Bootstrap member in NODE_ID=HTTP_ENDPOINT form. Required only for a new store.
     #[arg(long = "member")]
     members: Vec<String>,
@@ -61,6 +67,8 @@ struct NodeArgs {
     listen: SocketAddr,
     #[arg(long, default_value = "http://127.0.0.1:50050")]
     coordinator: String,
+    #[arg(long, default_value_t = 0, hide = true)]
+    stop_response_delay_ms: u64,
 }
 
 #[derive(Args, Clone)]
@@ -111,6 +119,20 @@ struct ChangeArgs {
     members: Vec<String>,
 }
 
+#[derive(Args)]
+struct ExecuteChangeArgs {
+    #[arg(long, default_value = "http://127.0.0.1:50050")]
+    coordinator: String,
+    #[arg(long, default_value_t = 120_000)]
+    deadline_ms: u64,
+    #[arg(long)]
+    change_id: String,
+    #[arg(long)]
+    base_epoch: u64,
+    #[arg(long)]
+    target_epoch: u64,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -125,6 +147,7 @@ async fn main() -> Result<()> {
         Command::Topology(args) => run_topology(args).await,
         Command::BeginChange(args) => run_begin_change(args).await,
         Command::ChangeStatus(args) => run_change_status(args).await,
+        Command::ExecuteChange(args) => run_execute_change(args).await,
     }
 }
 
@@ -155,25 +178,62 @@ async fn run_coordinator(args: CoordinatorArgs) -> Result<()> {
         active_change = state.active_change.is_some(),
         "coordinator ready"
     );
+    let service = CoordinatorService::new(
+        state,
+        repository,
+        Duration::from_millis(args.migration_timeout_ms),
+    )
+    .with_pre_publish_delay(Duration::from_millis(args.pre_publish_delay_ms));
+    let recovery_service = service.clone();
+    tokio::spawn(async move {
+        match recovery_service.resume_interrupted_change().await {
+            Ok(Some(change)) => {
+                tracing::info!(change_id = %change.change_id, phase = ?change.phase, "resumed topology change");
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(%error, "failed to resume topology change");
+            }
+        }
+    });
     Server::builder()
-        .add_service(CoordinatorServer::new(CoordinatorService::new(
-            state, repository,
-        )))
+        .add_service(
+            CoordinatorServer::new(service)
+                .max_decoding_message_size(MAX_CONTROL_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_CONTROL_MESSAGE_BYTES),
+        )
         .serve_with_shutdown(args.listen, shutdown_signal())
         .await?;
     Ok(())
 }
 
 async fn run_node(args: NodeArgs) -> Result<()> {
-    let service = DataNodeService::connect(args.id.clone(), args.coordinator).await?;
-    info!(node_id = %args.id, listen = %args.listen, "data node ready");
+    let service = DataNodeService::connect(args.id.clone(), args.coordinator)
+        .await?
+        .with_stop_response_delay(Duration::from_millis(args.stop_response_delay_ms));
+    let mut remote_shutdown = service.shutdown_receiver();
+    info!(
+        node_id = %args.id,
+        process_instance_id = service.process_instance_id(),
+        listen = %args.listen,
+        "data node ready"
+    );
     Server::builder()
         .add_service(
             DataNodeServer::new(service)
-                .max_decoding_message_size(MAX_DATA_MESSAGE_BYTES)
-                .max_encoding_message_size(MAX_DATA_MESSAGE_BYTES),
+                .max_decoding_message_size(MAX_CONTROL_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_CONTROL_MESSAGE_BYTES),
         )
-        .serve_with_shutdown(args.listen, shutdown_signal())
+        .serve_with_shutdown(args.listen, async move {
+            tokio::select! {
+                () = shutdown_signal() => {}
+                result = remote_shutdown.changed() => {
+                    if result.is_err() || *remote_shutdown.borrow() {
+                        tracing::info!("data node received remote shutdown");
+                    }
+                }
+            }
+        })
         .await?;
     Ok(())
 }
@@ -235,6 +295,16 @@ async fn run_change_status(args: ClientArgs) -> Result<()> {
         "{}",
         serde_json::to_string_pretty(&client.topology_change().await?)?
     );
+    Ok(())
+}
+
+async fn run_execute_change(args: ExecuteChangeArgs) -> Result<()> {
+    let client =
+        HashringClient::connect(args.coordinator, Duration::from_millis(args.deadline_ms)).await?;
+    let change = client
+        .execute_topology_change(args.change_id, args.base_epoch, args.target_epoch)
+        .await?;
+    println!("{}", serde_json::to_string_pretty(&change)?);
     Ok(())
 }
 

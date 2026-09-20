@@ -29,6 +29,9 @@ service Coordinator {
   rpc GetTopology(Empty) returns (TopologySnapshot);
   rpc BeginTopologyChange(BeginTopologyChangeRequest) returns (TopologyChangeSnapshot);
   rpc GetTopologyChange(Empty) returns (GetTopologyChangeResponse);
+  rpc ExecuteTopologyChange(ExecuteTopologyChangeRequest) returns (TopologyChangeSnapshot);
+  rpc RegisterNode(RegisterNodeRequest) returns (Empty);
+  rpc IsStopConfirmed(StopRequest) returns (StopConfirmationResponse);
 }
 
 enum MigrationPhase {
@@ -43,6 +46,8 @@ enum MigrationPhase {
   CLEANING_UP = 8;
   COMPLETE = 9;
   ABORTED = 10;
+  RESETTING = 11;
+  ABORTING = 12;
 }
 
 message RangeMigration {
@@ -54,6 +59,11 @@ message RangeMigration {
   uint64 snapshot_records = 6;
   uint64 changelog_watermark = 7;
   bool verified = 8;
+  string source_endpoint = 9;
+  string destination_endpoint = 10;
+  string source_process_instance_id = 11;
+  string destination_process_instance_id = 12;
+  bool source_cleaned = 13;
 }
 
 message TopologyChangeSnapshot {
@@ -62,14 +72,125 @@ message TopologyChangeSnapshot {
   TopologySnapshot target_topology = 3;
   MigrationPhase phase = 4;
   repeated RangeMigration ranges = 5;
+  repeated string stopped_node_ids = 6;
+  repeated string stopping_node_ids = 7;
+  repeated string stop_prepared_node_ids = 8;
 }
 
 message BeginTopologyChangeRequest {
   repeated Member target_members = 1;
 }
 
+message ExecuteTopologyChangeRequest {
+  string change_id = 1;
+  uint64 base_epoch = 2;
+  uint64 target_epoch = 3;
+}
+
+message RegisterNodeRequest {
+  string node_id = 1;
+  string process_instance_id = 2;
+}
+
+message StopConfirmationResponse {
+  bool confirmed = 1;
+}
+
 message GetTopologyChangeResponse {
   TopologyChangeSnapshot change = 1;
+}
+
+message RangeSpec {
+  string change_id = 1;
+  string range_id = 2;
+  uint64 start_exclusive = 3;
+  uint64 end_inclusive = 4;
+  string source_node_id = 5;
+  string destination_node_id = 6;
+}
+
+message MigrationRecord {
+  bytes key = 1;
+  bytes value = 2;
+  RecordVersion version = 3;
+}
+
+message JournalRecord {
+  uint64 watermark = 1;
+  MigrationRecord record = 2;
+}
+
+message PrepareRangeRequest {
+  RangeSpec range = 1;
+}
+
+message PrepareSourceRangeResponse {
+  string process_instance_id = 1;
+}
+
+message PrepareDestinationRangeResponse {
+  string process_instance_id = 1;
+}
+
+message NodeInfoResponse {
+  string node_id = 1;
+  string process_instance_id = 2;
+}
+
+message SnapshotPageRequest {
+  string change_id = 1;
+  string range_id = 2;
+  uint64 cursor = 3;
+  uint64 max_bytes = 4;
+}
+
+message SnapshotPageResponse {
+  repeated MigrationRecord records = 1;
+  uint64 next_cursor = 2;
+  bool done = 3;
+}
+
+message ChangelogPageRequest {
+  string change_id = 1;
+  string range_id = 2;
+  uint64 after_watermark = 3;
+  uint64 max_bytes = 4;
+}
+
+message ChangelogPageResponse {
+  repeated JournalRecord records = 1;
+  uint64 current_watermark = 2;
+}
+
+message ApplyMigrationBatchRequest {
+  string change_id = 1;
+  string range_id = 2;
+  repeated MigrationRecord snapshot_records = 3;
+  repeated JournalRecord journal_records = 4;
+}
+
+message RangeControlRequest {
+  string change_id = 1;
+  string range_id = 2;
+}
+
+message PauseRangeResponse {
+  uint64 final_watermark = 1;
+}
+
+message RangeDigestResponse {
+  uint64 record_count = 1;
+  string digest = 2;
+  uint64 changelog_watermark = 3;
+}
+
+message InstallTopologyRequest {
+  TopologySnapshot topology = 1;
+}
+
+message StopRequest {
+  string node_id = 1;
+  string process_instance_id = 2;
 }
 
 message RecordVersion {
@@ -128,4 +249,19 @@ message PutResponse {
 service DataNode {
   rpc Get(GetRequest) returns (GetResponse);
   rpc Put(PutRequest) returns (PutResponse);
+  rpc PrepareSourceRange(PrepareRangeRequest) returns (PrepareSourceRangeResponse);
+  rpc PrepareDestinationRange(PrepareRangeRequest) returns (PrepareDestinationRangeResponse);
+  rpc GetProcessInfo(Empty) returns (NodeInfoResponse);
+  rpc ReadSnapshotPage(SnapshotPageRequest) returns (SnapshotPageResponse);
+  rpc ReadChangelogPage(ChangelogPageRequest) returns (ChangelogPageResponse);
+  rpc ApplyMigrationBatch(ApplyMigrationBatchRequest) returns (Empty);
+  rpc PauseRangeWrites(RangeControlRequest) returns (PauseRangeResponse);
+  rpc SourceRangeDigest(RangeControlRequest) returns (RangeDigestResponse);
+  rpc DestinationRangeDigest(RangeControlRequest) returns (RangeDigestResponse);
+  rpc CommitDestinationRange(RangeControlRequest) returns (Empty);
+  rpc CleanupSourceRange(RangeControlRequest) returns (Empty);
+  rpc AbortRangeMigration(RangeControlRequest) returns (Empty);
+  rpc InstallTopology(InstallTopologyRequest) returns (Empty);
+  rpc PrepareStop(StopRequest) returns (Empty);
+  rpc Stop(StopRequest) returns (Empty);
 }

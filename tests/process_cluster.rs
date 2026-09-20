@@ -6,7 +6,11 @@ use std::{
 };
 
 use hashring_rs::client::{ClientError, HashringClient};
-use hashring_rs::{migration::MigrationPhase, topology::Member};
+use hashring_rs::{
+    migration::{MigrationPhase, RangeMigration, TopologyChange},
+    proto::ErrorCode,
+    topology::{Member, TopologySnapshot},
+};
 use tonic::Code;
 
 struct Process(Child);
@@ -15,6 +19,10 @@ impl Process {
     fn stop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+
+    fn has_exited(&mut self) -> bool {
+        self.0.try_wait().unwrap().is_some()
     }
 }
 
@@ -46,6 +54,17 @@ fn spawn_process(arguments: &[String]) -> Process {
     )
 }
 
+fn wait_for_listener(port: u16) {
+    let address = format!("127.0.0.1:{port}").parse().unwrap();
+    for _ in 0..100 {
+        if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(20)).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("listener did not become ready on port {port}");
+}
+
 fn coordinator_arguments(
     coordinator_port: u16,
     state: &Path,
@@ -57,6 +76,8 @@ fn coordinator_arguments(
         format!("127.0.0.1:{coordinator_port}"),
         "--state".into(),
         state.display().to_string(),
+        "--virtual-nodes".into(),
+        "32".into(),
     ];
     for (node_id, port) in members {
         arguments.extend([
@@ -75,6 +96,93 @@ async fn connect_eventually(endpoint: &str) -> HashringClient {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("coordinator did not become ready at {endpoint}");
+}
+
+fn token_in_range(token: u64, range: &RangeMigration) -> bool {
+    if range.start_exclusive < range.end_inclusive {
+        token > range.start_exclusive && token <= range.end_inclusive
+    } else if range.start_exclusive > range.end_inclusive {
+        token > range.start_exclusive || token <= range.end_inclusive
+    } else {
+        true
+    }
+}
+
+fn moving_key_indexes(
+    topology: &TopologySnapshot,
+    keys: &[Vec<u8>],
+    ranges: &[RangeMigration],
+) -> Vec<usize> {
+    keys.iter()
+        .enumerate()
+        .filter_map(|(index, key)| {
+            let token = topology.key_token(key);
+            ranges
+                .iter()
+                .any(|range| token_in_range(token, range))
+                .then_some(index)
+        })
+        .collect()
+}
+
+async fn execute_while_writing_moving_keys(
+    observer: &HashringClient,
+    executor: HashringClient,
+    plan: TopologyChange,
+    keys: &[Vec<u8>],
+    expected: &std::sync::Arc<tokio::sync::Mutex<Vec<Vec<u8>>>>,
+    label: &str,
+) -> TopologyChange {
+    let old_topology = observer.topology().await;
+    let indexes = moving_key_indexes(&old_topology, keys, &plan.ranges);
+    assert!(!indexes.is_empty(), "test has no keys in moving ranges");
+    let identity = (
+        plan.change_id.clone(),
+        plan.base_epoch,
+        plan.target_topology.epoch,
+    );
+    let execution = tokio::spawn(async move {
+        executor
+            .execute_topology_change(identity.0, identity.1, identity.2)
+            .await
+            .unwrap()
+    });
+
+    let mut observed_copy = false;
+    for _ in 0..2_000 {
+        if let Some(change) = observer.topology_change().await.unwrap()
+            && matches!(
+                change.phase,
+                MigrationPhase::CopyingSnapshot | MigrationPhase::ReplayingChangelog
+            )
+        {
+            observed_copy = true;
+            break;
+        }
+        assert!(
+            !execution.is_finished(),
+            "{label} completed before copy overlap"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(observed_copy, "{label} never entered its online copy phase");
+
+    let mut writes_during_migration = 0_usize;
+    while !execution.is_finished() {
+        let index = indexes[writes_during_migration % indexes.len()];
+        let value = format!("{label}-overlap-{writes_during_migration}").into_bytes();
+        observer
+            .put(keys[index].clone(), value.clone())
+            .await
+            .unwrap();
+        expected.lock().await[index] = value;
+        writes_during_migration += 1;
+    }
+    assert!(
+        writes_during_migration > 0,
+        "{label} had no write overlapping migration"
+    );
+    execution.await.unwrap()
 }
 
 #[tokio::test]
@@ -143,6 +251,53 @@ async fn separate_processes_route_bytes_and_survive_coordinator_restart() {
     for node in &mut nodes {
         node.stop();
     }
+}
+
+#[tokio::test]
+async fn committed_node_replacement_is_fenced_instead_of_serving_empty_data() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("coordinator.redb");
+    let ports = unused_ports(2);
+    let coordinator_port = ports[0];
+    let coordinator_endpoint = format!("http://127.0.0.1:{coordinator_port}");
+    let members = vec![("node-1".to_owned(), ports[1])];
+    let mut coordinator = spawn_process(&coordinator_arguments(coordinator_port, &state, &members));
+    let client = connect_eventually(&coordinator_endpoint).await;
+    let node_args = [
+        "node".into(),
+        "--id".into(),
+        "node-1".into(),
+        "--listen".into(),
+        format!("127.0.0.1:{}", ports[1]),
+        "--coordinator".into(),
+        coordinator_endpoint.clone(),
+    ];
+    let mut node = spawn_process(&node_args);
+    wait_for_listener(ports[1]);
+    client
+        .put(b"durable-owner".to_vec(), b"value".to_vec())
+        .await
+        .unwrap();
+    node.stop();
+
+    let mut replacement = spawn_process(&node_args);
+    for _ in 0..100 {
+        if replacement.has_exited() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        replacement.has_exited(),
+        "replacement process was not fenced"
+    );
+    let error = client.get(b"durable-owner".to_vec()).await.unwrap_err();
+    assert!(
+        !matches!(error, ClientError::Operation(ref failure) if failure.code == ErrorCode::NotFound),
+        "lost owner data was reported as an authoritative cache miss"
+    );
+
+    coordinator.stop();
 }
 
 #[tokio::test]
@@ -224,5 +379,609 @@ async fn topology_change_plan_is_exclusive_durable_and_not_published() {
     assert_eq!(recovered.ranges, change.ranges);
     assert_eq!(restarted.topology().await.epoch, 1);
 
+    coordinator.stop();
+}
+
+#[tokio::test]
+async fn online_scale_out_and_scale_in_preserve_concurrent_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("coordinator.redb");
+    let ports = unused_ports(3);
+    let coordinator_port = ports[0];
+    let coordinator_endpoint = format!("http://127.0.0.1:{coordinator_port}");
+    let node_1_endpoint = format!("http://127.0.0.1:{}", ports[1]);
+    let node_2_endpoint = format!("http://127.0.0.1:{}", ports[2]);
+    let initial_members = vec![("node-1".to_owned(), ports[1])];
+    let mut coordinator = spawn_process(&coordinator_arguments(
+        coordinator_port,
+        &state,
+        &initial_members,
+    ));
+    let client = connect_eventually(&coordinator_endpoint).await;
+    let mut node_1 = spawn_process(&[
+        "node".into(),
+        "--id".into(),
+        "node-1".into(),
+        "--listen".into(),
+        format!("127.0.0.1:{}", ports[1]),
+        "--coordinator".into(),
+        coordinator_endpoint.clone(),
+    ]);
+
+    let keys: Vec<_> = (0_u64..5_000)
+        .map(|index| index.to_be_bytes().to_vec())
+        .collect();
+    let expected = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    for (index, key) in keys.iter().enumerate() {
+        let mut value = vec![index as u8; 4 * 1024];
+        value[..8].copy_from_slice(&(index as u64).to_be_bytes());
+        client.put(key.clone(), value.clone()).await.unwrap();
+        expected.lock().await.push(value);
+    }
+
+    let two_members = vec![
+        Member {
+            node_id: "node-1".into(),
+            endpoint: node_1_endpoint.clone(),
+        },
+        Member {
+            node_id: "node-2".into(),
+            endpoint: node_2_endpoint.clone(),
+        },
+    ];
+    let scale_out_plan = client
+        .begin_topology_change(two_members.clone())
+        .await
+        .unwrap();
+    let mut node_2 = spawn_process(&[
+        "node".into(),
+        "--id".into(),
+        "node-2".into(),
+        "--listen".into(),
+        format!("127.0.0.1:{}", ports[2]),
+        "--coordinator".into(),
+        coordinator_endpoint.clone(),
+    ]);
+    wait_for_listener(ports[2]);
+
+    let executor = HashringClient::connect(coordinator_endpoint.clone(), Duration::from_secs(60))
+        .await
+        .unwrap();
+    let scale_out = execute_while_writing_moving_keys(
+        &client,
+        executor,
+        scale_out_plan,
+        &keys,
+        &expected,
+        "scale-out",
+    )
+    .await;
+    assert_eq!(scale_out.phase, MigrationPhase::Complete);
+    assert_eq!(scale_out.target_topology.epoch, 2);
+
+    let fresh = HashringClient::connect(coordinator_endpoint.clone(), Duration::from_secs(2))
+        .await
+        .unwrap();
+    let expected_values = expected.lock().await.clone();
+    for (index, key) in keys.iter().enumerate() {
+        assert_eq!(
+            fresh.get(key.clone()).await.unwrap().value,
+            expected_values[index]
+        );
+    }
+
+    let scale_in_plan = fresh
+        .begin_topology_change(vec![two_members[1].clone()])
+        .await
+        .unwrap();
+    let executor = HashringClient::connect(coordinator_endpoint.clone(), Duration::from_secs(60))
+        .await
+        .unwrap();
+    let scale_in = execute_while_writing_moving_keys(
+        &fresh,
+        executor,
+        scale_in_plan,
+        &keys,
+        &expected,
+        "scale-in",
+    )
+    .await;
+    assert_eq!(scale_in.phase, MigrationPhase::Complete);
+    assert_eq!(scale_in.target_topology.epoch, 3);
+
+    let final_client = HashringClient::connect(coordinator_endpoint, Duration::from_secs(2))
+        .await
+        .unwrap();
+    let expected_values = expected.lock().await.clone();
+    for (index, key) in keys.iter().enumerate() {
+        assert_eq!(
+            final_client.get(key.clone()).await.unwrap().value,
+            expected_values[index]
+        );
+    }
+    for _ in 0..50 {
+        if node_1.has_exited() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(node_1.has_exited());
+
+    node_2.stop();
+    coordinator.stop();
+}
+
+#[tokio::test]
+async fn scale_in_recovers_after_lost_stop_acknowledgement() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("coordinator.redb");
+    let ports = unused_ports(3);
+    let coordinator_port = ports[0];
+    let coordinator_endpoint = format!("http://127.0.0.1:{coordinator_port}");
+    let members = vec![
+        ("node-1".to_owned(), ports[1]),
+        ("node-2".to_owned(), ports[2]),
+    ];
+    let mut coordinator = spawn_process(&coordinator_arguments(coordinator_port, &state, &members));
+    let client = connect_eventually(&coordinator_endpoint).await;
+    let mut node_1 = spawn_process(&[
+        "node".into(),
+        "--id".into(),
+        "node-1".into(),
+        "--listen".into(),
+        format!("127.0.0.1:{}", ports[1]),
+        "--coordinator".into(),
+        coordinator_endpoint.clone(),
+        "--stop-response-delay-ms".into(),
+        "2000".into(),
+    ]);
+    let mut node_2 = spawn_process(&[
+        "node".into(),
+        "--id".into(),
+        "node-2".into(),
+        "--listen".into(),
+        format!("127.0.0.1:{}", ports[2]),
+        "--coordinator".into(),
+        coordinator_endpoint.clone(),
+    ]);
+    wait_for_listener(ports[1]);
+    wait_for_listener(ports[2]);
+
+    for index in 0_u64..1_000 {
+        client
+            .put(index.to_be_bytes().to_vec(), vec![index as u8; 1024])
+            .await
+            .unwrap();
+    }
+    let plan = client
+        .begin_topology_change(vec![Member {
+            node_id: "node-2".into(),
+            endpoint: format!("http://127.0.0.1:{}", ports[2]),
+        }])
+        .await
+        .unwrap();
+    let mut executor = spawn_process(&[
+        "execute-change".into(),
+        "--coordinator".into(),
+        coordinator_endpoint.clone(),
+        "--deadline-ms".into(),
+        "60000".into(),
+        "--change-id".into(),
+        plan.change_id,
+        "--base-epoch".into(),
+        plan.base_epoch.to_string(),
+        "--target-epoch".into(),
+        plan.target_topology.epoch.to_string(),
+    ]);
+
+    let mut observed_stop_intent = false;
+    for _ in 0..2_000 {
+        if let Ok(Some(change)) = client.topology_change().await
+            && change.phase == MigrationPhase::CleaningUp
+            && change
+                .stop_prepared_node_ids
+                .iter()
+                .any(|node| node == "node-1")
+        {
+            observed_stop_intent = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert!(
+        observed_stop_intent,
+        "coordinator never persisted stop intent"
+    );
+    coordinator.stop();
+    executor.stop();
+    for _ in 0..700 {
+        if node_1.has_exited() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        node_1.has_exited(),
+        "removed node did not execute fenced stop"
+    );
+
+    coordinator = spawn_process(&coordinator_arguments(coordinator_port, &state, &[]));
+    let observer = connect_eventually(&coordinator_endpoint).await;
+    let mut complete = false;
+    for _ in 0..500 {
+        if let Ok(Some(change)) = observer.topology_change().await
+            && change.phase == MigrationPhase::Complete
+        {
+            complete = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(complete, "stop-intent recovery did not complete");
+    observer.refresh_topology().await.unwrap();
+    for index in (0_u64..1_000).step_by(31) {
+        assert_eq!(
+            observer
+                .get(index.to_be_bytes().to_vec())
+                .await
+                .unwrap()
+                .value,
+            vec![index as u8; 1024]
+        );
+    }
+
+    node_2.stop();
+    coordinator.stop();
+}
+
+#[tokio::test]
+async fn coordinator_restart_resumes_an_interrupted_copy() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("coordinator.redb");
+    let ports = unused_ports(3);
+    let coordinator_port = ports[0];
+    let coordinator_endpoint = format!("http://127.0.0.1:{coordinator_port}");
+    let node_1_endpoint = format!("http://127.0.0.1:{}", ports[1]);
+    let node_2_endpoint = format!("http://127.0.0.1:{}", ports[2]);
+    let initial_members = vec![("node-1".to_owned(), ports[1])];
+    let mut coordinator = spawn_process(&coordinator_arguments(
+        coordinator_port,
+        &state,
+        &initial_members,
+    ));
+    let client = connect_eventually(&coordinator_endpoint).await;
+    let mut node_1 = spawn_process(&[
+        "node".into(),
+        "--id".into(),
+        "node-1".into(),
+        "--listen".into(),
+        format!("127.0.0.1:{}", ports[1]),
+        "--coordinator".into(),
+        coordinator_endpoint.clone(),
+    ]);
+    wait_for_listener(ports[1]);
+
+    let value = vec![91; 4 * 1024];
+    let mut writes = tokio::task::JoinSet::new();
+    for index in 0_u64..5_000 {
+        let client = client.clone();
+        let value = value.clone();
+        writes.spawn(async move {
+            client
+                .put(index.to_be_bytes().to_vec(), value)
+                .await
+                .unwrap();
+        });
+        if writes.len() >= 64 {
+            writes.join_next().await.unwrap().unwrap();
+        }
+    }
+    while let Some(result) = writes.join_next().await {
+        result.unwrap();
+    }
+
+    let change = client
+        .begin_topology_change(vec![
+            Member {
+                node_id: "node-1".into(),
+                endpoint: node_1_endpoint,
+            },
+            Member {
+                node_id: "node-2".into(),
+                endpoint: node_2_endpoint,
+            },
+        ])
+        .await
+        .unwrap();
+    let mut node_2 = spawn_process(&[
+        "node".into(),
+        "--id".into(),
+        "node-2".into(),
+        "--listen".into(),
+        format!("127.0.0.1:{}", ports[2]),
+        "--coordinator".into(),
+        coordinator_endpoint.clone(),
+    ]);
+    wait_for_listener(ports[2]);
+    let mut executor = spawn_process(&[
+        "execute-change".into(),
+        "--coordinator".into(),
+        coordinator_endpoint.clone(),
+        "--deadline-ms".into(),
+        "60000".into(),
+        "--change-id".into(),
+        change.change_id,
+        "--base-epoch".into(),
+        change.base_epoch.to_string(),
+        "--target-epoch".into(),
+        change.target_topology.epoch.to_string(),
+    ]);
+
+    let mut observed_copy = false;
+    for _ in 0..500 {
+        if let Ok(Some(change)) = client.topology_change().await
+            && change.phase == MigrationPhase::CopyingSnapshot
+            && change
+                .ranges
+                .iter()
+                .filter(|range| range.snapshot_records > 0)
+                .count()
+                > 0
+            && change
+                .ranges
+                .iter()
+                .filter(|range| range.snapshot_records > 0)
+                .count()
+                < change.ranges.len()
+        {
+            observed_copy = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert!(observed_copy, "migration never left the planned phase");
+    coordinator.stop();
+    executor.stop();
+
+    coordinator = spawn_process(&coordinator_arguments(coordinator_port, &state, &[]));
+    let observer = connect_eventually(&coordinator_endpoint).await;
+    let mut completed = false;
+    for _ in 0..1_000 {
+        if let Ok(Some(change)) = observer.topology_change().await
+            && change.phase == MigrationPhase::Complete
+        {
+            completed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(completed, "restarted coordinator did not finish migration");
+    observer.refresh_topology().await.unwrap();
+    assert_eq!(observer.topology().await.epoch, 2);
+    for index in (0_u64..5_000).step_by(47) {
+        assert_eq!(
+            observer
+                .get(index.to_be_bytes().to_vec())
+                .await
+                .unwrap()
+                .value,
+            value
+        );
+    }
+
+    node_1.stop();
+    node_2.stop();
+    coordinator.stop();
+}
+
+#[tokio::test]
+async fn destination_restart_before_publication_aborts_change() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("coordinator.redb");
+    let ports = unused_ports(3);
+    let coordinator_port = ports[0];
+    let coordinator_endpoint = format!("http://127.0.0.1:{coordinator_port}");
+    let initial_members = vec![("node-1".to_owned(), ports[1])];
+    let mut coordinator_args = coordinator_arguments(coordinator_port, &state, &initial_members);
+    coordinator_args.extend(["--pre-publish-delay-ms".into(), "2000".into()]);
+    let mut coordinator = spawn_process(&coordinator_args);
+    let client = connect_eventually(&coordinator_endpoint).await;
+    let mut node_1 = spawn_process(&[
+        "node".into(),
+        "--id".into(),
+        "node-1".into(),
+        "--listen".into(),
+        format!("127.0.0.1:{}", ports[1]),
+        "--coordinator".into(),
+        coordinator_endpoint.clone(),
+    ]);
+    wait_for_listener(ports[1]);
+    for index in 0_u64..1_000 {
+        client
+            .put(index.to_be_bytes().to_vec(), vec![index as u8; 1024])
+            .await
+            .unwrap();
+    }
+    let plan = client
+        .begin_topology_change(vec![
+            Member {
+                node_id: "node-1".into(),
+                endpoint: format!("http://127.0.0.1:{}", ports[1]),
+            },
+            Member {
+                node_id: "node-2".into(),
+                endpoint: format!("http://127.0.0.1:{}", ports[2]),
+            },
+        ])
+        .await
+        .unwrap();
+    let mut node_2 = spawn_process(&[
+        "node".into(),
+        "--id".into(),
+        "node-2".into(),
+        "--listen".into(),
+        format!("127.0.0.1:{}", ports[2]),
+        "--coordinator".into(),
+        coordinator_endpoint.clone(),
+    ]);
+    wait_for_listener(ports[2]);
+    let mut executor = spawn_process(&[
+        "execute-change".into(),
+        "--coordinator".into(),
+        coordinator_endpoint.clone(),
+        "--deadline-ms".into(),
+        "60000".into(),
+        "--change-id".into(),
+        plan.change_id,
+        "--base-epoch".into(),
+        plan.base_epoch.to_string(),
+        "--target-epoch".into(),
+        plan.target_topology.epoch.to_string(),
+    ]);
+
+    let mut ready = false;
+    for _ in 0..1_000 {
+        if let Ok(Some(change)) = client.topology_change().await
+            && change.phase == MigrationPhase::ReadyToPublish
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert!(ready, "migration never reached pre-publication fence");
+    node_2.stop();
+    node_2 = spawn_process(&[
+        "node".into(),
+        "--id".into(),
+        "node-2".into(),
+        "--listen".into(),
+        format!("127.0.0.1:{}", ports[2]),
+        "--coordinator".into(),
+        coordinator_endpoint.clone(),
+    ]);
+    wait_for_listener(ports[2]);
+
+    let mut aborted = false;
+    for _ in 0..1_000 {
+        if let Ok(Some(change)) = client.topology_change().await
+            && change.phase == MigrationPhase::Aborted
+        {
+            aborted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(aborted, "replacement destination was published");
+    client.refresh_topology().await.unwrap();
+    assert_eq!(client.topology().await.epoch, 1);
+    for index in (0_u64..1_000).step_by(29) {
+        assert_eq!(
+            client
+                .get(index.to_be_bytes().to_vec())
+                .await
+                .unwrap()
+                .value,
+            vec![index as u8; 1024]
+        );
+    }
+
+    executor.stop();
+    node_1.stop();
+    node_2.stop();
+    coordinator.stop();
+}
+
+#[tokio::test]
+async fn unavailable_destination_aborts_without_publishing() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("coordinator.redb");
+    let ports = unused_ports(3);
+    let coordinator_port = ports[0];
+    let coordinator_endpoint = format!("http://127.0.0.1:{coordinator_port}");
+    let initial_members = vec![("node-1".to_owned(), ports[1])];
+    let mut coordinator = spawn_process(&coordinator_arguments(
+        coordinator_port,
+        &state,
+        &initial_members,
+    ));
+    let client = connect_eventually(&coordinator_endpoint).await;
+    let mut node_1 = spawn_process(&[
+        "node".into(),
+        "--id".into(),
+        "node-1".into(),
+        "--listen".into(),
+        format!("127.0.0.1:{}", ports[1]),
+        "--coordinator".into(),
+        coordinator_endpoint.clone(),
+    ]);
+    wait_for_listener(ports[1]);
+    client
+        .put(b"survivor".to_vec(), b"authoritative".to_vec())
+        .await
+        .unwrap();
+    let change = client
+        .begin_topology_change(vec![
+            Member {
+                node_id: "node-1".into(),
+                endpoint: format!("http://127.0.0.1:{}", ports[1]),
+            },
+            Member {
+                node_id: "node-2".into(),
+                endpoint: format!("http://127.0.0.1:{}", ports[2]),
+            },
+        ])
+        .await
+        .unwrap();
+    let executor = HashringClient::connect(coordinator_endpoint.clone(), Duration::from_secs(5))
+        .await
+        .unwrap();
+    let old_identity = (
+        change.change_id.clone(),
+        change.base_epoch,
+        change.target_topology.epoch,
+    );
+    assert!(
+        executor
+            .execute_topology_change(old_identity.0.clone(), old_identity.1, old_identity.2,)
+            .await
+            .is_err()
+    );
+    let change = client.topology_change().await.unwrap().unwrap();
+    assert_eq!(change.phase, MigrationPhase::Aborted);
+    client.refresh_topology().await.unwrap();
+    assert_eq!(client.topology().await.epoch, 1);
+    assert_eq!(
+        client.get(b"survivor".to_vec()).await.unwrap().value,
+        b"authoritative"
+    );
+
+    let replacement = client
+        .begin_topology_change(vec![
+            Member {
+                node_id: "node-1".into(),
+                endpoint: format!("http://127.0.0.1:{}", ports[1]),
+            },
+            Member {
+                node_id: "node-2".into(),
+                endpoint: format!("http://127.0.0.1:{}", ports[2]),
+            },
+        ])
+        .await
+        .unwrap();
+    assert_ne!(replacement.change_id, old_identity.0);
+    assert!(
+        executor
+            .execute_topology_change(old_identity.0, old_identity.1, old_identity.2)
+            .await
+            .is_err(),
+        "a retry for an older change must not execute its replacement"
+    );
+    assert_eq!(
+        client.topology_change().await.unwrap().unwrap().change_id,
+        replacement.change_id
+    );
+
+    node_1.stop();
     coordinator.stop();
 }

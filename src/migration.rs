@@ -5,9 +5,12 @@ use thiserror::Error;
 
 use crate::topology::{Member, TopologyError, TopologySnapshot};
 
+pub const MAX_MIGRATION_RANGES: usize = 16_384;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum MigrationPhase {
     Planned,
+    Resetting,
     CopyingSnapshot,
     ReplayingChangelog,
     PausingWrites,
@@ -16,6 +19,7 @@ pub enum MigrationPhase {
     Published,
     CleaningUp,
     Complete,
+    Aborting,
     Aborted,
 }
 
@@ -33,6 +37,16 @@ pub struct RangeMigration {
     pub end_inclusive: u64,
     pub source_node_id: String,
     pub destination_node_id: String,
+    #[serde(default)]
+    pub source_endpoint: String,
+    #[serde(default)]
+    pub destination_endpoint: String,
+    #[serde(default)]
+    pub source_process_instance_id: String,
+    #[serde(default)]
+    pub destination_process_instance_id: String,
+    #[serde(default)]
+    pub source_cleaned: bool,
     pub snapshot_records: u64,
     pub changelog_watermark: u64,
     pub verified: bool,
@@ -45,6 +59,12 @@ pub struct TopologyChange {
     pub target_topology: TopologySnapshot,
     pub phase: MigrationPhase,
     pub ranges: Vec<RangeMigration>,
+    #[serde(default)]
+    pub stopped_node_ids: Vec<String>,
+    #[serde(default)]
+    pub stopping_node_ids: Vec<String>,
+    #[serde(default)]
+    pub stop_prepared_node_ids: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -53,8 +73,12 @@ pub enum MigrationError {
     Topology(#[from] TopologyError),
     #[error("target membership is identical to committed membership")]
     NoMembershipChange,
+    #[error("changing the endpoint of existing node {0} is not supported for in-memory nodes")]
+    EndpointChangeUnsupported(String),
     #[error("topology epoch overflow")]
     EpochOverflow,
+    #[error("topology change exceeds the {MAX_MIGRATION_RANGES} moving-range limit")]
+    TooManyRanges,
     #[error("migration payload omitted target topology")]
     MissingTargetTopology,
     #[error("unknown migration phase: {0}")]
@@ -66,6 +90,17 @@ impl TopologyChange {
         committed: &TopologySnapshot,
         target_members: Vec<Member>,
     ) -> Result<Self, MigrationError> {
+        for current in &committed.members {
+            if let Some(target) = target_members
+                .iter()
+                .find(|target| target.node_id == current.node_id)
+                && target.endpoint != current.endpoint
+            {
+                return Err(MigrationError::EndpointChangeUnsupported(
+                    current.node_id.clone(),
+                ));
+            }
+        }
         let target_epoch = committed
             .epoch
             .checked_add(1)
@@ -80,12 +115,16 @@ impl TopologyChange {
             return Err(MigrationError::NoMembershipChange);
         }
 
+        let ranges = moving_ranges(committed, &target_topology)?;
         Ok(Self {
             change_id: uuid::Uuid::new_v4().to_string(),
             base_epoch: committed.epoch,
-            ranges: moving_ranges(committed, &target_topology)?,
+            ranges,
             target_topology,
             phase: MigrationPhase::Planned,
+            stopped_node_ids: Vec::new(),
+            stopping_node_ids: Vec::new(),
+            stop_prepared_node_ids: Vec::new(),
         })
     }
 }
@@ -93,7 +132,7 @@ impl TopologyChange {
 pub fn moving_ranges(
     committed: &TopologySnapshot,
     target: &TopologySnapshot,
-) -> Result<Vec<RangeMigration>, TopologyError> {
+) -> Result<Vec<RangeMigration>, MigrationError> {
     let boundaries: BTreeSet<_> = committed
         .assignments
         .iter()
@@ -101,7 +140,7 @@ pub fn moving_ranges(
         .map(|assignment| assignment.token)
         .collect();
     if boundaries.is_empty() {
-        return Err(TopologyError::NoAssignments);
+        return Err(TopologyError::NoAssignments.into());
     }
 
     let ordered: Vec<_> = boundaries.into_iter().collect();
@@ -113,6 +152,9 @@ pub fn moving_ranges(
         let source = committed.owner_for_token(end)?;
         let destination = target.owner_for_token(end)?;
         if source.node_id != destination.node_id {
+            if ranges.len() == MAX_MIGRATION_RANGES {
+                return Err(MigrationError::TooManyRanges);
+            }
             let range_id = range_id(previous, end, &source.node_id, &destination.node_id);
             ranges.push(RangeMigration {
                 range_id,
@@ -120,6 +162,11 @@ pub fn moving_ranges(
                 end_inclusive: end,
                 source_node_id: source.node_id.clone(),
                 destination_node_id: destination.node_id.clone(),
+                source_endpoint: source.endpoint.clone(),
+                destination_endpoint: destination.endpoint.clone(),
+                source_process_instance_id: String::new(),
+                destination_process_instance_id: String::new(),
+                source_cleaned: false,
                 snapshot_records: 0,
                 changelog_watermark: 0,
                 verified: false,
@@ -146,6 +193,7 @@ impl From<MigrationPhase> for crate::proto::MigrationPhase {
     fn from(phase: MigrationPhase) -> Self {
         match phase {
             MigrationPhase::Planned => Self::Planned,
+            MigrationPhase::Resetting => Self::Resetting,
             MigrationPhase::CopyingSnapshot => Self::CopyingSnapshot,
             MigrationPhase::ReplayingChangelog => Self::ReplayingChangelog,
             MigrationPhase::PausingWrites => Self::PausingWrites,
@@ -154,6 +202,7 @@ impl From<MigrationPhase> for crate::proto::MigrationPhase {
             MigrationPhase::Published => Self::Published,
             MigrationPhase::CleaningUp => Self::CleaningUp,
             MigrationPhase::Complete => Self::Complete,
+            MigrationPhase::Aborting => Self::Aborting,
             MigrationPhase::Aborted => Self::Aborted,
         }
     }
@@ -168,6 +217,7 @@ impl TryFrom<i32> for MigrationPhase {
         match phase {
             crate::proto::MigrationPhase::Unspecified => Err(MigrationError::UnknownPhase(value)),
             crate::proto::MigrationPhase::Planned => Ok(Self::Planned),
+            crate::proto::MigrationPhase::Resetting => Ok(Self::Resetting),
             crate::proto::MigrationPhase::CopyingSnapshot => Ok(Self::CopyingSnapshot),
             crate::proto::MigrationPhase::ReplayingChangelog => Ok(Self::ReplayingChangelog),
             crate::proto::MigrationPhase::PausingWrites => Ok(Self::PausingWrites),
@@ -176,6 +226,7 @@ impl TryFrom<i32> for MigrationPhase {
             crate::proto::MigrationPhase::Published => Ok(Self::Published),
             crate::proto::MigrationPhase::CleaningUp => Ok(Self::CleaningUp),
             crate::proto::MigrationPhase::Complete => Ok(Self::Complete),
+            crate::proto::MigrationPhase::Aborting => Ok(Self::Aborting),
             crate::proto::MigrationPhase::Aborted => Ok(Self::Aborted),
         }
     }
@@ -189,6 +240,11 @@ impl From<&RangeMigration> for crate::proto::RangeMigration {
             end_inclusive: range.end_inclusive,
             source_node_id: range.source_node_id.clone(),
             destination_node_id: range.destination_node_id.clone(),
+            source_endpoint: range.source_endpoint.clone(),
+            destination_endpoint: range.destination_endpoint.clone(),
+            source_process_instance_id: range.source_process_instance_id.clone(),
+            destination_process_instance_id: range.destination_process_instance_id.clone(),
+            source_cleaned: range.source_cleaned,
             snapshot_records: range.snapshot_records,
             changelog_watermark: range.changelog_watermark,
             verified: range.verified,
@@ -204,6 +260,11 @@ impl From<crate::proto::RangeMigration> for RangeMigration {
             end_inclusive: range.end_inclusive,
             source_node_id: range.source_node_id,
             destination_node_id: range.destination_node_id,
+            source_endpoint: range.source_endpoint,
+            destination_endpoint: range.destination_endpoint,
+            source_process_instance_id: range.source_process_instance_id,
+            destination_process_instance_id: range.destination_process_instance_id,
+            source_cleaned: range.source_cleaned,
             snapshot_records: range.snapshot_records,
             changelog_watermark: range.changelog_watermark,
             verified: range.verified,
@@ -219,6 +280,9 @@ impl From<&TopologyChange> for crate::proto::TopologyChangeSnapshot {
             target_topology: Some((&change.target_topology).into()),
             phase: crate::proto::MigrationPhase::from(change.phase).into(),
             ranges: change.ranges.iter().map(Into::into).collect(),
+            stopped_node_ids: change.stopped_node_ids.clone(),
+            stopping_node_ids: change.stopping_node_ids.clone(),
+            stop_prepared_node_ids: change.stop_prepared_node_ids.clone(),
         }
     }
 }
@@ -236,6 +300,9 @@ impl TryFrom<crate::proto::TopologyChangeSnapshot> for TopologyChange {
                 .try_into()?,
             phase: change.phase.try_into()?,
             ranges: change.ranges.into_iter().map(Into::into).collect(),
+            stopped_node_ids: change.stopped_node_ids,
+            stopping_node_ids: change.stopping_node_ids,
+            stop_prepared_node_ids: change.stop_prepared_node_ids,
         })
     }
 }
@@ -275,6 +342,15 @@ mod tests {
         assert!(matches!(
             TopologyChange::plan(&committed, committed.members.clone()),
             Err(MigrationError::NoMembershipChange)
+        ));
+    }
+
+    #[test]
+    fn endpoint_only_replacement_is_rejected() {
+        let committed = TopologySnapshot::new(1, 42, 16, vec![member("a", 1)]).unwrap();
+        assert!(matches!(
+            TopologyChange::plan(&committed, vec![member("a", 2)]),
+            Err(MigrationError::EndpointChangeUnsupported(node)) if node == "a"
         ));
     }
 }
