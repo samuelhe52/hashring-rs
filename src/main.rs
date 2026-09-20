@@ -1,7 +1,8 @@
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use hashring_experiment::{ExperimentConfig, ExperimentMode, run_experiment};
 use hashring_rs::{
     client::HashringClient,
     coordinator::{CoordinatorService, RedbTopologyRepository, load_or_initialize},
@@ -39,6 +40,8 @@ enum Command {
     ChangeStatus(ClientArgs),
     /// Execute the active migration through publication and cleanup.
     ExecuteChange(ExecuteChangeArgs),
+    /// Run a reproducible separate-process correctness or performance experiment.
+    Experiment(ExperimentArgs),
 }
 
 #[derive(Args)]
@@ -134,6 +137,45 @@ struct ExecuteChangeArgs {
     target_epoch: u64,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum ExperimentModeArg {
+    Correctness,
+    Performance,
+}
+
+#[derive(Args)]
+struct ExperimentArgs {
+    #[arg(long, value_enum, default_value_t = ExperimentModeArg::Correctness)]
+    mode: ExperimentModeArg,
+    /// Empty or not-yet-created directory for the manifest, raw logs, and summary.
+    #[arg(long)]
+    output: PathBuf,
+    /// Peak node count. Correctness mode starts with one fewer node, then scales out and in.
+    #[arg(long, default_value_t = 10)]
+    nodes: usize,
+    /// Logical keys. Defaults to 20,000 for correctness and 1,000,000 for performance.
+    #[arg(long)]
+    keys: Option<u64>,
+    #[arg(long, default_value_t = 128)]
+    value_bytes: usize,
+    #[arg(long, default_value_t = 64)]
+    concurrency: usize,
+    #[arg(long, default_value_t = 1)]
+    seed: u64,
+    #[arg(long, default_value_t = 128)]
+    virtual_nodes: u32,
+    #[arg(long, default_value_t = 30_000)]
+    operation_timeout_ms: u64,
+    #[arg(long, default_value_t = 600_000)]
+    migration_timeout_ms: u64,
+    /// Deterministic pre-publication observation window for migration stress runs.
+    #[arg(long, default_value_t = 250)]
+    pre_publish_delay_ms: u64,
+    /// Refuse the run unless build and runtime source match the same clean commit.
+    #[arg(long)]
+    require_clean_source: bool,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -149,7 +191,39 @@ async fn main() -> Result<()> {
         Command::BeginChange(args) => run_begin_change(args).await,
         Command::ChangeStatus(args) => run_change_status(args).await,
         Command::ExecuteChange(args) => run_execute_change(args).await,
+        Command::Experiment(args) => run_local_experiment(args).await,
     }
+}
+
+async fn run_local_experiment(args: ExperimentArgs) -> Result<()> {
+    let mode = match args.mode {
+        ExperimentModeArg::Correctness => ExperimentMode::Correctness,
+        ExperimentModeArg::Performance => ExperimentMode::Performance,
+    };
+    let key_count = args.keys.unwrap_or(match mode {
+        ExperimentMode::Correctness => 20_000,
+        ExperimentMode::Performance => 1_000_000,
+    });
+    let summary = run_experiment(
+        ExperimentConfig {
+            mode,
+            output_dir: args.output,
+            node_count: args.nodes,
+            key_count,
+            value_bytes: args.value_bytes,
+            concurrency: args.concurrency,
+            hash_seed: args.seed,
+            virtual_nodes: args.virtual_nodes,
+            operation_timeout_ms: args.operation_timeout_ms,
+            migration_timeout_ms: args.migration_timeout_ms,
+            pre_publish_delay_ms: args.pre_publish_delay_ms,
+            require_clean_source: args.require_clean_source,
+        },
+        std::env::current_exe()?,
+    )
+    .await?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
 }
 
 async fn run_coordinator(args: CoordinatorArgs) -> Result<()> {

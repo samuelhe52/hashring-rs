@@ -2,6 +2,7 @@ use std::{
     net::TcpListener,
     path::Path,
     process::{Child, Command, Stdio},
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
@@ -14,6 +15,11 @@ use hashring_rs::{
 use tonic::Code;
 
 struct Process(Child);
+
+fn process_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 impl Process {
     fn stop(&mut self) {
@@ -187,6 +193,7 @@ async fn execute_while_writing_moving_keys(
 
 #[tokio::test]
 async fn separate_processes_route_bytes_and_survive_coordinator_restart() {
+    let _guard = process_test_lock().lock().await;
     let directory = tempfile::tempdir().unwrap();
     let state = directory.path().join("coordinator.redb");
     let ports = unused_ports(3);
@@ -255,6 +262,7 @@ async fn separate_processes_route_bytes_and_survive_coordinator_restart() {
 
 #[tokio::test]
 async fn committed_node_replacement_is_fenced_instead_of_serving_empty_data() {
+    let _guard = process_test_lock().lock().await;
     let directory = tempfile::tempdir().unwrap();
     let state = directory.path().join("coordinator.redb");
     let ports = unused_ports(2);
@@ -302,6 +310,7 @@ async fn committed_node_replacement_is_fenced_instead_of_serving_empty_data() {
 
 #[tokio::test]
 async fn permanent_grpc_status_is_returned_without_deadline_retry() {
+    let _guard = process_test_lock().lock().await;
     let directory = tempfile::tempdir().unwrap();
     let state = directory.path().join("coordinator.redb");
     let coordinator_port = unused_ports(1)[0];
@@ -330,6 +339,7 @@ async fn permanent_grpc_status_is_returned_without_deadline_retry() {
 
 #[tokio::test]
 async fn topology_change_plan_is_exclusive_durable_and_not_published() {
+    let _guard = process_test_lock().lock().await;
     let directory = tempfile::tempdir().unwrap();
     let state = directory.path().join("coordinator.redb");
     let ports = unused_ports(3);
@@ -384,6 +394,7 @@ async fn topology_change_plan_is_exclusive_durable_and_not_published() {
 
 #[tokio::test]
 async fn online_scale_out_and_scale_in_preserve_concurrent_writes() {
+    let _guard = process_test_lock().lock().await;
     let directory = tempfile::tempdir().unwrap();
     let state = directory.path().join("coordinator.redb");
     let ports = unused_ports(3);
@@ -513,6 +524,7 @@ async fn online_scale_out_and_scale_in_preserve_concurrent_writes() {
 
 #[tokio::test]
 async fn scale_in_recovers_after_lost_stop_acknowledgement() {
+    let _guard = process_test_lock().lock().await;
     let directory = tempfile::tempdir().unwrap();
     let state = directory.path().join("coordinator.redb");
     let ports = unused_ports(3);
@@ -636,6 +648,7 @@ async fn scale_in_recovers_after_lost_stop_acknowledgement() {
 
 #[tokio::test]
 async fn coordinator_restart_resumes_an_interrupted_copy() {
+    let _guard = process_test_lock().lock().await;
     let directory = tempfile::tempdir().unwrap();
     let state = directory.path().join("coordinator.redb");
     let ports = unused_ports(3);
@@ -776,6 +789,7 @@ async fn coordinator_restart_resumes_an_interrupted_copy() {
 
 #[tokio::test]
 async fn destination_restart_before_publication_aborts_change() {
+    let _guard = process_test_lock().lock().await;
     let directory = tempfile::tempdir().unwrap();
     let state = directory.path().join("coordinator.redb");
     let ports = unused_ports(3);
@@ -894,6 +908,7 @@ async fn destination_restart_before_publication_aborts_change() {
 
 #[tokio::test]
 async fn unavailable_destination_aborts_without_publishing() {
+    let _guard = process_test_lock().lock().await;
     let directory = tempfile::tempdir().unwrap();
     let state = directory.path().join("coordinator.redb");
     let ports = unused_ports(3);
@@ -984,4 +999,74 @@ async fn unavailable_destination_aborts_without_publishing() {
 
     node_1.stop();
     coordinator.stop();
+}
+
+#[tokio::test]
+async fn experiment_runner_preserves_reproducibility_artifacts() {
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let output_directory = directory.path().join("experiment");
+    let output = Command::new(env!("CARGO_BIN_EXE_hashring-rs"))
+        .args([
+            "experiment",
+            "--mode",
+            "correctness",
+            "--output",
+            output_directory.to_str().unwrap(),
+            "--nodes",
+            "3",
+            "--keys",
+            "100",
+            "--value-bytes",
+            "32",
+            "--concurrency",
+            "16",
+            "--virtual-nodes",
+            "16",
+            "--operation-timeout-ms",
+            "10000",
+            "--migration-timeout-ms",
+            "60000",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "experiment failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output_directory.join("manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["config"]["node_count"], 3);
+    assert_eq!(manifest["config"]["key_count"], 100);
+    assert_eq!(manifest["schema_version"], 2);
+    assert_eq!(manifest["executable_blake3"].as_str().unwrap().len(), 64);
+    assert!(manifest["build"]["git_commit"].is_string());
+    assert_eq!(manifest["config"]["pre_publish_delay_ms"], 250);
+    assert_eq!(manifest["source_reproducible"], false);
+    assert_eq!(
+        manifest["build"]["source_tree_blake3"],
+        manifest["runtime_source"]["source_tree_blake3"]
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output_directory.join("summary.json")).unwrap())
+            .unwrap();
+    assert_eq!(summary["success"], true);
+    assert_eq!(summary["final_epoch"], 3);
+    let events = std::fs::read_to_string(output_directory.join("events.jsonl")).unwrap();
+    assert_eq!(
+        events
+            .lines()
+            .filter(|line| line.contains("migration_write_overlap_observed"))
+            .count(),
+        2
+    );
+    assert!(events.contains("untouched_moving_sentinels"));
+    assert!(
+        output_directory
+            .join("process-logs/coordinator.stderr.log")
+            .is_file()
+    );
 }

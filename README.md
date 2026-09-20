@@ -35,18 +35,54 @@ cargo run -- topology
 
 The root package contains the operational binary and a compatibility facade for
 the original public module paths. Implementation responsibilities are separated
-into four workspace crates:
+into five workspace crates:
 
 - `hashring-core` owns the protobuf contract, topology and migration domain
   types, shared protocol limits, and coordinator transport configuration;
 - `hashring-client` owns routing, deadlines, retries, and public client errors;
 - `hashring-coordinator` owns durable cluster state and migration orchestration;
 - `hashring-node` owns in-memory records, migration staging, and the data-node
-  service.
+  service;
+- `hashring-experiment` owns reproducible real-process workload orchestration
+  and evidence capture.
 
 The client, coordinator, and node depend on `hashring-core`, but not on one
 another. This keeps the wire/domain boundary reusable without coupling clients
 to either server implementation.
+
+## Reproducible experiments
+
+The `experiment` command launches a coordinator and ordinary data-node child
+processes, drives them through the reusable client, and writes a configuration
+manifest, JSON-lines event log, per-process stdout/stderr, coordinator database,
+and JSON summary into a new or empty output directory.
+
+```sh
+cargo build --release
+
+# Correctness and migration stress: starts with 9 nodes, scales to 10 while
+# rewriting half of the moving keys, preserves the other moving keys as snapshot
+# sentinels, scales back to 9 under another rewrite, and verifies every key after
+# each stage.
+target/release/hashring-rs experiment \
+  --mode correctness --require-clean-source \
+  --output results/correctness-10-node
+
+# Nominal acceptance profile: 10 data nodes and 1,000,000 logical keys.
+target/release/hashring-rs experiment \
+  --mode performance --require-clean-source \
+  --output results/performance-10-node-1m
+```
+
+Correctness mode defaults to 20,000 keys; performance mode defaults to
+1,000,000. Both default to 10 peak nodes, 128-byte values, concurrency 64,
+seed 1, and 128 virtual nodes. Use explicit flags to vary them; the manifest
+always records the actual configuration, build-time revision/toolchain/profile,
+runtime source status and diff, and a BLAKE3 digest of the executable. The
+`results` directory is ignored by Git so raw databases and logs stay local, but
+the runner never overwrites a non-empty result directory. Formal runs use
+`--require-clean-source`; dirty ad hoc runs remain available but are explicitly
+marked `source_reproducible=false` in the manifest.
 
 ## Change membership
 
