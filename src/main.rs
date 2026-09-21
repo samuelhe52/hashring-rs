@@ -1,11 +1,14 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use hashring_experiment::{ExperimentConfig, ExperimentMode, run_experiment};
 use hashring_rs::{
     client::HashringClient,
-    coordinator::{CoordinatorService, RedbTopologyRepository, load_or_initialize},
+    coordinator::{
+        CoordinatorService, DEFAULT_RANGE_MOVE_CONCURRENCY, RedbTopologyRepository,
+        load_or_initialize,
+    },
     limits::MAX_CONTROL_MESSAGE_BYTES,
     node::DataNodeService,
     proto::{coordinator_server::CoordinatorServer, data_node_server::DataNodeServer},
@@ -58,6 +61,9 @@ struct CoordinatorArgs {
     virtual_nodes: u32,
     #[arg(long, default_value_t = 120_000)]
     migration_timeout_ms: u64,
+    /// Maximum number of disjoint ranges moved concurrently within one topology change.
+    #[arg(long, default_value_t = NonZeroUsize::new(DEFAULT_RANGE_MOVE_CONCURRENCY).unwrap())]
+    range_move_concurrency: NonZeroUsize,
     #[arg(long, default_value_t = 0, hide = true)]
     pre_publish_delay_ms: u64,
     /// Bootstrap member in NODE_ID=HTTP_ENDPOINT form. Required only for a new store.
@@ -180,6 +186,9 @@ struct ExperimentArgs {
     operation_timeout_ms: u64,
     #[arg(long, default_value_t = 600_000)]
     migration_timeout_ms: u64,
+    /// Maximum number of disjoint ranges moved concurrently within one topology change.
+    #[arg(long, default_value_t = DEFAULT_RANGE_MOVE_CONCURRENCY)]
+    range_move_concurrency: usize,
     /// Deterministic pre-publication observation window for migration stress runs.
     #[arg(long, default_value_t = 250)]
     pre_publish_delay_ms: u64,
@@ -229,6 +238,7 @@ async fn run_local_experiment(args: ExperimentArgs) -> Result<()> {
             virtual_nodes: args.virtual_nodes,
             operation_timeout_ms: args.operation_timeout_ms,
             migration_timeout_ms: args.migration_timeout_ms,
+            range_move_concurrency: args.range_move_concurrency,
             pre_publish_delay_ms: args.pre_publish_delay_ms,
             require_clean_source: args.require_clean_source,
         },
@@ -264,6 +274,7 @@ async fn run_coordinator(args: CoordinatorArgs) -> Result<()> {
         digest = %state.committed.digest,
         members = state.committed.members.len(),
         active_change = state.active_change.is_some(),
+        range_move_concurrency = args.range_move_concurrency.get(),
         "coordinator ready"
     );
     let service = CoordinatorService::new(
@@ -271,6 +282,7 @@ async fn run_coordinator(args: CoordinatorArgs) -> Result<()> {
         repository,
         Duration::from_millis(args.migration_timeout_ms),
     )
+    .with_range_move_concurrency(args.range_move_concurrency.get())
     .with_pre_publish_delay(Duration::from_millis(args.pre_publish_delay_ms));
     let recovery_service = service.clone();
     tokio::spawn(async move {

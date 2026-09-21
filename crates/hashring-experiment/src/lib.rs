@@ -43,6 +43,7 @@ pub struct ExperimentConfig {
     pub virtual_nodes: u32,
     pub operation_timeout_ms: u64,
     pub migration_timeout_ms: u64,
+    pub range_move_concurrency: usize,
     pub pre_publish_delay_ms: u64,
     pub require_clean_source: bool,
 }
@@ -376,6 +377,8 @@ async fn run_cluster(
         config.virtual_nodes.to_string(),
         "--migration-timeout-ms".into(),
         config.migration_timeout_ms.to_string(),
+        "--range-move-concurrency".into(),
+        config.range_move_concurrency.to_string(),
     ];
     coordinator_args.extend([
         "--pre-publish-delay-ms".into(),
@@ -988,6 +991,10 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
         "key_count exceeds the platform address space"
     );
     ensure!(config.concurrency > 0, "concurrency must be positive");
+    ensure!(
+        config.range_move_concurrency > 0,
+        "range_move_concurrency must be positive"
+    );
     ensure!(config.value_bytes > 0, "value_bytes must be positive");
     ensure!(
         config.value_bytes <= DEFAULT_MAX_VALUE_BYTES,

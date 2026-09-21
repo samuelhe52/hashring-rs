@@ -484,6 +484,7 @@ dependencies = [
 name = "hashring-coordinator"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "hashring-core",
  "redb",
  "serde",

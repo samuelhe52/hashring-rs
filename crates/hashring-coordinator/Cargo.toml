@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+futures = "0.3"
 hashring-core = { version = "0.1.0", path = "../hashring-core" }
 redb = "2"
 serde = { version = "1", features = ["derive"] }

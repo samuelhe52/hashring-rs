@@ -111,8 +111,10 @@ cargo run -- change-status
 ```
 
 The source remains authoritative while a point-in-time snapshot is copied and
-concurrent puts and deletes are replayed from a bounded changelog. Cutover briefly
-returns retryable `RangeBusy` responses for affected writes while reads continue,
+independent ranges are moved concurrently with a default limit of 16. Use
+`coordinator --range-move-concurrency N` (or the same `experiment` option) to tune
+that bound. Concurrent puts and deletes are replayed from a bounded changelog.
+Cutover briefly returns retryable `RangeBusy` responses for affected writes while reads continue,
 verifies the live-record count, contiguous watermark, and a BLAKE3 digest, then
 publishes the new epoch. During the read handoff, the frozen source and committed
 destination contain the same data; destination writes remain fenced until every

@@ -1283,6 +1283,7 @@ async fn experiment_runner_preserves_reproducibility_artifacts() {
     assert_eq!(manifest["executable_blake3"].as_str().unwrap().len(), 64);
     assert!(manifest["build"]["git_commit"].is_string());
     assert_eq!(manifest["config"]["pre_publish_delay_ms"], 250);
+    assert_eq!(manifest["config"]["range_move_concurrency"], 16);
     assert_eq!(
         manifest["build"]["source_tree_blake3"],
         manifest["runtime_source"]["source_tree_blake3"]

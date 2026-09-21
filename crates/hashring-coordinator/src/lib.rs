@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use futures::{StreamExt, stream::FuturesUnordered};
 use redb::{Database, TableDefinition};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -35,6 +36,7 @@ use hashring_core::{
 const TOPOLOGY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("topology");
 const COMMITTED_KEY: &str = "committed";
 const CLUSTER_STATE_KEY: &str = "cluster-state-v1";
+pub const DEFAULT_RANGE_MOVE_CONCURRENCY: usize = 16;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterState {
@@ -275,6 +277,7 @@ pub struct CoordinatorService {
     repository: Arc<dyn CoordinatorRepository>,
     execution_lock: Arc<Mutex<()>>,
     migration_timeout: Duration,
+    range_move_concurrency: usize,
     pre_publish_delay: Duration,
 }
 
@@ -289,8 +292,15 @@ impl CoordinatorService {
             repository,
             execution_lock: Arc::new(Mutex::new(())),
             migration_timeout,
+            range_move_concurrency: DEFAULT_RANGE_MOVE_CONCURRENCY,
             pre_publish_delay: Duration::ZERO,
         }
+    }
+
+    pub fn with_range_move_concurrency(mut self, concurrency: usize) -> Self {
+        assert!(concurrency > 0, "range move concurrency must be positive");
+        self.range_move_concurrency = concurrency;
+        self
     }
 
     pub fn with_pre_publish_delay(mut self, delay: Duration) -> Self {
@@ -362,12 +372,22 @@ impl CoordinatorService {
         let deadline = Instant::now() + self.migration_timeout;
         self.set_phase(MigrationPhase::CopyingSnapshot).await?;
         change.phase = MigrationPhase::CopyingSnapshot;
-        for range in change.ranges.clone() {
-            let progress = match self.copy_range(&change, &range, deadline).await {
-                Ok(progress) => progress,
-                Err(error) => return self.abort_after_error(&change, error).await,
-            };
-            self.store_range_progress(&progress).await?;
+        let change_ref = &change;
+        let progresses = match try_map_bounded(
+            change.ranges.clone(),
+            self.range_move_concurrency,
+            |range| async move {
+                let progress = self.copy_range(change_ref, &range, deadline).await?;
+                self.store_range_progress(&progress).await?;
+                Ok(progress)
+            },
+        )
+        .await
+        {
+            Ok(progresses) => progresses,
+            Err(error) => return self.abort_after_error(&change, error).await,
+        };
+        for progress in progresses {
             replace_range_progress(&mut change, progress);
         }
 
@@ -375,27 +395,43 @@ impl CoordinatorService {
         change.phase = MigrationPhase::ReplayingChangelog;
         self.set_phase(MigrationPhase::PausingWrites).await?;
         change.phase = MigrationPhase::PausingWrites;
-        let mut final_watermarks = BTreeMap::new();
-        for range in &change.ranges {
-            let watermark = match self.pause_range(&change, range, deadline).await {
-                Ok(watermark) => watermark,
-                Err(error) => return self.abort_after_error(&change, error).await,
-            };
-            final_watermarks.insert(range.range_id.clone(), watermark);
-        }
+        let change_ref = &change;
+        let final_watermarks = match try_map_bounded(
+            change.ranges.clone(),
+            self.range_move_concurrency,
+            |range| async move {
+                let watermark = self.pause_range(change_ref, &range, deadline).await?;
+                Ok((range.range_id, watermark))
+            },
+        )
+        .await
+        {
+            Ok(watermarks) => watermarks.into_iter().collect::<BTreeMap<_, _>>(),
+            Err(error) => return self.abort_after_error(&change, error).await,
+        };
 
         self.set_phase(MigrationPhase::Verifying).await?;
         change.phase = MigrationPhase::Verifying;
-        for range in change.ranges.clone() {
-            let final_watermark = final_watermarks[&range.range_id];
-            let progress = match self
-                .finalize_range(&change, &range, final_watermark, deadline)
-                .await
-            {
-                Ok(progress) => progress,
-                Err(error) => return self.abort_after_error(&change, error).await,
-            };
-            self.store_range_progress(&progress).await?;
+        let change_ref = &change;
+        let final_watermarks = &final_watermarks;
+        let progresses = match try_map_bounded(
+            change.ranges.clone(),
+            self.range_move_concurrency,
+            |range| async move {
+                let final_watermark = final_watermarks[&range.range_id];
+                let progress = self
+                    .finalize_range(change_ref, &range, final_watermark, deadline)
+                    .await?;
+                self.store_range_progress(&progress).await?;
+                Ok(progress)
+            },
+        )
+        .await
+        {
+            Ok(progresses) => progresses,
+            Err(error) => return self.abort_after_error(&change, error).await,
+        };
+        for progress in progresses {
             replace_range_progress(&mut change, progress);
         }
 
@@ -697,41 +733,60 @@ impl CoordinatorService {
             .collect();
         self.install_on_members(&change.target_topology, &removed_members, deadline)
             .await?;
-        for range in &change.ranges {
-            let mut destination = connect_node(&range.destination_endpoint, deadline).await?;
-            rpc_before(
-                deadline,
-                destination.activate_destination_range(RangeControlRequest {
-                    change_id: change.change_id.clone(),
-                    range_id: range.range_id.clone(),
-                }),
-            )
-            .await?;
-        }
+        let change_id = &change.change_id;
+        try_map_bounded(
+            change.ranges.clone(),
+            self.range_move_concurrency,
+            |range| async move {
+                let mut destination = connect_node(&range.destination_endpoint, deadline).await?;
+                rpc_before(
+                    deadline,
+                    destination.activate_destination_range(RangeControlRequest {
+                        change_id: change_id.clone(),
+                        range_id: range.range_id,
+                    }),
+                )
+                .await?;
+                Ok::<(), Status>(())
+            },
+        )
+        .await?;
         self.set_phase(MigrationPhase::CleaningUp).await?;
         change.phase = MigrationPhase::CleaningUp;
-        for range in change.ranges.clone() {
-            if range.source_cleaned
-                || change.stopping_node_ids.contains(&range.source_node_id)
-                || change
-                    .stop_prepared_node_ids
-                    .contains(&range.source_node_id)
-                || change.stopped_node_ids.contains(&range.source_node_id)
-            {
-                continue;
-            }
-            let mut source = connect_node(&range.source_endpoint, deadline).await?;
-            rpc_before(
-                deadline,
-                source.cleanup_source_range(RangeControlRequest {
-                    change_id: change.change_id.clone(),
-                    range_id: range.range_id.clone(),
-                }),
-            )
-            .await?;
-            let mut progress = range;
-            progress.source_cleaned = true;
-            self.store_range_progress(&progress).await?;
+        let ranges_to_clean: Vec<_> = change
+            .ranges
+            .iter()
+            .filter(|range| {
+                !range.source_cleaned
+                    && !change.stopping_node_ids.contains(&range.source_node_id)
+                    && !change
+                        .stop_prepared_node_ids
+                        .contains(&range.source_node_id)
+                    && !change.stopped_node_ids.contains(&range.source_node_id)
+            })
+            .cloned()
+            .collect();
+        let change_id = &change.change_id;
+        let cleaned = try_map_bounded(
+            ranges_to_clean,
+            self.range_move_concurrency,
+            |mut range| async move {
+                let mut source = connect_node(&range.source_endpoint, deadline).await?;
+                rpc_before(
+                    deadline,
+                    source.cleanup_source_range(RangeControlRequest {
+                        change_id: change_id.clone(),
+                        range_id: range.range_id.clone(),
+                    }),
+                )
+                .await?;
+                range.source_cleaned = true;
+                self.store_range_progress(&range).await?;
+                Ok::<RangeMigration, Status>(range)
+            },
+        )
+        .await?;
+        for progress in cleaned {
             replace_range_progress(&mut change, progress);
         }
         let mut removed_sources: BTreeMap<String, (String, String)> = BTreeMap::new();
@@ -906,20 +961,29 @@ impl CoordinatorService {
         change: &TopologyChange,
         deadline: Instant,
     ) -> Result<(), Status> {
-        for range in &change.ranges {
-            let control = RangeControlRequest {
-                change_id: change.change_id.clone(),
-                range_id: range.range_id.clone(),
-            };
-            let mut source = connect_node(&range.source_endpoint, deadline).await?;
-            rpc_before(deadline, source.abort_range_migration(control.clone())).await?;
-            // Destination staging is never client-visible before publication,
-            // so inability to discard it is not an ownership safety failure.
-            if let Ok(mut destination) = connect_node(&range.destination_endpoint, deadline).await {
-                let _ = rpc_before(deadline, destination.abort_range_migration(control)).await;
-            }
-        }
-        Ok(())
+        let change_id = &change.change_id;
+        try_map_bounded(
+            change.ranges.clone(),
+            self.range_move_concurrency,
+            |range| async move {
+                let control = RangeControlRequest {
+                    change_id: change_id.clone(),
+                    range_id: range.range_id,
+                };
+                let mut source = connect_node(&range.source_endpoint, deadline).await?;
+                rpc_before(deadline, source.abort_range_migration(control.clone())).await?;
+                // Destination staging is never client-visible before publication,
+                // so inability to discard it is not an ownership safety failure.
+                if let Ok(mut destination) =
+                    connect_node(&range.destination_endpoint, deadline).await
+                {
+                    let _ = rpc_before(deadline, destination.abort_range_migration(control)).await;
+                }
+                Ok::<(), Status>(())
+            },
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn abort_prepublication_change(&self, change: &TopologyChange) -> Result<(), Status> {
@@ -1263,6 +1327,48 @@ fn is_absence_status(status: &Status) -> bool {
     status.code() == tonic::Code::Unavailable
 }
 
+async fn try_map_bounded<I, F, Fut, T, E>(
+    items: I,
+    concurrency: usize,
+    mut operation: F,
+) -> Result<Vec<T>, E>
+where
+    I: IntoIterator,
+    F: FnMut(I::Item) -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    let mut items = items.into_iter();
+    let mut in_flight = FuturesUnordered::new();
+    for item in items.by_ref().take(concurrency) {
+        in_flight.push(operation(item));
+    }
+
+    // State-changing RPCs may continue remotely if their client futures are dropped.
+    // After the first error, stop launching work but drain every operation already started
+    // before the caller begins abort cleanup.
+    let mut values = Vec::new();
+    let mut first_error = None;
+    while let Some(result) = in_flight.next().await {
+        match result {
+            Ok(value) => {
+                values.push(value);
+                if first_error.is_none()
+                    && let Some(item) = items.next()
+                {
+                    in_flight.push(operation(item));
+                }
+            }
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Err(_) => {}
+        }
+    }
+
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(values),
+    }
+}
+
 async fn replay_changelog(
     source: &mut DataNodeClient<tonic::transport::Channel>,
     destination: &mut DataNodeClient<tonic::transport::Channel>,
@@ -1342,10 +1448,22 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use super::*;
     use hashring_core::topology::Member;
+    use tokio::sync::Barrier;
+
+    struct ActiveWork(Arc<AtomicUsize>);
+
+    impl Drop for ActiveWork {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
 
     #[derive(Default)]
     struct MemoryRepository(Mutex<Option<ClusterState>>);
@@ -1372,6 +1490,64 @@ mod tests {
             }],
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn bounded_range_work_overlaps_and_honors_limit() {
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let first_batch = Arc::new(Barrier::new(4));
+        let work = try_map_bounded(0..6, 3, |item| {
+            let running = running.clone();
+            let peak = peak.clone();
+            let first_batch = first_batch.clone();
+            async move {
+                let active = running.fetch_add(1, Ordering::SeqCst) + 1;
+                let _guard = ActiveWork(running);
+                peak.fetch_max(active, Ordering::SeqCst);
+                if item < 3 {
+                    first_batch.wait().await;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                Ok::<_, ()>(item)
+            }
+        });
+
+        let (_, result) = tokio::join!(first_batch.wait(), work);
+        let mut result = result.unwrap();
+        result.sort_unstable();
+        assert_eq!(result, (0..6).collect::<Vec<_>>());
+        assert_eq!(peak.load(Ordering::SeqCst), 3);
+        assert_eq!(running.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_range_work_drains_started_siblings_after_an_error() {
+        let sibling_completed = Arc::new(AtomicUsize::new(0));
+        let unscheduled_started = Arc::new(AtomicUsize::new(0));
+        let work = try_map_bounded(0..3, 2, |item| {
+            let sibling_completed = sibling_completed.clone();
+            let unscheduled_started = unscheduled_started.clone();
+            async move {
+                match item {
+                    0 => Err("range failed"),
+                    1 => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        sibling_completed.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                    _ => {
+                        unscheduled_started.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                }
+            }
+        });
+
+        let result = work.await;
+        assert_eq!(result, Err("range failed"));
+        assert_eq!(sibling_completed.load(Ordering::SeqCst), 1);
+        assert_eq!(unscheduled_started.load(Ordering::SeqCst), 0);
     }
 
     #[test]
