@@ -23,7 +23,8 @@ use tonic::{Request, Response, Status};
 use hashring_core::{
     limits::{MAX_CONTROL_MESSAGE_BYTES, MAX_MIGRATION_PAGE_BYTES},
     migration::{
-        MAX_MIGRATION_RANGES, MigrationError, MigrationPhase, RangeMigration, TopologyChange,
+        MAX_MIGRATION_RANGES, MAX_REPLICA_OBLIGATIONS, MigrationError, MigrationPhase,
+        RangeMigration, TopologyChange,
     },
     proto::{
         self, ApplyMigrationBatchRequest, ChangelogPageRequest, InstallTopologyRequest,
@@ -55,6 +56,11 @@ impl ClusterState {
             if change.ranges.len() > MAX_MIGRATION_RANGES {
                 return Err(RepositoryError::InvalidState(format!(
                     "active change exceeds the {MAX_MIGRATION_RANGES} moving-range limit"
+                )));
+            }
+            if change.replica_obligations.len() > MAX_REPLICA_OBLIGATIONS {
+                return Err(RepositoryError::InvalidState(format!(
+                    "active change exceeds the {MAX_REPLICA_OBLIGATIONS} replica-obligation limit"
                 )));
             }
             change.target_topology.validate()?;

@@ -23,6 +23,22 @@ message TopologySnapshot {
   repeated Member members = 6;
   repeated TokenAssignment assignments = 7;
   string digest = 8;
+  uint32 desired_replication_factor = 9;
+  WriteAckPolicy write_ack_policy = 10;
+  WriteAvailabilityGuard write_availability_guard = 11;
+}
+
+enum WriteAckPolicy {
+  WRITE_ACK_POLICY_UNSPECIFIED = 0;
+  OWNER_ONLY = 1;
+  FIRST_SUCCESSOR = 2;
+  ALL_REPLICAS = 3;
+}
+
+message WriteAvailabilityGuard {
+  uint32 minimum_admitted_copies = 1;
+  uint32 minimum_healthy_followers = 2;
+  uint64 max_replica_lag_millis = 3;
 }
 
 service Coordinator {
@@ -80,6 +96,14 @@ message TopologyChangeSnapshot {
   repeated string stopped_node_ids = 6;
   repeated string stopping_node_ids = 7;
   repeated string stop_prepared_node_ids = 8;
+  repeated ReplicaObligation replica_obligations = 9;
+}
+
+message ReplicaObligation {
+  uint64 start_exclusive = 1;
+  uint64 end_inclusive = 2;
+  string source_node_id = 3;
+  string destination_node_id = 4;
 }
 
 message BeginTopologyChangeRequest {

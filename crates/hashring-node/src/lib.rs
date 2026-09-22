@@ -29,7 +29,7 @@ use hashring_core::{
         RegisterNodeRequest, SnapshotPageRequest, SnapshotPageResponse, StopRequest,
         coordinator_client::CoordinatorClient, data_node_server::DataNode,
     },
-    topology::TopologySnapshot,
+    topology::{TopologySnapshot, WriteAckPolicy},
 };
 
 pub const DEFAULT_MAX_MIGRATION_JOURNAL_BYTES: usize = 16 * 1024 * 1024;
@@ -347,6 +347,13 @@ impl DataNode for DataNodeService {
                 ..Default::default()
             }));
         }
+        if let Some(error) = unsupported_write_policy_error(&state) {
+            return Ok(Response::new(PutResponse {
+                current_epoch: error.current_epoch,
+                error: Some(error),
+                ..Default::default()
+            }));
+        }
 
         let token = state.topology.key_token(&request.key);
         let journal_record_bytes = request.key.len() + request.value.len() + 128;
@@ -459,6 +466,12 @@ impl DataNode for DataNodeService {
         self.refresh_if_newer(request.topology_epoch).await?;
         let mut state = self.state.write().await;
         if let Some(error) = self.owner_error(&state, &request.key)? {
+            return Ok(Response::new(DeleteResponse {
+                current_epoch: error.current_epoch,
+                error: Some(error),
+            }));
+        }
+        if let Some(error) = unsupported_write_policy_error(&state) {
             return Ok(Response::new(DeleteResponse {
                 current_epoch: error.current_epoch,
                 error: Some(error),
@@ -1048,6 +1061,17 @@ impl DataNode for DataNodeService {
     }
 }
 
+fn unsupported_write_policy_error(state: &NodeState) -> Option<OperationError> {
+    (state.topology.write_ack_policy != WriteAckPolicy::OwnerOnly).then(|| OperationError {
+        current_epoch: state.topology.epoch,
+        ..operation_error(
+            ErrorCode::Unavailable,
+            "committed write acknowledgement policy is not active yet",
+            true,
+        )
+    })
+}
+
 impl DataNodeService {
     fn validate_stop_request(&self, request: &StopRequest) -> Result<(), Status> {
         if request.node_id != self.node_id
@@ -1224,7 +1248,7 @@ async fn wait_for_durable_stop_confirmation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hashring_core::topology::Member;
+    use hashring_core::topology::{Member, TopologyConfig};
 
     fn service() -> DataNodeService {
         let topology = TopologySnapshot::new(
@@ -1268,6 +1292,56 @@ mod tests {
             end_inclusive,
             source_node_id: "node-1".into(),
             destination_node_id: "node-2".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn strong_ack_policies_fail_writes_closed_until_replication_is_active() {
+        for policy in [WriteAckPolicy::FirstSuccessor, WriteAckPolicy::AllReplicas] {
+            let service = service();
+            let topology = TopologySnapshot::new_with_config(
+                2,
+                42,
+                8,
+                vec![Member {
+                    node_id: "node-1".into(),
+                    endpoint: "http://127.0.0.1:5001".into(),
+                }],
+                TopologyConfig {
+                    write_ack_policy: policy,
+                    ..TopologyConfig::default()
+                },
+            )
+            .unwrap();
+            service
+                .install_topology(Request::new(InstallTopologyRequest {
+                    topology: Some((&topology).into()),
+                }))
+                .await
+                .unwrap();
+
+            let put = service
+                .put(Request::new(PutRequest {
+                    key: b"key".to_vec(),
+                    value: b"value".to_vec(),
+                    topology_epoch: 2,
+                    request_id: "put".into(),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(put.error.unwrap().code, ErrorCode::Unavailable as i32);
+            let delete = service
+                .delete(Request::new(DeleteRequest {
+                    key: b"key".to_vec(),
+                    topology_epoch: 2,
+                    request_id: "delete".into(),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(delete.error.unwrap().code, ErrorCode::Unavailable as i32);
+            assert!(service.state.read().await.records.is_empty());
         }
     }
 
