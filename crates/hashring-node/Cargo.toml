@@ -10,3 +10,6 @@ hashring-core = { version = "0.1.0", path = "../hashring-core" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tonic = { version = "0.12", features = ["transport"] }
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio-stream = { version = "0.1", features = ["net"] }

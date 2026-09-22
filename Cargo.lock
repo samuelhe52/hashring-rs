@@ -534,6 +534,7 @@ dependencies = [
  "blake3",
  "hashring-core",
  "tokio",
+ "tokio-stream",
  "tonic",
  "uuid",
 ]

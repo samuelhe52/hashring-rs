@@ -1,5 +1,6 @@
 pub const DEFAULT_MAX_KEY_BYTES: usize = 64 * 1024;
 pub const DEFAULT_MAX_VALUE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_MUTATION_ID_BYTES: usize = 128;
 pub const MAX_MIGRATION_PAGE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Accommodates the maximum key and value plus protobuf framing and metadata.

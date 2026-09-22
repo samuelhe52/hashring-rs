@@ -3,19 +3,19 @@
 
 use std::{
     cmp::Ordering,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
 };
 
-use tokio::sync::{Mutex, RwLock, watch};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, watch};
 use tonic::{Request, Response, Status};
 
 pub use hashring_core::limits::{
     DEFAULT_MAX_KEY_BYTES, DEFAULT_MAX_VALUE_BYTES, MAX_CONTROL_MESSAGE_BYTES,
-    MAX_DATA_MESSAGE_BYTES, MAX_MIGRATION_PAGE_BYTES,
+    MAX_DATA_MESSAGE_BYTES, MAX_MIGRATION_PAGE_BYTES, MAX_MUTATION_ID_BYTES,
 };
 pub use hashring_core::transport::{configure_coordinator_client, fetch_topology};
 
@@ -26,18 +26,25 @@ use hashring_core::{
         JournalRecord, MigrationRecord, NodeInfoResponse, OperationError, PauseRangeResponse,
         PrepareDestinationRangeResponse, PrepareRangeRequest, PrepareSourceRangeResponse,
         PutRequest, PutResponse, RangeControlRequest, RangeDigestResponse, RecordVersion,
-        RegisterNodeRequest, SnapshotPageRequest, SnapshotPageResponse, StopRequest,
-        coordinator_client::CoordinatorClient, data_node_server::DataNode,
+        RegisterNodeRequest, ReplicateMutationResponse, ReplicationEntry, SnapshotPageRequest,
+        SnapshotPageResponse, StopRequest, coordinator_client::CoordinatorClient,
+        data_node_client::DataNodeClient, data_node_server::DataNode,
     },
     topology::{TopologySnapshot, WriteAckPolicy},
+    transport::configure_data_node_client,
 };
 
 pub const DEFAULT_MAX_MIGRATION_JOURNAL_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PENDING_REPLICATION_BYTES: usize = 64 * 1024 * 1024;
+const REPLICATION_STREAM_QUEUE_CAPACITY: usize = 8;
+const MAX_REPLICATION_FINGERPRINTS: u64 = 4_096;
+const REPLICATION_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Clone)]
 struct Record {
     value: Arc<[u8]>,
     version: RecordVersion,
+    deleted: bool,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -106,10 +113,74 @@ struct DestinationMigration {
     writes_activated: bool,
 }
 
+#[derive(Default)]
+struct FollowerStreamState {
+    applied_sequence: u64,
+    last_owner_sequence: u64,
+    fingerprints: HashMap<u64, String>,
+}
+
+struct PreparedReplication {
+    follower_node_id: String,
+    follower_endpoint: String,
+    stream_sequence: u64,
+    mutation: Arc<ReplicationMutation>,
+}
+
+struct ReplicationMutation {
+    topology_epoch: u64,
+    owner_node_id: String,
+    key: Arc<[u8]>,
+    value: Arc<[u8]>,
+    deleted: bool,
+    version: RecordVersion,
+    mutation_id: String,
+}
+
+impl PreparedReplication {
+    fn to_proto(&self) -> ReplicationEntry {
+        ReplicationEntry {
+            topology_epoch: self.mutation.topology_epoch,
+            owner_node_id: self.mutation.owner_node_id.clone(),
+            stream_sequence: self.stream_sequence,
+            key: self.mutation.key.to_vec(),
+            value: self.mutation.value.to_vec(),
+            deleted: self.mutation.deleted,
+            version: Some(self.mutation.version.clone()),
+            mutation_id: self.mutation.mutation_id.clone(),
+        }
+    }
+}
+
+struct PendingReplication {
+    prepared: PreparedReplication,
+    _budget: Arc<ReplicationBudget>,
+}
+
+struct ReplicationReservation {
+    queue: mpsc::OwnedPermit<PendingReplication>,
+    budget: Arc<ReplicationBudget>,
+}
+
+struct ReplicationBudget(#[allow(dead_code)] OwnedSemaphorePermit);
+
+type ReplicationStreamKey = (u64, String, String);
+
+#[derive(Clone)]
+struct ReplicationDispatcher {
+    state: Arc<RwLock<NodeState>>,
+    streams: Arc<StdMutex<HashMap<ReplicationStreamKey, mpsc::Sender<PendingReplication>>>>,
+    failed_streams: Arc<StdMutex<HashSet<ReplicationStreamKey>>>,
+    retained_budget: Arc<Semaphore>,
+    active_rpc_budget: Arc<Semaphore>,
+}
+
 struct NodeState {
     topology: TopologySnapshot,
     records: HashMap<Vec<u8>, Record>,
     next_sequence: u64,
+    owner_stream_sequences: HashMap<(u64, String), u64>,
+    follower_streams: HashMap<(u64, String), FollowerStreamState>,
     sources: HashMap<(String, String), SourceMigration>,
     destinations: HashMap<(String, String), DestinationMigration>,
     journal_bytes_total: usize,
@@ -154,6 +225,7 @@ pub struct DataNodeService {
     process_instance_id: String,
     coordinator_endpoint: String,
     state: Arc<RwLock<NodeState>>,
+    replication_dispatch: ReplicationDispatcher,
     refresh_lock: Arc<Mutex<()>>,
     max_key_bytes: usize,
     max_value_bytes: usize,
@@ -193,18 +265,23 @@ impl DataNodeService {
         )
         .await?;
         let (shutdown, _) = watch::channel(false);
+        let state = Arc::new(RwLock::new(NodeState {
+            topology,
+            records: HashMap::new(),
+            next_sequence: 0,
+            owner_stream_sequences: HashMap::new(),
+            follower_streams: HashMap::new(),
+            sources: HashMap::new(),
+            destinations: HashMap::new(),
+            journal_bytes_total: 0,
+        }));
+        let replication_dispatch = start_replication_dispatch(state.clone());
         Ok(Self {
             node_id,
             process_instance_id,
             coordinator_endpoint,
-            state: Arc::new(RwLock::new(NodeState {
-                topology,
-                records: HashMap::new(),
-                next_sequence: 0,
-                sources: HashMap::new(),
-                destinations: HashMap::new(),
-                journal_bytes_total: 0,
-            })),
+            state,
+            replication_dispatch,
             refresh_lock: Arc::new(Mutex::new(())),
             max_key_bytes: DEFAULT_MAX_KEY_BYTES,
             max_value_bytes: DEFAULT_MAX_VALUE_BYTES,
@@ -241,7 +318,15 @@ impl DataNodeService {
             .map_err(|error| Status::unavailable(error.to_string()))?;
         let mut state = self.state.write().await;
         if topology.epoch >= state.topology.epoch {
+            let epoch = topology.epoch;
             state.topology = topology;
+            state
+                .owner_stream_sequences
+                .retain(|(stream_epoch, _), _| *stream_epoch == epoch);
+            state
+                .follower_streams
+                .retain(|(stream_epoch, _), _| *stream_epoch == epoch);
+            self.replication_dispatch.prune_epoch(epoch);
         }
         Ok(())
     }
@@ -302,7 +387,11 @@ impl DataNode for DataNodeService {
                 ..Default::default()
             }));
         }
-        let Some(record) = state.records.get(&request.key) else {
+        let Some(record) = state
+            .records
+            .get(&request.key)
+            .filter(|record| !record.deleted)
+        else {
             return Ok(Response::new(GetResponse {
                 current_epoch: state.topology.epoch,
                 error: Some(OperationError {
@@ -325,6 +414,16 @@ impl DataNode for DataNodeService {
         if let Some(error) = self.validate_key(&request.key) {
             return Ok(Response::new(PutResponse {
                 error: Some(error),
+                ..Default::default()
+            }));
+        }
+        if request.request_id.is_empty() || request.request_id.len() > MAX_MUTATION_ID_BYTES {
+            return Ok(Response::new(PutResponse {
+                error: Some(operation_error(
+                    ErrorCode::InvalidArgument,
+                    format!("mutation id must contain 1 to {MAX_MUTATION_ID_BYTES} bytes"),
+                    false,
+                )),
                 ..Default::default()
             }));
         }
@@ -416,15 +515,45 @@ impl DataNode for DataNodeService {
             }));
         }
 
-        state.next_sequence += 1;
+        let next_sequence = state.next_sequence + 1;
         let version = RecordVersion {
             topology_epoch: state.topology.epoch,
-            owner_sequence: state.next_sequence,
+            owner_sequence: next_sequence,
             owner_node_id: self.node_id.clone(),
         };
+        let replications = match prepare_replication_entries(
+            &mut state,
+            &request.key,
+            &request.value,
+            false,
+            &version,
+            request.request_id,
+        ) {
+            Ok(replications) => replications,
+            Err(()) => {
+                return Ok(Response::new(PutResponse {
+                    current_epoch: state.topology.epoch,
+                    error: Some(replication_backpressure_error(state.topology.epoch)),
+                    ..Default::default()
+                }));
+            }
+        };
+        let reservations = match self.replication_dispatch.reserve(&replications) {
+            Ok(reservations) => reservations,
+            Err(()) => {
+                rollback_replication_sequences(&mut state, &replications);
+                return Ok(Response::new(PutResponse {
+                    current_epoch: state.topology.epoch,
+                    error: Some(replication_backpressure_error(state.topology.epoch)),
+                    ..Default::default()
+                }));
+            }
+        };
+        state.next_sequence = next_sequence;
         let record = Record {
             value: request.value.into(),
             version: version.clone(),
+            deleted: false,
         };
         state.records.insert(request.key.clone(), record.clone());
         for source in state
@@ -445,9 +574,12 @@ impl DataNode for DataNodeService {
             });
         }
         state.journal_bytes_total += journal_growth;
+        let current_epoch = state.topology.epoch;
+        self.replication_dispatch
+            .dispatch(replications, reservations);
         Ok(Response::new(PutResponse {
             version: Some(version),
-            current_epoch: state.topology.epoch,
+            current_epoch,
             error: None,
         }))
     }
@@ -460,6 +592,16 @@ impl DataNode for DataNodeService {
         if let Some(error) = self.validate_key(&request.key) {
             return Ok(Response::new(DeleteResponse {
                 error: Some(error),
+                ..Default::default()
+            }));
+        }
+        if request.request_id.is_empty() || request.request_id.len() > MAX_MUTATION_ID_BYTES {
+            return Ok(Response::new(DeleteResponse {
+                error: Some(operation_error(
+                    ErrorCode::InvalidArgument,
+                    format!("mutation id must contain 1 to {MAX_MUTATION_ID_BYTES} bytes"),
+                    false,
+                )),
                 ..Default::default()
             }));
         }
@@ -516,13 +658,6 @@ impl DataNode for DataNodeService {
             }));
         }
 
-        if !state.records.contains_key(&request.key) {
-            return Ok(Response::new(DeleteResponse {
-                current_epoch: state.topology.epoch,
-                error: None,
-            }));
-        }
-
         let journal_record_bytes = request.key.len() + 128;
         let matching_sources = state
             .sources
@@ -544,13 +679,48 @@ impl DataNode for DataNodeService {
             }));
         }
 
-        state.next_sequence += 1;
+        let next_sequence = state.next_sequence + 1;
         let version = RecordVersion {
             topology_epoch: state.topology.epoch,
-            owner_sequence: state.next_sequence,
+            owner_sequence: next_sequence,
             owner_node_id: self.node_id.clone(),
         };
-        state.records.remove(&request.key);
+        let replications = match prepare_replication_entries(
+            &mut state,
+            &request.key,
+            &[],
+            true,
+            &version,
+            request.request_id,
+        ) {
+            Ok(replications) => replications,
+            Err(()) => {
+                return Ok(Response::new(DeleteResponse {
+                    current_epoch: state.topology.epoch,
+                    error: Some(replication_backpressure_error(state.topology.epoch)),
+                }));
+            }
+        };
+        let reservations = match self.replication_dispatch.reserve(&replications) {
+            Ok(reservations) => reservations,
+            Err(()) => {
+                rollback_replication_sequences(&mut state, &replications);
+                return Ok(Response::new(DeleteResponse {
+                    current_epoch: state.topology.epoch,
+                    error: Some(replication_backpressure_error(state.topology.epoch)),
+                }));
+            }
+        };
+        state.next_sequence = next_sequence;
+        apply_internal_record(
+            &mut state.records,
+            request.key.clone(),
+            Record {
+                value: Arc::from([]),
+                version: version.clone(),
+                deleted: true,
+            },
+        );
         for source in state
             .sources
             .values_mut()
@@ -569,9 +739,136 @@ impl DataNode for DataNodeService {
             });
         }
         state.journal_bytes_total += journal_growth;
+        let current_epoch = state.topology.epoch;
+        self.replication_dispatch
+            .dispatch(replications, reservations);
         Ok(Response::new(DeleteResponse {
-            current_epoch: state.topology.epoch,
+            current_epoch,
             error: None,
+        }))
+    }
+
+    async fn replicate_mutation(
+        &self,
+        request: Request<ReplicationEntry>,
+    ) -> Result<Response<ReplicateMutationResponse>, Status> {
+        let entry = request.into_inner();
+        if entry.stream_sequence == 0 {
+            return Err(Status::invalid_argument(
+                "replication stream sequence must be greater than zero",
+            ));
+        }
+        if entry.mutation_id.is_empty() || entry.mutation_id.len() > MAX_MUTATION_ID_BYTES {
+            return Err(Status::invalid_argument(format!(
+                "mutation id must contain 1 to {MAX_MUTATION_ID_BYTES} bytes"
+            )));
+        }
+        if entry.key.is_empty() || entry.key.len() > self.max_key_bytes {
+            return Err(Status::invalid_argument("replication key size is invalid"));
+        }
+        if entry.value.len() > self.max_value_bytes {
+            return Err(Status::resource_exhausted(
+                "replication value exceeds the node limit",
+            ));
+        }
+        if entry.deleted && !entry.value.is_empty() {
+            return Err(Status::invalid_argument(
+                "deleted replication entry must omit its value",
+            ));
+        }
+        let version = entry
+            .version
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("replication entry omitted version"))?;
+        if version.topology_epoch != entry.topology_epoch
+            || version.owner_node_id != entry.owner_node_id
+        {
+            return Err(Status::failed_precondition(
+                "replication entry version does not match its stream authority",
+            ));
+        }
+
+        let mut state = self.state.write().await;
+        if entry.topology_epoch != state.topology.epoch {
+            return Err(Status::failed_precondition(format!(
+                "replication epoch {} does not match installed epoch {}",
+                entry.topology_epoch, state.topology.epoch
+            )));
+        }
+        let owner = state
+            .topology
+            .owner(&entry.key)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        if owner.node_id != entry.owner_node_id {
+            return Err(Status::failed_precondition(
+                "replication entry was not issued by the current owner",
+            ));
+        }
+        let replicas = state
+            .topology
+            .replica_node_ids_for_token(state.topology.key_token(&entry.key))
+            .map_err(|error| Status::internal(error.to_string()))?;
+        if !replicas[1..].contains(&self.node_id.as_str()) {
+            return Err(Status::failed_precondition(
+                "this node is not a desired follower for the mutation",
+            ));
+        }
+
+        let fingerprint = replication_fingerprint(&entry);
+        let stream_key = (entry.topology_epoch, entry.owner_node_id.clone());
+        let stream = state.follower_streams.entry(stream_key).or_default();
+        if entry.stream_sequence <= stream.applied_sequence {
+            if stream
+                .fingerprints
+                .get(&entry.stream_sequence)
+                .is_some_and(|existing| existing == &fingerprint)
+            {
+                return Ok(Response::new(ReplicateMutationResponse {
+                    applied_stream_sequence: stream.applied_sequence,
+                }));
+            }
+            return Err(Status::already_exists(
+                "replication stream sequence conflicts with an applied entry",
+            ));
+        }
+        let expected = stream.applied_sequence.saturating_add(1);
+        if entry.stream_sequence != expected {
+            return Err(Status::aborted(format!(
+                "replication gap: expected sequence {expected}, received {}",
+                entry.stream_sequence
+            )));
+        }
+        if version.owner_sequence <= stream.last_owner_sequence {
+            return Err(Status::failed_precondition(
+                "replication record version did not advance the owner sequence",
+            ));
+        }
+
+        apply_internal_record(
+            &mut state.records,
+            entry.key,
+            Record {
+                value: entry.value.into(),
+                version: version.clone(),
+                deleted: entry.deleted,
+            },
+        );
+        let stream = state
+            .follower_streams
+            .get_mut(&(entry.topology_epoch, entry.owner_node_id))
+            .expect("replication stream was initialized above");
+        stream.applied_sequence = entry.stream_sequence;
+        stream.last_owner_sequence = version.owner_sequence;
+        stream
+            .fingerprints
+            .insert(entry.stream_sequence, fingerprint);
+        if entry.stream_sequence > MAX_REPLICATION_FINGERPRINTS {
+            stream
+                .fingerprints
+                .remove(&(entry.stream_sequence - MAX_REPLICATION_FINGERPRINTS));
+        }
+        Ok(Response::new(ReplicateMutationResponse {
+            applied_stream_sequence: stream.applied_sequence,
         }))
     }
 
@@ -737,7 +1034,7 @@ impl DataNode for DataNodeService {
                 key: key.clone(),
                 value: record.value.to_vec(),
                 version: Some(record.version.clone()),
-                deleted: false,
+                deleted: record.deleted,
             };
             let size = migration_record_size(&record);
             if !records.is_empty() && bytes + size > max_bytes {
@@ -807,11 +1104,6 @@ impl DataNode for DataNodeService {
             ));
         }
         for record in request.snapshot_records {
-            if record.deleted {
-                return Err(Status::invalid_argument(
-                    "snapshot record must contain a live value",
-                ));
-            }
             if !destination.range.contains(topology.key_token(&record.key)) {
                 return Err(Status::invalid_argument(
                     "snapshot record is outside the prepared range",
@@ -959,10 +1251,11 @@ impl DataNode for DataNodeService {
             .records
             .keys()
             .filter(|record_key| {
-                range.contains(topology.key_token(record_key))
+                let token = topology.key_token(record_key);
+                range.contains(token)
                     && topology
-                        .owner(record_key)
-                        .is_ok_and(|owner| owner.node_id != self.node_id)
+                        .replica_node_ids_for_token(token)
+                        .is_ok_and(|replicas| !replicas.contains(&self.node_id.as_str()))
             })
             .cloned()
             .collect();
@@ -1011,7 +1304,15 @@ impl DataNode for DataNodeService {
                 "cannot install an older topology",
             ));
         }
+        let epoch = topology.epoch;
         state.topology = topology;
+        state
+            .owner_stream_sequences
+            .retain(|(stream_epoch, _), _| *stream_epoch == epoch);
+        state
+            .follower_streams
+            .retain(|(stream_epoch, _), _| *stream_epoch == epoch);
+        self.replication_dispatch.prune_epoch(epoch);
         Ok(Response::new(proto::Empty {}))
     }
 
@@ -1072,6 +1373,310 @@ fn unsupported_write_policy_error(state: &NodeState) -> Option<OperationError> {
     })
 }
 
+fn prepare_replication_entries(
+    state: &mut NodeState,
+    key: &[u8],
+    value: &[u8],
+    deleted: bool,
+    version: &RecordVersion,
+    mutation_id: String,
+) -> Result<Vec<PreparedReplication>, ()> {
+    let token = state.topology.key_token(key);
+    let follower_ids: Vec<_> = state
+        .topology
+        .replica_node_ids_for_token(token)
+        .expect("installed topology was validated")
+        .into_iter()
+        .skip(1)
+        .map(str::to_owned)
+        .collect();
+    let followers: Vec<_> = follower_ids
+        .into_iter()
+        .map(|node_id| {
+            let endpoint = state
+                .topology
+                .members
+                .iter()
+                .find(|member| member.node_id == node_id)
+                .expect("replica placement references a topology member")
+                .endpoint
+                .clone();
+            (node_id, endpoint)
+        })
+        .collect();
+
+    let per_entry_bytes = key
+        .len()
+        .checked_add(value.len())
+        .and_then(|bytes| bytes.checked_add(version.owner_node_id.len()))
+        .and_then(|bytes| bytes.checked_add(mutation_id.len()))
+        .and_then(|bytes| bytes.checked_add(256))
+        .ok_or(())?;
+    if per_entry_bytes > MAX_PENDING_REPLICATION_BYTES {
+        return Err(());
+    }
+    let mutation = Arc::new(ReplicationMutation {
+        topology_epoch: state.topology.epoch,
+        owner_node_id: version.owner_node_id.clone(),
+        key: Arc::from(key),
+        value: Arc::from(value),
+        deleted,
+        version: version.clone(),
+        mutation_id,
+    });
+
+    Ok(followers
+        .into_iter()
+        .map(|(follower_node_id, follower_endpoint)| {
+            let sequence = state
+                .owner_stream_sequences
+                .entry((state.topology.epoch, follower_node_id.clone()))
+                .or_default();
+            *sequence += 1;
+            PreparedReplication {
+                follower_node_id,
+                follower_endpoint,
+                stream_sequence: *sequence,
+                mutation: mutation.clone(),
+            }
+        })
+        .collect())
+}
+
+fn rollback_replication_sequences(state: &mut NodeState, entries: &[PreparedReplication]) {
+    for entry in entries {
+        let key = (
+            entry.mutation.topology_epoch,
+            entry.follower_node_id.clone(),
+        );
+        let sequence = state
+            .owner_stream_sequences
+            .get_mut(&key)
+            .expect("prepared replication initialized its owner stream");
+        debug_assert_eq!(*sequence, entry.stream_sequence);
+        *sequence -= 1;
+        if *sequence == 0 {
+            state.owner_stream_sequences.remove(&key);
+        }
+    }
+}
+
+fn replication_backpressure_error(epoch: u64) -> OperationError {
+    OperationError {
+        current_epoch: epoch,
+        ..operation_error(
+            ErrorCode::ResourceExhausted,
+            "replication queue is full or requires catch-up; retry with backoff",
+            true,
+        )
+    }
+}
+
+fn replication_fingerprint(entry: &ReplicationEntry) -> String {
+    let mut digest = blake3::Hasher::new();
+    digest.update(b"hashring-rs:replication-entry:v1\0");
+    digest.update(&entry.topology_epoch.to_be_bytes());
+    digest.update(&(entry.owner_node_id.len() as u64).to_be_bytes());
+    digest.update(entry.owner_node_id.as_bytes());
+    digest.update(&entry.stream_sequence.to_be_bytes());
+    digest.update(&(entry.key.len() as u64).to_be_bytes());
+    digest.update(&entry.key);
+    digest.update(&(entry.value.len() as u64).to_be_bytes());
+    digest.update(&entry.value);
+    digest.update(&[u8::from(entry.deleted)]);
+    if let Some(version) = &entry.version {
+        digest.update(&version.topology_epoch.to_be_bytes());
+        digest.update(&version.owner_sequence.to_be_bytes());
+        digest.update(&(version.owner_node_id.len() as u64).to_be_bytes());
+        digest.update(version.owner_node_id.as_bytes());
+    }
+    digest.update(&(entry.mutation_id.len() as u64).to_be_bytes());
+    digest.update(entry.mutation_id.as_bytes());
+    digest.finalize().to_hex().to_string()
+}
+
+fn start_replication_dispatch(state: Arc<RwLock<NodeState>>) -> ReplicationDispatcher {
+    ReplicationDispatcher {
+        state,
+        streams: Arc::new(StdMutex::new(HashMap::new())),
+        failed_streams: Arc::new(StdMutex::new(HashSet::new())),
+        retained_budget: Arc::new(Semaphore::new(MAX_PENDING_REPLICATION_BYTES)),
+        active_rpc_budget: Arc::new(Semaphore::new(MAX_PENDING_REPLICATION_BYTES)),
+    }
+}
+
+impl ReplicationDispatcher {
+    fn prune_epoch(&self, epoch: u64) {
+        if let Ok(mut streams) = self.streams.lock() {
+            streams.retain(|(stream_epoch, _, _), sender| {
+                *stream_epoch == epoch && !sender.is_closed()
+            });
+        }
+        if let Ok(mut failed) = self.failed_streams.lock() {
+            failed.retain(|(stream_epoch, _, _)| *stream_epoch == epoch);
+        }
+    }
+
+    fn reserve(&self, entries: &[PreparedReplication]) -> Result<Vec<ReplicationReservation>, ()> {
+        let failed = self.failed_streams.lock().map_err(|_| ())?;
+        let mut streams = self.streams.lock().map_err(|_| ())?;
+        let mut reservations = Vec::with_capacity(entries.len());
+        let budget = entries
+            .first()
+            .map(|entry| {
+                let bytes =
+                    u32::try_from(replication_mutation_bytes(&entry.mutation)).map_err(|_| ())?;
+                self.retained_budget
+                    .clone()
+                    .try_acquire_many_owned(bytes)
+                    .map(ReplicationBudget)
+                    .map(Arc::new)
+                    .map_err(|_| ())
+            })
+            .transpose()?;
+        for entry in entries {
+            let stream_key = replication_stream_key(entry);
+            if failed.contains(&stream_key) {
+                return Err(());
+            }
+            let sender = streams.entry(stream_key.clone()).or_insert_with(|| {
+                let (sender, receiver) = mpsc::channel(REPLICATION_STREAM_QUEUE_CAPACITY);
+                tokio::spawn(deliver_replication_stream(
+                    self.state.clone(),
+                    self.failed_streams.clone(),
+                    self.active_rpc_budget.clone(),
+                    stream_key,
+                    receiver,
+                ));
+                sender
+            });
+            let queue = sender.clone().try_reserve_owned().map_err(|_| ())?;
+            reservations.push(ReplicationReservation {
+                queue,
+                budget: budget.clone().expect("non-empty replication has a budget"),
+            });
+        }
+        Ok(reservations)
+    }
+
+    fn dispatch(
+        &self,
+        entries: Vec<PreparedReplication>,
+        reservations: Vec<ReplicationReservation>,
+    ) {
+        debug_assert_eq!(entries.len(), reservations.len());
+        for (prepared, reservation) in entries.into_iter().zip(reservations) {
+            reservation.queue.send(PendingReplication {
+                prepared,
+                _budget: reservation.budget,
+            });
+        }
+    }
+}
+
+fn replication_stream_key(entry: &PreparedReplication) -> ReplicationStreamKey {
+    (
+        entry.mutation.topology_epoch,
+        entry.mutation.owner_node_id.clone(),
+        entry.follower_node_id.clone(),
+    )
+}
+
+fn replication_mutation_bytes(mutation: &ReplicationMutation) -> usize {
+    mutation.key.len()
+        + mutation.value.len()
+        + mutation.owner_node_id.len()
+        + mutation.mutation_id.len()
+        + 256
+}
+
+async fn deliver_replication_stream(
+    state: Arc<RwLock<NodeState>>,
+    failed_streams: Arc<StdMutex<HashSet<ReplicationStreamKey>>>,
+    active_rpc_budget: Arc<Semaphore>,
+    stream_key: ReplicationStreamKey,
+    mut entries: mpsc::Receiver<PendingReplication>,
+) {
+    let mut client = None;
+    while let Some(pending) = entries.recv().await {
+        let prepared = &pending.prepared;
+        let mut retry_delay = std::time::Duration::from_millis(25);
+        loop {
+            if state.read().await.topology.epoch != prepared.mutation.topology_epoch {
+                return;
+            }
+            if client.is_none() {
+                match tokio::time::timeout(
+                    REPLICATION_RPC_TIMEOUT,
+                    DataNodeClient::connect(prepared.follower_endpoint.clone()),
+                )
+                .await
+                {
+                    Ok(Ok(connected)) => client = Some(configure_data_node_client(connected)),
+                    Ok(Err(_)) | Err(_) => {
+                        tokio::time::sleep(retry_delay).await;
+                        retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(1));
+                        continue;
+                    }
+                }
+            }
+            let active_bytes = u32::try_from(replication_mutation_bytes(&prepared.mutation))
+                .expect("validated replication size fits u32");
+            let Ok(active_budget) = active_rpc_budget
+                .clone()
+                .acquire_many_owned(active_bytes)
+                .await
+            else {
+                return;
+            };
+            let result = tokio::time::timeout(
+                REPLICATION_RPC_TIMEOUT,
+                client
+                    .as_mut()
+                    .expect("replication client was connected above")
+                    .replicate_mutation(prepared.to_proto()),
+            )
+            .await
+            .map(|result| result.map(Response::into_inner));
+            drop(active_budget);
+            match result {
+                Ok(Ok(response))
+                    if response.applied_stream_sequence >= prepared.stream_sequence =>
+                {
+                    break;
+                }
+                Ok(Err(status)) if retryable_replication_status(status.code()) => {
+                    client = None;
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(1));
+                }
+                Err(_) => {
+                    client = None;
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(1));
+                }
+                Ok(Ok(_)) | Ok(Err(_)) => {
+                    if let Ok(mut failed) = failed_streams.lock() {
+                        failed.insert(stream_key);
+                    }
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn retryable_replication_status(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::Cancelled
+            | tonic::Code::Unknown
+            | tonic::Code::DeadlineExceeded
+            | tonic::Code::ResourceExhausted
+            | tonic::Code::Unavailable
+    )
+}
+
 impl DataNodeService {
     fn validate_stop_request(&self, request: &StopRequest) -> Result<(), Status> {
         if request.node_id != self.node_id
@@ -1111,14 +1716,10 @@ fn apply_record(
     let version = record
         .version
         .ok_or_else(|| Status::invalid_argument("migration record omitted version"))?;
-    if record.deleted {
-        if !record.value.is_empty() {
-            return Err(Status::invalid_argument(
-                "deleted migration record must omit its value",
-            ));
-        }
-        records.remove(&record.key);
-        return Ok(());
+    if record.deleted && !record.value.is_empty() {
+        return Err(Status::invalid_argument(
+            "deleted migration record must omit its value",
+        ));
     }
     apply_internal_record(
         records,
@@ -1126,6 +1727,7 @@ fn apply_record(
         Record {
             value: record.value.into(),
             version,
+            deleted: record.deleted,
         },
     );
     Ok(())
@@ -1157,7 +1759,7 @@ fn range_digest(records: &HashMap<Vec<u8>, Record>, watermark: u64) -> RangeDige
     let mut ordered: Vec<_> = records.iter().collect();
     ordered.sort_by_key(|(key, _)| *key);
     let mut digest = blake3::Hasher::new();
-    digest.update(b"hashring-rs:records:v1\0");
+    digest.update(b"hashring-rs:records:v2\0");
     for (key, record) in &ordered {
         digest.update(&(key.len() as u64).to_be_bytes());
         digest.update(key);
@@ -1167,6 +1769,7 @@ fn range_digest(records: &HashMap<Vec<u8>, Record>, watermark: u64) -> RangeDige
         digest.update(record.version.owner_node_id.as_bytes());
         digest.update(&(record.value.len() as u64).to_be_bytes());
         digest.update(record.value.as_ref());
+        digest.update(&[u8::from(record.deleted)]);
     }
     RangeDigestResponse {
         record_count: ordered.len() as u64,
@@ -1248,7 +1851,7 @@ async fn wait_for_durable_stop_confirmation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hashring_core::topology::{Member, TopologyConfig};
+    use hashring_core::topology::{Member, TopologyConfig, WriteAvailabilityGuard};
 
     fn service() -> DataNodeService {
         let topology = TopologySnapshot::new(
@@ -1261,19 +1864,28 @@ mod tests {
             }],
         )
         .unwrap();
+        service_for("node-1", topology)
+    }
+
+    fn service_for(node_id: &str, topology: TopologySnapshot) -> DataNodeService {
         let (shutdown, _) = watch::channel(false);
+        let state = Arc::new(RwLock::new(NodeState {
+            topology,
+            records: HashMap::new(),
+            next_sequence: 0,
+            owner_stream_sequences: HashMap::new(),
+            follower_streams: HashMap::new(),
+            sources: HashMap::new(),
+            destinations: HashMap::new(),
+            journal_bytes_total: 0,
+        }));
+        let replication_dispatch = start_replication_dispatch(state.clone());
         DataNodeService {
-            node_id: "node-1".into(),
+            node_id: node_id.into(),
             process_instance_id: "instance-1".into(),
             coordinator_endpoint: "http://127.0.0.1:5000".into(),
-            state: Arc::new(RwLock::new(NodeState {
-                topology,
-                records: HashMap::new(),
-                next_sequence: 0,
-                sources: HashMap::new(),
-                destinations: HashMap::new(),
-                journal_bytes_total: 0,
-            })),
+            state,
+            replication_dispatch,
             refresh_lock: Arc::new(Mutex::new(())),
             max_key_bytes: DEFAULT_MAX_KEY_BYTES,
             max_value_bytes: DEFAULT_MAX_VALUE_BYTES,
@@ -1281,6 +1893,77 @@ mod tests {
             stop_response_delay: std::time::Duration::ZERO,
             stop_prepared: Arc::new(AtomicBool::new(false)),
             shutdown,
+        }
+    }
+
+    fn replication_topology(desired_replication_factor: u32) -> TopologySnapshot {
+        TopologySnapshot::new_with_config(
+            1,
+            42,
+            8,
+            vec![
+                Member {
+                    node_id: "node-1".into(),
+                    endpoint: "http://127.0.0.1:5001".into(),
+                },
+                Member {
+                    node_id: "node-2".into(),
+                    endpoint: "http://127.0.0.1:5002".into(),
+                },
+                Member {
+                    node_id: "node-3".into(),
+                    endpoint: "http://127.0.0.1:5003".into(),
+                },
+            ],
+            TopologyConfig {
+                desired_replication_factor,
+                write_availability_guard: WriteAvailabilityGuard {
+                    minimum_admitted_copies: desired_replication_factor.min(2),
+                    minimum_healthy_followers: desired_replication_factor.saturating_sub(1).min(1),
+                    ..WriteAvailabilityGuard::default()
+                },
+                ..TopologyConfig::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn key_with_placement(
+        topology: &TopologySnapshot,
+        predicate: impl Fn(&[&str]) -> bool,
+    ) -> Vec<u8> {
+        (0_u64..100_000)
+            .map(|value| value.to_be_bytes().to_vec())
+            .find(|key| {
+                topology
+                    .replica_node_ids_for_token(topology.key_token(key))
+                    .is_ok_and(|replicas| predicate(&replicas))
+            })
+            .expect("test topology should contain a matching placement")
+    }
+
+    fn replication_entry(
+        topology: &TopologySnapshot,
+        key: Vec<u8>,
+        stream_sequence: u64,
+        owner_sequence: u64,
+        value: &[u8],
+        deleted: bool,
+    ) -> ReplicationEntry {
+        let owner = topology.owner(&key).unwrap();
+        ReplicationEntry {
+            topology_epoch: topology.epoch,
+            owner_node_id: owner.node_id.clone(),
+            stream_sequence,
+            key,
+            value: value.to_vec(),
+            deleted,
+            version: Some(RecordVersion {
+                topology_epoch: topology.epoch,
+                owner_sequence,
+                owner_node_id: owner.node_id.clone(),
+            }),
+            mutation_id: format!("mutation-{stream_sequence}"),
         }
     }
 
@@ -1293,6 +1976,483 @@ mod tests {
             source_node_id: "node-1".into(),
             destination_node_id: "node-2".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn follower_applies_only_contiguous_authorized_replication() {
+        let topology = replication_topology(3);
+        let key = key_with_placement(&topology, |replicas| replicas[1..].contains(&"node-2"));
+        let service = service_for("node-2", topology.clone());
+        let put = replication_entry(&topology, key.clone(), 1, 10, b"value", false);
+
+        let applied = service
+            .replicate_mutation(Request::new(put.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(applied.applied_stream_sequence, 1);
+        assert_eq!(
+            service.state.read().await.records[&key].value.as_ref(),
+            b"value"
+        );
+        let client_read = service
+            .get(Request::new(GetRequest {
+                key: key.clone(),
+                topology_epoch: topology.epoch,
+                request_id: "get".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(client_read.error.unwrap().code, ErrorCode::Moved as i32);
+
+        let duplicate = service
+            .replicate_mutation(Request::new(put.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(duplicate.applied_stream_sequence, 1);
+        let mut conflict = put;
+        conflict.value = b"different".to_vec();
+        assert_eq!(
+            service
+                .replicate_mutation(Request::new(conflict))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::AlreadyExists
+        );
+
+        let gap = replication_entry(&topology, key.clone(), 3, 12, b"later", false);
+        assert_eq!(
+            service
+                .replicate_mutation(Request::new(gap))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Aborted
+        );
+        let stale_version = replication_entry(&topology, key.clone(), 2, 10, b"later", false);
+        assert_eq!(
+            service
+                .replicate_mutation(Request::new(stale_version))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+
+        let delete = replication_entry(&topology, key.clone(), 2, 11, b"", true);
+        let applied = service
+            .replicate_mutation(Request::new(delete))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(applied.applied_stream_sequence, 2);
+        assert!(service.state.read().await.records[&key].deleted);
+    }
+
+    #[tokio::test]
+    async fn follower_rejects_stale_wrong_owner_and_out_of_coverage_entries() {
+        let topology = replication_topology(2);
+        let follower_key = key_with_placement(&topology, |replicas| {
+            replicas[0] != "node-2" && replicas[1..].contains(&"node-2")
+        });
+        let outside_key = key_with_placement(&topology, |replicas| !replicas.contains(&"node-2"));
+        let service = service_for("node-2", topology.clone());
+
+        let mut stale = replication_entry(&topology, follower_key.clone(), 1, 1, b"value", false);
+        stale.topology_epoch = 0;
+        stale.version.as_mut().unwrap().topology_epoch = 0;
+        assert_eq!(
+            service
+                .replicate_mutation(Request::new(stale))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+
+        let mut oversized_id =
+            replication_entry(&topology, follower_key.clone(), 1, 1, b"value", false);
+        oversized_id.mutation_id = "x".repeat(MAX_MUTATION_ID_BYTES + 1);
+        assert_eq!(
+            service
+                .replicate_mutation(Request::new(oversized_id))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+
+        let mut wrong_owner = replication_entry(&topology, follower_key, 1, 1, b"value", false);
+        let incorrect_node_id = topology
+            .members
+            .iter()
+            .find(|member| member.node_id != wrong_owner.owner_node_id)
+            .unwrap()
+            .node_id
+            .clone();
+        wrong_owner.owner_node_id = incorrect_node_id.clone();
+        wrong_owner.version.as_mut().unwrap().owner_node_id = incorrect_node_id;
+        assert_eq!(
+            service
+                .replicate_mutation(Request::new(wrong_owner))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+
+        let outside = replication_entry(&topology, outside_key, 1, 1, b"value", false);
+        assert_eq!(
+            service
+                .replicate_mutation(Request::new(outside))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
+
+    #[test]
+    fn owner_assigns_independent_contiguous_sequences_per_follower() {
+        let topology = replication_topology(3);
+        let key = key_with_placement(&topology, |replicas| replicas[0] == "node-1");
+        let mut state = NodeState {
+            topology,
+            records: HashMap::new(),
+            next_sequence: 0,
+            owner_stream_sequences: HashMap::new(),
+            follower_streams: HashMap::new(),
+            sources: HashMap::new(),
+            destinations: HashMap::new(),
+            journal_bytes_total: 0,
+        };
+        let version = RecordVersion {
+            topology_epoch: 1,
+            owner_sequence: 1,
+            owner_node_id: "node-1".into(),
+        };
+        let first = prepare_replication_entries(
+            &mut state,
+            &key,
+            b"one",
+            false,
+            &version,
+            "mutation-1".into(),
+        )
+        .unwrap();
+        let second = prepare_replication_entries(
+            &mut state,
+            &key,
+            b"two",
+            false,
+            &RecordVersion {
+                owner_sequence: 2,
+                ..version
+            },
+            "mutation-2".into(),
+        )
+        .unwrap();
+
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 2);
+        for follower in first {
+            let next = second
+                .iter()
+                .find(|candidate| candidate.follower_node_id == follower.follower_node_id)
+                .unwrap();
+            assert_eq!(follower.stream_sequence, 1);
+            assert_eq!(next.stream_sequence, 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_only_delivers_put_and_delete_to_follower_in_order() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let follower_endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let topology = TopologySnapshot::new_with_config(
+            1,
+            42,
+            8,
+            vec![
+                Member {
+                    node_id: "node-1".into(),
+                    endpoint: "http://127.0.0.1:1".into(),
+                },
+                Member {
+                    node_id: "node-2".into(),
+                    endpoint: follower_endpoint,
+                },
+            ],
+            TopologyConfig {
+                desired_replication_factor: 2,
+                ..TopologyConfig::default()
+            },
+        )
+        .unwrap();
+        let follower = service_for("node-2", topology.clone());
+        let follower_state = follower.state.clone();
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(proto::data_node_server::DataNodeServer::new(follower))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let owner = service_for("node-1", topology.clone());
+        let key = key_with_placement(&topology, |replicas| replicas[0] == "node-1");
+
+        let put = owner
+            .put(Request::new(PutRequest {
+                key: key.clone(),
+                value: b"replicated".to_vec(),
+                topology_epoch: 1,
+                request_id: "put-1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(put.error.is_none());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if follower_state
+                    .read()
+                    .await
+                    .records
+                    .get(&key)
+                    .is_some_and(|record| record.value.as_ref() == b"replicated")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let deleted = owner
+            .delete(Request::new(DeleteRequest {
+                key: key.clone(),
+                topology_epoch: 1,
+                request_id: "delete-1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(deleted.error.is_none());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let state = follower_state.read().await;
+                if state.records.get(&key).is_some_and(|record| record.deleted)
+                    && state
+                        .follower_streams
+                        .values()
+                        .any(|stream| stream.applied_sequence == 2)
+                {
+                    break;
+                }
+                drop(state);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let mut concurrent = Vec::new();
+        for index in 0..6_u8 {
+            let owner = owner.clone();
+            let key = key.clone();
+            concurrent.push(tokio::spawn(async move {
+                owner
+                    .put(Request::new(PutRequest {
+                        key,
+                        value: vec![index],
+                        topology_epoch: 1,
+                        request_id: format!("concurrent-{index}"),
+                    }))
+                    .await
+                    .unwrap()
+                    .into_inner()
+            }));
+        }
+        for write in concurrent {
+            assert!(write.await.unwrap().error.is_none());
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let state = follower_state.read().await;
+                if state
+                    .follower_streams
+                    .values()
+                    .any(|stream| stream.applied_sequence == 8)
+                    && state.records[&key].version.owner_sequence == 8
+                {
+                    break;
+                }
+                drop(state);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unavailable_follower_backpressures_before_unbounded_queue_growth() {
+        let topology = TopologySnapshot::new_with_config(
+            1,
+            42,
+            8,
+            vec![
+                Member {
+                    node_id: "node-1".into(),
+                    endpoint: "http://127.0.0.1:1".into(),
+                },
+                Member {
+                    node_id: "node-2".into(),
+                    endpoint: "http://127.0.0.1:2".into(),
+                },
+            ],
+            TopologyConfig {
+                desired_replication_factor: 2,
+                ..TopologyConfig::default()
+            },
+        )
+        .unwrap();
+        let owner = service_for("node-1", topology.clone());
+        let key = key_with_placement(&topology, |replicas| replicas[0] == "node-1");
+        let mut successful = 0;
+        let rejected = loop {
+            let response = owner
+                .put(Request::new(PutRequest {
+                    key: key.clone(),
+                    value: vec![successful as u8],
+                    topology_epoch: 1,
+                    request_id: format!("put-{successful}"),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            if let Some(error) = response.error {
+                break error;
+            }
+            successful += 1;
+            assert!(successful <= REPLICATION_STREAM_QUEUE_CAPACITY + 1);
+        };
+
+        assert_eq!(rejected.code, ErrorCode::ResourceExhausted as i32);
+        let state = owner.state.read().await;
+        assert_eq!(state.next_sequence, successful as u64);
+        assert_eq!(
+            state.records[&key].version.owner_sequence,
+            successful as u64
+        );
+        assert_eq!(
+            state.owner_stream_sequences.values().copied().next(),
+            Some(successful as u64)
+        );
+    }
+
+    #[tokio::test]
+    async fn older_replicated_delete_cannot_erase_newer_seeded_value() {
+        let topology = replication_topology(3);
+        let key = key_with_placement(&topology, |replicas| replicas[1..].contains(&"node-2"));
+        let service = service_for("node-2", topology.clone());
+        let owner_node_id = topology.owner(&key).unwrap().node_id.clone();
+        service.state.write().await.records.insert(
+            key.clone(),
+            Record {
+                value: Arc::from(b"newer".as_slice()),
+                version: RecordVersion {
+                    topology_epoch: topology.epoch,
+                    owner_sequence: 11,
+                    owner_node_id,
+                },
+                deleted: false,
+            },
+        );
+
+        let delete = replication_entry(&topology, key.clone(), 1, 10, b"", true);
+        service
+            .replicate_mutation(Request::new(delete))
+            .await
+            .unwrap();
+        let state = service.state.read().await;
+        assert_eq!(state.records[&key].value.as_ref(), b"newer");
+        assert!(!state.records[&key].deleted);
+    }
+
+    #[tokio::test]
+    async fn source_cleanup_retains_records_needed_as_follower_copies() {
+        let topology = TopologySnapshot::new_with_config(
+            2,
+            42,
+            8,
+            vec![
+                Member {
+                    node_id: "node-1".into(),
+                    endpoint: "http://127.0.0.1:5001".into(),
+                },
+                Member {
+                    node_id: "node-2".into(),
+                    endpoint: "http://127.0.0.1:5002".into(),
+                },
+            ],
+            TopologyConfig {
+                desired_replication_factor: 2,
+                ..TopologyConfig::default()
+            },
+        )
+        .unwrap();
+        let key = key_with_placement(&topology, |replicas| {
+            replicas[0] == "node-2" && replicas[1] == "node-1"
+        });
+        let service = service_for("node-1", topology);
+        let (snapshot_ready, _) = watch::channel(true);
+        {
+            let mut state = service.state.write().await;
+            state.records.insert(
+                key.clone(),
+                Record {
+                    value: Arc::from(b"replica".as_slice()),
+                    version: RecordVersion {
+                        topology_epoch: 1,
+                        owner_sequence: 1,
+                        owner_node_id: "node-1".into(),
+                    },
+                    deleted: false,
+                },
+            );
+            state.sources.insert(
+                ("change-1".into(), "range-1".into()),
+                SourceMigration {
+                    range: RangeSpec {
+                        change_id: "change-1".into(),
+                        range_id: "range-1".into(),
+                        start_exclusive: 0,
+                        end_inclusive: 0,
+                        source_node_id: "node-1".into(),
+                        destination_node_id: "node-2".into(),
+                    },
+                    snapshot_keys: Some(Vec::new()),
+                    snapshot_ready,
+                    journal: Vec::new(),
+                    journal_bytes: 0,
+                    watermark: 0,
+                    writes_paused: true,
+                },
+            );
+        }
+
+        service
+            .cleanup_source_range(Request::new(RangeControlRequest {
+                change_id: "change-1".into(),
+                range_id: "range-1".into(),
+            }))
+            .await
+            .unwrap();
+        assert!(service.state.read().await.records.contains_key(&key));
     }
 
     #[tokio::test]
@@ -1615,14 +2775,7 @@ mod tests {
             .into_inner();
         assert!(first.error.is_none());
         assert_eq!(service.state.read().await.next_sequence, 2);
-        assert!(
-            !service
-                .state
-                .read()
-                .await
-                .records
-                .contains_key(b"key".as_slice())
-        );
+        assert!(service.state.read().await.records[b"key".as_slice()].deleted);
 
         let second = service
             .delete(Request::new(DeleteRequest {
@@ -1634,7 +2787,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert!(second.error.is_none());
-        assert_eq!(service.state.read().await.next_sequence, 2);
+        assert_eq!(service.state.read().await.next_sequence, 3);
 
         service
             .put(Request::new(PutRequest {
@@ -1655,7 +2808,7 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(restored.value, b"restored");
-        assert_eq!(restored.version.unwrap().owner_sequence, 3);
+        assert_eq!(restored.version.unwrap().owner_sequence, 4);
     }
 
     #[tokio::test]
@@ -1682,13 +2835,27 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(oversized.error.unwrap().code, ErrorCode::TooLarge as i32);
+
+        let oversized_mutation_id = service
+            .delete(Request::new(DeleteRequest {
+                key: b"key".to_vec(),
+                topology_epoch: 1,
+                request_id: "x".repeat(MAX_MUTATION_ID_BYTES + 1),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            oversized_mutation_id.error.unwrap().code,
+            ErrorCode::InvalidArgument as i32
+        );
         assert_eq!(service.state.read().await.next_sequence, 0);
     }
 
     #[tokio::test]
-    async fn snapshot_skips_a_deleted_key_and_journals_the_deletion() {
-        let service = service();
-        service
+    async fn snapshot_and_changelog_preserve_a_deleted_key_tombstone() {
+        let source = service();
+        source
             .put(Request::new(PutRequest {
                 key: b"key".to_vec(),
                 value: b"value".to_vec(),
@@ -1697,13 +2864,13 @@ mod tests {
             }))
             .await
             .unwrap();
-        service
+        source
             .prepare_source_range(Request::new(PrepareRangeRequest {
                 range: Some(range(0)),
             }))
             .await
             .unwrap();
-        service
+        source
             .delete(Request::new(DeleteRequest {
                 key: b"key".to_vec(),
                 topology_epoch: 1,
@@ -1712,7 +2879,7 @@ mod tests {
             .await
             .unwrap();
 
-        let snapshot = service
+        let snapshot = source
             .read_snapshot_page(Request::new(SnapshotPageRequest {
                 change_id: "change-1".into(),
                 range_id: "range-1".into(),
@@ -1722,11 +2889,12 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert!(snapshot.records.is_empty());
+        assert_eq!(snapshot.records.len(), 1);
+        assert!(snapshot.records[0].deleted);
         assert_eq!(snapshot.next_cursor, 1);
         assert!(snapshot.done);
 
-        let changelog = service
+        let changelog = source
             .read_changelog_page(Request::new(ChangelogPageRequest {
                 change_id: "change-1".into(),
                 range_id: "range-1".into(),
@@ -1739,7 +2907,7 @@ mod tests {
         assert_eq!(changelog.current_watermark, 1);
         assert!(changelog.records[0].record.as_ref().unwrap().deleted);
 
-        let digest = service
+        let digest = source
             .source_range_digest(Request::new(RangeControlRequest {
                 change_id: "change-1".into(),
                 range_id: "range-1".into(),
@@ -1747,8 +2915,53 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(digest.record_count, 0);
+        assert_eq!(digest.record_count, 1);
         assert_eq!(digest.changelog_watermark, 1);
+
+        let mut destination = service();
+        destination.node_id = "node-2".into();
+        destination
+            .prepare_destination_range(Request::new(PrepareRangeRequest {
+                range: Some(range(0)),
+            }))
+            .await
+            .unwrap();
+        destination
+            .apply_migration_batch(Request::new(ApplyMigrationBatchRequest {
+                change_id: "change-1".into(),
+                range_id: "range-1".into(),
+                snapshot_records: snapshot.records,
+                journal_records: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        let destination_digest = destination
+            .destination_range_digest(Request::new(RangeControlRequest {
+                change_id: "change-1".into(),
+                range_id: "range-1".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(destination_digest.digest, digest.digest);
+        destination
+            .commit_destination_range(Request::new(RangeControlRequest {
+                change_id: "change-1".into(),
+                range_id: "range-1".into(),
+            }))
+            .await
+            .unwrap();
+        destination.node_id = "node-1".into();
+        let read = destination
+            .get(Request::new(GetRequest {
+                key: b"key".to_vec(),
+                topology_epoch: 1,
+                request_id: "get-deleted".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(read.error.unwrap().code, ErrorCode::NotFound as i32);
     }
 
     #[tokio::test]
@@ -1764,6 +2977,7 @@ mod tests {
                     owner_sequence: 1,
                     owner_node_id: "node-2".into(),
                 },
+                deleted: false,
             },
         );
         destination
@@ -1809,13 +3023,13 @@ mod tests {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(digest.record_count, 0);
+        assert_eq!(digest.record_count, 1);
         assert_eq!(digest.changelog_watermark, 1);
         destination
             .commit_destination_range(Request::new(control))
             .await
             .unwrap();
-        assert!(destination.state.read().await.records.is_empty());
+        assert!(destination.state.read().await.records[b"key".as_slice()].deleted);
     }
 
     #[tokio::test]
@@ -1892,9 +3106,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            destination.state.read().await.destinations[&key]
-                .records
-                .is_empty()
+            destination.state.read().await.destinations[&key].records[b"key".as_slice()].deleted
         );
     }
 

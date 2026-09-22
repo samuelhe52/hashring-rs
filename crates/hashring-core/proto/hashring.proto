@@ -229,6 +229,21 @@ message RecordVersion {
   string owner_node_id = 3;
 }
 
+message ReplicationEntry {
+  uint64 topology_epoch = 1;
+  string owner_node_id = 2;
+  uint64 stream_sequence = 3;
+  bytes key = 4;
+  bytes value = 5;
+  bool deleted = 6;
+  RecordVersion version = 7;
+  string mutation_id = 8;
+}
+
+message ReplicateMutationResponse {
+  uint64 applied_stream_sequence = 1;
+}
+
 enum ErrorCode {
   ERROR_CODE_UNSPECIFIED = 0;
   NOT_FOUND = 1;
@@ -291,6 +306,7 @@ service DataNode {
   rpc Get(GetRequest) returns (GetResponse);
   rpc Put(PutRequest) returns (PutResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc ReplicateMutation(ReplicationEntry) returns (ReplicateMutationResponse);
   rpc PrepareSourceRange(PrepareRangeRequest) returns (PrepareSourceRangeResponse);
   rpc PrepareDestinationRange(PrepareRangeRequest) returns (PrepareDestinationRangeResponse);
   rpc GetProcessInfo(Empty) returns (NodeInfoResponse);
