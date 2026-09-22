@@ -2,13 +2,13 @@
 #![allow(clippy::result_large_err)]
 
 use std::{
-    cmp::Ordering,
-    collections::{HashMap, HashSet, VecDeque},
+    cmp::{Ordering, Reverse},
+    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, watch};
@@ -22,9 +22,10 @@ pub use hashring_core::transport::{configure_coordinator_client, fetch_topology}
 
 use hashring_core::{
     proto::{
-        self, ApplyMigrationBatchRequest, ChangelogPageRequest, ChangelogPageResponse,
-        DeleteRequest, DeleteResponse, ErrorCode, GetRequest, GetResponse, InstallTopologyRequest,
-        JournalRecord, MigrationRecord, NodeInfoResponse, OperationError, PauseRangeResponse,
+        self, ApplyDedupBatchRequest, ApplyMigrationBatchRequest, ChangelogPageRequest,
+        ChangelogPageResponse, DedupSnapshotPageResponse, DeduplicationRecord, DeleteRequest,
+        DeleteResponse, ErrorCode, GetRequest, GetResponse, InstallTopologyRequest, JournalRecord,
+        MigrationRecord, NodeInfoResponse, OperationError, PauseRangeResponse,
         PrepareDestinationRangeResponse, PrepareRangeRequest, PrepareSourceRangeResponse,
         PutRequest, PutResponse, RangeControlRequest, RangeDigestResponse, RecordVersion,
         RegisterNodeRequest, ReplicateMutationResponse, ReplicationCheckpointRequest,
@@ -42,6 +43,17 @@ const MAX_PENDING_REPLICATION_BYTES: usize = 64 * 1024 * 1024;
 const REPLICATION_STREAM_QUEUE_CAPACITY: usize = 8;
 const MAX_REPLICATION_FINGERPRINTS: u64 = 4_096;
 const REPLICATION_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const IDEMPOTENCY_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+const MAX_DEDUP_BYTES: usize = 16 * 1024 * 1024;
+
+struct DedupEntry {
+    key: Arc<[u8]>,
+    fingerprint: [u8; 32],
+    version: RecordVersion,
+    deleted: bool,
+    retained_bytes: usize,
+    expires_at: Instant,
+}
 
 #[derive(Clone)]
 struct Record {
@@ -101,6 +113,7 @@ impl TryFrom<proto::RangeSpec> for RangeSpec {
 struct SourceMigration {
     range: RangeSpec,
     snapshot_keys: Option<Vec<Vec<u8>>>,
+    snapshot_dedup_ids: Vec<String>,
     snapshot_ready: watch::Sender<bool>,
     journal: Vec<JournalRecord>,
     journal_bytes: usize,
@@ -111,9 +124,18 @@ struct SourceMigration {
 struct DestinationMigration {
     range: RangeSpec,
     records: HashMap<Vec<u8>, Record>,
+    dedup: HashMap<String, StagedDedup>,
+    dedup_bytes: usize,
     watermark: u64,
     committed: bool,
     writes_activated: bool,
+}
+
+#[derive(Clone)]
+struct StagedDedup {
+    record: DeduplicationRecord,
+    expires_at: Instant,
+    retained_bytes: usize,
 }
 
 #[derive(Default)]
@@ -189,6 +211,9 @@ struct NodeState {
     sources: HashMap<(String, String), SourceMigration>,
     destinations: HashMap<(String, String), DestinationMigration>,
     journal_bytes_total: usize,
+    dedup: HashMap<String, DedupEntry>,
+    dedup_expirations: BinaryHeap<Reverse<(Instant, String)>>,
+    dedup_bytes: usize,
 }
 
 struct SnapshotPreparationGuard {
@@ -235,6 +260,7 @@ pub struct DataNodeService {
     max_key_bytes: usize,
     max_value_bytes: usize,
     max_journal_bytes: usize,
+    max_dedup_bytes: usize,
     stop_response_delay: std::time::Duration,
     stop_prepared: Arc<AtomicBool>,
     shutdown: watch::Sender<bool>,
@@ -280,6 +306,9 @@ impl DataNodeService {
             sources: HashMap::new(),
             destinations: HashMap::new(),
             journal_bytes_total: 0,
+            dedup: HashMap::new(),
+            dedup_expirations: BinaryHeap::new(),
+            dedup_bytes: 0,
         }));
         let replication_dispatch = start_replication_dispatch(state.clone());
         Ok(Self {
@@ -292,6 +321,7 @@ impl DataNodeService {
             max_key_bytes: DEFAULT_MAX_KEY_BYTES,
             max_value_bytes: DEFAULT_MAX_VALUE_BYTES,
             max_journal_bytes: DEFAULT_MAX_MIGRATION_JOURNAL_BYTES,
+            max_dedup_bytes: MAX_DEDUP_BYTES,
             stop_response_delay: std::time::Duration::ZERO,
             stop_prepared: Arc::new(AtomicBool::new(false)),
             shutdown,
@@ -455,6 +485,40 @@ impl DataNode for DataNodeService {
                 ..Default::default()
             }));
         }
+        let dedup_now = Instant::now();
+        purge_expired_dedup(&mut state, dedup_now);
+        let fingerprint = mutation_fingerprint(&request.key, &request.value, false);
+        if let Some(existing) = state.dedup.get(&request.request_id) {
+            if existing.fingerprint == fingerprint && !existing.deleted {
+                return Ok(Response::new(PutResponse {
+                    version: Some(existing.version.clone()),
+                    current_epoch: state.topology.epoch,
+                    error: None,
+                }));
+            }
+            return Ok(Response::new(PutResponse {
+                current_epoch: state.topology.epoch,
+                error: Some(operation_error(
+                    ErrorCode::MutationIdConflict,
+                    "mutation ID was reused with a different operation or payload",
+                    false,
+                )),
+                ..Default::default()
+            }));
+        }
+        let dedup_cost =
+            dedup_retained_bytes(&request.request_id, request.key.len(), self.node_id.len());
+        if state.dedup_bytes.saturating_add(dedup_cost) > self.max_dedup_bytes {
+            return Ok(Response::new(PutResponse {
+                current_epoch: state.topology.epoch,
+                error: Some(operation_error(
+                    ErrorCode::ResourceExhausted,
+                    "mutation retry window is full; retry with backoff",
+                    true,
+                )),
+                ..Default::default()
+            }));
+        }
         if let Some(error) = unsupported_write_policy_error(&state) {
             return Ok(Response::new(PutResponse {
                 current_epoch: error.current_epoch,
@@ -464,7 +528,8 @@ impl DataNode for DataNodeService {
         }
 
         let token = state.topology.key_token(&request.key);
-        let journal_record_bytes = request.key.len() + request.value.len() + 128;
+        let journal_record_bytes =
+            request.key.len() + request.value.len() + request.request_id.len() + 128;
         let matching_sources = state
             .sources
             .values()
@@ -530,6 +595,7 @@ impl DataNode for DataNodeService {
             owner_sequence: next_sequence,
             owner_node_id: self.node_id.clone(),
         };
+        let mutation_id = request.request_id.clone();
         let replications = match prepare_replication_entries(
             &mut state,
             &request.key,
@@ -590,10 +656,21 @@ impl DataNode for DataNodeService {
                     value: record.value.to_vec(),
                     version: Some(record.version.clone()),
                     deleted: false,
+                    mutation_id: mutation_id.clone(),
+                    remaining_window_millis: 0,
                 }),
             });
         }
         state.journal_bytes_total += journal_growth;
+        insert_dedup(
+            &mut state,
+            mutation_id,
+            Arc::from(request.key.as_slice()),
+            fingerprint,
+            version.clone(),
+            false,
+            Instant::now(),
+        );
         let current_epoch = state.topology.epoch;
         self.replication_dispatch
             .dispatch(replications, reservations);
@@ -631,6 +708,37 @@ impl DataNode for DataNodeService {
             return Ok(Response::new(DeleteResponse {
                 current_epoch: error.current_epoch,
                 error: Some(error),
+            }));
+        }
+        let dedup_now = Instant::now();
+        purge_expired_dedup(&mut state, dedup_now);
+        let fingerprint = mutation_fingerprint(&request.key, &[], true);
+        if let Some(existing) = state.dedup.get(&request.request_id) {
+            if existing.fingerprint == fingerprint && existing.deleted {
+                return Ok(Response::new(DeleteResponse {
+                    current_epoch: state.topology.epoch,
+                    error: None,
+                }));
+            }
+            return Ok(Response::new(DeleteResponse {
+                current_epoch: state.topology.epoch,
+                error: Some(operation_error(
+                    ErrorCode::MutationIdConflict,
+                    "mutation ID was reused with a different operation or payload",
+                    false,
+                )),
+            }));
+        }
+        let dedup_cost =
+            dedup_retained_bytes(&request.request_id, request.key.len(), self.node_id.len());
+        if state.dedup_bytes.saturating_add(dedup_cost) > self.max_dedup_bytes {
+            return Ok(Response::new(DeleteResponse {
+                current_epoch: state.topology.epoch,
+                error: Some(operation_error(
+                    ErrorCode::ResourceExhausted,
+                    "mutation retry window is full; retry with backoff",
+                    true,
+                )),
             }));
         }
         if let Some(error) = unsupported_write_policy_error(&state) {
@@ -678,7 +786,7 @@ impl DataNode for DataNodeService {
             }));
         }
 
-        let journal_record_bytes = request.key.len() + 128;
+        let journal_record_bytes = request.key.len() + request.request_id.len() + 128;
         let matching_sources = state
             .sources
             .values()
@@ -705,6 +813,7 @@ impl DataNode for DataNodeService {
             owner_sequence: next_sequence,
             owner_node_id: self.node_id.clone(),
         };
+        let mutation_id = request.request_id.clone();
         let replications = match prepare_replication_entries(
             &mut state,
             &request.key,
@@ -766,10 +875,21 @@ impl DataNode for DataNodeService {
                     value: Vec::new(),
                     version: Some(version.clone()),
                     deleted: true,
+                    mutation_id: mutation_id.clone(),
+                    remaining_window_millis: 0,
                 }),
             });
         }
         state.journal_bytes_total += journal_growth;
+        insert_dedup(
+            &mut state,
+            mutation_id,
+            Arc::from(request.key.as_slice()),
+            fingerprint,
+            version.clone(),
+            true,
+            Instant::now(),
+        );
         let current_epoch = state.topology.epoch;
         self.replication_dispatch
             .dispatch(replications, reservations);
@@ -1019,6 +1139,27 @@ impl DataNode for DataNodeService {
             ));
         }
 
+        let dedup_now = Instant::now();
+        purge_expired_dedup(&mut state, dedup_now);
+        let mutation_fingerprint = mutation_fingerprint(&entry.key, &entry.value, entry.deleted);
+        if state.dedup.contains_key(&entry.mutation_id) {
+            return Err(Status::already_exists(
+                "replication stream reused a live mutation ID",
+            ));
+        }
+        if state.dedup_bytes.saturating_add(dedup_retained_bytes(
+            &entry.mutation_id,
+            entry.key.len(),
+            version.owner_node_id.len(),
+        )) > self.max_dedup_bytes
+        {
+            return Err(Status::resource_exhausted(
+                "follower mutation retry window is full",
+            ));
+        }
+        let mutation_id = entry.mutation_id.clone();
+        let dedup_key: Arc<[u8]> = Arc::from(entry.key.as_slice());
+
         apply_internal_record(
             &mut state.records,
             entry.key,
@@ -1042,8 +1183,18 @@ impl DataNode for DataNodeService {
                 .fingerprints
                 .remove(&(entry.stream_sequence - MAX_REPLICATION_FINGERPRINTS));
         }
+        let applied_stream_sequence = stream.applied_sequence;
+        insert_dedup(
+            &mut state,
+            mutation_id,
+            dedup_key,
+            mutation_fingerprint,
+            version.clone(),
+            entry.deleted,
+            Instant::now(),
+        );
         Ok(Response::new(ReplicateMutationResponse {
-            applied_stream_sequence: stream.applied_sequence,
+            applied_stream_sequence,
         }))
     }
 
@@ -1062,7 +1213,7 @@ impl DataNode for DataNodeService {
             ));
         }
         let key = range.key();
-        let (all_keys, topology, ready) = {
+        let (all_keys, dedup_keys, topology, ready) = {
             let mut state = self.state.write().await;
             if let Some(existing) = state.sources.get(&key) {
                 if existing.range != range {
@@ -1082,6 +1233,11 @@ impl DataNode for DataNodeService {
                 }));
             }
             let all_keys = state.records.keys().cloned().collect::<Vec<_>>();
+            let dedup_keys = state
+                .dedup
+                .iter()
+                .map(|(id, entry)| (id.clone(), entry.key.clone()))
+                .collect::<Vec<_>>();
             let topology = state.topology.clone();
             let (ready, _) = watch::channel(false);
             state.sources.insert(
@@ -1089,6 +1245,7 @@ impl DataNode for DataNodeService {
                 SourceMigration {
                     range: range.clone(),
                     snapshot_keys: None,
+                    snapshot_dedup_ids: Vec::new(),
                     snapshot_ready: ready.clone(),
                     journal: Vec::new(),
                     journal_bytes: 0,
@@ -1096,7 +1253,7 @@ impl DataNode for DataNodeService {
                     writes_paused: false,
                 },
             );
-            (all_keys, topology, ready)
+            (all_keys, dedup_keys, topology, ready)
         };
         let mut preparation = SnapshotPreparationGuard {
             state: self.state.clone(),
@@ -1111,6 +1268,12 @@ impl DataNode for DataNodeService {
             .filter(|record_key| range.contains(topology.key_token(record_key)))
             .collect();
         snapshot_keys.sort();
+        let mut snapshot_dedup_ids: Vec<_> = dedup_keys
+            .into_iter()
+            .filter(|(_, record_key)| range.contains(topology.key_token(record_key)))
+            .map(|(id, _)| id)
+            .collect();
+        snapshot_dedup_ids.sort();
         let mut state = self.state.write().await;
         let source = state
             .sources
@@ -1122,6 +1285,7 @@ impl DataNode for DataNodeService {
             ));
         }
         source.snapshot_keys = Some(snapshot_keys);
+        source.snapshot_dedup_ids = snapshot_dedup_ids;
         ready.send_replace(true);
         preparation.disarm();
         Ok(Response::new(PrepareSourceRangeResponse {
@@ -1156,6 +1320,8 @@ impl DataNode for DataNodeService {
                 DestinationMigration {
                     range,
                     records: HashMap::new(),
+                    dedup: HashMap::new(),
+                    dedup_bytes: 0,
                     watermark: 0,
                     committed: false,
                     writes_activated: false,
@@ -1210,6 +1376,8 @@ impl DataNode for DataNodeService {
                 value: record.value.to_vec(),
                 version: Some(record.version.clone()),
                 deleted: record.deleted,
+                mutation_id: String::new(),
+                remaining_window_millis: 0,
             };
             let size = migration_record_size(&record);
             if !records.is_empty() && bytes + size > max_bytes {
@@ -1223,6 +1391,59 @@ impl DataNode for DataNodeService {
             records,
             next_cursor: next_cursor as u64,
             done: next_cursor == snapshot_keys.len(),
+        }))
+    }
+
+    async fn read_dedup_snapshot_page(
+        &self,
+        request: Request<SnapshotPageRequest>,
+    ) -> Result<Response<DedupSnapshotPageResponse>, Status> {
+        let request = request.into_inner();
+        let state = self.state.read().await;
+        let source = state
+            .sources
+            .get(&(request.change_id, request.range_id))
+            .ok_or_else(|| Status::not_found("source migration not prepared"))?;
+        if source.snapshot_keys.is_none() {
+            return Err(Status::unavailable(
+                "source snapshot is still being prepared",
+            ));
+        }
+        let ids = &source.snapshot_dedup_ids;
+        let start = usize::try_from(request.cursor)
+            .map_err(|_| Status::invalid_argument("dedup cursor is too large"))?;
+        if start > ids.len() {
+            return Err(Status::out_of_range("dedup cursor exceeds record count"));
+        }
+        let mut next_cursor = start;
+        let mut bytes = 0;
+        let mut records = Vec::new();
+        let now = Instant::now();
+        for id in &ids[start..] {
+            next_cursor += 1;
+            let Some(entry) = state.dedup.get(id).filter(|entry| entry.expires_at > now) else {
+                continue;
+            };
+            let record = DeduplicationRecord {
+                mutation_id: id.clone(),
+                key: entry.key.to_vec(),
+                fingerprint: entry.fingerprint.to_vec(),
+                version: Some(entry.version.clone()),
+                deleted: entry.deleted,
+                remaining_window_millis: remaining_window_millis(entry.expires_at, now),
+            };
+            let size = dedup_record_size(&record);
+            if !records.is_empty() && bytes + size > page_limit(request.max_bytes) {
+                next_cursor -= 1;
+                break;
+            }
+            bytes += size;
+            records.push(record);
+        }
+        Ok(Response::new(DedupSnapshotPageResponse {
+            records,
+            next_cursor: next_cursor as u64,
+            done: next_cursor == ids.len(),
         }))
     }
 
@@ -1254,7 +1475,21 @@ impl DataNode for DataNodeService {
                 break;
             }
             bytes += size;
-            records.push(entry.clone());
+            let mut copied = entry.clone();
+            if let Some(record) = copied.record.as_mut() {
+                record.remaining_window_millis = state
+                    .dedup
+                    .get(&record.mutation_id)
+                    .filter(|dedup| {
+                        dedup.fingerprint
+                            == mutation_fingerprint(&record.key, &record.value, record.deleted)
+                            && Some(&dedup.version) == record.version.as_ref()
+                    })
+                    .map_or(0, |dedup| {
+                        remaining_window_millis(dedup.expires_at, Instant::now())
+                    });
+            }
+            records.push(copied);
         }
         Ok(Response::new(ChangelogPageResponse {
             records,
@@ -1278,6 +1513,7 @@ impl DataNode for DataNodeService {
                 "destination range is already committed",
             ));
         }
+        purge_staged_dedup(destination, Instant::now());
         for record in request.snapshot_records {
             if !destination.range.contains(topology.key_token(&record.key)) {
                 return Err(Status::invalid_argument(
@@ -1305,8 +1541,48 @@ impl DataNode for DataNodeService {
                     "journal record is outside the prepared range",
                 ));
             }
+            if !record.mutation_id.is_empty() {
+                let dedup = DeduplicationRecord {
+                    mutation_id: record.mutation_id.clone(),
+                    key: record.key.clone(),
+                    fingerprint: mutation_fingerprint(&record.key, &record.value, record.deleted)
+                        .to_vec(),
+                    version: record.version.clone(),
+                    deleted: record.deleted,
+                    remaining_window_millis: record.remaining_window_millis,
+                };
+                stage_dedup(destination, dedup, self.max_dedup_bytes)?;
+            }
             apply_record(&mut destination.records, record)?;
             destination.watermark = entry.watermark;
+        }
+        Ok(Response::new(proto::Empty {}))
+    }
+
+    async fn apply_dedup_batch(
+        &self,
+        request: Request<ApplyDedupBatchRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        let request = request.into_inner();
+        let mut state = self.state.write().await;
+        let topology = state.topology.clone();
+        let destination = state
+            .destinations
+            .get_mut(&(request.change_id, request.range_id))
+            .ok_or_else(|| Status::not_found("destination migration not prepared"))?;
+        if destination.committed {
+            return Err(Status::failed_precondition(
+                "destination range is already committed",
+            ));
+        }
+        purge_staged_dedup(destination, Instant::now());
+        for record in request.records {
+            if !destination.range.contains(topology.key_token(&record.key)) {
+                return Err(Status::invalid_argument(
+                    "dedup record is outside the prepared range",
+                ));
+            }
+            stage_dedup(destination, record, self.max_dedup_bytes)?;
         }
         Ok(Response::new(proto::Empty {}))
     }
@@ -1371,17 +1647,55 @@ impl DataNode for DataNodeService {
         let request = request.into_inner();
         let mut state = self.state.write().await;
         let key = (request.change_id, request.range_id);
-        let (range, records) = {
+        let (range, records, dedup) = {
             let destination = state
                 .destinations
-                .get_mut(&key)
+                .get(&key)
                 .ok_or_else(|| Status::not_found("destination migration not prepared"))?;
             if destination.committed {
                 return Ok(Response::new(proto::Empty {}));
             }
-            destination.committed = true;
-            (destination.range.clone(), destination.records.clone())
+            (
+                destination.range.clone(),
+                destination.records.clone(),
+                destination
+                    .dedup
+                    .iter()
+                    .filter(|(_, entry)| entry.expires_at > Instant::now())
+                    .map(|(id, entry)| (id.clone(), entry.clone()))
+                    .collect::<HashMap<_, _>>(),
+            )
         };
+        purge_expired_dedup(&mut state, Instant::now());
+        let mut added_bytes = 0usize;
+        for staged in dedup.values() {
+            let record = &staged.record;
+            if let Some(existing) = state.dedup.get(&record.mutation_id) {
+                if existing.fingerprint.as_slice() != record.fingerprint
+                    || Some(&existing.version) != record.version.as_ref()
+                    || existing.deleted != record.deleted
+                {
+                    return Err(Status::failed_precondition(
+                        "destination mutation ID conflicts with existing retry record",
+                    ));
+                }
+            } else {
+                let version = record
+                    .version
+                    .as_ref()
+                    .expect("staged dedup version was validated");
+                added_bytes = added_bytes.saturating_add(dedup_retained_bytes(
+                    &record.mutation_id,
+                    record.key.len(),
+                    version.owner_node_id.len(),
+                ));
+            }
+        }
+        if state.dedup_bytes.saturating_add(added_bytes) > self.max_dedup_bytes {
+            return Err(Status::resource_exhausted(
+                "destination mutation retry window is full",
+            ));
+        }
         let topology = state.topology.clone();
         state
             .records
@@ -1389,6 +1703,29 @@ impl DataNode for DataNodeService {
         for (key, record) in records {
             apply_internal_record(&mut state.records, key, record);
         }
+        for (id, staged) in dedup {
+            if state.dedup.contains_key(&id) {
+                continue;
+            }
+            let record = staged.record;
+            insert_dedup_until(
+                &mut state,
+                id,
+                Arc::from(record.key),
+                record
+                    .fingerprint
+                    .try_into()
+                    .expect("staged fingerprint was validated"),
+                record.version.expect("staged version was validated"),
+                record.deleted,
+                staged.expires_at,
+            );
+        }
+        state
+            .destinations
+            .get_mut(&key)
+            .expect("destination was checked above")
+            .committed = true;
         Ok(Response::new(proto::Empty {}))
     }
 
@@ -1673,6 +2010,177 @@ fn replication_fingerprint(entry: &ReplicationEntry) -> String {
     digest.finalize().to_hex().to_string()
 }
 
+fn mutation_fingerprint(key: &[u8], value: &[u8], deleted: bool) -> [u8; 32] {
+    let mut digest = blake3::Hasher::new();
+    digest.update(b"hashring-rs:mutation:v1\0");
+    digest.update(&(key.len() as u64).to_be_bytes());
+    digest.update(key);
+    digest.update(&[u8::from(deleted)]);
+    digest.update(&(value.len() as u64).to_be_bytes());
+    digest.update(value);
+    *digest.finalize().as_bytes()
+}
+
+fn dedup_retained_bytes(mutation_id: &str, key_len: usize, owner_len: usize) -> usize {
+    mutation_id.len().saturating_mul(2)
+        + key_len
+        + owner_len
+        + std::mem::size_of::<DedupEntry>()
+        + std::mem::size_of::<(Instant, String)>()
+        + std::mem::size_of::<DeduplicationRecord>()
+        + std::mem::size_of::<StagedDedup>()
+        + 128 // hash-table buckets and allocator metadata
+}
+
+fn dedup_record_size(record: &DeduplicationRecord) -> usize {
+    record.mutation_id.len()
+        + record.key.len()
+        + record.fingerprint.len()
+        + record
+            .version
+            .as_ref()
+            .map_or(0, |version| version.owner_node_id.len())
+        + 128
+}
+
+fn stage_dedup(
+    destination: &mut DestinationMigration,
+    record: DeduplicationRecord,
+    max_dedup_bytes: usize,
+) -> Result<(), Status> {
+    if record.remaining_window_millis == 0 {
+        return Ok(());
+    }
+    if record.mutation_id.is_empty()
+        || record.mutation_id.len() > MAX_MUTATION_ID_BYTES
+        || record.fingerprint.len() != 32
+        || record.version.is_none()
+    {
+        return Err(Status::invalid_argument("invalid deduplication record"));
+    }
+    let expires_at = Instant::now()
+        + std::time::Duration::from_millis(record.remaining_window_millis.min(60_000));
+    if let Some(existing) = destination.dedup.get_mut(&record.mutation_id) {
+        let same = existing.record.key == record.key
+            && existing.record.fingerprint == record.fingerprint
+            && existing.record.version == record.version
+            && existing.record.deleted == record.deleted;
+        if !same {
+            return Err(Status::failed_precondition(
+                "conflicting mutation ID in destination migration",
+            ));
+        }
+        existing.expires_at = existing.expires_at.max(expires_at);
+        return Ok(());
+    }
+    let version = record.version.as_ref().expect("version was checked above");
+    let cost = dedup_retained_bytes(
+        &record.mutation_id,
+        record.key.len(),
+        version.owner_node_id.len(),
+    );
+    if destination.dedup_bytes.saturating_add(cost) > max_dedup_bytes {
+        return Err(Status::resource_exhausted(
+            "staged mutation retry window is full",
+        ));
+    }
+    destination.dedup_bytes += cost;
+    destination.dedup.insert(
+        record.mutation_id.clone(),
+        StagedDedup {
+            record,
+            expires_at,
+            retained_bytes: cost,
+        },
+    );
+    Ok(())
+}
+
+fn purge_staged_dedup(destination: &mut DestinationMigration, now: Instant) {
+    destination.dedup.retain(|_, entry| entry.expires_at > now);
+    destination.dedup_bytes = destination
+        .dedup
+        .values()
+        .map(|entry| entry.retained_bytes)
+        .sum();
+}
+
+fn remaining_window_millis(expires_at: Instant, now: Instant) -> u64 {
+    let remaining = expires_at.saturating_duration_since(now);
+    if remaining.is_zero() {
+        return 0;
+    }
+    u64::try_from(remaining.as_nanos().div_ceil(1_000_000))
+        .unwrap_or(u64::MAX)
+        .min(60_000)
+}
+
+fn purge_expired_dedup(state: &mut NodeState, now: Instant) {
+    while state
+        .dedup_expirations
+        .peek()
+        .is_some_and(|Reverse((expires_at, _))| *expires_at <= now)
+    {
+        let Reverse((_, mutation_id)) = state
+            .dedup_expirations
+            .pop()
+            .expect("expiration was checked above");
+        if state.dedup.get(&mutation_id).is_some_and(|entry| entry.expires_at <= now)
+            && let Some(entry) = state.dedup.remove(&mutation_id)
+        {
+            state.dedup_bytes -= entry.retained_bytes;
+        }
+    }
+}
+
+fn insert_dedup(
+    state: &mut NodeState,
+    mutation_id: String,
+    key: Arc<[u8]>,
+    fingerprint: [u8; 32],
+    version: RecordVersion,
+    deleted: bool,
+    now: Instant,
+) {
+    let expires_at = now + IDEMPOTENCY_WINDOW;
+    insert_dedup_until(
+        state,
+        mutation_id,
+        key,
+        fingerprint,
+        version,
+        deleted,
+        expires_at,
+    );
+}
+
+fn insert_dedup_until(
+    state: &mut NodeState,
+    mutation_id: String,
+    key: Arc<[u8]>,
+    fingerprint: [u8; 32],
+    version: RecordVersion,
+    deleted: bool,
+    expires_at: Instant,
+) {
+    let retained_bytes = dedup_retained_bytes(&mutation_id, key.len(), version.owner_node_id.len());
+    state
+        .dedup_expirations
+        .push(Reverse((expires_at, mutation_id.clone())));
+    state.dedup.insert(
+        mutation_id,
+        DedupEntry {
+            key,
+            fingerprint,
+            version,
+            deleted,
+            retained_bytes,
+            expires_at,
+        },
+    );
+    state.dedup_bytes += retained_bytes;
+}
+
 fn now_unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1905,7 +2413,7 @@ fn page_limit(requested: u64) -> usize {
 }
 
 fn migration_record_size(record: &MigrationRecord) -> usize {
-    record.key.len() + record.value.len() + 128
+    record.key.len() + record.value.len() + record.mutation_id.len() + 128
 }
 
 fn apply_record(
@@ -2078,6 +2586,9 @@ mod tests {
             sources: HashMap::new(),
             destinations: HashMap::new(),
             journal_bytes_total: 0,
+            dedup: HashMap::new(),
+            dedup_expirations: BinaryHeap::new(),
+            dedup_bytes: 0,
         }));
         let replication_dispatch = start_replication_dispatch(state.clone());
         DataNodeService {
@@ -2090,6 +2601,7 @@ mod tests {
             max_key_bytes: DEFAULT_MAX_KEY_BYTES,
             max_value_bytes: DEFAULT_MAX_VALUE_BYTES,
             max_journal_bytes: DEFAULT_MAX_MIGRATION_JOURNAL_BYTES,
+            max_dedup_bytes: MAX_DEDUP_BYTES,
             stop_response_delay: std::time::Duration::ZERO,
             stop_prepared: Arc::new(AtomicBool::new(false)),
             shutdown,
@@ -2434,6 +2946,9 @@ mod tests {
             sources: HashMap::new(),
             destinations: HashMap::new(),
             journal_bytes_total: 0,
+            dedup: HashMap::new(),
+            dedup_expirations: BinaryHeap::new(),
+            dedup_bytes: 0,
         };
         let version = RecordVersion {
             topology_epoch: 1,
@@ -2535,6 +3050,12 @@ mod tests {
         })
         .await
         .unwrap();
+        assert_eq!(
+            follower_state.read().await.dedup["put-1"]
+                .version
+                .owner_sequence,
+            1
+        );
 
         let deleted = owner
             .delete(Request::new(DeleteRequest {
@@ -2725,6 +3246,8 @@ mod tests {
                 DestinationMigration {
                     range: spec,
                     records,
+                    dedup: HashMap::new(),
+                    dedup_bytes: 0,
                     watermark: 0,
                     committed: false,
                     writes_activated: false,
@@ -2929,6 +3452,7 @@ mod tests {
                         destination_node_id: "node-2".into(),
                     },
                     snapshot_keys: Some(Vec::new()),
+                    snapshot_dedup_ids: Vec::new(),
                     snapshot_ready,
                     journal: Vec::new(),
                     journal_bytes: 0,
@@ -3117,6 +3641,8 @@ mod tests {
                         owner_node_id: "node-1".into(),
                     }),
                     deleted: false,
+                    mutation_id: String::new(),
+                    remaining_window_millis: 0,
                 }],
                 journal_records: Vec::new(),
             }))
@@ -3242,6 +3768,351 @@ mod tests {
             .unwrap()
             .into_inner();
         assert!(deleted.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn owner_retries_reuse_original_result_and_reject_mutation_id_conflicts() {
+        let service = service();
+        let first = PutRequest {
+            key: b"key".to_vec(),
+            value: b"original".to_vec(),
+            topology_epoch: 1,
+            request_id: "same-id".into(),
+        };
+        let original = service
+            .put(Request::new(first.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(original.error.is_none());
+        let retry = service
+            .put(Request::new(first.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(retry.version, original.version);
+        assert_eq!(service.state.read().await.next_sequence, 1);
+
+        let mut conflicting = first;
+        conflicting.value = b"different".to_vec();
+        let conflict = service
+            .put(Request::new(conflicting))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            conflict.error.unwrap().code,
+            ErrorCode::MutationIdConflict as i32
+        );
+        let delete_conflict = service
+            .delete(Request::new(DeleteRequest {
+                key: b"key".to_vec(),
+                topology_epoch: 1,
+                request_id: "same-id".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            delete_conflict.error.unwrap().code,
+            ErrorCode::MutationIdConflict as i32
+        );
+        assert_eq!(service.state.read().await.next_sequence, 1);
+        assert_eq!(
+            service.state.read().await.records[b"key".as_slice()]
+                .value
+                .as_ref(),
+            b"original"
+        );
+
+        let delete = DeleteRequest {
+            key: b"key".to_vec(),
+            topology_epoch: 1,
+            request_id: "delete-id".into(),
+        };
+        assert!(
+            service
+                .delete(Request::new(delete.clone()))
+                .await
+                .unwrap()
+                .into_inner()
+                .error
+                .is_none()
+        );
+        assert!(
+            service
+                .delete(Request::new(delete))
+                .await
+                .unwrap()
+                .into_inner()
+                .error
+                .is_none()
+        );
+        assert_eq!(service.state.read().await.next_sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn dedup_budget_rejects_before_apply_and_expired_records_free_capacity() {
+        let mut service = service();
+        service.max_dedup_bytes = dedup_retained_bytes("first", b"key-1".len(), "node-1".len());
+        let first = PutRequest {
+            key: b"key-1".to_vec(),
+            value: b"one".to_vec(),
+            topology_epoch: 1,
+            request_id: "first".into(),
+        };
+        assert!(
+            service
+                .put(Request::new(first))
+                .await
+                .unwrap()
+                .into_inner()
+                .error
+                .is_none()
+        );
+        let second = PutRequest {
+            key: b"key-2".to_vec(),
+            value: b"two".to_vec(),
+            topology_epoch: 1,
+            request_id: "other".into(),
+        };
+        let rejected = service
+            .put(Request::new(second.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            rejected.error.unwrap().code,
+            ErrorCode::ResourceExhausted as i32
+        );
+        assert_eq!(service.state.read().await.next_sequence, 1);
+        assert!(
+            !service
+                .state
+                .read()
+                .await
+                .records
+                .contains_key(b"key-2".as_slice())
+        );
+        let mut state = service.state.write().await;
+        state.dedup.get_mut("first").unwrap().expires_at =
+            Instant::now() - std::time::Duration::from_millis(1);
+        state.dedup_expirations.push(Reverse((
+            Instant::now() - std::time::Duration::from_millis(1),
+            "first".into(),
+        )));
+        drop(state);
+        assert!(
+            service
+                .put(Request::new(second))
+                .await
+                .unwrap()
+                .into_inner()
+                .error
+                .is_none()
+        );
+        assert_eq!(service.state.read().await.next_sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn migration_carries_snapshot_and_journal_mutation_ids() {
+        let source = service();
+        let before = PutRequest {
+            key: b"before".to_vec(),
+            value: b"one".to_vec(),
+            topology_epoch: 1,
+            request_id: "before-id".into(),
+        };
+        let first_version = source
+            .put(Request::new(before.clone()))
+            .await
+            .unwrap()
+            .into_inner()
+            .version
+            .unwrap();
+        source
+            .prepare_source_range(Request::new(PrepareRangeRequest {
+                range: Some(range(0)),
+            }))
+            .await
+            .unwrap();
+        let after = PutRequest {
+            key: b"after".to_vec(),
+            value: b"two".to_vec(),
+            topology_epoch: 1,
+            request_id: "after-id".into(),
+        };
+        let second_version = source
+            .put(Request::new(after.clone()))
+            .await
+            .unwrap()
+            .into_inner()
+            .version
+            .unwrap();
+        let snapshot = source
+            .read_snapshot_page(Request::new(SnapshotPageRequest {
+                change_id: "change-1".into(),
+                range_id: "range-1".into(),
+                cursor: 0,
+                max_bytes: MAX_MIGRATION_PAGE_BYTES as u64,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let dedup = source
+            .read_dedup_snapshot_page(Request::new(SnapshotPageRequest {
+                change_id: "change-1".into(),
+                range_id: "range-1".into(),
+                cursor: 0,
+                max_bytes: MAX_MIGRATION_PAGE_BYTES as u64,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(dedup.records.len(), 1);
+        assert_eq!(dedup.records[0].mutation_id, "before-id");
+        let journal = source
+            .read_changelog_page(Request::new(ChangelogPageRequest {
+                change_id: "change-1".into(),
+                range_id: "range-1".into(),
+                after_watermark: 0,
+                max_bytes: MAX_MIGRATION_PAGE_BYTES as u64,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(journal.records.len(), 1);
+        assert_eq!(
+            journal.records[0].record.as_ref().unwrap().mutation_id,
+            "after-id"
+        );
+
+        let mut destination = service();
+        destination.node_id = "node-2".into();
+        destination
+            .prepare_destination_range(Request::new(PrepareRangeRequest {
+                range: Some(range(0)),
+            }))
+            .await
+            .unwrap();
+        destination
+            .apply_migration_batch(Request::new(ApplyMigrationBatchRequest {
+                change_id: "change-1".into(),
+                range_id: "range-1".into(),
+                snapshot_records: snapshot.records,
+                journal_records: Vec::new(),
+            }))
+            .await
+            .unwrap();
+        destination
+            .apply_dedup_batch(Request::new(ApplyDedupBatchRequest {
+                change_id: "change-1".into(),
+                range_id: "range-1".into(),
+                records: dedup.records,
+            }))
+            .await
+            .unwrap();
+        destination
+            .apply_migration_batch(Request::new(ApplyMigrationBatchRequest {
+                change_id: "change-1".into(),
+                range_id: "range-1".into(),
+                snapshot_records: Vec::new(),
+                journal_records: journal.records,
+            }))
+            .await
+            .unwrap();
+        destination
+            .commit_destination_range(Request::new(RangeControlRequest {
+                change_id: "change-1".into(),
+                range_id: "range-1".into(),
+            }))
+            .await
+            .unwrap();
+        destination.node_id = "node-1".into(); // The test topology still routes ownership to node-1.
+        let retry_before = destination
+            .put(Request::new(before))
+            .await
+            .unwrap()
+            .into_inner();
+        let retry_after = destination
+            .put(Request::new(after))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(retry_before.version, Some(first_version));
+        assert_eq!(retry_after.version, Some(second_version));
+        assert_eq!(destination.state.read().await.next_sequence, 0);
+    }
+
+    #[tokio::test]
+    async fn expired_staged_ids_free_migration_budget_before_commit() {
+        let mut destination = service();
+        destination.node_id = "node-2".into();
+        destination.max_dedup_bytes = dedup_retained_bytes("first", b"key-1".len(), "node-1".len());
+        destination
+            .prepare_destination_range(Request::new(PrepareRangeRequest {
+                range: Some(range(0)),
+            }))
+            .await
+            .unwrap();
+        let make_record = |id: &str, key: &[u8]| DeduplicationRecord {
+            mutation_id: id.into(),
+            key: key.to_vec(),
+            fingerprint: mutation_fingerprint(key, b"value", false).to_vec(),
+            version: Some(RecordVersion {
+                topology_epoch: 1,
+                owner_sequence: 1,
+                owner_node_id: "node-1".into(),
+            }),
+            deleted: false,
+            remaining_window_millis: 60_000,
+        };
+        let request = |record| ApplyDedupBatchRequest {
+            change_id: "change-1".into(),
+            range_id: "range-1".into(),
+            records: vec![record],
+        };
+        destination
+            .apply_dedup_batch(Request::new(request(make_record("first", b"key-1"))))
+            .await
+            .unwrap();
+        destination
+            .state
+            .write()
+            .await
+            .destinations
+            .get_mut(&("change-1".into(), "range-1".into()))
+            .unwrap()
+            .dedup
+            .get_mut("first")
+            .unwrap()
+            .expires_at = Instant::now() - std::time::Duration::from_millis(1);
+        destination
+            .apply_dedup_batch(Request::new(request(make_record("other", b"key-2"))))
+            .await
+            .unwrap();
+        let staged_expiry = {
+            let mut state = destination.state.write().await;
+            let entry = state
+                .destinations
+                .get_mut(&("change-1".into(), "range-1".into()))
+                .unwrap()
+                .dedup
+                .get_mut("other")
+                .unwrap();
+            entry.expires_at = Instant::now() + std::time::Duration::from_secs(5);
+            entry.expires_at
+        };
+        destination
+            .commit_destination_range(Request::new(RangeControlRequest {
+                change_id: "change-1".into(),
+                range_id: "range-1".into(),
+            }))
+            .await
+            .unwrap();
+        let state = destination.state.read().await;
+        assert!(!state.dedup.contains_key("first"));
+        assert_eq!(state.dedup["other"].expires_at, staged_expiry);
     }
 
     #[tokio::test]
@@ -3490,6 +4361,8 @@ mod tests {
                     owner_node_id: "node-1".into(),
                 }),
                 deleted: true,
+                mutation_id: String::new(),
+                remaining_window_millis: 0,
             }),
         };
         let batch = ApplyMigrationBatchRequest {
@@ -3541,6 +4414,8 @@ mod tests {
                 value: Vec::new(),
                 version: Some(version(owner_sequence)),
                 deleted: true,
+                mutation_id: String::new(),
+                remaining_window_millis: 0,
             }),
         };
         let put = |watermark, owner_sequence, value: &[u8]| JournalRecord {
@@ -3550,6 +4425,8 @@ mod tests {
                 value: value.to_vec(),
                 version: Some(version(owner_sequence)),
                 deleted: false,
+                mutation_id: String::new(),
+                remaining_window_millis: 0,
             }),
         };
 

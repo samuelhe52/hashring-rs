@@ -27,9 +27,9 @@ use hashring_core::{
         RangeMigration, TopologyChange,
     },
     proto::{
-        self, ApplyMigrationBatchRequest, ChangelogPageRequest, InstallTopologyRequest,
-        PrepareRangeRequest, RangeControlRequest, SnapshotPageRequest, StopRequest,
-        coordinator_server::Coordinator, data_node_client::DataNodeClient,
+        self, ApplyDedupBatchRequest, ApplyMigrationBatchRequest, ChangelogPageRequest,
+        InstallTopologyRequest, PrepareRangeRequest, RangeControlRequest, SnapshotPageRequest,
+        StopRequest, coordinator_server::Coordinator, data_node_client::DataNodeClient,
     },
     topology::{Member, TopologySnapshot},
 };
@@ -1219,6 +1219,36 @@ impl CoordinatorService {
                 .await?;
             }
             cursor = page.next_cursor;
+            if page.done {
+                break;
+            }
+        }
+
+        let mut dedup_cursor = 0;
+        loop {
+            let page = rpc_before(
+                deadline,
+                source.read_dedup_snapshot_page(SnapshotPageRequest {
+                    change_id: change.change_id.clone(),
+                    range_id: range.range_id.clone(),
+                    cursor: dedup_cursor,
+                    max_bytes: MAX_MIGRATION_PAGE_BYTES as u64,
+                }),
+            )
+            .await?
+            .into_inner();
+            if !page.records.is_empty() {
+                rpc_before(
+                    deadline,
+                    destination.apply_dedup_batch(ApplyDedupBatchRequest {
+                        change_id: change.change_id.clone(),
+                        range_id: range.range_id.clone(),
+                        records: page.records,
+                    }),
+                )
+                .await?;
+            }
+            dedup_cursor = page.next_cursor;
             if page.done {
                 break;
             }

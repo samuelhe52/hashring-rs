@@ -172,6 +172,29 @@ message MigrationRecord {
   bytes value = 2;
   RecordVersion version = 3;
   bool deleted = 4;
+  string mutation_id = 5;
+  uint64 remaining_window_millis = 6;
+}
+
+message DeduplicationRecord {
+  string mutation_id = 1;
+  bytes key = 2;
+  bytes fingerprint = 3;
+  RecordVersion version = 4;
+  bool deleted = 5;
+  uint64 remaining_window_millis = 6;
+}
+
+message DedupSnapshotPageResponse {
+  repeated DeduplicationRecord records = 1;
+  uint64 next_cursor = 2;
+  bool done = 3;
+}
+
+message ApplyDedupBatchRequest {
+  string change_id = 1;
+  string range_id = 2;
+  repeated DeduplicationRecord records = 3;
 }
 
 message JournalRecord {
@@ -303,6 +326,7 @@ enum ErrorCode {
   TOO_LARGE = 6;
   RESOURCE_EXHAUSTED = 7;
   INVALID_ARGUMENT = 8;
+  MUTATION_ID_CONFLICT = 9;
 }
 
 message OperationError {
@@ -362,8 +386,10 @@ service DataNode {
   rpc PrepareDestinationRange(PrepareRangeRequest) returns (PrepareDestinationRangeResponse);
   rpc GetProcessInfo(Empty) returns (NodeInfoResponse);
   rpc ReadSnapshotPage(SnapshotPageRequest) returns (SnapshotPageResponse);
+  rpc ReadDedupSnapshotPage(SnapshotPageRequest) returns (DedupSnapshotPageResponse);
   rpc ReadChangelogPage(ChangelogPageRequest) returns (ChangelogPageResponse);
   rpc ApplyMigrationBatch(ApplyMigrationBatchRequest) returns (Empty);
+  rpc ApplyDedupBatch(ApplyDedupBatchRequest) returns (Empty);
   rpc PauseRangeWrites(RangeControlRequest) returns (PauseRangeResponse);
   rpc SourceRangeDigest(RangeControlRequest) returns (RangeDigestResponse);
   rpc DestinationRangeDigest(RangeControlRequest) returns (RangeDigestResponse);
