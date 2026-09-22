@@ -3,11 +3,12 @@
 
 use std::{
     cmp::Ordering,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering as AtomicOrdering},
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, watch};
@@ -26,9 +27,11 @@ use hashring_core::{
         JournalRecord, MigrationRecord, NodeInfoResponse, OperationError, PauseRangeResponse,
         PrepareDestinationRangeResponse, PrepareRangeRequest, PrepareSourceRangeResponse,
         PutRequest, PutResponse, RangeControlRequest, RangeDigestResponse, RecordVersion,
-        RegisterNodeRequest, ReplicateMutationResponse, ReplicationEntry, SnapshotPageRequest,
-        SnapshotPageResponse, StopRequest, coordinator_client::CoordinatorClient,
-        data_node_client::DataNodeClient, data_node_server::DataNode,
+        RegisterNodeRequest, ReplicateMutationResponse, ReplicationCheckpointRequest,
+        ReplicationEntry, ReplicationProgressRequest, ReplicationProgressResponse,
+        SnapshotPageRequest, SnapshotPageResponse, StopRequest,
+        coordinator_client::CoordinatorClient, data_node_client::DataNodeClient,
+        data_node_server::DataNode,
     },
     topology::{TopologySnapshot, WriteAckPolicy},
     transport::configure_data_node_client,
@@ -117,6 +120,7 @@ struct DestinationMigration {
 struct FollowerStreamState {
     applied_sequence: u64,
     last_owner_sequence: u64,
+    checkpoint_sequence: u64,
     fingerprints: HashMap<u64, String>,
 }
 
@@ -180,6 +184,7 @@ struct NodeState {
     records: HashMap<Vec<u8>, Record>,
     next_sequence: u64,
     owner_stream_sequences: HashMap<(u64, String), u64>,
+    owner_stream_unacked: HashMap<(u64, String), VecDeque<(u64, u64)>>,
     follower_streams: HashMap<(u64, String), FollowerStreamState>,
     sources: HashMap<(String, String), SourceMigration>,
     destinations: HashMap<(String, String), DestinationMigration>,
@@ -270,6 +275,7 @@ impl DataNodeService {
             records: HashMap::new(),
             next_sequence: 0,
             owner_stream_sequences: HashMap::new(),
+            owner_stream_unacked: HashMap::new(),
             follower_streams: HashMap::new(),
             sources: HashMap::new(),
             destinations: HashMap::new(),
@@ -322,6 +328,9 @@ impl DataNodeService {
             state.topology = topology;
             state
                 .owner_stream_sequences
+                .retain(|(stream_epoch, _), _| *stream_epoch == epoch);
+            state
+                .owner_stream_unacked
                 .retain(|(stream_epoch, _), _| *stream_epoch == epoch);
             state
                 .follower_streams
@@ -550,6 +559,17 @@ impl DataNode for DataNodeService {
             }
         };
         state.next_sequence = next_sequence;
+        let now = now_unix_millis();
+        for entry in &replications {
+            state
+                .owner_stream_unacked
+                .entry((
+                    entry.mutation.topology_epoch,
+                    entry.follower_node_id.clone(),
+                ))
+                .or_default()
+                .push_back((entry.stream_sequence, now));
+        }
         let record = Record {
             value: request.value.into(),
             version: version.clone(),
@@ -712,6 +732,17 @@ impl DataNode for DataNodeService {
             }
         };
         state.next_sequence = next_sequence;
+        let now = now_unix_millis();
+        for entry in &replications {
+            state
+                .owner_stream_unacked
+                .entry((
+                    entry.mutation.topology_epoch,
+                    entry.follower_node_id.clone(),
+                ))
+                .or_default()
+                .push_back((entry.stream_sequence, now));
+        }
         apply_internal_record(
             &mut state.records,
             request.key.clone(),
@@ -745,6 +776,141 @@ impl DataNode for DataNodeService {
         Ok(Response::new(DeleteResponse {
             current_epoch,
             error: None,
+        }))
+    }
+
+    async fn get_replication_progress(
+        &self,
+        request: Request<ReplicationProgressRequest>,
+    ) -> Result<Response<ReplicationProgressResponse>, Status> {
+        let request = request.into_inner();
+        let state = self.state.read().await;
+        if request.topology_epoch != state.topology.epoch {
+            return Err(Status::failed_precondition(
+                "replication progress epoch is stale",
+            ));
+        }
+        if request.owner_node_id.is_empty() || request.follower_node_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "replication stream identity is empty",
+            ));
+        }
+        let (stream_sequence, oldest_unacked_unix_millis) = if self.node_id == request.owner_node_id
+        {
+            if self
+                .replication_dispatch
+                .failed_streams
+                .lock()
+                .map_err(|_| Status::internal("replication stream state is poisoned"))?
+                .contains(&(
+                    request.topology_epoch,
+                    request.owner_node_id.clone(),
+                    request.follower_node_id.clone(),
+                ))
+            {
+                return Err(Status::failed_precondition(
+                    "owner replication stream is terminal",
+                ));
+            }
+            let key = (request.topology_epoch, request.follower_node_id);
+            (
+                state
+                    .owner_stream_sequences
+                    .get(&key)
+                    .copied()
+                    .unwrap_or_default(),
+                state
+                    .owner_stream_unacked
+                    .get(&key)
+                    .and_then(|queue| queue.front().map(|(_, at)| *at))
+                    .unwrap_or_default(),
+            )
+        } else if self.node_id == request.follower_node_id {
+            let key = (request.topology_epoch, request.owner_node_id);
+            state
+                .follower_streams
+                .get(&key)
+                .map_or((0, 0), |stream| (stream.applied_sequence, 0))
+        } else {
+            return Err(Status::failed_precondition(
+                "node is not part of this replication stream",
+            ));
+        };
+        Ok(Response::new(ReplicationProgressResponse {
+            process_instance_id: self.process_instance_id.clone(),
+            stream_sequence,
+            oldest_unacked_unix_millis,
+        }))
+    }
+
+    async fn install_replication_checkpoint(
+        &self,
+        request: Request<ReplicationCheckpointRequest>,
+    ) -> Result<Response<ReplicationProgressResponse>, Status> {
+        let request = request.into_inner();
+        let mut state = self.state.write().await;
+        if request.topology_epoch != state.topology.epoch
+            || request.follower_node_id != self.node_id
+        {
+            return Err(Status::failed_precondition(
+                "checkpoint does not match follower epoch",
+            ));
+        }
+        let expected: HashSet<_> = state
+            .topology
+            .derived_ranges()
+            .map_err(|error| Status::internal(error.to_string()))?
+            .into_iter()
+            .filter(|range| {
+                range.owner_node_id == request.owner_node_id
+                    && range.follower_node_ids.contains(&self.node_id)
+            })
+            .map(|range| (range.start_exclusive, range.end_inclusive))
+            .collect();
+        if expected.is_empty() || request.verified_ranges.len() != expected.len() {
+            return Err(Status::failed_precondition(
+                "checkpoint does not cover the full follower stream",
+            ));
+        }
+        let mut actual = HashSet::new();
+        for control in &request.verified_ranges {
+            let destination = state
+                .destinations
+                .get(&(control.change_id.clone(), control.range_id.clone()))
+                .ok_or_else(|| Status::failed_precondition("checkpoint range was not prepared"))?;
+            if !destination.committed
+                || destination.range.source_node_id != request.owner_node_id
+                || destination.range.destination_node_id != self.node_id
+                || !actual.insert((
+                    destination.range.start_exclusive,
+                    destination.range.end_inclusive,
+                ))
+            {
+                return Err(Status::failed_precondition(
+                    "checkpoint contains an unverified or duplicate range",
+                ));
+            }
+        }
+        if actual != expected {
+            return Err(Status::failed_precondition(
+                "checkpoint has incomplete stream coverage",
+            ));
+        }
+        let stream = state
+            .follower_streams
+            .entry((request.topology_epoch, request.owner_node_id))
+            .or_default();
+        if request.stream_sequence < stream.applied_sequence {
+            return Err(Status::failed_precondition(
+                "checkpoint would rewind the follower stream",
+            ));
+        }
+        stream.applied_sequence = request.stream_sequence;
+        stream.checkpoint_sequence = request.stream_sequence;
+        Ok(Response::new(ReplicationProgressResponse {
+            process_instance_id: self.process_instance_id.clone(),
+            stream_sequence: stream.applied_sequence,
+            oldest_unacked_unix_millis: 0,
         }))
     }
 
@@ -822,6 +988,15 @@ impl DataNode for DataNodeService {
                 .fingerprints
                 .get(&entry.stream_sequence)
                 .is_some_and(|existing| existing == &fingerprint)
+            {
+                return Ok(Response::new(ReplicateMutationResponse {
+                    applied_stream_sequence: stream.applied_sequence,
+                }));
+            }
+            // The verified full-stream snapshot supersedes queued entries from
+            // before its checkpoint. They cannot mutate data after the snapshot.
+            if entry.stream_sequence <= stream.checkpoint_sequence
+                && !stream.fingerprints.contains_key(&entry.stream_sequence)
             {
                 return Ok(Response::new(ReplicateMutationResponse {
                     applied_stream_sequence: stream.applied_sequence,
@@ -1310,6 +1485,9 @@ impl DataNode for DataNodeService {
             .owner_stream_sequences
             .retain(|(stream_epoch, _), _| *stream_epoch == epoch);
         state
+            .owner_stream_unacked
+            .retain(|(stream_epoch, _), _| *stream_epoch == epoch);
+        state
             .follower_streams
             .retain(|(stream_epoch, _), _| *stream_epoch == epoch);
         self.replication_dispatch.prune_epoch(epoch);
@@ -1495,6 +1673,15 @@ fn replication_fingerprint(entry: &ReplicationEntry) -> String {
     digest.finalize().to_hex().to_string()
 }
 
+fn now_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
 fn start_replication_dispatch(state: Arc<RwLock<NodeState>>) -> ReplicationDispatcher {
     ReplicationDispatcher {
         state,
@@ -1643,6 +1830,17 @@ async fn deliver_replication_stream(
                 Ok(Ok(response))
                     if response.applied_stream_sequence >= prepared.stream_sequence =>
                 {
+                    let mut state = state.write().await;
+                    if let Some(queue) = state.owner_stream_unacked.get_mut(&(
+                        prepared.mutation.topology_epoch,
+                        prepared.follower_node_id.clone(),
+                    )) {
+                        while queue.front().is_some_and(|(sequence, _)| {
+                            *sequence <= response.applied_stream_sequence
+                        }) {
+                            queue.pop_front();
+                        }
+                    }
                     break;
                 }
                 Ok(Err(status)) if retryable_replication_status(status.code()) => {
@@ -1669,7 +1867,8 @@ async fn deliver_replication_stream(
 fn retryable_replication_status(code: tonic::Code) -> bool {
     matches!(
         code,
-        tonic::Code::Cancelled
+        tonic::Code::Aborted
+            | tonic::Code::Cancelled
             | tonic::Code::Unknown
             | tonic::Code::DeadlineExceeded
             | tonic::Code::ResourceExhausted
@@ -1874,6 +2073,7 @@ mod tests {
             records: HashMap::new(),
             next_sequence: 0,
             owner_stream_sequences: HashMap::new(),
+            owner_stream_unacked: HashMap::new(),
             follower_streams: HashMap::new(),
             sources: HashMap::new(),
             destinations: HashMap::new(),
@@ -2053,6 +2253,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_stream_checkpoint_repairs_a_gap_without_replaying_old_entries() {
+        let topology = replication_topology(3);
+        let follower = service_for("node-2", topology.clone());
+        let ranges: Vec<_> = topology
+            .derived_ranges()
+            .unwrap()
+            .into_iter()
+            .filter(|range| {
+                range.owner_node_id == "node-1"
+                    && range.follower_node_ids.iter().any(|node| node == "node-2")
+            })
+            .collect();
+        assert!(ranges.len() > 1);
+        let controls: Vec<_> = ranges
+            .iter()
+            .enumerate()
+            .map(|(index, range)| {
+                let control = RangeControlRequest {
+                    change_id: "repair-test".into(),
+                    range_id: format!("range-{index}"),
+                };
+                let spec = proto::RangeSpec {
+                    change_id: control.change_id.clone(),
+                    range_id: control.range_id.clone(),
+                    start_exclusive: range.start_exclusive,
+                    end_inclusive: range.end_inclusive,
+                    source_node_id: "node-1".into(),
+                    destination_node_id: "node-2".into(),
+                };
+                (control, spec)
+            })
+            .collect();
+        for (control, spec) in &controls {
+            follower
+                .prepare_destination_range(Request::new(PrepareRangeRequest {
+                    range: Some(spec.clone()),
+                }))
+                .await
+                .unwrap();
+            follower
+                .commit_destination_range(Request::new(control.clone()))
+                .await
+                .unwrap();
+        }
+        let checkpoint = ReplicationCheckpointRequest {
+            topology_epoch: 1,
+            owner_node_id: "node-1".into(),
+            follower_node_id: "node-2".into(),
+            stream_sequence: 5,
+            verified_ranges: controls
+                .iter()
+                .map(|(control, _)| control.clone())
+                .collect(),
+        };
+        let mut incomplete = checkpoint.clone();
+        incomplete.verified_ranges.pop();
+        assert_eq!(
+            follower
+                .install_replication_checkpoint(Request::new(incomplete))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        let installed = follower
+            .install_replication_checkpoint(Request::new(checkpoint))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(installed.stream_sequence, 5);
+        let key = key_with_placement(&topology, |replicas| {
+            replicas[0] == "node-1" && replicas.contains(&"node-2")
+        });
+        let old = replication_entry(&topology, key.clone(), 1, 1, b"stale", false);
+        assert_eq!(
+            follower
+                .replicate_mutation(Request::new(old))
+                .await
+                .unwrap()
+                .into_inner()
+                .applied_stream_sequence,
+            5
+        );
+        assert!(!follower.state.read().await.records.contains_key(&key));
+        let gap = replication_entry(&topology, key.clone(), 7, 7, b"gap", false);
+        assert_eq!(
+            follower
+                .replicate_mutation(Request::new(gap))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Aborted
+        );
+        let next = replication_entry(&topology, key.clone(), 6, 6, b"current", false);
+        follower
+            .replicate_mutation(Request::new(next))
+            .await
+            .unwrap();
+        assert_eq!(
+            follower.state.read().await.records[&key].value.as_ref(),
+            b"current"
+        );
+    }
+
+    #[tokio::test]
     async fn follower_rejects_stale_wrong_owner_and_out_of_coverage_entries() {
         let topology = replication_topology(2);
         let follower_key = key_with_placement(&topology, |replicas| {
@@ -2124,6 +2429,7 @@ mod tests {
             records: HashMap::new(),
             next_sequence: 0,
             owner_stream_sequences: HashMap::new(),
+            owner_stream_unacked: HashMap::new(),
             follower_streams: HashMap::new(),
             sources: HashMap::new(),
             destinations: HashMap::new(),
@@ -2286,6 +2592,193 @@ mod tests {
                     .values()
                     .any(|stream| stream.applied_sequence == 8)
                     && state.records[&key].version.owner_sequence == 8
+                {
+                    break;
+                }
+                drop(state);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn dispatcher_resumes_after_a_verified_gap_checkpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let topology = TopologySnapshot::new_with_config(
+            1,
+            42,
+            4,
+            vec![
+                Member {
+                    node_id: "node-1".into(),
+                    endpoint: "http://127.0.0.1:1".into(),
+                },
+                Member {
+                    node_id: "node-2".into(),
+                    endpoint: format!("http://{}", listener.local_addr().unwrap()),
+                },
+            ],
+            TopologyConfig {
+                desired_replication_factor: 2,
+                ..TopologyConfig::default()
+            },
+        )
+        .unwrap();
+        let follower = service_for("node-2", topology.clone());
+        let follower_rpc = follower.clone();
+        let follower_state = follower.state.clone();
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(proto::data_node_server::DataNodeServer::new(follower))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let owner = service_for("node-1", topology.clone());
+        let key = key_with_placement(&topology, |replicas| replicas[0] == "node-1");
+        for (id, value) in [("first", b"one".as_slice())] {
+            let result = owner
+                .put(Request::new(PutRequest {
+                    key: key.clone(),
+                    value: value.to_vec(),
+                    topology_epoch: 1,
+                    request_id: id.into(),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(result.error.is_none());
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if follower_state
+                    .read()
+                    .await
+                    .follower_streams
+                    .values()
+                    .any(|stream| stream.applied_sequence == 1)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        {
+            let mut state = follower_state.write().await;
+            state.follower_streams.clear();
+            state.records.clear();
+        }
+        let result = owner
+            .put(Request::new(PutRequest {
+                key: key.clone(),
+                value: b"two".to_vec(),
+                topology_epoch: 1,
+                request_id: "second".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(result.error.is_none());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            follower_state
+                .read()
+                .await
+                .follower_streams
+                .values()
+                .all(|stream| stream.applied_sequence == 0)
+        );
+        let source_records = owner.state.read().await.records.clone();
+        let mut controls = Vec::new();
+        for (index, range) in topology
+            .derived_ranges()
+            .unwrap()
+            .into_iter()
+            .filter(|range| {
+                range.owner_node_id == "node-1"
+                    && range.follower_node_ids.contains(&"node-2".into())
+            })
+            .enumerate()
+        {
+            let control = RangeControlRequest {
+                change_id: "repair-dispatch".into(),
+                range_id: format!("range-{index}"),
+            };
+            let spec = RangeSpec {
+                change_id: control.change_id.clone(),
+                range_id: control.range_id.clone(),
+                start_exclusive: range.start_exclusive,
+                end_inclusive: range.end_inclusive,
+                source_node_id: "node-1".into(),
+                destination_node_id: "node-2".into(),
+            };
+            let records = source_records
+                .iter()
+                .filter(|(key, _)| spec.contains(topology.key_token(key)))
+                .map(|(key, record)| (key.clone(), record.clone()))
+                .collect();
+            follower_state.write().await.destinations.insert(
+                spec.key(),
+                DestinationMigration {
+                    range: spec,
+                    records,
+                    watermark: 0,
+                    committed: false,
+                    writes_activated: false,
+                },
+            );
+            follower_rpc
+                .commit_destination_range(Request::new(control.clone()))
+                .await
+                .unwrap();
+            controls.push(control);
+        }
+        let checkpoint = follower_rpc
+            .install_replication_checkpoint(Request::new(ReplicationCheckpointRequest {
+                topology_epoch: 1,
+                owner_node_id: "node-1".into(),
+                follower_node_id: "node-2".into(),
+                stream_sequence: 2,
+                verified_ranges: controls,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(checkpoint.stream_sequence, 2);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let state = owner.state.read().await;
+                if state.owner_stream_unacked.values().all(VecDeque::is_empty) {
+                    break;
+                }
+                drop(state);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let result = owner
+            .put(Request::new(PutRequest {
+                key: key.clone(),
+                value: b"three".to_vec(),
+                topology_epoch: 1,
+                request_id: "third".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(result.error.is_none());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let state = follower_state.read().await;
+                if state
+                    .follower_streams
+                    .values()
+                    .any(|stream| stream.applied_sequence == 3)
+                    && state.records[&key].value.as_ref() == b"three"
                 {
                     break;
                 }

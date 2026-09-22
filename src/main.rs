@@ -295,6 +295,13 @@ async fn run_coordinator(args: CoordinatorArgs) -> Result<()> {
                 tracing::error!(%error, "failed to resume topology change");
             }
         }
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            if let Err(error) = recovery_service.resume_replica_repairs().await {
+                tracing::warn!(%error, "replica repair pass failed");
+            }
+        }
     });
     Server::builder()
         .add_service(

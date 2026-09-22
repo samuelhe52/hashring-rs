@@ -1006,6 +1006,13 @@ mod tests {
 
     #[tonic::async_trait]
     impl Coordinator for FakeCoordinator {
+        async fn get_replica_status(
+            &self,
+            _request: Request<proto::Empty>,
+        ) -> Result<Response<proto::ReplicaStatusResponse>, Status> {
+            Err(Status::unimplemented("unused by client tests"))
+        }
+
         async fn get_topology(
             &self,
             _request: Request<proto::Empty>,

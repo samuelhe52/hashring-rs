@@ -2,14 +2,20 @@ use std::{
     net::TcpListener,
     path::Path,
     process::{Child, Command, Stdio},
-    sync::OnceLock,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use hashring_rs::client::{ClientConfig, ClientError, HashringClient};
 use hashring_rs::{
     migration::{MigrationPhase, RangeMigration, TopologyChange},
-    proto::{ErrorCode, GetRequest, data_node_client::DataNodeClient},
+    proto::{
+        Empty, ErrorCode, GetRequest, coordinator_client::CoordinatorClient,
+        data_node_client::DataNodeClient,
+    },
     topology::{Member, TopologySnapshot},
 };
 use tonic::Code;
@@ -110,6 +116,125 @@ async fn connect_without_polling(endpoint: &str, timeout: Duration) -> HashringC
     HashringClient::connect_with_config(endpoint, config)
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn follower_admissions_are_seeded_and_survive_coordinator_restart() {
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("coordinator.redb");
+    let ports = unused_ports(4);
+    let coordinator_port = ports[0];
+    let coordinator_endpoint = format!("http://127.0.0.1:{coordinator_port}");
+    let members: Vec<_> = (1..=3)
+        .map(|index| (format!("node-{index}"), ports[index]))
+        .collect();
+    let mut args = coordinator_arguments(coordinator_port, &state, &members);
+    let vnode_position = args.iter().position(|argument| argument == "32").unwrap();
+    args[vnode_position] = "1".into();
+    let mut coordinator = spawn_process(&args);
+    let client = connect_eventually(&coordinator_endpoint).await;
+    let mut nodes: Vec<_> = members
+        .iter()
+        .map(|(node_id, port)| {
+            spawn_process(&[
+                "node".into(),
+                "--id".into(),
+                node_id.clone(),
+                "--listen".into(),
+                format!("127.0.0.1:{port}"),
+                "--coordinator".into(),
+                coordinator_endpoint.clone(),
+            ])
+        })
+        .collect();
+    for index in 0..40_u64 {
+        let key = index.to_be_bytes().to_vec();
+        client
+            .put(key.clone(), index.to_be_bytes().to_vec())
+            .await
+            .unwrap();
+        if index % 3 == 0 {
+            client.delete(key).await.unwrap();
+        }
+    }
+    let stop_writes = Arc::new(AtomicBool::new(false));
+    let writer_client = client.clone();
+    let writer_stop = stop_writes.clone();
+    let writer = tokio::spawn(async move {
+        let mut writes = 0_u64;
+        while !writer_stop.load(Ordering::Relaxed) {
+            let key = b"concurrent-replica-seed".to_vec();
+            writer_client
+                .put(key.clone(), writes.to_be_bytes().to_vec())
+                .await
+                .unwrap();
+            if writes.is_multiple_of(3) {
+                writer_client.delete(key).await.unwrap();
+            }
+            writes += 1;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        writes
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut admin = CoordinatorClient::connect(coordinator_endpoint.clone())
+        .await
+        .unwrap();
+    loop {
+        let status = admin
+            .get_replica_status(Empty {})
+            .await
+            .unwrap()
+            .into_inner();
+        if status.ranges.iter().all(|range| {
+            range.current_rf == 3 && range.followers.iter().all(|follower| follower.admitted)
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replica admissions did not complete: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    stop_writes.store(true, Ordering::Relaxed);
+    assert!(writer.await.unwrap() > 0);
+    loop {
+        let status = admin
+            .get_replica_status(Empty {})
+            .await
+            .unwrap()
+            .into_inner();
+        if status.ranges.iter().all(|range| {
+            range.followers.iter().all(|follower| {
+                follower.lag_known && follower.stream_head == follower.stream_cursor
+            })
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replica streams remained behind: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    coordinator.stop();
+    coordinator = spawn_process(&coordinator_arguments(coordinator_port, &state, &[]));
+    let _client = connect_eventually(&coordinator_endpoint).await;
+    let mut admin = CoordinatorClient::connect(coordinator_endpoint.clone())
+        .await
+        .unwrap();
+    let status = admin
+        .get_replica_status(Empty {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(status.ranges.iter().all(|range| range.current_rf == 3));
+    coordinator.stop();
+    for node in &mut nodes {
+        node.stop();
+    }
 }
 
 fn token_in_range(token: u64, range: &RangeMigration) -> bool {

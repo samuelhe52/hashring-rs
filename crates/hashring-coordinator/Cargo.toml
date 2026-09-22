@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+blake3 = "1"
 futures = "0.3"
 hashring-core = { version = "0.1.0", path = "../hashring-core" }
 redb = "2"
@@ -12,3 +13,4 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tonic = { version = "0.12", features = ["transport"] }
+tracing = "0.1"

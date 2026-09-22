@@ -49,6 +49,35 @@ service Coordinator {
   rpc ExecuteTopologyChange(ExecuteTopologyChangeRequest) returns (TopologyChangeSnapshot);
   rpc RegisterNode(RegisterNodeRequest) returns (Empty);
   rpc IsStopConfirmed(StopRequest) returns (StopConfirmationResponse);
+  rpc GetReplicaStatus(Empty) returns (ReplicaStatusResponse);
+}
+
+message ReplicaStatusResponse {
+  uint64 topology_epoch = 1;
+  repeated RangeReplicaStatus ranges = 2;
+}
+
+message RangeReplicaStatus {
+  uint64 start_exclusive = 1;
+  uint64 end_inclusive = 2;
+  string owner_node_id = 3;
+  uint32 desired_rf = 4;
+  // Registered owner plus durable admissions for their recorded process IDs.
+  // This is not a liveness or write-eligibility signal; inspect lag_known/lag.
+  uint32 current_rf = 5;
+  repeated FollowerReplicaStatus followers = 6;
+}
+
+message FollowerReplicaStatus {
+  string node_id = 1;
+  bool admitted = 2;
+  string process_instance_id = 3;
+  uint64 verified_watermark = 4;
+  uint64 stream_cursor = 5;
+  uint64 lag_millis = 6;
+  bool lag_known = 7;
+  string repair_state = 8;
+  uint64 stream_head = 9;
 }
 
 message CurrentEpochResponse {
@@ -244,6 +273,26 @@ message ReplicateMutationResponse {
   uint64 applied_stream_sequence = 1;
 }
 
+message ReplicationProgressRequest {
+  uint64 topology_epoch = 1;
+  string owner_node_id = 2;
+  string follower_node_id = 3;
+}
+
+message ReplicationProgressResponse {
+  string process_instance_id = 1;
+  uint64 stream_sequence = 2;
+  uint64 oldest_unacked_unix_millis = 3;
+}
+
+message ReplicationCheckpointRequest {
+  uint64 topology_epoch = 1;
+  string owner_node_id = 2;
+  string follower_node_id = 3;
+  uint64 stream_sequence = 4;
+  repeated RangeControlRequest verified_ranges = 5;
+}
+
 enum ErrorCode {
   ERROR_CODE_UNSPECIFIED = 0;
   NOT_FOUND = 1;
@@ -307,6 +356,8 @@ service DataNode {
   rpc Put(PutRequest) returns (PutResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
   rpc ReplicateMutation(ReplicationEntry) returns (ReplicateMutationResponse);
+  rpc GetReplicationProgress(ReplicationProgressRequest) returns (ReplicationProgressResponse);
+  rpc InstallReplicationCheckpoint(ReplicationCheckpointRequest) returns (ReplicationProgressResponse);
   rpc PrepareSourceRange(PrepareRangeRequest) returns (PrepareSourceRangeResponse);
   rpc PrepareDestinationRange(PrepareRangeRequest) returns (PrepareDestinationRangeResponse);
   rpc GetProcessInfo(Empty) returns (NodeInfoResponse);

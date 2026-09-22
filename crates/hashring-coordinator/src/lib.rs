@@ -7,7 +7,7 @@ use std::{
     future::Future,
     path::Path,
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use futures::{StreamExt, stream::FuturesUnordered};
@@ -47,11 +47,82 @@ pub struct ClusterState {
     pub process_instances: BTreeMap<String, String>,
     #[serde(default)]
     pub stop_confirmations: BTreeMap<String, BTreeSet<String>>,
+    #[serde(default)]
+    pub replica_admissions: Vec<ReplicaAdmission>,
+    #[serde(default)]
+    pub replica_repairs: Vec<ReplicaRepair>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReplicaAdmission {
+    pub epoch: u64,
+    pub start_exclusive: u64,
+    pub end_inclusive: u64,
+    pub owner_node_id: String,
+    pub node_id: String,
+    pub process_instance_id: String,
+    pub verified_watermark: u64,
+    pub stream_cursor: u64,
+    pub digest: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReplicaRepairPhase {
+    Pending,
+    Copying,
+    Verifying,
+    Complete,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReplicaRepair {
+    pub epoch: u64,
+    pub start_exclusive: u64,
+    pub end_inclusive: u64,
+    pub owner_node_id: String,
+    pub node_id: String,
+    pub phase: ReplicaRepairPhase,
+}
+
+struct PreparedReplicaSeed {
+    task: ReplicaRepair,
+    control: RangeControlRequest,
+    admission: ReplicaAdmission,
+}
+
+struct CopiedReplicaSeed {
+    task: ReplicaRepair,
+    change: TopologyChange,
+    range: RangeMigration,
+    control: RangeControlRequest,
+    follower_instance: String,
+}
+
+fn replica_repair_control(task: &ReplicaRepair) -> RangeControlRequest {
+    let mut id = blake3::Hasher::new();
+    id.update(b"hashring-rs:replica-repair:v1\0");
+    id.update(&task.epoch.to_be_bytes());
+    id.update(&task.start_exclusive.to_be_bytes());
+    id.update(&task.end_inclusive.to_be_bytes());
+    id.update(task.owner_node_id.as_bytes());
+    id.update(task.node_id.as_bytes());
+    let change_id = format!("repair-{}", id.finalize().to_hex());
+    RangeControlRequest {
+        range_id: change_id.clone(),
+        change_id,
+    }
 }
 
 impl ClusterState {
     fn validate(&self) -> Result<(), RepositoryError> {
         self.committed.validate()?;
+        if self.replica_admissions.len() > MAX_REPLICA_OBLIGATIONS
+            || self.replica_repairs.len() > MAX_REPLICA_OBLIGATIONS
+        {
+            return Err(RepositoryError::InvalidState(format!(
+                "replica metadata exceeds the {MAX_REPLICA_OBLIGATIONS} task limit"
+            )));
+        }
         if let Some(change) = &self.active_change {
             if change.ranges.len() > MAX_MIGRATION_RANGES {
                 return Err(RepositoryError::InvalidState(format!(
@@ -102,8 +173,164 @@ impl ClusterState {
                 "durable stop confirmations must identify a node and process instance".into(),
             ));
         }
+        let desired: BTreeSet<_> = self
+            .committed
+            .derived_ranges()?
+            .into_iter()
+            .flat_map(|range| {
+                range.follower_node_ids.into_iter().map(move |node_id| {
+                    (
+                        range.start_exclusive,
+                        range.end_inclusive,
+                        range.owner_node_id.clone(),
+                        node_id,
+                    )
+                })
+            })
+            .collect();
+        let mut admissions = BTreeSet::new();
+        for admission in &self.replica_admissions {
+            let key = (
+                admission.start_exclusive,
+                admission.end_inclusive,
+                admission.owner_node_id.clone(),
+                admission.node_id.clone(),
+            );
+            if admission.epoch != self.committed.epoch
+                || admission.process_instance_id.is_empty()
+                || admission.digest.is_empty()
+                || !desired.contains(&key)
+                || !admissions.insert(key)
+            {
+                return Err(RepositoryError::InvalidState(
+                    "invalid or duplicate replica admission".into(),
+                ));
+            }
+        }
+        let mut repairs = BTreeSet::new();
+        for repair in &self.replica_repairs {
+            let key = (
+                repair.start_exclusive,
+                repair.end_inclusive,
+                repair.owner_node_id.clone(),
+                repair.node_id.clone(),
+            );
+            if repair.epoch != self.committed.epoch
+                || !desired.contains(&key)
+                || !repairs.insert(key.clone())
+                || (repair.phase == ReplicaRepairPhase::Complete && !admissions.contains(&key))
+            {
+                return Err(RepositoryError::InvalidState(
+                    "invalid or duplicate replica repair".into(),
+                ));
+            }
+        }
         Ok(())
     }
+}
+
+fn reconcile_replica_repairs(state: &mut ClusterState) -> Result<(), RepositoryError> {
+    let epoch = state.committed.epoch;
+    let ranges = state.committed.derived_ranges()?;
+    if ranges
+        .iter()
+        .map(|range| range.follower_node_ids.len())
+        .sum::<usize>()
+        > MAX_REPLICA_OBLIGATIONS
+    {
+        return Err(RepositoryError::InvalidState(format!(
+            "topology exceeds the {MAX_REPLICA_OBLIGATIONS} replica-task limit"
+        )));
+    }
+    let desired: BTreeSet<_> = ranges
+        .iter()
+        .flat_map(|range| {
+            range.follower_node_ids.iter().map(|node_id| {
+                (
+                    range.start_exclusive,
+                    range.end_inclusive,
+                    range.owner_node_id.clone(),
+                    node_id.clone(),
+                )
+            })
+        })
+        .collect();
+    state.replica_admissions.retain(|admission| {
+        admission.epoch == epoch
+            && state.process_instances.get(&admission.node_id)
+                == Some(&admission.process_instance_id)
+            && desired.contains(&(
+                admission.start_exclusive,
+                admission.end_inclusive,
+                admission.owner_node_id.clone(),
+                admission.node_id.clone(),
+            ))
+    });
+    state.replica_repairs.retain(|repair| {
+        repair.epoch == epoch
+            && desired.contains(&(
+                repair.start_exclusive,
+                repair.end_inclusive,
+                repair.owner_node_id.clone(),
+                repair.node_id.clone(),
+            ))
+    });
+    let admitted: BTreeSet<_> = state
+        .replica_admissions
+        .iter()
+        .map(|admission| {
+            (
+                admission.start_exclusive,
+                admission.end_inclusive,
+                admission.owner_node_id.clone(),
+                admission.node_id.clone(),
+            )
+        })
+        .collect();
+    for repair in &mut state.replica_repairs {
+        if repair.phase == ReplicaRepairPhase::Complete
+            && !admitted.contains(&(
+                repair.start_exclusive,
+                repair.end_inclusive,
+                repair.owner_node_id.clone(),
+                repair.node_id.clone(),
+            ))
+        {
+            repair.phase = ReplicaRepairPhase::Pending;
+        }
+    }
+    let mut existing: BTreeSet<_> = state
+        .replica_repairs
+        .iter()
+        .map(|repair| {
+            (
+                repair.start_exclusive,
+                repair.end_inclusive,
+                repair.owner_node_id.clone(),
+                repair.node_id.clone(),
+            )
+        })
+        .collect();
+    for range in ranges {
+        for node_id in range.follower_node_ids {
+            if existing.insert((
+                range.start_exclusive,
+                range.end_inclusive,
+                range.owner_node_id.clone(),
+                node_id.clone(),
+            )) {
+                state.replica_repairs.push(ReplicaRepair {
+                    epoch,
+                    start_exclusive: range.start_exclusive,
+                    end_inclusive: range.end_inclusive,
+                    owner_node_id: range.owner_node_id.clone(),
+                    node_id,
+                    phase: ReplicaRepairPhase::Pending,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Error)]
@@ -169,6 +396,7 @@ impl CoordinatorRepository for RedbTopologyRepository {
         if let Some(bytes) = table.get(CLUSTER_STATE_KEY)? {
             let mut state: ClusterState = serde_json::from_slice(bytes.value())?;
             upgrade_persisted_state(&mut state)?;
+            reconcile_replica_repairs(&mut state)?;
             state.validate()?;
             return Ok(Some(state));
         }
@@ -176,12 +404,15 @@ impl CoordinatorRepository for RedbTopologyRepository {
         // topology. Promote them in memory; the next state write upgrades them.
         if let Some(bytes) = table.get(COMMITTED_KEY)? {
             let committed: TopologySnapshot = serde_json::from_slice(bytes.value())?;
-            let state = ClusterState {
+            let mut state = ClusterState {
                 committed,
                 active_change: None,
                 process_instances: BTreeMap::new(),
                 stop_confirmations: BTreeMap::new(),
+                replica_admissions: Vec::new(),
+                replica_repairs: Vec::new(),
             };
+            reconcile_replica_repairs(&mut state)?;
             state.validate()?;
             return Ok(Some(state));
         }
@@ -267,12 +498,15 @@ pub fn load_or_initialize(
     }
 
     let bootstrap = bootstrap.ok_or(RepositoryError::MissingBootstrap)?;
-    let state = ClusterState {
+    let mut state = ClusterState {
         committed: bootstrap,
         active_change: None,
         process_instances: BTreeMap::new(),
         stop_confirmations: BTreeMap::new(),
+        replica_admissions: Vec::new(),
+        replica_repairs: Vec::new(),
     };
+    reconcile_replica_repairs(&mut state)?;
     repository.store_state(&state)?;
     Ok(state)
 }
@@ -312,6 +546,418 @@ impl CoordinatorService {
     pub fn with_pre_publish_delay(mut self, delay: Duration) -> Self {
         self.pre_publish_delay = delay;
         self
+    }
+
+    /// Retry durable follower repairs when no topology transition is active.
+    /// A failed task remains pending; the next call can safely start it again.
+    pub async fn resume_replica_repairs(&self) -> Result<usize, Status> {
+        let _execution = self.execution_lock.lock().await;
+        let tasks = {
+            let mut state = self.state.write().await;
+            if state
+                .active_change
+                .as_ref()
+                .is_some_and(|change| !change.phase.is_terminal())
+            {
+                return Ok(0);
+            }
+            let mut next = state.clone();
+            reconcile_replica_repairs(&mut next)
+                .map_err(|error| Status::internal(error.to_string()))?;
+            for repair in &mut next.replica_repairs {
+                if repair.phase != ReplicaRepairPhase::Complete {
+                    repair.phase = ReplicaRepairPhase::Pending;
+                }
+            }
+            if next != *state {
+                self.repository
+                    .store_state(&next)
+                    .map_err(|error| Status::internal(error.to_string()))?;
+                *state = next;
+            }
+            let mut groups: BTreeMap<(String, String), Vec<ReplicaRepair>> = BTreeMap::new();
+            for repair in &state.replica_repairs {
+                if state.process_instances.contains_key(&repair.owner_node_id)
+                    && state.process_instances.contains_key(&repair.node_id)
+                {
+                    groups
+                        .entry((repair.owner_node_id.clone(), repair.node_id.clone()))
+                        .or_default()
+                        .push(repair.clone());
+                }
+            }
+            groups.retain(|_, repairs| {
+                repairs
+                    .iter()
+                    .any(|repair| repair.phase == ReplicaRepairPhase::Pending)
+            });
+            groups.into_values().collect::<Vec<_>>()
+        };
+        let results = try_map_bounded(
+            tasks,
+            self.range_move_concurrency.min(4),
+            |tasks| async move {
+                // Keep other ranges available if one destination is down. Failed
+                // tasks retain durable Pending state for the next retry.
+                match self.seed_replica_group(&tasks).await {
+                    Ok(()) => Ok::<_, Status>(tasks.len()),
+                    Err(error) => {
+                        tracing::warn!(
+                            owner = %tasks[0].owner_node_id,
+                            follower = %tasks[0].node_id,
+                            %error,
+                            "replica seed remains pending"
+                        );
+                        Ok(0)
+                    }
+                }
+            },
+        )
+        .await?;
+        Ok(results.into_iter().sum())
+    }
+
+    async fn copy_replica(&self, task: &ReplicaRepair) -> Result<CopiedReplicaSeed, Status> {
+        let (topology, owner_instance, follower_instance) = {
+            let state = self.state.read().await;
+            if state.committed.epoch != task.epoch {
+                return Err(Status::failed_precondition("replica task epoch is stale"));
+            }
+            let owner_instance = state
+                .process_instances
+                .get(&task.owner_node_id)
+                .ok_or_else(|| Status::unavailable("owner process is not registered"))?
+                .clone();
+            let follower_instance = state
+                .process_instances
+                .get(&task.node_id)
+                .ok_or_else(|| Status::unavailable("follower process is not registered"))?
+                .clone();
+            (state.committed.clone(), owner_instance, follower_instance)
+        };
+        let owner = topology
+            .members
+            .iter()
+            .find(|member| member.node_id == task.owner_node_id)
+            .ok_or_else(|| Status::internal("repair owner is absent from topology"))?;
+        let follower = topology
+            .members
+            .iter()
+            .find(|member| member.node_id == task.node_id)
+            .ok_or_else(|| Status::internal("repair follower is absent from topology"))?;
+        let control = replica_repair_control(task);
+        let range = RangeMigration {
+            range_id: control.range_id.clone(),
+            start_exclusive: task.start_exclusive,
+            end_inclusive: task.end_inclusive,
+            source_node_id: task.owner_node_id.clone(),
+            destination_node_id: task.node_id.clone(),
+            source_endpoint: owner.endpoint.clone(),
+            destination_endpoint: follower.endpoint.clone(),
+            source_process_instance_id: String::new(),
+            destination_process_instance_id: String::new(),
+            source_cleaned: false,
+            snapshot_records: 0,
+            changelog_watermark: 0,
+            verified: false,
+        };
+        let change = TopologyChange {
+            change_id: control.change_id.clone(),
+            base_epoch: task.epoch,
+            target_topology: topology,
+            phase: MigrationPhase::CopyingSnapshot,
+            ranges: Vec::new(),
+            replica_obligations: Vec::new(),
+            stopped_node_ids: Vec::new(),
+            stopping_node_ids: Vec::new(),
+            stop_prepared_node_ids: Vec::new(),
+        };
+        let deadline = Instant::now() + self.migration_timeout;
+        let mut source = connect_node(&range.source_endpoint, deadline).await?;
+        let mut destination = connect_node(&range.destination_endpoint, deadline).await?;
+        // A retry first releases any write fence left by an interrupted attempt.
+        rpc_before(deadline, source.abort_range_migration(control.clone())).await?;
+        rpc_before(deadline, destination.abort_range_migration(control.clone())).await?;
+        self.set_repair_phase(task, ReplicaRepairPhase::Copying)
+            .await?;
+        let copied = self.copy_range(&change, &range, deadline).await?;
+        if copied.source_process_instance_id != owner_instance
+            || copied.destination_process_instance_id != follower_instance
+        {
+            return Err(Status::failed_precondition(
+                "replica process changed during snapshot",
+            ));
+        }
+        Ok(CopiedReplicaSeed {
+            task: task.clone(),
+            change,
+            range: copied,
+            control,
+            follower_instance,
+        })
+    }
+
+    async fn finish_replica(
+        &self,
+        copied: CopiedReplicaSeed,
+        final_watermark: u64,
+        deadline: Instant,
+    ) -> Result<PreparedReplicaSeed, Status> {
+        self.set_repair_phase(&copied.task, ReplicaRepairPhase::Verifying)
+            .await?;
+        let verified = self
+            .finalize_range(&copied.change, &copied.range, final_watermark, deadline)
+            .await?;
+        let mut source = connect_node(&copied.range.source_endpoint, deadline).await?;
+        let digest = rpc_before(deadline, source.source_range_digest(copied.control.clone()))
+            .await?
+            .into_inner()
+            .digest;
+        Ok(PreparedReplicaSeed {
+            task: copied.task.clone(),
+            control: copied.control,
+            admission: ReplicaAdmission {
+                epoch: copied.task.epoch,
+                start_exclusive: copied.task.start_exclusive,
+                end_inclusive: copied.task.end_inclusive,
+                owner_node_id: copied.task.owner_node_id,
+                node_id: copied.task.node_id,
+                process_instance_id: copied.follower_instance,
+                verified_watermark: verified.changelog_watermark,
+                stream_cursor: 0,
+                digest,
+            },
+        })
+    }
+
+    async fn seed_replica_group(&self, tasks: &[ReplicaRepair]) -> Result<(), Status> {
+        let first = tasks
+            .first()
+            .ok_or_else(|| Status::invalid_argument("empty repair group"))?;
+        let (topology, owner_instance, follower_instance) = {
+            let state = self.state.read().await;
+            (
+                state.committed.clone(),
+                state.process_instances.get(&first.owner_node_id).cloned(),
+                state.process_instances.get(&first.node_id).cloned(),
+            )
+        };
+        if topology.epoch != first.epoch {
+            return Err(Status::failed_precondition("repair stream epoch is stale"));
+        }
+        let expected: BTreeSet<_> = topology
+            .derived_ranges()
+            .map_err(|error| Status::internal(error.to_string()))?
+            .into_iter()
+            .filter(|range| {
+                range.owner_node_id == first.owner_node_id
+                    && range.follower_node_ids.contains(&first.node_id)
+            })
+            .map(|range| (range.start_exclusive, range.end_inclusive))
+            .collect();
+        let actual: BTreeSet<_> = tasks
+            .iter()
+            .map(|task| (task.start_exclusive, task.end_inclusive))
+            .collect();
+        if expected.is_empty()
+            || expected != actual
+            || tasks.iter().any(|task| {
+                task.epoch != first.epoch
+                    || task.owner_node_id != first.owner_node_id
+                    || task.node_id != first.node_id
+            })
+        {
+            return Err(Status::failed_precondition(
+                "repair group does not cover its full stream",
+            ));
+        }
+        let owner_endpoint = topology
+            .members
+            .iter()
+            .find(|member| member.node_id == first.owner_node_id)
+            .ok_or_else(|| Status::internal("repair owner is absent"))?
+            .endpoint
+            .clone();
+        let follower_endpoint = topology
+            .members
+            .iter()
+            .find(|member| member.node_id == first.node_id)
+            .ok_or_else(|| Status::internal("repair follower is absent"))?
+            .endpoint
+            .clone();
+        let mut prepared = Vec::with_capacity(tasks.len());
+        let result = async {
+            // Snapshot all ranges while writes continue. Only the short final
+            // replay/checkpoint window fences writes for this stream.
+            let copied = try_map_bounded(
+                tasks.to_vec(),
+                self.range_move_concurrency.min(4),
+                |task| async move { self.copy_replica(&task).await },
+            )
+            .await?;
+            let deadline = Instant::now() + self.migration_timeout;
+            let paused =
+                try_map_bounded(copied, self.range_move_concurrency, |copied| async move {
+                    let watermark = self
+                        .pause_range(&copied.change, &copied.range, deadline)
+                        .await?;
+                    Ok::<_, Status>((copied, watermark))
+                })
+                .await?;
+            prepared = try_map_bounded(
+                paused,
+                self.range_move_concurrency.min(4),
+                |(copied, watermark)| async move {
+                    self.finish_replica(copied, watermark, deadline).await
+                },
+            )
+            .await?;
+            let deadline = Instant::now() + self.migration_timeout;
+            let mut source = connect_node(&owner_endpoint, deadline).await?;
+            let mut destination = connect_node(&follower_endpoint, deadline).await?;
+            let request = proto::ReplicationProgressRequest {
+                topology_epoch: first.epoch,
+                owner_node_id: first.owner_node_id.clone(),
+                follower_node_id: first.node_id.clone(),
+            };
+            let head = rpc_before(deadline, source.get_replication_progress(request))
+                .await?
+                .into_inner();
+            if Some(head.process_instance_id.as_str()) != owner_instance.as_deref() {
+                return Err(Status::failed_precondition(
+                    "owner process changed before checkpoint",
+                ));
+            }
+            let checkpoint = rpc_before(
+                deadline,
+                destination.install_replication_checkpoint(proto::ReplicationCheckpointRequest {
+                    topology_epoch: first.epoch,
+                    owner_node_id: first.owner_node_id.clone(),
+                    follower_node_id: first.node_id.clone(),
+                    stream_sequence: head.stream_sequence,
+                    verified_ranges: prepared.iter().map(|seed| seed.control.clone()).collect(),
+                }),
+            )
+            .await?
+            .into_inner();
+            if Some(checkpoint.process_instance_id.as_str()) != follower_instance.as_deref()
+                || checkpoint.stream_sequence < head.stream_sequence
+            {
+                return Err(Status::failed_precondition(
+                    "follower process changed before checkpoint",
+                ));
+            }
+            for seed in &mut prepared {
+                seed.admission.stream_cursor = checkpoint.stream_sequence;
+                rpc_before(deadline, source.cleanup_source_range(seed.control.clone())).await?;
+                rpc_before(
+                    deadline,
+                    destination.abort_range_migration(seed.control.clone()),
+                )
+                .await?;
+            }
+            for seed in &prepared {
+                self.store_repair_admission(&seed.task, seed.admission.clone())
+                    .await?;
+            }
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            let cleanup_deadline = Instant::now() + self.migration_timeout;
+            let controls: Vec<_> = tasks.iter().map(replica_repair_control).collect();
+            if let Ok(mut source) = connect_node(&owner_endpoint, cleanup_deadline).await {
+                for control in &controls {
+                    let _ = rpc_before(
+                        cleanup_deadline,
+                        source.abort_range_migration(control.clone()),
+                    )
+                    .await;
+                }
+            }
+            if let Ok(mut destination) = connect_node(&follower_endpoint, cleanup_deadline).await {
+                for control in &controls {
+                    let _ = rpc_before(
+                        cleanup_deadline,
+                        destination.abort_range_migration(control.clone()),
+                    )
+                    .await;
+                }
+            }
+            for task in tasks {
+                self.set_repair_phase(task, ReplicaRepairPhase::Pending)
+                    .await?;
+            }
+        }
+        result
+    }
+
+    async fn set_repair_phase(
+        &self,
+        task: &ReplicaRepair,
+        phase: ReplicaRepairPhase,
+    ) -> Result<(), Status> {
+        let mut state = self.state.write().await;
+        let mut next = state.clone();
+        let repair = next
+            .replica_repairs
+            .iter_mut()
+            .find(|repair| {
+                repair == &task
+                    || (repair.epoch == task.epoch
+                        && repair.start_exclusive == task.start_exclusive
+                        && repair.end_inclusive == task.end_inclusive
+                        && repair.owner_node_id == task.owner_node_id
+                        && repair.node_id == task.node_id)
+            })
+            .ok_or_else(|| Status::failed_precondition("replica repair was invalidated"))?;
+        repair.phase = phase;
+        self.repository
+            .store_state(&next)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        *state = next;
+        Ok(())
+    }
+
+    async fn store_repair_admission(
+        &self,
+        task: &ReplicaRepair,
+        admission: ReplicaAdmission,
+    ) -> Result<(), Status> {
+        let mut state = self.state.write().await;
+        let mut next = state.clone();
+        if next.committed.epoch != task.epoch
+            || next.process_instances.get(&task.node_id) != Some(&admission.process_instance_id)
+        {
+            return Err(Status::failed_precondition(
+                "replica changed before durable admission",
+            ));
+        }
+        let repair = next
+            .replica_repairs
+            .iter_mut()
+            .find(|repair| {
+                repair.epoch == task.epoch
+                    && repair.start_exclusive == task.start_exclusive
+                    && repair.end_inclusive == task.end_inclusive
+                    && repair.owner_node_id == task.owner_node_id
+                    && repair.node_id == task.node_id
+            })
+            .ok_or_else(|| Status::failed_precondition("replica repair was invalidated"))?;
+        repair.phase = ReplicaRepairPhase::Complete;
+        next.replica_admissions.retain(|existing| {
+            !(existing.epoch == task.epoch
+                && existing.start_exclusive == task.start_exclusive
+                && existing.end_inclusive == task.end_inclusive
+                && existing.owner_node_id == task.owner_node_id
+                && existing.node_id == task.node_id)
+        });
+        next.replica_admissions.push(admission);
+        self.repository
+            .store_state(&next)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        *state = next;
+        Ok(())
     }
 
     pub async fn resume_interrupted_change(&self) -> Result<Option<TopologyChange>, Status> {
@@ -478,6 +1124,8 @@ impl CoordinatorService {
             }
             active.phase = MigrationPhase::Published;
             next.committed = active.target_topology.clone();
+            reconcile_replica_repairs(&mut next)
+                .map_err(|error| Status::internal(error.to_string()))?;
             self.repository
                 .store_state(&next)
                 .map_err(|error| Status::internal(error.to_string()))?;
@@ -1141,6 +1789,157 @@ impl Coordinator for CoordinatorService {
         Ok(Response::new(proto::CurrentEpochResponse { epoch }))
     }
 
+    async fn get_replica_status(
+        &self,
+        _request: Request<proto::Empty>,
+    ) -> Result<Response<proto::ReplicaStatusResponse>, Status> {
+        let state = self.state.read().await.clone();
+        let epoch = state.committed.epoch;
+        let members: BTreeMap<_, _> = state
+            .committed
+            .members
+            .iter()
+            .map(|member| (member.node_id.clone(), member.endpoint.clone()))
+            .collect();
+        let pairs: BTreeSet<_> = state
+            .replica_repairs
+            .iter()
+            .map(|repair| (repair.owner_node_id.clone(), repair.node_id.clone()))
+            .collect();
+        let progress = try_map_bounded(pairs, self.range_move_concurrency, |(owner, follower)| {
+            let source_endpoint = members.get(&owner).cloned();
+            let destination_endpoint = members.get(&follower).cloned();
+            let owner_instance = state.process_instances.get(&owner).cloned();
+            let follower_instance = state.process_instances.get(&follower).cloned();
+            async move {
+                let current = match (
+                    source_endpoint,
+                    destination_endpoint,
+                    owner_instance,
+                    follower_instance,
+                ) {
+                    (
+                        Some(source_endpoint),
+                        Some(destination_endpoint),
+                        Some(owner_instance),
+                        Some(follower_instance),
+                    ) => {
+                        read_replication_pair(
+                            epoch,
+                            &owner,
+                            &follower,
+                            &source_endpoint,
+                            &destination_endpoint,
+                            &owner_instance,
+                            &follower_instance,
+                        )
+                        .await
+                    }
+                    _ => None,
+                };
+                Ok::<_, Status>(((owner, follower), current))
+            }
+        })
+        .await?
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        let admissions: BTreeMap<_, _> = state
+            .replica_admissions
+            .iter()
+            .map(|admission| {
+                (
+                    (
+                        admission.start_exclusive,
+                        admission.end_inclusive,
+                        admission.owner_node_id.as_str(),
+                        admission.node_id.as_str(),
+                    ),
+                    admission,
+                )
+            })
+            .collect();
+        let repairs: BTreeMap<_, _> = state
+            .replica_repairs
+            .iter()
+            .map(|repair| {
+                (
+                    (
+                        repair.start_exclusive,
+                        repair.end_inclusive,
+                        repair.owner_node_id.as_str(),
+                        repair.node_id.as_str(),
+                    ),
+                    repair,
+                )
+            })
+            .collect();
+        let ranges = state
+            .committed
+            .derived_ranges()
+            .map_err(|error| Status::internal(error.to_string()))?
+            .into_iter()
+            .map(|range| {
+                let followers: Vec<_> = range
+                    .follower_node_ids
+                    .iter()
+                    .map(|node_id| {
+                        let key = (
+                            range.start_exclusive,
+                            range.end_inclusive,
+                            range.owner_node_id.as_str(),
+                            node_id.as_str(),
+                        );
+                        let admission = admissions.get(&key).copied().filter(|admission| {
+                            state.process_instances.get(node_id)
+                                == Some(&admission.process_instance_id)
+                        });
+                        let repair = repairs.get(&key).copied();
+                        let live = progress
+                            .get(&(range.owner_node_id.clone(), node_id.clone()))
+                            .and_then(Option::as_ref);
+                        proto::FollowerReplicaStatus {
+                            node_id: node_id.clone(),
+                            admitted: admission.is_some(),
+                            process_instance_id: admission
+                                .map(|admission| admission.process_instance_id.clone())
+                                .unwrap_or_default(),
+                            verified_watermark: admission
+                                .map(|admission| admission.verified_watermark)
+                                .unwrap_or_default(),
+                            stream_cursor: live
+                                .map(|(_, cursor, _)| *cursor)
+                                .or_else(|| admission.map(|admission| admission.stream_cursor))
+                                .unwrap_or_default(),
+                            lag_millis: live.map(|(_, _, lag)| *lag).unwrap_or_default(),
+                            lag_known: live.is_some(),
+                            stream_head: live.map(|(head, _, _)| *head).unwrap_or_default(),
+                            repair_state: repair
+                                .map(|repair| format!("{:?}", repair.phase))
+                                .unwrap_or_default(),
+                        }
+                    })
+                    .collect();
+                proto::RangeReplicaStatus {
+                    start_exclusive: range.start_exclusive,
+                    end_inclusive: range.end_inclusive,
+                    owner_node_id: range.owner_node_id.clone(),
+                    desired_rf: state.committed.desired_replication_factor,
+                    current_rf: u32::from(
+                        state.process_instances.contains_key(&range.owner_node_id),
+                    ) + followers
+                        .iter()
+                        .filter(|follower| follower.admitted)
+                        .count() as u32,
+                    followers,
+                }
+            })
+            .collect();
+        Ok(Response::new(proto::ReplicaStatusResponse {
+            topology_epoch: epoch,
+            ranges,
+        }))
+    }
+
     async fn begin_topology_change(
         &self,
         request: Request<proto::BeginTopologyChangeRequest>,
@@ -1166,6 +1965,18 @@ impl Coordinator for CoordinatorService {
         }
         let change = TopologyChange::plan(&state.committed, target_members)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let target_tasks: usize = change
+            .target_topology
+            .derived_ranges()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?
+            .iter()
+            .map(|range| range.follower_node_ids.len())
+            .sum();
+        if target_tasks > MAX_REPLICA_OBLIGATIONS {
+            return Err(Status::resource_exhausted(format!(
+                "target topology exceeds the {MAX_REPLICA_OBLIGATIONS} replica-task limit"
+            )));
+        }
         let mut next = state.clone();
         next.active_change = Some(change.clone());
         self.repository
@@ -1424,6 +2235,54 @@ async fn replay_changelog(
     }
 }
 
+async fn read_replication_pair(
+    epoch: u64,
+    owner: &str,
+    follower: &str,
+    owner_endpoint: &str,
+    follower_endpoint: &str,
+    owner_instance: &str,
+    follower_instance: &str,
+) -> Option<(u64, u64, u64)> {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut source = connect_node(owner_endpoint, deadline).await.ok()?;
+    let mut destination = connect_node(follower_endpoint, deadline).await.ok()?;
+    let request = proto::ReplicationProgressRequest {
+        topology_epoch: epoch,
+        owner_node_id: owner.to_owned(),
+        follower_node_id: follower.to_owned(),
+    };
+    let head = rpc_before(deadline, source.get_replication_progress(request.clone()))
+        .await
+        .ok()?
+        .into_inner();
+    let applied = rpc_before(deadline, destination.get_replication_progress(request))
+        .await
+        .ok()?
+        .into_inner();
+    if head.process_instance_id != owner_instance
+        || applied.process_instance_id != follower_instance
+    {
+        return None;
+    }
+    let lag = if applied.stream_sequence >= head.stream_sequence {
+        0
+    } else {
+        let last = head.oldest_unacked_unix_millis;
+        if last == 0 {
+            return None;
+        }
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_millis()
+            .saturating_sub(u128::from(last))
+            .try_into()
+            .unwrap_or(u64::MAX)
+    };
+    Some((head.stream_sequence, applied.stream_sequence, lag))
+}
+
 async fn connect_node(
     endpoint: &str,
     deadline: Instant,
@@ -1591,6 +2450,8 @@ mod tests {
             active_change: Some(change),
             process_instances: BTreeMap::new(),
             stop_confirmations: BTreeMap::new(),
+            replica_admissions: Vec::new(),
+            replica_repairs: Vec::new(),
         };
         let mut old = serde_json::to_value(state).unwrap();
         old.as_object_mut().unwrap().remove("process_instances");
@@ -1637,6 +2498,8 @@ mod tests {
                 active_change: Some(change),
                 process_instances: BTreeMap::from([("n1".into(), "process-1".into())]),
                 stop_confirmations: BTreeMap::new(),
+                replica_admissions: Vec::new(),
+                replica_repairs: Vec::new(),
             },
             repository,
             Duration::from_secs(1),
@@ -1670,5 +2533,102 @@ mod tests {
             .unwrap()
             .into_inner();
         assert!(!replacement.confirmed);
+    }
+
+    #[tokio::test]
+    async fn replica_status_only_counts_verified_current_processes() {
+        let repository = Arc::new(MemoryRepository::default());
+        let topology = TopologySnapshot::new(
+            1,
+            7,
+            1,
+            vec![
+                Member {
+                    node_id: "n1".into(),
+                    endpoint: "http://127.0.0.1:5001".into(),
+                },
+                Member {
+                    node_id: "n2".into(),
+                    endpoint: "http://127.0.0.1:5002".into(),
+                },
+                Member {
+                    node_id: "n3".into(),
+                    endpoint: "http://127.0.0.1:5003".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let mut state = load_or_initialize(repository.as_ref(), Some(topology)).unwrap();
+        assert_eq!(
+            state.replica_repairs.len(),
+            state.committed.derived_ranges().unwrap().len() * 2
+        );
+        let repair = state.replica_repairs[0].clone();
+        state
+            .process_instances
+            .insert(repair.owner_node_id.clone(), "owner-1".into());
+        state
+            .process_instances
+            .insert(repair.node_id.clone(), "follower-1".into());
+        state.replica_admissions.push(ReplicaAdmission {
+            epoch: repair.epoch,
+            start_exclusive: repair.start_exclusive,
+            end_inclusive: repair.end_inclusive,
+            owner_node_id: repair.owner_node_id.clone(),
+            node_id: repair.node_id.clone(),
+            process_instance_id: "follower-1".into(),
+            verified_watermark: 4,
+            stream_cursor: 7,
+            digest: "verified".into(),
+        });
+        state.replica_repairs[0].phase = ReplicaRepairPhase::Complete;
+        repository.store_state(&state).unwrap();
+        let restored = load_or_initialize(repository.as_ref(), None).unwrap();
+        assert_eq!(restored.replica_admissions, state.replica_admissions);
+        let service = CoordinatorService::new(restored, repository, Duration::from_secs(1));
+        let status = service
+            .get_replica_status(Request::new(proto::Empty {}))
+            .await
+            .unwrap()
+            .into_inner();
+        let range = status
+            .ranges
+            .iter()
+            .find(|range| {
+                range.start_exclusive == repair.start_exclusive
+                    && range.end_inclusive == repair.end_inclusive
+            })
+            .unwrap();
+        assert_eq!(range.current_rf, 2);
+        assert!(
+            range
+                .followers
+                .iter()
+                .any(|follower| follower.node_id == repair.node_id && follower.admitted)
+        );
+        service
+            .state
+            .write()
+            .await
+            .process_instances
+            .insert(repair.node_id, "follower-2".into());
+        let status = service
+            .get_replica_status(Request::new(proto::Empty {}))
+            .await
+            .unwrap()
+            .into_inner();
+        let range = status
+            .ranges
+            .iter()
+            .find(|range| {
+                range.start_exclusive == repair.start_exclusive
+                    && range.end_inclusive == repair.end_inclusive
+            })
+            .unwrap();
+        assert_eq!(range.current_rf, 1);
+        let mut state = service.state.read().await.clone();
+        reconcile_replica_repairs(&mut state).unwrap();
+        assert!(state.replica_admissions.is_empty());
+        assert_eq!(state.replica_repairs[0].phase, ReplicaRepairPhase::Pending);
     }
 }
