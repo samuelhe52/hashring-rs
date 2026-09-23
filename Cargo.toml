@@ -38,3 +38,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+debug = true
+# 可选：同时保留符号名称
+strip = false

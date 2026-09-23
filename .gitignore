@@ -26,3 +26,6 @@
 # Local planning and scratch files
 /PLAN.md
 /tmp/
+
+// Performance testing
+perf*
