@@ -1,6 +1,101 @@
 use super::*;
 
 #[tokio::test]
+async fn published_direct_merge_resumes_after_coordinator_restart() {
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("direct-merge.redb");
+    let ports = unused_ports(4);
+    let endpoint = format!("http://127.0.0.1:{}", ports[0]);
+    let members: Vec<_> = (1..=3)
+        .map(|index| (format!("node-{index}"), ports[index]))
+        .collect();
+    let mut args = coordinator_arguments(ports[0], &state, &members);
+    args.extend(["--post-publish-delay-ms".into(), "2000".into()]);
+    let mut coordinator = spawn_process(&args);
+    wait_for_listener(ports[0]);
+    let client = HashringClient::connect(&endpoint, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let _nodes: Vec<_> = members
+        .iter()
+        .map(|(node_id, port)| {
+            spawn_process(&[
+                "node".into(),
+                "--id".into(),
+                node_id.clone(),
+                "--listen".into(),
+                format!("127.0.0.1:{port}"),
+                "--coordinator".into(),
+                endpoint.clone(),
+            ])
+        })
+        .collect();
+    wait_for_full_rf(&endpoint, 1, 3).await;
+    let old = client.topology().await;
+    let key = (0_u64..10_000)
+        .map(|value| value.to_be_bytes().to_vec())
+        .find(|key| old.owner(key).unwrap().node_id == "node-1")
+        .unwrap();
+    client.put(key.clone(), b"merged".to_vec()).await.unwrap();
+    let plan = client
+        .begin_topology_change(promoted_members(&members[1..]))
+        .await
+        .unwrap();
+    assert!(plan.direct_merge);
+    assert!(plan.ranges.is_empty());
+    let runner = client.clone();
+    let task = tokio::spawn(async move {
+        runner
+            .execute_topology_change(&plan.change_id, plan.base_epoch, plan.target_topology.epoch)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if client
+                .topology_change()
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|change| change.phase == MigrationPhase::Published)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("direct merge did not publish");
+    coordinator.stop();
+    let _ = task.await;
+    coordinator = spawn_process(&coordinator_arguments(ports[0], &state, &[]));
+    wait_for_listener(ports[0]);
+    let fresh = HashringClient::connect(&endpoint, Duration::from_secs(20))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(25), async {
+        loop {
+            if fresh
+                .topology_change()
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|change| change.phase == MigrationPhase::Complete)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("direct merge did not recover");
+    assert_eq!(fresh.get(key.clone()).await.unwrap().value, b"merged");
+    fresh.put(key.clone(), b"after".to_vec()).await.unwrap();
+    assert_eq!(fresh.get(key).await.unwrap().value, b"after");
+    coordinator.stop();
+}
+
+#[tokio::test]
 async fn rf_and_guard_transitions_publish_and_preserve_data() {
     let _guard = process_test_lock().lock().await;
     let directory = tempfile::tempdir().unwrap();
@@ -795,10 +890,11 @@ async fn three_to_four_to_three_preserves_data_and_replica_readiness() {
         .begin_topology_change(promoted_members(&members[..3]))
         .await
         .unwrap();
-    assert!(
-        plan.ranges
-            .iter()
-            .any(|range| { token_in_range(plan.target_topology.key_token(&moving_key), range) })
+    assert!(plan.direct_merge);
+    assert!(plan.ranges.is_empty());
+    assert_ne!(
+        expanded.target_topology.owner(&moving_key).unwrap().node_id,
+        plan.target_topology.owner(&moving_key).unwrap().node_id
     );
     let contracted = client
         .execute_topology_change(&plan.change_id, plan.base_epoch, plan.target_topology.epoch)

@@ -802,6 +802,7 @@ mod tests {
             stop_prepared_node_ids: Vec::new(),
             failed_node_id: None,
             activation_ready: false,
+            direct_merge: false,
         };
         let wire = crate::proto::TopologyChangeSnapshot::from(&change);
         assert!(wire.encoded_len() <= crate::limits::MAX_CONTROL_MESSAGE_BYTES);

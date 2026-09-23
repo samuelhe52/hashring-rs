@@ -85,6 +85,8 @@ pub struct TopologyChange {
     pub failed_node_id: Option<String>,
     #[serde(default)]
     pub activation_ready: bool,
+    #[serde(default)]
+    pub direct_merge: bool,
 }
 
 #[derive(Debug, Error)]
@@ -173,6 +175,7 @@ impl TopologyChange {
             stop_prepared_node_ids: Vec::new(),
             failed_node_id: None,
             activation_ready: false,
+            direct_merge: false,
         })
     }
 }
@@ -383,6 +386,7 @@ impl From<&TopologyChange> for crate::proto::TopologyChangeSnapshot {
             stop_prepared_node_ids: change.stop_prepared_node_ids.clone(),
             failed_node_id: change.failed_node_id.clone().unwrap_or_default(),
             activation_ready: change.activation_ready,
+            direct_merge: change.direct_merge,
         }
     }
 }
@@ -413,6 +417,7 @@ impl TryFrom<crate::proto::TopologyChangeSnapshot> for TopologyChange {
             stop_prepared_node_ids: change.stop_prepared_node_ids,
             failed_node_id: (!change.failed_node_id.is_empty()).then_some(change.failed_node_id),
             activation_ready: change.activation_ready,
+            direct_merge: change.direct_merge,
         })
     }
 }

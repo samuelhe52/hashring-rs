@@ -75,8 +75,9 @@ async fn experiment_runner_preserves_reproducibility_artifacts() {
             .lines()
             .filter(|line| line.contains("migration_mutation_overlap_observed"))
             .count(),
-        2
+        1
     );
+    assert!(events.contains("direct_merge_cutover_observed"));
     assert!(events.contains("untouched_moving_sentinels"));
     assert!(events.contains("deleted_moving_keys"));
     assert!(events.contains("restored_moving_keys"));

@@ -62,6 +62,9 @@ impl CoordinatorService {
                 return Ok(change);
             }
             MigrationPhase::Published | MigrationPhase::CleaningUp => {
+                if change.direct_merge {
+                    return self.finish_direct_merge(change).await;
+                }
                 if change.supersedes_change_id.is_some() {
                     return self.finish_recovered_change(change).await;
                 }
@@ -80,6 +83,9 @@ impl CoordinatorService {
             }
         }
 
+        if change.direct_merge {
+            return self.execute_direct_merge(change, retry_transient).await;
+        }
         if change.ranges.is_empty()
             && change.replica_obligations.is_empty()
             && change.target_topology.members == self.state.read().await.committed.members
@@ -1207,7 +1213,10 @@ impl CoordinatorService {
     pub(super) async fn finish_abort(&self, change: &TopologyChange) -> Result<(), Status> {
         let deadline = Instant::now() + self.migration_timeout;
         self.clear_prepublication_nodes(change, deadline).await?;
-        if change.ranges.is_empty() && change.replica_obligations.is_empty() {
+        if change.direct_merge {
+            self.set_direct_merge_fence(change, false, true, deadline)
+                .await?;
+        } else if change.ranges.is_empty() && change.replica_obligations.is_empty() {
             self.policy_fence_members(change, false, deadline).await?;
         }
         self.set_phase(MigrationPhase::Aborted).await

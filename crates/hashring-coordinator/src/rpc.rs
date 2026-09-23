@@ -353,8 +353,12 @@ impl Coordinator for CoordinatorService {
                 "change membership and topology configuration in separate transitions",
             ));
         }
-        let change = TopologyChange::plan_with_config(&state.committed, target_members, config)
+        let mut change = TopologyChange::plan_with_config(&state.committed, target_members, config)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if can_direct_merge(&state, &change) {
+            change.direct_merge = true;
+            change.ranges.clear();
+        }
         let target = &change.target_topology;
         let member_count = target.members.len();
         let guard = &target.write_availability_guard;

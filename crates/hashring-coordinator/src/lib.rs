@@ -608,12 +608,14 @@ struct PeerFailure {
 
 mod change;
 mod failure;
+mod merge;
 mod migration_helpers;
 mod policy;
 mod repair;
 mod rpc;
 
 use failure::*;
+use merge::*;
 use migration_helpers::*;
 
 #[cfg(test)]

@@ -109,6 +109,56 @@ fn failover_requires_admitted_coverage_for_every_old_interval() {
 }
 
 #[test]
+fn direct_merge_requires_admitted_natural_successor_coverage() {
+    let members: Vec<_> = (1..=3)
+        .map(|index| Member {
+            node_id: format!("n{index}"),
+            endpoint: format!("http://127.0.0.1:500{index}"),
+        })
+        .collect();
+    let mut config = hashring_core::topology::TopologyConfig::default();
+    config.write_availability_guard.minimum_admitted_copies = 1;
+    config.write_availability_guard.minimum_healthy_followers = 0;
+    let old = TopologySnapshot::new_with_config(1, 7, 4, members.clone(), config).unwrap();
+    let change = TopologyChange::plan(
+        &old,
+        members
+            .into_iter()
+            .filter(|member| member.node_id != "n1")
+            .collect(),
+    )
+    .unwrap();
+    let repo = MemoryRepository::default();
+    let mut state = load_or_initialize(&repo, Some(old.clone())).unwrap();
+    for member in &old.members {
+        state.process_instances.insert(
+            member.node_id.clone(),
+            format!("{}-process", member.node_id),
+        );
+    }
+    assert!(!can_direct_merge(&state, &change));
+    for range in old.derived_ranges().unwrap() {
+        let follower = range.follower_node_ids.first().unwrap();
+        state.replica_admissions.push(ReplicaAdmission {
+            epoch: old.epoch,
+            start_exclusive: range.start_exclusive,
+            end_inclusive: range.end_inclusive,
+            owner_node_id: range.owner_node_id,
+            node_id: follower.clone(),
+            process_instance_id: format!("{follower}-process"),
+            verified_watermark: 0,
+            stream_cursor: 0,
+            digest: "verified".into(),
+        });
+    }
+    assert!(can_direct_merge(&state, &change));
+    state
+        .replica_admissions
+        .retain(|admission| admission.owner_node_id != "n1");
+    assert!(!can_direct_merge(&state, &change));
+}
+
+#[test]
 fn a_single_failed_peer_link_never_confirms_node_failure() {
     let members: Vec<_> = (1..=3)
         .map(|index| Member {

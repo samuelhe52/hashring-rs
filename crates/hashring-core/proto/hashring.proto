@@ -144,6 +144,7 @@ message TopologyChangeSnapshot {
   bool activation_ready = 11;
   TopologySnapshot base_topology = 12;
   string supersedes_change_id = 13;
+  bool direct_merge = 14;
 }
 
 message ReplicaObligation {

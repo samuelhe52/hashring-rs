@@ -513,6 +513,7 @@ impl CoordinatorService {
             stop_prepared_node_ids: Vec::new(),
             failed_node_id: None,
             activation_ready: false,
+            direct_merge: false,
         };
         let deadline = Instant::now() + self.migration_timeout;
         let mut source = connect_node(&range.source_endpoint, deadline).await?;

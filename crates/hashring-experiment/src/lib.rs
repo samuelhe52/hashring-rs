@@ -1055,6 +1055,7 @@ async fn migrate_while_mutating(
     events: &EventLog,
 ) -> Result<Duration> {
     let label = workload.label;
+    let direct_merge = change.direct_merge;
     events.record(
         "migration_started",
         json!({ "label": label, "change_id": change.change_id }),
@@ -1067,7 +1068,11 @@ async fn migrate_while_mutating(
             .execute_topology_change(change_id, change.base_epoch, change.target_topology.epoch)
             .await
     });
-    let active_phase = wait_for_migration_activity(admin_client).await?;
+    let active_phase = if direct_merge {
+        None
+    } else {
+        Some(wait_for_migration_activity(admin_client).await?)
+    };
     let completed_mutations = Arc::new(AtomicU64::new(0));
     let writer_client = workload_client.clone();
     let writer_progress = completed_mutations.clone();
@@ -1082,25 +1087,27 @@ async fn migrate_while_mutating(
         )
         .await
     });
-    let (overlap_phase, overlap_mutations) =
-        match wait_for_mutation_overlap(admin_client, &completed_mutations, &writer).await {
-            Ok(overlap) => overlap,
-            Err(error) => {
-                writer.abort();
-                execution.abort();
-                return Err(error);
-            }
-        };
-    events.record(
-        "migration_mutation_overlap_observed",
-        json!({
-            "label": label,
-            "initial_phase": format!("{active_phase:?}"),
-            "observed_phase": format!("{overlap_phase:?}"),
-            "completed_mutations_while_active": overlap_mutations,
-            "untouched_moving_sentinels": workload.sentinel_count,
-        }),
-    )?;
+    if !direct_merge {
+        let (overlap_phase, overlap_mutations) =
+            match wait_for_mutation_overlap(admin_client, &completed_mutations, &writer).await {
+                Ok(overlap) => overlap,
+                Err(error) => {
+                    writer.abort();
+                    execution.abort();
+                    return Err(error);
+                }
+            };
+        events.record(
+            "migration_mutation_overlap_observed",
+            json!({
+                "label": label,
+                "initial_phase": format!("{:?}", active_phase.expect("copy migration has an active phase")),
+                "observed_phase": format!("{overlap_phase:?}"),
+                "completed_mutations_while_active": overlap_mutations,
+                "untouched_moving_sentinels": workload.sentinel_count,
+            }),
+        )?;
+    }
     let mutations = writer.await.context("joining concurrent mutator")??;
     let completed = execution.await.context("joining migration execution")??;
     ensure!(
@@ -1108,6 +1115,16 @@ async fn migrate_while_mutating(
         "migration ended in {:?}",
         completed.phase
     );
+    if direct_merge {
+        events.record(
+            "direct_merge_cutover_observed",
+            json!({
+                "label": label,
+                "completed_mutations": completed_mutations.load(AtomicOrdering::Acquire),
+                "untouched_moving_sentinels": workload.sentinel_count,
+            }),
+        )?;
+    }
     let duration = started.elapsed();
     events.record(
         "migration_complete",
@@ -1345,27 +1362,27 @@ fn moving_key_cohorts(change: &TopologyChange, key_count: u64) -> Result<MovingK
 }
 
 fn moving_keys(change: &TopologyChange, key_count: u64) -> Vec<u64> {
+    let base = change
+        .base_topology
+        .as_ref()
+        .expect("planned change includes its base topology");
     let mut moving = Vec::new();
     for key in 0..key_count {
         let encoded = key.to_be_bytes();
-        let token = change.target_topology.key_token(&encoded);
-        if change
-            .ranges
-            .iter()
-            .any(|range| range_contains(range.start_exclusive, range.end_inclusive, token))
+        if base
+            .owner(&encoded)
+            .expect("base topology is valid")
+            .node_id
+            != change
+                .target_topology
+                .owner(&encoded)
+                .expect("target topology is valid")
+                .node_id
         {
             moving.push(key);
         }
     }
     moving
-}
-
-fn range_contains(start_exclusive: u64, end_inclusive: u64, token: u64) -> bool {
-    match start_exclusive.cmp(&end_inclusive) {
-        std::cmp::Ordering::Less => token > start_exclusive && token <= end_inclusive,
-        std::cmp::Ordering::Greater => token > start_exclusive || token <= end_inclusive,
-        std::cmp::Ordering::Equal => true,
-    }
 }
 
 fn deterministic_value(key: u64, round: u64, value_bytes: usize) -> Vec<u8> {
