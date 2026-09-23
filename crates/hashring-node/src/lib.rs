@@ -12,7 +12,10 @@ use std::{
 };
 
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, watch};
-use tonic::{Request, Response, Status};
+use tonic::{
+    Request, Response, Status,
+    transport::{Channel, Endpoint},
+};
 
 pub use hashring_core::limits::{
     DEFAULT_MAX_KEY_BYTES, DEFAULT_MAX_VALUE_BYTES, MAX_CONTROL_MESSAGE_BYTES,
@@ -262,6 +265,7 @@ pub struct DataNodeService {
     node_id: String,
     process_instance_id: String,
     coordinator_endpoint: String,
+    coordinator_channel: Channel,
     state: Arc<RwLock<NodeState>>,
     replication_dispatch: ReplicationDispatcher,
     refresh_lock: Arc<Mutex<()>>,
@@ -284,11 +288,9 @@ impl DataNodeService {
             || topology.write_ack_policy != WriteAckPolicy::OwnerOnly;
         let status = if needs_status {
             let result = tokio::time::timeout(REPLICATION_RPC_TIMEOUT, async {
-                let mut client = configure_coordinator_client(
-                    CoordinatorClient::connect(self.coordinator_endpoint.clone())
-                        .await
-                        .map_err(|error| error.to_string())?,
-                );
+                let mut client = configure_coordinator_client(CoordinatorClient::new(
+                    self.coordinator_channel.clone(),
+                ));
                 client
                     .get_replica_status(proto::Empty {})
                     .await
@@ -385,6 +387,10 @@ impl DataNodeService {
             process_instance_id.clone(),
         )
         .await?;
+        // A Channel reconnects on demand and is cheap to clone. Guarded writes
+        // must not create a fresh TCP connection for every readiness check.
+        let coordinator_channel =
+            Endpoint::from_shared(coordinator_endpoint.clone())?.connect_lazy();
         let (shutdown, _) = watch::channel(false);
         let state = Arc::new(RwLock::new(NodeState {
             topology,
@@ -408,6 +414,7 @@ impl DataNodeService {
             node_id,
             process_instance_id,
             coordinator_endpoint,
+            coordinator_channel,
             state,
             replication_dispatch,
             refresh_lock: Arc::new(Mutex::new(())),
@@ -433,9 +440,9 @@ impl DataNodeService {
         // makes local authority expire no later than the coordinator's grant.
         let sent_at = Instant::now();
         let response = tokio::time::timeout(REPLICATION_RPC_TIMEOUT, async {
-            let mut client = configure_coordinator_client(
-                CoordinatorClient::connect(self.coordinator_endpoint.clone()).await?,
-            );
+            let mut client = configure_coordinator_client(CoordinatorClient::new(
+                self.coordinator_channel.clone(),
+            ));
             Ok::<_, anyhow::Error>(
                 client
                     .renew_node_lease(proto::RenewNodeLeaseRequest {
@@ -514,15 +521,8 @@ impl DataNodeService {
         if selected.is_empty() {
             return;
         }
-        let coordinator = match tokio::time::timeout(
-            PEER_PROBE_TIMEOUT,
-            CoordinatorClient::connect(self.coordinator_endpoint.clone()),
-        )
-        .await
-        {
-            Ok(Ok(client)) => configure_coordinator_client(client),
-            _ => return,
-        };
+        let coordinator =
+            configure_coordinator_client(CoordinatorClient::new(self.coordinator_channel.clone()));
         let mut probes = tokio::task::JoinSet::new();
         for member in selected {
             let mut coordinator = coordinator.clone();
@@ -3326,6 +3326,7 @@ mod tests {
             node_id: node_id.into(),
             process_instance_id: "instance-1".into(),
             coordinator_endpoint: "http://127.0.0.1:5000".into(),
+            coordinator_channel: Endpoint::from_static("http://127.0.0.1:5000").connect_lazy(),
             state,
             replication_dispatch,
             refresh_lock: Arc::new(Mutex::new(())),
@@ -4357,7 +4358,9 @@ mod tests {
                         ..Default::default()
                     },
                 ],
+                ..Default::default()
             }],
+            ..Default::default()
         };
         assert!(required_followers(&topology, token, Some(&status), "node-1").is_err());
         status.ranges[0].followers[0].lag_known = true;

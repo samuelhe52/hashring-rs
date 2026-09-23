@@ -289,6 +289,25 @@ impl HashringClient {
             .map_err(ClientError::from)
     }
 
+    pub async fn replica_status(&self) -> Result<proto::ReplicaStatusResponse, ClientError> {
+        let endpoint = self.inner.coordinator_endpoint.clone();
+        tokio::time::timeout(self.inner.operation_timeout, async move {
+            let mut client =
+                configure_coordinator_client(CoordinatorClient::connect(endpoint).await?);
+            Ok::<_, anyhow::Error>(
+                client
+                    .get_replica_status(proto::Empty {})
+                    .await?
+                    .into_inner(),
+            )
+        })
+        .await
+        .map_err(|_| ClientError::DeadlineExceeded {
+            unknown_write_outcome: false,
+        })?
+        .map_err(ClientError::from)
+    }
+
     pub async fn execute_topology_change(
         &self,
         change_id: impl Into<String>,

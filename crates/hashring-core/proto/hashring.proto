@@ -57,6 +57,7 @@ service Coordinator {
 message ReplicaStatusResponse {
   uint64 topology_epoch = 1;
   repeated RangeReplicaStatus ranges = 2;
+  bool activation_pending = 3;
 }
 
 message RangeReplicaStatus {
@@ -68,6 +69,12 @@ message RangeReplicaStatus {
   // This is not a liveness or write-eligibility signal; inspect lag_known/lag.
   uint32 current_rf = 5;
   repeated FollowerReplicaStatus followers = 6;
+  bool owner_leased = 7;
+  uint32 live_rf = 8;
+  bool writable = 9;
+  string write_block_reason = 10;
+  bool under_replicated = 11;
+  bool repairing = 12;
 }
 
 message FollowerReplicaStatus {
@@ -80,6 +87,11 @@ message FollowerReplicaStatus {
   bool lag_known = 7;
   string repair_state = 8;
   uint64 stream_head = 9;
+  bool leased = 10;
+  bool healthy = 11;
+  uint32 repair_retry_count = 12;
+  uint64 repair_next_attempt_unix_millis = 13;
+  string repair_last_error = 14;
 }
 
 message CurrentEpochResponse {

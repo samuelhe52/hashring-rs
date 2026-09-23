@@ -18,7 +18,10 @@ use tokio::{
     sync::{Mutex, RwLock, watch},
     time::Instant,
 };
-use tonic::{Request, Response, Status};
+use tonic::{
+    Request, Response, Status,
+    transport::{Channel, Endpoint},
+};
 
 use hashring_core::{
     limits::{MAX_CONTROL_MESSAGE_BYTES, MAX_MIGRATION_PAGE_BYTES},
@@ -33,12 +36,22 @@ use hashring_core::{
         data_node_client::DataNodeClient,
     },
     topology::{Member, TopologySnapshot, WriteAckPolicy},
+    transport::configure_data_node_client,
 };
 
 const TOPOLOGY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("topology");
 const COMMITTED_KEY: &str = "committed";
 const CLUSTER_STATE_KEY: &str = "cluster-state-v1";
+fn unix_millis_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
 pub const DEFAULT_RANGE_MOVE_CONCURRENCY: usize = 16;
+const MAX_REPAIR_GROUPS_PER_PASS: usize = 32;
 pub const NODE_LEASE_DURATION: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -86,6 +99,12 @@ pub struct ReplicaRepair {
     pub owner_node_id: String,
     pub node_id: String,
     pub phase: ReplicaRepairPhase,
+    #[serde(default)]
+    pub retry_count: u32,
+    #[serde(default)]
+    pub next_attempt_unix_millis: u64,
+    #[serde(default)]
+    pub last_error: String,
 }
 
 struct PreparedReplicaSeed {
@@ -335,6 +354,9 @@ fn reconcile_replica_repairs(state: &mut ClusterState) -> Result<(), RepositoryE
                     owner_node_id: range.owner_node_id.clone(),
                     node_id,
                     phase: ReplicaRepairPhase::Pending,
+                    retry_count: 0,
+                    next_attempt_unix_millis: 0,
+                    last_error: String::new(),
                 });
             }
         }
@@ -532,6 +554,7 @@ pub struct CoordinatorService {
     pre_publish_delay: Duration,
     lease_grants: Arc<Mutex<BTreeMap<String, NodeLeaseGrant>>>,
     peer_failures: Arc<Mutex<BTreeMap<(String, String), PeerFailure>>>,
+    status_channels: Arc<Mutex<BTreeMap<String, Channel>>>,
     startup_at: Instant,
     repair_interrupt: Arc<watch::Sender<u64>>,
 }
@@ -565,6 +588,7 @@ impl CoordinatorService {
             pre_publish_delay: Duration::ZERO,
             lease_grants: Arc::new(Mutex::new(BTreeMap::new())),
             peer_failures: Arc::new(Mutex::new(BTreeMap::new())),
+            status_channels: Arc::new(Mutex::new(BTreeMap::new())),
             startup_at: Instant::now(),
             repair_interrupt: Arc::new(repair_interrupt),
         }
@@ -677,6 +701,7 @@ impl CoordinatorService {
                 *state = next;
             }
             let mut groups: BTreeMap<(String, String), Vec<ReplicaRepair>> = BTreeMap::new();
+            let now_unix_millis = unix_millis_now();
             for repair in &state.replica_repairs {
                 if state.process_instances.contains_key(&repair.owner_node_id)
                     && state.process_instances.contains_key(&repair.node_id)
@@ -691,8 +716,23 @@ impl CoordinatorService {
                 repairs
                     .iter()
                     .any(|repair| repair.phase == ReplicaRepairPhase::Pending)
+                    && repairs.iter().all(|repair| {
+                        repair.phase == ReplicaRepairPhase::Complete
+                            || repair.next_attempt_unix_millis <= now_unix_millis
+                    })
             });
-            groups.into_values().collect::<Vec<_>>()
+            // Bound one pass as well as in-flight work. Remaining groups stay
+            // durable and are considered on the next periodic pass.
+            let mut due = groups.into_values().collect::<Vec<_>>();
+            due.sort_by_key(|group| {
+                group
+                    .iter()
+                    .map(|repair| repair.retry_count)
+                    .max()
+                    .unwrap_or(0)
+            });
+            due.truncate(MAX_REPAIR_GROUPS_PER_PASS);
+            due
         };
         let work = try_map_bounded(
             tasks,
@@ -703,6 +743,7 @@ impl CoordinatorService {
                 match self.seed_replica_group(&tasks).await {
                     Ok(()) => Ok::<_, Status>(tasks.len()),
                     Err(error) => {
+                        self.record_repair_failure(&tasks, &error).await?;
                         tracing::warn!(
                             owner = %tasks[0].owner_node_id,
                             follower = %tasks[0].node_id,
@@ -725,6 +766,38 @@ impl CoordinatorService {
             }
         };
         Ok(results.into_iter().sum())
+    }
+
+    async fn record_repair_failure(
+        &self,
+        tasks: &[ReplicaRepair],
+        error: &Status,
+    ) -> Result<(), Status> {
+        let mut state = self.state.write().await;
+        let mut next = state.clone();
+        let now = unix_millis_now();
+        for task in tasks {
+            if let Some(repair) = next.replica_repairs.iter_mut().find(|repair| {
+                repair.epoch == task.epoch
+                    && repair.start_exclusive == task.start_exclusive
+                    && repair.end_inclusive == task.end_inclusive
+                    && repair.owner_node_id == task.owner_node_id
+                    && repair.node_id == task.node_id
+                    && repair.phase != ReplicaRepairPhase::Complete
+            }) {
+                repair.retry_count = repair.retry_count.saturating_add(1);
+                let delay_secs = 1u64 << repair.retry_count.min(6);
+                repair.next_attempt_unix_millis = now.saturating_add(delay_secs.min(60) * 1000);
+                repair.last_error = error.message().chars().take(256).collect();
+            }
+        }
+        if next != *state {
+            self.repository
+                .store_state(&next)
+                .map_err(|error| Status::internal(error.to_string()))?;
+            *state = next;
+        }
+        Ok(())
     }
 
     async fn cleanup_interrupted_repairs(&self) -> Result<(), Status> {
@@ -1177,6 +1250,9 @@ impl CoordinatorService {
             })
             .ok_or_else(|| Status::failed_precondition("replica repair was invalidated"))?;
         repair.phase = ReplicaRepairPhase::Complete;
+        repair.retry_count = 0;
+        repair.next_attempt_unix_millis = 0;
+        repair.last_error.clear();
         next.replica_admissions.retain(|existing| {
             !(existing.epoch == task.epoch
                 && existing.start_exclusive == task.start_exclusive
@@ -2486,6 +2562,20 @@ impl Coordinator for CoordinatorService {
             .iter()
             .map(|member| (member.node_id.clone(), member.endpoint.clone()))
             .collect();
+        let channels = {
+            let mut cache = self.status_channels.lock().await;
+            let active: BTreeSet<_> = members.values().cloned().collect();
+            cache.retain(|endpoint, _| active.contains(endpoint));
+            for endpoint in &active {
+                if !cache.contains_key(endpoint) {
+                    let channel = Endpoint::from_shared(endpoint.clone())
+                        .map_err(|error| Status::internal(error.to_string()))?
+                        .connect_lazy();
+                    cache.insert(endpoint.clone(), channel);
+                }
+            }
+            cache.clone()
+        };
         let pairs: BTreeSet<_> = state
             .replica_repairs
             .iter()
@@ -2494,6 +2584,14 @@ impl Coordinator for CoordinatorService {
         let progress = try_map_bounded(pairs, self.range_move_concurrency, |(owner, follower)| {
             let source_endpoint = members.get(&owner).cloned();
             let destination_endpoint = members.get(&follower).cloned();
+            let source_channel = source_endpoint
+                .as_ref()
+                .and_then(|endpoint| channels.get(endpoint))
+                .cloned();
+            let destination_channel = destination_endpoint
+                .as_ref()
+                .and_then(|endpoint| channels.get(endpoint))
+                .cloned();
             let owner_instance = live_nodes
                 .contains(&owner)
                 .then(|| state.process_instances.get(&owner).cloned())
@@ -2504,14 +2602,14 @@ impl Coordinator for CoordinatorService {
                 .flatten();
             async move {
                 let current = match (
-                    source_endpoint,
-                    destination_endpoint,
+                    source_channel,
+                    destination_channel,
                     owner_instance,
                     follower_instance,
                 ) {
                     (
-                        Some(source_endpoint),
-                        Some(destination_endpoint),
+                        Some(source_channel),
+                        Some(destination_channel),
                         Some(owner_instance),
                         Some(follower_instance),
                     ) => {
@@ -2519,8 +2617,8 @@ impl Coordinator for CoordinatorService {
                             epoch,
                             &owner,
                             &follower,
-                            &source_endpoint,
-                            &destination_endpoint,
+                            source_channel,
+                            destination_channel,
                             &owner_instance,
                             &follower_instance,
                         )
@@ -2564,12 +2662,17 @@ impl Coordinator for CoordinatorService {
                 )
             })
             .collect();
+        let activation_pending = state.active_change.as_ref().is_some_and(|change| {
+            change.phase == MigrationPhase::Published && !change.activation_ready
+        });
         let ranges = state
             .committed
             .derived_ranges()
             .map_err(|error| Status::internal(error.to_string()))?
             .into_iter()
             .map(|range| {
+                let owner_leased = live_nodes.contains(&range.owner_node_id);
+                let guard = &state.committed.write_availability_guard;
                 let followers: Vec<_> = range
                     .follower_node_ids
                     .iter()
@@ -2589,6 +2692,10 @@ impl Coordinator for CoordinatorService {
                         let live = progress
                             .get(&(range.owner_node_id.clone(), node_id.clone()))
                             .and_then(Option::as_ref);
+                        let leased = live_nodes.contains(node_id);
+                        let healthy = admission.is_some()
+                            && leased
+                            && live.is_some_and(|(_, _, lag)| *lag <= guard.max_replica_lag_millis);
                         proto::FollowerReplicaStatus {
                             node_id: node_id.clone(),
                             admitted: admission.is_some(),
@@ -2608,9 +2715,81 @@ impl Coordinator for CoordinatorService {
                             repair_state: repair
                                 .map(|repair| format!("{:?}", repair.phase))
                                 .unwrap_or_default(),
+                            leased,
+                            healthy,
+                            repair_retry_count: repair.map_or(0, |repair| repair.retry_count),
+                            repair_next_attempt_unix_millis: repair
+                                .map_or(0, |repair| repair.next_attempt_unix_millis),
+                            repair_last_error: repair
+                                .map_or(String::new(), |repair| repair.last_error.clone()),
                         }
                     })
                     .collect();
+                let admitted = followers
+                    .iter()
+                    .filter(|follower| follower.admitted)
+                    .count() as u32;
+                let healthy = followers.iter().filter(|follower| follower.healthy).count() as u32;
+                let live_rf = u32::from(owner_leased)
+                    + followers
+                        .iter()
+                        .filter(|follower| follower.admitted && follower.leased)
+                        .count() as u32;
+                let required = match state.committed.write_ack_policy {
+                    WriteAckPolicy::OwnerOnly => Vec::new(),
+                    WriteAckPolicy::FirstSuccessor => {
+                        range.follower_node_ids.iter().take(1).collect()
+                    }
+                    WriteAckPolicy::AllReplicas => range.follower_node_ids.iter().collect(),
+                };
+                let transition_fenced = state.active_change.as_ref().is_some_and(|change| {
+                    matches!(
+                        change.phase,
+                        MigrationPhase::PausingWrites
+                            | MigrationPhase::Verifying
+                            | MigrationPhase::ReadyToPublish
+                    ) && (change.target_topology.write_ack_policy
+                        != state.committed.write_ack_policy
+                        || change.ranges.iter().any(|moving| {
+                            intervals_overlap(
+                                range.start_exclusive,
+                                range.end_inclusive,
+                                moving.start_exclusive,
+                                moving.end_inclusive,
+                            )
+                        }))
+                });
+                let write_block_reason = if activation_pending {
+                    "topology activation pending".to_owned()
+                } else if transition_fenced {
+                    "topology cutover write fence may be active".to_owned()
+                } else if !owner_leased {
+                    "owner lease unavailable".to_owned()
+                } else if state.committed.write_ack_policy == WriteAckPolicy::FirstSuccessor
+                    && range.follower_node_ids.is_empty()
+                {
+                    "first successor is not in desired placement".to_owned()
+                } else if state.committed.write_ack_policy == WriteAckPolicy::AllReplicas
+                    && range.follower_node_ids.len() + 1
+                        < state.committed.desired_replication_factor as usize
+                {
+                    "complete desired replication factor is unavailable".to_owned()
+                } else if admitted.saturating_add(1) < guard.minimum_admitted_copies
+                    || healthy < guard.minimum_healthy_followers
+                {
+                    "minimum admitted-copy or healthy-follower guard is not satisfied".to_owned()
+                } else if let Some(missing) = required.into_iter().find(|node_id| {
+                    !followers
+                        .iter()
+                        .any(|follower| follower.node_id == **node_id && follower.healthy)
+                }) {
+                    format!("required follower {missing} is not healthy and admitted")
+                } else {
+                    String::new()
+                };
+                let repairing = followers
+                    .iter()
+                    .any(|follower| !follower.admitted || follower.repair_state != "Complete");
                 proto::RangeReplicaStatus {
                     start_exclusive: range.start_exclusive,
                     end_inclusive: range.end_inclusive,
@@ -2619,17 +2798,21 @@ impl Coordinator for CoordinatorService {
                     current_rf: u32::from(
                         state.process_instances.contains_key(&range.owner_node_id)
                             && !state.fenced_nodes.contains(&range.owner_node_id),
-                    ) + followers
-                        .iter()
-                        .filter(|follower| follower.admitted)
-                        .count() as u32,
+                    ) + admitted,
                     followers,
+                    owner_leased,
+                    live_rf,
+                    writable: write_block_reason.is_empty(),
+                    write_block_reason,
+                    under_replicated: live_rf < state.committed.desired_replication_factor,
+                    repairing,
                 }
             })
             .collect();
         Ok(Response::new(proto::ReplicaStatusResponse {
             topology_epoch: epoch,
             ranges,
+            activation_pending,
         }))
     }
 
@@ -2906,6 +3089,20 @@ impl Coordinator for CoordinatorService {
             .is_some_and(|instances| instances.contains(&request.process_instance_id));
         Ok(Response::new(proto::StopConfirmationResponse { confirmed }))
     }
+}
+
+fn interval_contains(start: u64, end: u64, token: u64) -> bool {
+    if start == end {
+        true
+    } else if start < end {
+        token > start && token <= end
+    } else {
+        token > start || token <= end
+    }
+}
+
+fn intervals_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
+    interval_contains(a_start, a_end, b_end) || interval_contains(b_start, b_end, a_end)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3235,14 +3432,14 @@ async fn read_replication_pair(
     epoch: u64,
     owner: &str,
     follower: &str,
-    owner_endpoint: &str,
-    follower_endpoint: &str,
+    owner_channel: Channel,
+    follower_channel: Channel,
     owner_instance: &str,
     follower_instance: &str,
 ) -> Option<(u64, u64, u64)> {
     let deadline = Instant::now() + Duration::from_millis(500);
-    let mut source = connect_node(owner_endpoint, deadline).await.ok()?;
-    let mut destination = connect_node(follower_endpoint, deadline).await.ok()?;
+    let mut source = configure_data_node_client(DataNodeClient::new(owner_channel));
+    let mut destination = configure_data_node_client(DataNodeClient::new(follower_channel));
     let request = proto::ReplicationProgressRequest {
         topology_epoch: epoch,
         owner_node_id: owner.to_owned(),
@@ -3591,8 +3788,10 @@ mod tests {
                             ..Default::default()
                         })
                         .collect(),
+                    ..Default::default()
                 })
                 .collect(),
+            ..Default::default()
         };
         assert!(policy_readiness_verified(&target, &status));
         status.ranges[0].followers[1].stream_cursor = 0;
@@ -3844,6 +4043,12 @@ mod tests {
             })
             .unwrap();
         assert_eq!(range.current_rf, 2);
+        assert_eq!(range.live_rf, 0);
+        assert!(!range.owner_leased);
+        assert!(!range.writable);
+        assert_eq!(range.write_block_reason, "owner lease unavailable");
+        assert!(range.under_replicated);
+        assert!(range.repairing);
         assert!(
             range
                 .followers
@@ -3874,5 +4079,43 @@ mod tests {
         reconcile_replica_repairs(&mut state).unwrap();
         assert!(state.replica_admissions.is_empty());
         assert_eq!(state.replica_repairs[0].phase, ReplicaRepairPhase::Pending);
+    }
+
+    #[tokio::test]
+    async fn repair_failure_is_durably_backed_off_and_reported() {
+        let repository = Arc::new(MemoryRepository::default());
+        let topology = TopologySnapshot::new(
+            1,
+            7,
+            1,
+            vec![
+                Member {
+                    node_id: "n1".into(),
+                    endpoint: "http://127.0.0.1:5001".into(),
+                },
+                Member {
+                    node_id: "n2".into(),
+                    endpoint: "http://127.0.0.1:5002".into(),
+                },
+                Member {
+                    node_id: "n3".into(),
+                    endpoint: "http://127.0.0.1:5003".into(),
+                },
+            ],
+        )
+        .unwrap();
+        let state = load_or_initialize(repository.as_ref(), Some(topology)).unwrap();
+        let task = state.replica_repairs[0].clone();
+        let service = CoordinatorService::new(state, repository.clone(), Duration::from_secs(1));
+        let before = unix_millis_now();
+        service
+            .record_repair_failure(&[task], &Status::unavailable("follower offline"))
+            .await
+            .unwrap();
+        let restored = load_or_initialize(repository.as_ref(), None).unwrap();
+        let repair = &restored.replica_repairs[0];
+        assert_eq!(repair.retry_count, 1);
+        assert!(repair.next_attempt_unix_millis >= before + 2_000);
+        assert_eq!(repair.last_error, "follower offline");
     }
 }

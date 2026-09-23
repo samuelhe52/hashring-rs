@@ -45,6 +45,8 @@ enum Command {
     BeginPolicyChange(PolicyChangeArgs),
     /// Print the active topology change, if any.
     ChangeStatus(ClientArgs),
+    /// Print per-range admission, liveness, write readiness, and repair state.
+    ReplicaStatus(ClientArgs),
     /// Execute the active migration through publication and cleanup.
     ExecuteChange(ExecuteChangeArgs),
     /// Run a reproducible separate-process correctness or performance experiment.
@@ -238,6 +240,7 @@ async fn main() -> Result<()> {
         Command::BeginChange(args) => run_begin_change(args).await,
         Command::BeginPolicyChange(args) => run_begin_policy_change(args).await,
         Command::ChangeStatus(args) => run_change_status(args).await,
+        Command::ReplicaStatus(args) => run_replica_status(args).await,
         Command::ExecuteChange(args) => run_execute_change(args).await,
         Command::Experiment(args) => run_local_experiment(args).await,
     }
@@ -466,6 +469,60 @@ async fn run_change_status(args: ClientArgs) -> Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&client.topology_change().await?)?
+    );
+    Ok(())
+}
+
+async fn run_replica_status(args: ClientArgs) -> Result<()> {
+    let status = connect_client(&args).await?.replica_status().await?;
+    let ranges: Vec<_> = status
+        .ranges
+        .into_iter()
+        .map(|range| {
+            let followers: Vec<_> = range
+                .followers
+                .into_iter()
+                .map(|follower| {
+                    serde_json::json!({
+                        "node_id": follower.node_id,
+                        "admitted": follower.admitted,
+                        "leased": follower.leased,
+                        "healthy": follower.healthy,
+                        "process_instance_id": follower.process_instance_id,
+                        "verified_watermark": follower.verified_watermark,
+                        "stream_cursor": follower.stream_cursor,
+                        "stream_head": follower.stream_head,
+                        "lag_millis": follower.lag_known.then_some(follower.lag_millis),
+                        "repair_state": follower.repair_state,
+                        "repair_retry_count": follower.repair_retry_count,
+                        "repair_next_attempt_unix_millis": follower.repair_next_attempt_unix_millis,
+                        "repair_last_error": follower.repair_last_error,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "start_exclusive": range.start_exclusive,
+                "end_inclusive": range.end_inclusive,
+                "owner_node_id": range.owner_node_id,
+                "desired_rf": range.desired_rf,
+                "current_rf": range.current_rf,
+                "live_rf": range.live_rf,
+                "owner_leased": range.owner_leased,
+                "writable": range.writable,
+                "write_block_reason": range.write_block_reason,
+                "under_replicated": range.under_replicated,
+                "repairing": range.repairing,
+                "followers": followers,
+            })
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "topology_epoch": status.topology_epoch,
+            "activation_pending": status.activation_pending,
+            "ranges": ranges,
+        }))?
     );
     Ok(())
 }
