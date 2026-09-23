@@ -365,6 +365,38 @@ fn initializes_once_then_loads_durable_value() {
     );
 }
 
+#[tokio::test]
+async fn recovery_block_reason_does_not_outlive_its_change() {
+    for terminal in [MigrationPhase::Complete, MigrationPhase::Aborted] {
+        let repository = Arc::new(MemoryRepository::default());
+        let committed = topology();
+        let mut state = load_or_initialize(repository.as_ref(), Some(committed.clone())).unwrap();
+        state.active_change = Some(
+            TopologyChange::plan(
+                &committed,
+                vec![
+                    committed.members[0].clone(),
+                    Member {
+                        node_id: "n2".into(),
+                        endpoint: "http://127.0.0.1:5002".into(),
+                    },
+                ],
+            )
+            .unwrap(),
+        );
+        state.recovery_block_reason = "failed original owner".into();
+        let service = CoordinatorService::new(state, repository.clone(), Duration::from_secs(1));
+
+        service.set_phase(terminal).await.unwrap();
+        assert!(
+            load_or_initialize(repository.as_ref(), None)
+                .unwrap()
+                .recovery_block_reason
+                .is_empty()
+        );
+    }
+}
+
 #[test]
 fn upgrades_prior_v1_topology_change_shape() {
     let committed = topology();
@@ -382,11 +414,13 @@ fn upgrades_prior_v1_topology_change_shape() {
     let state = ClusterState {
         committed,
         active_change: Some(change),
+        superseded_change: None,
         process_instances: BTreeMap::new(),
         stop_confirmations: BTreeMap::new(),
         replica_admissions: Vec::new(),
         replica_repairs: Vec::new(),
         fenced_nodes: BTreeSet::new(),
+        recovery_block_reason: String::new(),
     };
     let mut old = serde_json::to_value(state).unwrap();
     old.as_object_mut().unwrap().remove("process_instances");
@@ -433,11 +467,13 @@ async fn durable_stop_confirmation_survives_active_change_replacement() {
         ClusterState {
             committed,
             active_change: Some(change),
+            superseded_change: None,
             process_instances: BTreeMap::from([("n1".into(), "process-1".into())]),
             stop_confirmations: BTreeMap::new(),
             replica_admissions: Vec::new(),
             replica_repairs: Vec::new(),
             fenced_nodes: BTreeSet::new(),
+            recovery_block_reason: String::new(),
         },
         repository,
         Duration::from_secs(1),

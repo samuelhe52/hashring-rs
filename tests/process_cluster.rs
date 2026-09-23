@@ -68,7 +68,7 @@ fn spawn_process(arguments: &[String]) -> Process {
 
 fn wait_for_listener(port: u16) {
     let address = format!("127.0.0.1:{port}").parse().unwrap();
-    for _ in 0..100 {
+    for _ in 0..300 {
         if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(20)).is_ok() {
             return;
         }

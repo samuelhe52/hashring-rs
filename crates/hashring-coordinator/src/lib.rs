@@ -52,12 +52,16 @@ fn unix_millis_now() -> u64 {
 }
 pub const DEFAULT_RANGE_MOVE_CONCURRENCY: usize = 16;
 const MAX_REPAIR_GROUPS_PER_PASS: usize = 32;
+const MAX_PENDING_PROBES_PER_PASS: usize = 32;
+const PREPUBLICATION_FAILURE_GRACE: Duration = Duration::from_secs(30);
 pub const NODE_LEASE_DURATION: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterState {
     pub committed: TopologySnapshot,
     pub active_change: Option<TopologyChange>,
+    #[serde(default)]
+    pub superseded_change: Option<TopologyChange>,
     #[serde(default)]
     pub process_instances: BTreeMap<String, String>,
     #[serde(default)]
@@ -68,6 +72,8 @@ pub struct ClusterState {
     pub replica_repairs: Vec<ReplicaRepair>,
     #[serde(default)]
     pub fenced_nodes: BTreeSet<String>,
+    #[serde(default)]
+    pub recovery_block_reason: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -147,6 +153,17 @@ impl ClusterState {
             )));
         }
         if let Some(change) = &self.active_change {
+            if let Some(superseded_id) = &change.supersedes_change_id
+                && self.superseded_change.as_ref().is_none_or(|old| {
+                    old.change_id != *superseded_id
+                        || old.target_topology.epoch != change.base_epoch
+                        || old.phase != MigrationPhase::Published
+                })
+            {
+                return Err(RepositoryError::InvalidState(
+                    "recovery change has no matching published predecessor".into(),
+                ));
+            }
             if change.ranges.len() > MAX_MIGRATION_RANGES {
                 return Err(RepositoryError::InvalidState(format!(
                     "active change exceeds the {MAX_MIGRATION_RANGES} moving-range limit"
@@ -178,6 +195,16 @@ impl ClusterState {
                 return Err(RepositoryError::InvalidState(
                     "active change does not descend from committed topology".into(),
                 ));
+            }
+            if let Some(base) = &change.base_topology {
+                base.validate()?;
+                if base.epoch != change.base_epoch
+                    || (before_publication && base != &self.committed)
+                {
+                    return Err(RepositoryError::InvalidState(
+                        "active change has an invalid original topology".into(),
+                    ));
+                }
             }
         }
         if self
@@ -438,11 +465,13 @@ impl CoordinatorRepository for RedbTopologyRepository {
             let mut state = ClusterState {
                 committed,
                 active_change: None,
+                superseded_change: None,
                 process_instances: BTreeMap::new(),
                 stop_confirmations: BTreeMap::new(),
                 replica_admissions: Vec::new(),
                 replica_repairs: Vec::new(),
                 fenced_nodes: BTreeSet::new(),
+                recovery_block_reason: String::new(),
             };
             reconcile_replica_repairs(&mut state)?;
             state.validate()?;
@@ -533,11 +562,13 @@ pub fn load_or_initialize(
     let mut state = ClusterState {
         committed: bootstrap,
         active_change: None,
+        superseded_change: None,
         process_instances: BTreeMap::new(),
         stop_confirmations: BTreeMap::new(),
         replica_admissions: Vec::new(),
         replica_repairs: Vec::new(),
         fenced_nodes: BTreeSet::new(),
+        recovery_block_reason: String::new(),
     };
     reconcile_replica_repairs(&mut state)?;
     repository.store_state(&state)?;
@@ -552,8 +583,11 @@ pub struct CoordinatorService {
     migration_timeout: Duration,
     range_move_concurrency: usize,
     pre_publish_delay: Duration,
+    post_publish_delay: Duration,
     lease_grants: Arc<Mutex<BTreeMap<String, NodeLeaseGrant>>>,
     peer_failures: Arc<Mutex<BTreeMap<(String, String), PeerFailure>>>,
+    pending_change_outages: Arc<Mutex<BTreeMap<String, Instant>>>,
+    pending_change_probe_cursor: Arc<Mutex<usize>>,
     status_channels: Arc<Mutex<BTreeMap<String, Channel>>>,
     startup_at: Instant,
     repair_interrupt: Arc<watch::Sender<u64>>,

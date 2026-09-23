@@ -791,6 +791,8 @@ mod tests {
         let change = crate::migration::TopologyChange {
             change_id: "c".repeat(36),
             base_epoch: 0,
+            base_topology: None,
+            supersedes_change_id: None,
             target_topology: topology,
             phase: crate::migration::MigrationPhase::Planned,
             ranges: vec![range; crate::migration::MAX_MIGRATION_RANGES],

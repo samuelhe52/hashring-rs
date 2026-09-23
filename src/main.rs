@@ -78,6 +78,8 @@ struct CoordinatorArgs {
     range_move_concurrency: NonZeroUsize,
     #[arg(long, default_value_t = 0, hide = true)]
     pre_publish_delay_ms: u64,
+    #[arg(long, default_value_t = 0, hide = true)]
+    post_publish_delay_ms: u64,
     /// Bootstrap member in NODE_ID=HTTP_ENDPOINT form. Required only for a new store.
     #[arg(long = "member")]
     members: Vec<String>,
@@ -353,7 +355,8 @@ async fn run_coordinator(args: CoordinatorArgs) -> Result<()> {
         Duration::from_millis(args.migration_timeout_ms),
     )
     .with_range_move_concurrency(args.range_move_concurrency.get())
-    .with_pre_publish_delay(Duration::from_millis(args.pre_publish_delay_ms));
+    .with_pre_publish_delay(Duration::from_millis(args.pre_publish_delay_ms))
+    .with_post_publish_delay(Duration::from_millis(args.post_publish_delay_ms));
     let recovery_service = service.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));

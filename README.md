@@ -168,9 +168,18 @@ degraded but guard-compliant placement, then repair followers in the background.
 A restart of the
 ordinary coordinator resumes its persisted transition and repair plan. If a
 required target node remains unavailable, the published transition can remain
-pending; restore the same live process if possible and inspect `change-status`
-and `replica-status`. A second process loss during cutover is not automatically
-rolled back or reconfigured. Coordinator consensus/failover is not provided.
+pending. For a single-node join, loss of the new process before activation can be
+recovered by publishing a further epoch with the original members, but only
+when every original owner is still the same live process and the frozen source
+ranges retain their verified watermarks. The superseding change records the
+previous change ID and re-admits required followers before granting leases.
+Loss of an original owner or a more complex second failure remains blocked
+without a coverage proof; inspect `change-status` and `replica-status`, which
+reports the recovery block reason. Before publication, an unavailable new
+joiner that remains unavailable for 30 seconds causes the unpublished attempt
+to abort after source cleanup. Restore
+the same live process where possible. Coordinator consensus/failover is not
+provided.
 
 `replica-status` reports each range's nominal `current_rf`, leased `live_rf`,
 owner lease, follower admission/lag/health, `writable` and its block reason,

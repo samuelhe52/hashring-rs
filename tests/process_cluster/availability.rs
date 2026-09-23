@@ -292,6 +292,285 @@ async fn first_successor_failover_promotes_admitted_copy_without_bulk_copy() {
 }
 
 #[tokio::test]
+async fn lost_joiner_after_publication_recovers_in_a_forward_epoch() {
+    lost_joiner_after_publication_scenario(false, true).await;
+}
+
+#[tokio::test]
+async fn lost_joiner_after_publication_recovers_after_coordinator_restart() {
+    lost_joiner_after_publication_scenario(true, false).await;
+}
+
+async fn lost_joiner_after_publication_scenario(restart_coordinator: bool, first_successor: bool) {
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("published-recovery.redb");
+    let ports = unused_ports(5);
+    let endpoint = format!("http://127.0.0.1:{}", ports[0]);
+    let members: Vec<_> = (1..=4)
+        .map(|index| (format!("node-{index}"), ports[index]))
+        .collect();
+    let mut args = coordinator_arguments(ports[0], &state, &members[..3]);
+    for (flag, value) in [
+        ("--virtual-nodes", "4"),
+        ("--minimum-admitted-copies", "2"),
+        ("--minimum-healthy-followers", "1"),
+    ] {
+        let index = args.iter().position(|arg| arg == flag).unwrap() + 1;
+        args[index] = value.into();
+    }
+    args.extend([
+        "--migration-timeout-ms".into(),
+        "5000".into(),
+        "--post-publish-delay-ms".into(),
+        "8000".into(),
+    ]);
+    let mut coordinator = spawn_process(&args);
+    wait_for_listener(ports[0]);
+    let mut nodes: Vec<_> = members[..3]
+        .iter()
+        .map(|(node_id, port)| {
+            spawn_process(&[
+                "node".into(),
+                "--id".into(),
+                node_id.clone(),
+                "--listen".into(),
+                format!("127.0.0.1:{port}"),
+                "--coordinator".into(),
+                endpoint.clone(),
+            ])
+        })
+        .collect();
+    let client = HashringClient::connect(&endpoint, Duration::from_secs(90))
+        .await
+        .unwrap();
+    wait_for_full_rf(&endpoint, 1, 3).await;
+    if first_successor {
+        let policy = client
+            .begin_write_policy_change(WriteAckPolicy::FirstSuccessor)
+            .await
+            .unwrap();
+        client
+            .execute_topology_change(
+                &policy.change_id,
+                policy.base_epoch,
+                policy.target_topology.epoch,
+            )
+            .await
+            .unwrap();
+        wait_for_full_rf(&endpoint, policy.target_topology.epoch, 3).await;
+    }
+    let keys: Vec<_> = (0_u64..80)
+        .map(|index| index.to_be_bytes().to_vec())
+        .collect();
+    for (index, key) in keys.iter().enumerate() {
+        client
+            .put(key.clone(), vec![index as u8; 128])
+            .await
+            .unwrap();
+    }
+    let plan = client
+        .begin_topology_change(promoted_members(&members))
+        .await
+        .unwrap();
+    let old_topology = plan.base_topology.as_ref().unwrap();
+    assert!(keys.iter().any(|key| {
+        let token = old_topology.key_token(key);
+        plan.ranges.iter().any(|range| token_in_range(token, range))
+    }));
+    let first_target_epoch = plan.target_topology.epoch;
+    let original_change_id = plan.change_id.clone();
+    nodes.push(spawn_process(&[
+        "node".into(),
+        "--id".into(),
+        members[3].0.clone(),
+        "--listen".into(),
+        format!("127.0.0.1:{}", ports[4]),
+        "--coordinator".into(),
+        endpoint.clone(),
+    ]));
+    wait_for_listener(ports[4]);
+    let executor = client.clone();
+    let execution = tokio::spawn(async move {
+        executor
+            .execute_topology_change(&plan.change_id, plan.base_epoch, plan.target_topology.epoch)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if client
+                .topology_change()
+                .await
+                .unwrap()
+                .is_some_and(|change| change.phase == MigrationPhase::Published)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("join did not publish");
+    nodes[3].stop();
+    if restart_coordinator {
+        coordinator.stop();
+        let mut restart_args = coordinator_arguments(ports[0], &state, &[]);
+        restart_args.extend(["--migration-timeout-ms".into(), "5000".into()]);
+        coordinator = spawn_process(&restart_args);
+        wait_for_listener(ports[0]);
+    }
+    let recovery = tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            if let Some(change) = client.topology_change().await.unwrap()
+                && change.phase == MigrationPhase::Complete
+                && change.supersedes_change_id.as_deref() == Some(original_change_id.as_str())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await;
+    if recovery.is_err() {
+        eprintln!(
+            "recovery change: {:?}",
+            tokio::time::timeout(Duration::from_secs(2), client.topology_change()).await
+        );
+        let mut status_client = CoordinatorClient::connect(endpoint.clone()).await.unwrap();
+        eprintln!(
+            "recovery status: {:?}",
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                status_client.get_replica_status(Empty {})
+            )
+            .await
+        );
+        eprintln!("original execution finished: {}", execution.is_finished());
+    }
+    recovery.expect("published join was not superseded after the joiner died");
+    execution.abort();
+    client.refresh_topology().await.unwrap();
+    assert_eq!(client.topology().await.epoch, first_target_epoch + 1);
+    wait_for_full_rf(&endpoint, first_target_epoch + 1, 3).await;
+    for (index, key) in keys.iter().enumerate() {
+        assert_eq!(
+            client.get(key.clone()).await.unwrap().value,
+            vec![index as u8; 128]
+        );
+    }
+    coordinator.stop();
+}
+
+#[tokio::test]
+async fn lost_original_owner_during_join_stays_blocked_without_coverage_proof() {
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("blocked-cutover.redb");
+    let ports = unused_ports(5);
+    let endpoint = format!("http://127.0.0.1:{}", ports[0]);
+    let members: Vec<_> = (1..=4)
+        .map(|index| (format!("node-{index}"), ports[index]))
+        .collect();
+    let mut args = coordinator_arguments(ports[0], &state, &members[..3]);
+    let vnodes = args
+        .iter()
+        .position(|arg| arg == "--virtual-nodes")
+        .unwrap()
+        + 1;
+    args[vnodes] = "4".into();
+    args.extend([
+        "--migration-timeout-ms".into(),
+        "5000".into(),
+        "--post-publish-delay-ms".into(),
+        "8000".into(),
+    ]);
+    let _coordinator = spawn_process(&args);
+    wait_for_listener(ports[0]);
+    let mut nodes: Vec<_> = members[..3]
+        .iter()
+        .map(|(node_id, port)| {
+            spawn_process(&[
+                "node".into(),
+                "--id".into(),
+                node_id.clone(),
+                "--listen".into(),
+                format!("127.0.0.1:{port}"),
+                "--coordinator".into(),
+                endpoint.clone(),
+            ])
+        })
+        .collect();
+    let client = HashringClient::connect(&endpoint, Duration::from_secs(30))
+        .await
+        .unwrap();
+    for index in 0_u64..32 {
+        client
+            .put(index.to_be_bytes().to_vec(), index.to_be_bytes().to_vec())
+            .await
+            .unwrap();
+    }
+    let plan = client
+        .begin_topology_change(promoted_members(&members))
+        .await
+        .unwrap();
+    nodes.push(spawn_process(&[
+        "node".into(),
+        "--id".into(),
+        members[3].0.clone(),
+        "--listen".into(),
+        format!("127.0.0.1:{}", ports[4]),
+        "--coordinator".into(),
+        endpoint.clone(),
+    ]));
+    wait_for_listener(ports[4]);
+    let executor = client.clone();
+    let execution = tokio::spawn(async move {
+        executor
+            .execute_topology_change(&plan.change_id, plan.base_epoch, plan.target_topology.epoch)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if client
+                .topology_change()
+                .await
+                .unwrap()
+                .is_some_and(|change| change.phase == MigrationPhase::Published)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("join did not publish");
+    nodes[0].stop();
+    let mut coordinator = CoordinatorClient::connect(endpoint.clone()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(25), async {
+        loop {
+            let status = coordinator
+                .get_replica_status(Empty {})
+                .await
+                .unwrap()
+                .into_inner();
+            if status.ranges.iter().any(|range| {
+                range
+                    .write_block_reason
+                    .contains("cannot prove complete frozen-range coverage")
+            }) {
+                assert_eq!(status.topology_epoch, 2);
+                assert!(status.ranges.iter().all(|range| !range.writable));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .expect("cutover did not report the blocked recovery");
+    execution.abort();
+}
+
+#[tokio::test]
 async fn three_to_four_to_three_preserves_data_and_replica_readiness() {
     let _guard = process_test_lock().lock().await;
     let directory = tempfile::tempdir().unwrap();

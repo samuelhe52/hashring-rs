@@ -66,6 +66,10 @@ pub struct ReplicaObligation {
 pub struct TopologyChange {
     pub change_id: String,
     pub base_epoch: u64,
+    #[serde(default)]
+    pub base_topology: Option<TopologySnapshot>,
+    #[serde(default)]
+    pub supersedes_change_id: Option<String>,
     pub target_topology: TopologySnapshot,
     pub phase: MigrationPhase,
     pub ranges: Vec<RangeMigration>,
@@ -150,6 +154,8 @@ impl TopologyChange {
         Ok(Self {
             change_id: uuid::Uuid::new_v4().to_string(),
             base_epoch: committed.epoch,
+            base_topology: Some(committed.clone()),
+            supersedes_change_id: None,
             ranges,
             replica_obligations,
             target_topology,
@@ -358,6 +364,8 @@ impl From<&TopologyChange> for crate::proto::TopologyChangeSnapshot {
         Self {
             change_id: change.change_id.clone(),
             base_epoch: change.base_epoch,
+            base_topology: change.base_topology.as_ref().map(Into::into),
+            supersedes_change_id: change.supersedes_change_id.clone().unwrap_or_default(),
             target_topology: Some((&change.target_topology).into()),
             phase: crate::proto::MigrationPhase::from(change.phase).into(),
             ranges: change.ranges.iter().map(Into::into).collect(),
@@ -378,6 +386,9 @@ impl TryFrom<crate::proto::TopologyChangeSnapshot> for TopologyChange {
         Ok(Self {
             change_id: change.change_id,
             base_epoch: change.base_epoch,
+            base_topology: change.base_topology.map(TryInto::try_into).transpose()?,
+            supersedes_change_id: (!change.supersedes_change_id.is_empty())
+                .then_some(change.supersedes_change_id),
             target_topology: change
                 .target_topology
                 .ok_or(MigrationError::MissingTargetTopology)?

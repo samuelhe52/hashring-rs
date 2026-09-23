@@ -242,7 +242,11 @@ impl Coordinator for CoordinatorService {
                         }))
                 });
                 let write_block_reason = if activation_pending {
-                    "topology activation pending".to_owned()
+                    if state.recovery_block_reason.is_empty() {
+                        "topology activation pending".to_owned()
+                    } else {
+                        state.recovery_block_reason.clone()
+                    }
                 } else if transition_fenced {
                     "topology cutover write fence may be active".to_owned()
                 } else if !owner_leased {
@@ -367,6 +371,7 @@ impl Coordinator for CoordinatorService {
         }
         let mut next = state.clone();
         next.active_change = Some(change.clone());
+        next.recovery_block_reason.clear();
         self.repository
             .store_state(&next)
             .map_err(|error| Status::internal(error.to_string()))?;

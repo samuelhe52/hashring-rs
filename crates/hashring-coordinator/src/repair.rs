@@ -14,8 +14,11 @@ impl CoordinatorService {
             migration_timeout,
             range_move_concurrency: DEFAULT_RANGE_MOVE_CONCURRENCY,
             pre_publish_delay: Duration::ZERO,
+            post_publish_delay: Duration::ZERO,
             lease_grants: Arc::new(Mutex::new(BTreeMap::new())),
             peer_failures: Arc::new(Mutex::new(BTreeMap::new())),
+            pending_change_outages: Arc::new(Mutex::new(BTreeMap::new())),
+            pending_change_probe_cursor: Arc::new(Mutex::new(0)),
             status_channels: Arc::new(Mutex::new(BTreeMap::new())),
             startup_at: Instant::now(),
             repair_interrupt: Arc::new(repair_interrupt),
@@ -33,14 +36,22 @@ impl CoordinatorService {
         self
     }
 
+    pub fn with_post_publish_delay(mut self, delay: Duration) -> Self {
+        self.post_publish_delay = delay;
+        self
+    }
+
     /// Run one failure-confirmation pass. A missed lease is sufficient evidence;
     /// otherwise two independent, continuously failing peer probes are needed.
     pub async fn run_failure_pass(&self) -> Result<(), Status> {
-        if let Some(change) = self.state.read().await.active_change.clone()
+        let active_change = { self.state.read().await.active_change.clone() };
+        if let Some(change) = active_change
             && !change.phase.is_terminal()
         {
             if change.failed_node_id.is_some() {
                 self.execute_change(change_identity(&change), true).await?;
+            } else {
+                self.run_pending_change_failure_pass(&change).await?;
             }
             return Ok(());
         }
@@ -89,6 +100,7 @@ impl CoordinatorService {
         let mut next = current.clone();
         next.fenced_nodes.insert(failed_node_id);
         next.active_change = Some(change.clone());
+        next.recovery_block_reason.clear();
         self.repository
             .store_state(&next)
             .map_err(|error| Status::internal(error.to_string()))?;
@@ -97,6 +109,98 @@ impl CoordinatorService {
         self.repair_interrupt
             .send_modify(|generation| *generation += 1);
         self.execute_change(change_identity(&change), true).await?;
+        Ok(())
+    }
+
+    async fn run_pending_change_failure_pass(&self, change: &TopologyChange) -> Result<(), Status> {
+        let state = self.state.read().await.clone();
+        let mut participants: BTreeMap<_, _> = change
+            .target_topology
+            .members
+            .iter()
+            .map(|member| (member.node_id.clone(), member.clone()))
+            .collect();
+        if let Some(base) = &change.base_topology
+            && !matches!(
+                change.phase,
+                MigrationPhase::CleaningUp | MigrationPhase::Complete
+            )
+        {
+            for member in &base.members {
+                participants
+                    .entry(member.node_id.clone())
+                    .or_insert_with(|| member.clone());
+            }
+        }
+        let mut candidates: Vec<_> = participants
+            .into_values()
+            .filter_map(|member| {
+                state
+                    .process_instances
+                    .get(&member.node_id)
+                    .map(|instance| (member, instance.clone()))
+            })
+            .collect();
+        let candidate_ids: BTreeSet<_> = candidates
+            .iter()
+            .map(|(member, _)| member.node_id.clone())
+            .collect();
+        if !candidates.is_empty() {
+            let mut cursor = self.pending_change_probe_cursor.lock().await;
+            let start = *cursor % candidates.len();
+            candidates.rotate_left(start);
+            let scanned = candidates.len().min(MAX_PENDING_PROBES_PER_PASS);
+            candidates.truncate(scanned);
+            *cursor = (start + scanned) % candidate_ids.len();
+        }
+        let probes = try_map_bounded(candidates, 8, |(member, instance)| async move {
+            let deadline = Instant::now() + Duration::from_millis(500);
+            let healthy = match connect_node(&member.endpoint, deadline).await {
+                Ok(mut node) => rpc_before(deadline, node.get_process_info(proto::Empty {}))
+                    .await
+                    .is_ok_and(|response| {
+                        let info = response.into_inner();
+                        info.node_id == member.node_id && info.process_instance_id == instance
+                    }),
+                Err(_) => false,
+            };
+            Ok::<_, Status>((member.node_id, healthy))
+        })
+        .await?;
+        let now = Instant::now();
+        let confirmation_delay = if matches!(
+            change.phase,
+            MigrationPhase::Published | MigrationPhase::CleaningUp
+        ) {
+            NODE_LEASE_DURATION
+        } else {
+            PREPUBLICATION_FAILURE_GRACE
+        };
+        let mut outages = self.pending_change_outages.lock().await;
+        outages.retain(|node_id, _| candidate_ids.contains(node_id));
+        let mut confirmed = None;
+        for (node_id, healthy) in probes {
+            if healthy {
+                outages.remove(&node_id);
+            } else {
+                let first = outages.entry(node_id.clone()).or_insert(now);
+                if confirmed.is_none() && *first + confirmation_delay <= now {
+                    confirmed = Some(node_id);
+                }
+            }
+        }
+        drop(outages);
+        if let Some(failed_node_id) = confirmed
+            && let Err(error) = self
+                .recover_pending_change_failure(change_identity(change), &failed_node_id)
+                .await
+        {
+            self.set_recovery_block_reason(format!(
+                "confirmed unavailable node {failed_node_id}; recovery is blocked: {error}"
+            ))
+            .await?;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -398,6 +502,8 @@ impl CoordinatorService {
         let change = TopologyChange {
             change_id: control.change_id.clone(),
             base_epoch: task.epoch,
+            base_topology: None,
+            supersedes_change_id: None,
             target_topology: topology,
             phase: MigrationPhase::CopyingSnapshot,
             ranges: Vec::new(),

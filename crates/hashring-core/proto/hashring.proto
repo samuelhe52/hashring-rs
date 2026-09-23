@@ -142,6 +142,8 @@ message TopologyChangeSnapshot {
   repeated ReplicaObligation replica_obligations = 9;
   string failed_node_id = 10;
   bool activation_ready = 11;
+  TopologySnapshot base_topology = 12;
+  string supersedes_change_id = 13;
 }
 
 message ReplicaObligation {

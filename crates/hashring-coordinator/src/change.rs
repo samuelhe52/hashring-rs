@@ -13,10 +13,18 @@ impl CoordinatorService {
                 Ok(None)
             }
             None => Ok(None),
-            Some(change) => self
-                .execute_change(change_identity(&change), true)
-                .await
-                .map(Some),
+            Some(change) => {
+                let result = self.execute_change(change_identity(&change), true).await;
+                if let Err(error) = &result
+                    && change.supersedes_change_id.is_some()
+                {
+                    self.set_recovery_block_reason(format!(
+                        "published recovery is blocked: {error}"
+                    ))
+                    .await?;
+                }
+                result.map(Some)
+            }
         }
     }
 
@@ -54,6 +62,9 @@ impl CoordinatorService {
                 return Ok(change);
             }
             MigrationPhase::Published | MigrationPhase::CleaningUp => {
+                if change.supersedes_change_id.is_some() {
+                    return self.finish_recovered_change(change).await;
+                }
                 return self
                     .finish_published_change(change, Instant::now() + self.migration_timeout)
                     .await;
@@ -209,7 +220,239 @@ impl CoordinatorService {
             *state = next;
         }
         change.phase = MigrationPhase::Published;
+        if !self.post_publish_delay.is_zero() {
+            tokio::time::sleep(self.post_publish_delay).await;
+        }
         self.finish_published_change(change, deadline).await
+    }
+
+    pub(super) async fn set_recovery_block_reason(&self, reason: String) -> Result<(), Status> {
+        let mut state = self.state.write().await;
+        if state.recovery_block_reason == reason {
+            return Ok(());
+        }
+        let mut next = state.clone();
+        next.recovery_block_reason = reason;
+        self.repository
+            .store_state(&next)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        *state = next;
+        Ok(())
+    }
+
+    pub(super) async fn recover_pending_change_failure(
+        &self,
+        expected: ChangeIdentity,
+        failed_node_id: &str,
+    ) -> Result<(), Status> {
+        let _execution = self.execution_lock.lock().await;
+        let state = self.state.read().await.clone();
+        let Some(change) = state.active_change.clone() else {
+            return Ok(());
+        };
+        if change_identity(&change) != expected || change.phase.is_terminal() {
+            return Ok(());
+        }
+        if change.phase != MigrationPhase::Published || change.activation_ready {
+            if !change.activation_ready
+                && !matches!(
+                    change.phase,
+                    MigrationPhase::Aborting | MigrationPhase::CleaningUp
+                )
+                && change.base_topology.as_ref().is_some_and(|base| {
+                    !base
+                        .members
+                        .iter()
+                        .any(|member| member.node_id == failed_node_id)
+                })
+            {
+                self.abort_prepublication_change(&change).await?;
+                self.set_recovery_block_reason(String::new()).await?;
+                self.pending_change_outages.lock().await.clear();
+                return Ok(());
+            }
+            self.set_recovery_block_reason(format!(
+                "confirmed unavailable node {failed_node_id} during {:?}; automatic recovery requires a published, unactivated pure join",
+                change.phase
+            ))
+            .await?;
+            return Ok(());
+        }
+        let Some(base) = change.base_topology.as_ref() else {
+            self.set_recovery_block_reason(format!(
+                "confirmed unavailable node {failed_node_id}; original topology is unavailable for recovery"
+            ))
+            .await?;
+            return Ok(());
+        };
+        let surviving: BTreeSet<_> = state
+            .committed
+            .members
+            .iter()
+            .filter(|member| member.node_id != failed_node_id)
+            .map(|member| (member.node_id.clone(), member.endpoint.clone()))
+            .collect();
+        let original: BTreeSet<_> = base
+            .members
+            .iter()
+            .map(|member| (member.node_id.clone(), member.endpoint.clone()))
+            .collect();
+        let recoverable = !original.is_empty()
+            && surviving == original
+            && !original
+                .iter()
+                .any(|(node_id, _)| node_id == failed_node_id)
+            && change.ranges.iter().all(|range| {
+                range.destination_node_id == failed_node_id
+                    && range.verified
+                    && !range.source_cleaned
+                    && !range.source_process_instance_id.is_empty()
+                    && state.process_instances.get(&range.source_node_id)
+                        == Some(&range.source_process_instance_id)
+            });
+        if !recoverable {
+            self.set_recovery_block_reason(format!(
+                "confirmed unavailable node {failed_node_id}; surviving original owners cannot prove complete frozen-range coverage"
+            ))
+            .await?;
+            return Ok(());
+        }
+        let deadline = Instant::now() + self.migration_timeout;
+        for member in &base.members {
+            let expected_instance =
+                state
+                    .process_instances
+                    .get(&member.node_id)
+                    .ok_or_else(|| {
+                        Status::failed_precondition(format!(
+                            "original owner {} has no process identity",
+                            member.node_id
+                        ))
+                    })?;
+            let mut node = connect_node(&member.endpoint, deadline).await?;
+            let info = rpc_before(deadline, node.get_process_info(proto::Empty {}))
+                .await?
+                .into_inner();
+            if info.node_id != member.node_id || info.process_instance_id != *expected_instance {
+                return Err(Status::failed_precondition(format!(
+                    "original owner {} changed process instance",
+                    member.node_id
+                )));
+            }
+        }
+        for range in &change.ranges {
+            let mut source = connect_node(&range.source_endpoint, deadline).await?;
+            let digest = rpc_before(
+                deadline,
+                source.source_range_digest(RangeControlRequest {
+                    change_id: change.change_id.clone(),
+                    range_id: range.range_id.clone(),
+                }),
+            )
+            .await?
+            .into_inner();
+            if digest.changelog_watermark != range.changelog_watermark || digest.digest.is_empty() {
+                return Err(Status::failed_precondition(format!(
+                    "frozen source range {} no longer matches the verified watermark",
+                    range.range_id
+                )));
+            }
+        }
+        let mut recovery = TopologyChange::plan(&state.committed, base.members.clone())
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        recovery.ranges.clear();
+        recovery.phase = MigrationPhase::Published;
+        recovery.supersedes_change_id = Some(change.change_id.clone());
+        let mut current = self.state.write().await;
+        if current
+            .active_change
+            .as_ref()
+            .is_none_or(|active| change_identity(active) != expected)
+            || current.committed != state.committed
+        {
+            return Ok(());
+        }
+        let mut next = current.clone();
+        next.committed = recovery.target_topology.clone();
+        next.active_change = Some(recovery.clone());
+        next.superseded_change = Some(change);
+        next.fenced_nodes.insert(failed_node_id.to_owned());
+        next.process_instances.remove(failed_node_id);
+        next.replica_admissions.clear();
+        next.replica_repairs.clear();
+        next.recovery_block_reason.clear();
+        reconcile_replica_repairs(&mut next)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        self.repository
+            .store_state(&next)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        *current = next;
+        drop(current);
+        self.pending_change_outages.lock().await.clear();
+        self.finish_recovered_change(recovery).await?;
+        Ok(())
+    }
+
+    async fn finish_recovered_change(
+        &self,
+        mut change: TopologyChange,
+    ) -> Result<TopologyChange, Status> {
+        let original = self
+            .state
+            .read()
+            .await
+            .superseded_change
+            .clone()
+            .ok_or_else(|| {
+                Status::failed_precondition("superseded change is missing from durable state")
+            })?;
+        let deadline = Instant::now() + self.migration_timeout;
+        self.install_on_members_with_lease(
+            &change.target_topology,
+            &change.target_topology.members,
+            deadline,
+            false,
+        )
+        .await?;
+        let last_grant = self
+            .lease_grants
+            .lock()
+            .await
+            .values()
+            .map(|grant| grant.expires_at)
+            .max()
+            .unwrap_or(self.startup_at);
+        tokio::time::sleep_until(last_grant.max(self.startup_at + NODE_LEASE_DURATION)).await;
+        let deadline = Instant::now() + self.migration_timeout;
+        for range in &original.ranges {
+            let mut source = connect_node(&range.source_endpoint, deadline).await?;
+            rpc_before(
+                deadline,
+                source.abort_range_migration(RangeControlRequest {
+                    change_id: original.change_id.clone(),
+                    range_id: range.range_id.clone(),
+                }),
+            )
+            .await?;
+        }
+        let guard = &change.target_topology.write_availability_guard;
+        if change.target_topology.write_ack_policy != WriteAckPolicy::OwnerOnly
+            || guard.minimum_admitted_copies > 1
+            || guard.minimum_healthy_followers > 0
+        {
+            self.seed_repairs_for_activation().await?;
+        }
+        self.set_activation_ready().await?;
+        change.activation_ready = true;
+        self.install_on_members(
+            &change.target_topology,
+            &change.target_topology.members,
+            Instant::now() + self.migration_timeout,
+        )
+        .await?;
+        self.set_phase(MigrationPhase::Complete).await?;
+        change.phase = MigrationPhase::Complete;
+        Ok(change)
     }
 
     pub(super) async fn abort_after_error(
@@ -883,6 +1126,7 @@ impl CoordinatorService {
             ));
         }
         change.activation_ready = true;
+        next.recovery_block_reason.clear();
         self.repository
             .store_state(&next)
             .map_err(|error| Status::internal(error.to_string()))?;
@@ -1061,6 +1305,9 @@ impl CoordinatorService {
             .as_mut()
             .ok_or_else(|| Status::internal("active change disappeared"))?
             .phase = phase;
+        if phase.is_terminal() {
+            next.recovery_block_reason.clear();
+        }
         self.repository
             .store_state(&next)
             .map_err(|error| Status::internal(error.to_string()))?;
