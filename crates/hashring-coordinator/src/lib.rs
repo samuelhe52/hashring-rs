@@ -28,10 +28,11 @@ use hashring_core::{
     },
     proto::{
         self, ApplyDedupBatchRequest, ApplyMigrationBatchRequest, ChangelogPageRequest,
-        InstallTopologyRequest, PrepareRangeRequest, RangeControlRequest, SnapshotPageRequest,
-        StopRequest, coordinator_server::Coordinator, data_node_client::DataNodeClient,
+        InstallTopologyRequest, PolicyWriteFenceRequest, PrepareRangeRequest, RangeControlRequest,
+        SnapshotPageRequest, StopRequest, coordinator_server::Coordinator,
+        data_node_client::DataNodeClient,
     },
-    topology::{Member, TopologySnapshot},
+    topology::{Member, TopologySnapshot, WriteAckPolicy},
 };
 
 const TOPOLOGY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("topology");
@@ -1021,6 +1022,15 @@ impl CoordinatorService {
             }
         }
 
+        if change.ranges.is_empty()
+            && change.replica_obligations.is_empty()
+            && change.target_topology.members == self.state.read().await.committed.members
+            && change.target_topology.write_ack_policy
+                != self.state.read().await.committed.write_ack_policy
+        {
+            return self.execute_policy_change(change).await;
+        }
+
         let deadline = Instant::now() + self.migration_timeout;
         self.set_phase(MigrationPhase::CopyingSnapshot).await?;
         change.phase = MigrationPhase::CopyingSnapshot;
@@ -1062,7 +1072,9 @@ impl CoordinatorService {
             Err(error) => return self.abort_after_error(&change, error).await,
         };
 
-        self.set_phase(MigrationPhase::Verifying).await?;
+        if let Err(error) = self.set_phase(MigrationPhase::Verifying).await {
+            return self.abort_after_error(&change, error).await;
+        }
         change.phase = MigrationPhase::Verifying;
         let change_ref = &change;
         let final_watermarks = &final_watermarks;
@@ -1146,6 +1158,151 @@ impl CoordinatorService {
                 "migration failed ({original}); cleanup remains pending ({cleanup})"
             ))),
         }
+    }
+
+    async fn execute_policy_change(
+        &self,
+        mut change: TopologyChange,
+    ) -> Result<TopologyChange, Status> {
+        let deadline = Instant::now() + self.migration_timeout;
+        self.set_phase(MigrationPhase::PausingWrites).await?;
+        change.phase = MigrationPhase::PausingWrites;
+        if let Err(error) = self.policy_fence_members(&change, true, deadline).await {
+            return self.abort_after_error(&change, error).await;
+        }
+        if let Err(error) = self.set_phase(MigrationPhase::Verifying).await {
+            return self.abort_after_error(&change, error).await;
+        }
+        change.phase = MigrationPhase::Verifying;
+        {
+            loop {
+                let status = tokio::time::timeout_at(
+                    deadline,
+                    self.get_replica_status(Request::new(proto::Empty {})),
+                )
+                .await
+                .map_err(|_| Status::deadline_exceeded("policy readiness barrier timed out"))
+                .and_then(|response| response.map(Response::into_inner));
+                let status = match status {
+                    Ok(status) => status,
+                    Err(error) => return self.abort_after_error(&change, error).await,
+                };
+                if policy_readiness_verified(&change.target_topology, &status) {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return self
+                        .abort_after_error(
+                            &change,
+                            Status::deadline_exceeded(
+                                "required followers did not catch up before policy publication",
+                            ),
+                        )
+                        .await;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+        if let Err(error) = self.set_phase(MigrationPhase::ReadyToPublish).await {
+            return self.abort_after_error(&change, error).await;
+        }
+        change.phase = MigrationPhase::ReadyToPublish;
+        if !self.pre_publish_delay.is_zero() {
+            tokio::time::sleep(self.pre_publish_delay).await;
+        }
+        // Recheck after the optional pre-publication delay while all old owners are fenced.
+        {
+            let status = tokio::time::timeout_at(
+                deadline,
+                self.get_replica_status(Request::new(proto::Empty {})),
+            )
+            .await
+            .map_err(|_| Status::deadline_exceeded("policy readiness recheck timed out"))
+            .and_then(|response| response.map(Response::into_inner));
+            let status = match status {
+                Ok(status) => status,
+                Err(error) => return self.abort_after_error(&change, error).await,
+            };
+            if !policy_readiness_verified(&change.target_topology, &status) {
+                return self
+                    .abort_after_error(
+                        &change,
+                        Status::failed_precondition("policy readiness was lost before publication"),
+                    )
+                    .await;
+            }
+        }
+        let publication = {
+            let mut state = self.state.write().await;
+            let mut next = state.clone();
+            (|| -> Result<(), Status> {
+                if next
+                    .active_change
+                    .as_ref()
+                    .is_none_or(|active| change_identity(active) != change_identity(&change))
+                {
+                    return Err(Status::failed_precondition(
+                        "policy transition changed before publication",
+                    ));
+                }
+                next.active_change
+                    .as_mut()
+                    .expect("active transition was checked")
+                    .phase = MigrationPhase::Published;
+                next.committed = change.target_topology.clone();
+                // Identical placements plus the catch-up barrier preserve admission proof.
+                for admission in &mut next.replica_admissions {
+                    admission.epoch = next.committed.epoch;
+                }
+                for repair in &mut next.replica_repairs {
+                    repair.epoch = next.committed.epoch;
+                }
+                reconcile_replica_repairs(&mut next)
+                    .map_err(|error| Status::internal(error.to_string()))?;
+                self.repository
+                    .store_state(&next)
+                    .map_err(|error| Status::internal(error.to_string()))?;
+                *state = next;
+                Ok(())
+            })()
+        };
+        if let Err(error) = publication {
+            return self.abort_after_error(&change, error).await;
+        }
+        change.phase = MigrationPhase::Published;
+        self.finish_published_change(change, deadline).await
+    }
+
+    async fn policy_fence_members(
+        &self,
+        change: &TopologyChange,
+        pause: bool,
+        deadline: Instant,
+    ) -> Result<(), Status> {
+        let request = PolicyWriteFenceRequest {
+            change_id: change.change_id.clone(),
+            base_epoch: change.base_epoch,
+        };
+        let mut first_error = None;
+        for member in &change.target_topology.members {
+            let result = async {
+                let mut client = connect_node(&member.endpoint, deadline).await?;
+                if pause {
+                    rpc_before(deadline, client.pause_policy_writes(request.clone())).await?;
+                } else {
+                    rpc_before(deadline, client.resume_policy_writes(request.clone())).await?;
+                }
+                Ok::<(), Status>(())
+            }
+            .await;
+            if let Err(error) = result {
+                if pause {
+                    return Err(error);
+                }
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     async fn copy_range(
@@ -1390,6 +1547,9 @@ impl CoordinatorService {
             .await?;
         self.install_on_members(&change.target_topology, &other_targets, deadline)
             .await?;
+        if change.ranges.is_empty() && change.replica_obligations.is_empty() {
+            self.policy_fence_members(&change, false, deadline).await?;
+        }
         let target_ids: BTreeSet<String> = change
             .target_topology
             .members
@@ -1678,6 +1838,9 @@ impl CoordinatorService {
     async fn finish_abort(&self, change: &TopologyChange) -> Result<(), Status> {
         let deadline = Instant::now() + self.migration_timeout;
         self.clear_prepublication_nodes(change, deadline).await?;
+        if change.ranges.is_empty() && change.replica_obligations.is_empty() {
+            self.policy_fence_members(change, false, deadline).await?;
+        }
         self.set_phase(MigrationPhase::Aborted).await
     }
 
@@ -1974,8 +2137,13 @@ impl Coordinator for CoordinatorService {
         &self,
         request: Request<proto::BeginTopologyChangeRequest>,
     ) -> Result<Response<proto::TopologyChangeSnapshot>, Status> {
+        let request = request.into_inner();
+        let target_policy = request
+            .target_write_ack_policy
+            .map(WriteAckPolicy::try_from)
+            .transpose()
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let target_members = request
-            .into_inner()
             .target_members
             .into_iter()
             .map(|member| Member {
@@ -1993,8 +2161,19 @@ impl Coordinator for CoordinatorService {
                 "another topology change is already active",
             ));
         }
-        let change = TopologyChange::plan(&state.committed, target_members)
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        if target_policy.is_some_and(|policy| policy != state.committed.write_ack_policy)
+            && target_members != state.committed.members
+        {
+            return Err(Status::invalid_argument(
+                "change membership and ACK policy in separate topology transitions",
+            ));
+        }
+        let change = TopologyChange::plan_with_policy(
+            &state.committed,
+            target_members,
+            target_policy.unwrap_or(state.committed.write_ack_policy),
+        )
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let target_tasks: usize = change
             .target_topology
             .derived_ranges()
@@ -2265,6 +2444,74 @@ async fn replay_changelog(
     }
 }
 
+fn policy_readiness_verified(
+    topology: &TopologySnapshot,
+    status: &proto::ReplicaStatusResponse,
+) -> bool {
+    if status.topology_epoch != topology.epoch.saturating_sub(1) {
+        return false;
+    }
+    let Ok(ranges) = topology.derived_ranges() else {
+        return false;
+    };
+    let guard = &topology.write_availability_guard;
+    ranges.iter().all(|range| {
+        let Some(actual) = status.ranges.iter().find(|actual| {
+            actual.start_exclusive == range.start_exclusive
+                && actual.end_inclusive == range.end_inclusive
+                && actual.owner_node_id == range.owner_node_id
+        }) else {
+            return false;
+        };
+        let admitted = actual
+            .followers
+            .iter()
+            .filter(|follower| follower.admitted)
+            .count() as u32;
+        let healthy = actual
+            .followers
+            .iter()
+            .filter(|follower| {
+                follower.admitted
+                    && follower.lag_known
+                    && follower.lag_millis <= guard.max_replica_lag_millis
+                    && follower.stream_cursor == follower.stream_head
+            })
+            .count() as u32;
+        if actual.followers.iter().any(|follower| {
+            follower.admitted
+                && (!follower.lag_known || follower.stream_cursor != follower.stream_head)
+        }) {
+            return false;
+        }
+        if admitted.saturating_add(1) < guard.minimum_admitted_copies
+            || healthy < guard.minimum_healthy_followers
+        {
+            return false;
+        }
+        let needed: Vec<_> = match topology.write_ack_policy {
+            WriteAckPolicy::OwnerOnly => Vec::new(),
+            WriteAckPolicy::FirstSuccessor => range.follower_node_ids.first().into_iter().collect(),
+            WriteAckPolicy::AllReplicas => {
+                if range.follower_node_ids.len() + 1 < topology.desired_replication_factor as usize
+                {
+                    return false;
+                }
+                range.follower_node_ids.iter().collect()
+            }
+        };
+        needed.into_iter().all(|node_id| {
+            actual.followers.iter().any(|follower| {
+                &follower.node_id == node_id
+                    && follower.admitted
+                    && follower.lag_known
+                    && follower.lag_millis <= guard.max_replica_lag_millis
+                    && follower.stream_cursor == follower.stream_head
+            })
+        })
+    })
+}
+
 async fn read_replication_pair(
     epoch: u64,
     owner: &str,
@@ -2385,6 +2632,68 @@ mod tests {
             }],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn policy_epoch_barrier_requires_every_admitted_stream_caught_up() {
+        let base = TopologySnapshot::new_with_config(
+            1,
+            7,
+            1,
+            vec![
+                Member {
+                    node_id: "n1".into(),
+                    endpoint: "http://127.0.0.1:5001".into(),
+                },
+                Member {
+                    node_id: "n2".into(),
+                    endpoint: "http://127.0.0.1:5002".into(),
+                },
+                Member {
+                    node_id: "n3".into(),
+                    endpoint: "http://127.0.0.1:5003".into(),
+                },
+            ],
+            hashring_core::topology::TopologyConfig::default(),
+        )
+        .unwrap();
+        let target = TopologyChange::plan_with_policy(
+            &base,
+            base.members.clone(),
+            WriteAckPolicy::FirstSuccessor,
+        )
+        .unwrap()
+        .target_topology;
+        let mut status = proto::ReplicaStatusResponse {
+            topology_epoch: base.epoch,
+            ranges: target
+                .derived_ranges()
+                .unwrap()
+                .into_iter()
+                .map(|range| proto::RangeReplicaStatus {
+                    start_exclusive: range.start_exclusive,
+                    end_inclusive: range.end_inclusive,
+                    owner_node_id: range.owner_node_id,
+                    desired_rf: 3,
+                    current_rf: 3,
+                    followers: range
+                        .follower_node_ids
+                        .into_iter()
+                        .map(|node_id| proto::FollowerReplicaStatus {
+                            node_id,
+                            admitted: true,
+                            lag_known: true,
+                            stream_head: 1,
+                            stream_cursor: 1,
+                            ..Default::default()
+                        })
+                        .collect(),
+                })
+                .collect(),
+        };
+        assert!(policy_readiness_verified(&target, &status));
+        status.ranges[0].followers[1].stream_cursor = 0;
+        assert!(!policy_readiness_verified(&target, &status));
     }
 
     #[tokio::test]

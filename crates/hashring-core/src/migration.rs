@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::topology::{Member, TopologyError, TopologySnapshot};
+use crate::topology::{Member, TopologyError, TopologySnapshot, WriteAckPolicy};
 
 pub const MAX_MIGRATION_RANGES: usize = 16_384;
 pub const MAX_REPLICA_OBLIGATIONS: usize = 16_384;
@@ -83,7 +83,7 @@ pub struct TopologyChange {
 pub enum MigrationError {
     #[error("invalid target topology: {0}")]
     Topology(#[from] TopologyError),
-    #[error("target membership is identical to committed membership")]
+    #[error("target membership and write policy are identical to committed topology")]
     NoMembershipChange,
     #[error("changing the endpoint of existing node {0} is not supported for in-memory nodes")]
     EndpointChangeUnsupported(String),
@@ -104,6 +104,14 @@ impl TopologyChange {
         committed: &TopologySnapshot,
         target_members: Vec<Member>,
     ) -> Result<Self, MigrationError> {
+        Self::plan_with_policy(committed, target_members, committed.write_ack_policy)
+    }
+
+    pub fn plan_with_policy(
+        committed: &TopologySnapshot,
+        target_members: Vec<Member>,
+        target_policy: WriteAckPolicy,
+    ) -> Result<Self, MigrationError> {
         for current in &committed.members {
             if let Some(target) = target_members
                 .iter()
@@ -119,14 +127,18 @@ impl TopologyChange {
             .epoch
             .checked_add(1)
             .ok_or(MigrationError::EpochOverflow)?;
+        let mut config = committed.config();
+        config.write_ack_policy = target_policy;
         let target_topology = TopologySnapshot::new_with_config(
             target_epoch,
             committed.hash_seed,
             committed.virtual_nodes,
             target_members,
-            committed.config(),
+            config,
         )?;
-        if target_topology.members == committed.members {
+        if target_topology.members == committed.members
+            && target_policy == committed.write_ack_policy
+        {
             return Err(MigrationError::NoMembershipChange);
         }
 

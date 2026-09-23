@@ -137,6 +137,7 @@ message ReplicaObligation {
 
 message BeginTopologyChangeRequest {
   repeated Member target_members = 1;
+  optional WriteAckPolicy target_write_ack_policy = 2;
 }
 
 message ExecuteTopologyChangeRequest {
@@ -152,6 +153,11 @@ message RegisterNodeRequest {
 
 message StopConfirmationResponse {
   bool confirmed = 1;
+}
+
+message PolicyWriteFenceRequest {
+  string change_id = 1;
+  uint64 base_epoch = 2;
 }
 
 message GetTopologyChangeResponse {
@@ -327,6 +333,10 @@ enum ErrorCode {
   RESOURCE_EXHAUSTED = 7;
   INVALID_ARGUMENT = 8;
   MUTATION_ID_CONFLICT = 9;
+  TEMPORARILY_UNAVAILABLE = 10;
+  OUTCOME_UNKNOWN = 11;
+  REPLICA_NOT_READY = 12;
+  LEASE_EXPIRED = 13;
 }
 
 message OperationError {
@@ -398,6 +408,8 @@ service DataNode {
   rpc CleanupSourceRange(RangeControlRequest) returns (Empty);
   rpc AbortRangeMigration(RangeControlRequest) returns (Empty);
   rpc InstallTopology(InstallTopologyRequest) returns (Empty);
+  rpc PausePolicyWrites(PolicyWriteFenceRequest) returns (Empty);
+  rpc ResumePolicyWrites(PolicyWriteFenceRequest) returns (Empty);
   rpc PrepareStop(StopRequest) returns (Empty);
   rpc Stop(StopRequest) returns (Empty);
 }

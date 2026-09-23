@@ -23,7 +23,7 @@ use hashring_core::{
         GetRequest, OperationError, PutRequest, RecordVersion,
         coordinator_client::CoordinatorClient, data_node_client::DataNodeClient,
     },
-    topology::{Member, TopologyError, TopologySnapshot},
+    topology::{Member, TopologyError, TopologySnapshot, WriteAckPolicy},
     transport::{configure_coordinator_client, fetch_topology},
 };
 
@@ -208,6 +208,24 @@ impl HashringClient {
         &self,
         target_members: Vec<Member>,
     ) -> Result<TopologyChange, ClientError> {
+        self.begin_topology_change_with_policy(target_members, None)
+            .await
+    }
+
+    pub async fn begin_write_policy_change(
+        &self,
+        target_policy: WriteAckPolicy,
+    ) -> Result<TopologyChange, ClientError> {
+        let members = self.topology().await.members;
+        self.begin_topology_change_with_policy(members, Some(target_policy))
+            .await
+    }
+
+    async fn begin_topology_change_with_policy(
+        &self,
+        target_members: Vec<Member>,
+        target_policy: Option<WriteAckPolicy>,
+    ) -> Result<TopologyChange, ClientError> {
         let deadline = Instant::now() + self.inner.operation_timeout;
         let mut client = match tokio::time::timeout(
             remaining(deadline, false)?,
@@ -224,6 +242,8 @@ impl HashringClient {
             }
         };
         let request = BeginTopologyChangeRequest {
+            target_write_ack_policy: target_policy
+                .map(|policy| proto::WriteAckPolicy::from(policy).into()),
             target_members: target_members.iter().map(proto::Member::from).collect(),
         };
         let response = match tokio::time::timeout(
@@ -599,7 +619,22 @@ impl HashringClient {
                     .await?;
                 Ok(true)
             }
-            ErrorCode::RangeBusy | ErrorCode::ResourceExhausted if error.retryable => {
+            ErrorCode::RangeBusy
+            | ErrorCode::ResourceExhausted
+            | ErrorCode::TemporarilyUnavailable
+            | ErrorCode::ReplicaNotReady
+            | ErrorCode::OutcomeUnknown
+            | ErrorCode::LeaseExpired
+                if error.retryable =>
+            {
+                if error.current_epoch > attempted_epoch {
+                    self.refresh_topology_before(
+                        deadline,
+                        unknown_write_outcome,
+                        Some(error.current_epoch),
+                    )
+                    .await?;
+                }
                 self.retry_delay(deadline, attempt, unknown_write_outcome)
                     .await?;
                 Ok(true)
@@ -1332,5 +1367,45 @@ mod tests {
                 unknown_write_outcome: true
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn degraded_and_unknown_write_errors_retry_without_forcing_same_epoch_refresh() {
+        let (endpoint, coordinator, server) = start_fake_coordinator(Duration::ZERO).await;
+        let client = HashringClient::connect(endpoint, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let initial_calls = coordinator.topology_calls.load(Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut attempt = 0;
+        for (code, unknown) in [
+            (ErrorCode::TemporarilyUnavailable, false),
+            (ErrorCode::OutcomeUnknown, true),
+        ] {
+            assert!(
+                client
+                    .handle_retryable(
+                        OperationError {
+                            code: code.into(),
+                            current_epoch: 1,
+                            retryable: true,
+                            unknown_write_outcome: unknown,
+                            ..Default::default()
+                        },
+                        1,
+                        deadline,
+                        &mut attempt,
+                        unknown
+                    )
+                    .await
+                    .unwrap()
+            );
+        }
+        assert_eq!(attempt, 2);
+        assert_eq!(
+            coordinator.topology_calls.load(Ordering::SeqCst),
+            initial_calls
+        );
+        server.abort();
     }
 }

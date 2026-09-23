@@ -12,7 +12,7 @@ use hashring_rs::{
     limits::MAX_CONTROL_MESSAGE_BYTES,
     node::DataNodeService,
     proto::{coordinator_server::CoordinatorServer, data_node_server::DataNodeServer},
-    topology::{Member, TopologySnapshot},
+    topology::{Member, TopologyConfig, TopologySnapshot, WriteAckPolicy, WriteAvailabilityGuard},
 };
 use tonic::transport::Server;
 use tracing::info;
@@ -41,6 +41,8 @@ enum Command {
     Topology(ClientArgs),
     /// Persist a pending target topology and its moving-range plan.
     BeginChange(ChangeArgs),
+    /// Stage a committed-topology ACK policy transition.
+    BeginPolicyChange(PolicyChangeArgs),
     /// Print the active topology change, if any.
     ChangeStatus(ClientArgs),
     /// Execute the active migration through publication and cleanup.
@@ -59,6 +61,14 @@ struct CoordinatorArgs {
     seed: u64,
     #[arg(long, default_value_t = 128)]
     virtual_nodes: u32,
+    #[arg(long, default_value_t = 3)]
+    desired_replication_factor: u32,
+    #[arg(long, default_value_t = 2)]
+    minimum_admitted_copies: u32,
+    #[arg(long, default_value_t = 1)]
+    minimum_healthy_followers: u32,
+    #[arg(long, default_value_t = 5_000)]
+    max_replica_lag_ms: u64,
     #[arg(long, default_value_t = 120_000)]
     migration_timeout_ms: u64,
     /// Maximum number of disjoint ranges moved concurrently within one topology change.
@@ -141,6 +151,21 @@ struct ChangeArgs {
     members: Vec<String>,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum PolicyArg {
+    OwnerOnly,
+    FirstSuccessor,
+    AllReplicas,
+}
+
+#[derive(Args)]
+struct PolicyChangeArgs {
+    #[command(flatten)]
+    client: ClientArgs,
+    #[arg(long, value_enum)]
+    policy: PolicyArg,
+}
+
 #[derive(Args)]
 struct ExecuteChangeArgs {
     #[arg(long, default_value = "http://127.0.0.1:50050")]
@@ -211,6 +236,7 @@ async fn main() -> Result<()> {
         Command::Delete(args) => run_delete(args).await,
         Command::Topology(args) => run_topology(args).await,
         Command::BeginChange(args) => run_begin_change(args).await,
+        Command::BeginPolicyChange(args) => run_begin_policy_change(args).await,
         Command::ChangeStatus(args) => run_change_status(args).await,
         Command::ExecuteChange(args) => run_execute_change(args).await,
         Command::Experiment(args) => run_local_experiment(args).await,
@@ -257,7 +283,7 @@ async fn run_coordinator(args: CoordinatorArgs) -> Result<()> {
     let bootstrap = if args.members.is_empty() {
         None
     } else {
-        Some(TopologySnapshot::new(
+        Some(TopologySnapshot::new_with_config(
             1,
             args.seed,
             args.virtual_nodes,
@@ -265,6 +291,15 @@ async fn run_coordinator(args: CoordinatorArgs) -> Result<()> {
                 .iter()
                 .map(|member| parse_member(member))
                 .collect::<Result<Vec<_>>>()?,
+            TopologyConfig {
+                desired_replication_factor: args.desired_replication_factor,
+                write_availability_guard: WriteAvailabilityGuard {
+                    minimum_admitted_copies: args.minimum_admitted_copies,
+                    minimum_healthy_followers: args.minimum_healthy_followers,
+                    max_replica_lag_millis: args.max_replica_lag_ms,
+                },
+                ..TopologyConfig::default()
+            },
         )?)
     };
     let state = load_or_initialize(repository.as_ref(), bootstrap)?;
@@ -400,6 +435,18 @@ async fn run_begin_change(args: ChangeArgs) -> Result<()> {
         .map(|member| parse_member(member))
         .collect::<Result<Vec<_>>>()?;
     let change = client.begin_topology_change(members).await?;
+    println!("{}", serde_json::to_string_pretty(&change)?);
+    Ok(())
+}
+
+async fn run_begin_policy_change(args: PolicyChangeArgs) -> Result<()> {
+    let client = connect_client(&args.client).await?;
+    let policy = match args.policy {
+        PolicyArg::OwnerOnly => WriteAckPolicy::OwnerOnly,
+        PolicyArg::FirstSuccessor => WriteAckPolicy::FirstSuccessor,
+        PolicyArg::AllReplicas => WriteAckPolicy::AllReplicas,
+    };
+    let change = client.begin_write_policy_change(policy).await?;
     println!("{}", serde_json::to_string_pretty(&change)?);
     Ok(())
 }

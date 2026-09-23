@@ -16,7 +16,7 @@ use hashring_rs::{
         Empty, ErrorCode, GetRequest, coordinator_client::CoordinatorClient,
         data_node_client::DataNodeClient,
     },
-    topology::{Member, TopologySnapshot},
+    topology::{Member, TopologySnapshot, WriteAckPolicy},
 };
 use tonic::Code;
 
@@ -90,6 +90,10 @@ fn coordinator_arguments(
         state.display().to_string(),
         "--virtual-nodes".into(),
         "32".into(),
+        "--minimum-admitted-copies".into(),
+        "1".into(),
+        "--minimum-healthy-followers".into(),
+        "0".into(),
     ];
     for (node_id, port) in members {
         arguments.extend([
@@ -116,6 +120,213 @@ async fn connect_without_polling(endpoint: &str, timeout: Duration) -> HashringC
     HashringClient::connect_with_config(endpoint, config)
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn policy_strengthening_waits_for_admitted_caught_up_followers() {
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("policy-coordinator.redb");
+    let ports = unused_ports(4);
+    let coordinator_port = ports[0];
+    let endpoint = format!("http://127.0.0.1:{coordinator_port}");
+    let members: Vec<_> = (1..=3)
+        .map(|index| (format!("node-{index}"), ports[index]))
+        .collect();
+    let mut args = coordinator_arguments(coordinator_port, &state, &members);
+    let min_copies = args
+        .iter()
+        .position(|arg| arg == "--minimum-admitted-copies")
+        .unwrap();
+    args[min_copies + 1] = "2".into();
+    let min_healthy = args
+        .iter()
+        .position(|arg| arg == "--minimum-healthy-followers")
+        .unwrap();
+    args[min_healthy + 1] = "1".into();
+    let vnodes = args
+        .iter()
+        .position(|arg| arg == "--virtual-nodes")
+        .unwrap();
+    args[vnodes + 1] = "1".into();
+    let _coordinator = spawn_process(&args);
+    wait_for_listener(coordinator_port);
+    let client = HashringClient::connect(&endpoint, Duration::from_secs(15))
+        .await
+        .unwrap();
+    let _nodes: Vec<_> = members
+        .iter()
+        .map(|(node_id, port)| {
+            spawn_process(&[
+                "node".into(),
+                "--id".into(),
+                node_id.clone(),
+                "--listen".into(),
+                format!("127.0.0.1:{port}"),
+                "--coordinator".into(),
+                endpoint.clone(),
+            ])
+        })
+        .collect();
+    let ready = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let mut coordinator = CoordinatorClient::connect(endpoint.clone()).await.unwrap();
+            let status = coordinator
+                .get_replica_status(Empty {})
+                .await
+                .unwrap()
+                .into_inner();
+            if !status.ranges.is_empty()
+                && status.ranges.iter().all(|range| {
+                    range.followers.len() == 2
+                        && range.followers.iter().all(|follower| {
+                            follower.admitted
+                                && follower.lag_known
+                                && follower.stream_head == follower.stream_cursor
+                        })
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(ready.is_ok(), "replica admission did not become ready");
+    let first = client
+        .begin_write_policy_change(WriteAckPolicy::FirstSuccessor)
+        .await
+        .unwrap();
+    let applied = client
+        .execute_topology_change(
+            &first.change_id,
+            first.base_epoch,
+            first.target_topology.epoch,
+        )
+        .await
+        .unwrap();
+    assert_eq!(applied.phase, MigrationPhase::Complete);
+    let put = client
+        .put(b"policy-key".to_vec(), b"first".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(put.topology_epoch, applied.target_topology.epoch);
+    let all = client
+        .begin_write_policy_change(WriteAckPolicy::AllReplicas)
+        .await
+        .unwrap();
+    let applied = client
+        .execute_topology_change(&all.change_id, all.base_epoch, all.target_topology.epoch)
+        .await
+        .unwrap();
+    assert_eq!(applied.phase, MigrationPhase::Complete);
+    let put = client
+        .put(b"policy-key".to_vec(), b"all".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(put.topology_epoch, applied.target_topology.epoch);
+}
+
+#[tokio::test]
+async fn all_replicas_policy_cannot_publish_under_replicated_and_unfences_on_abort() {
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("under-replicated-policy.redb");
+    let ports = unused_ports(3);
+    let endpoint = format!("http://127.0.0.1:{}", ports[0]);
+    let members: Vec<_> = (1..=2)
+        .map(|index| (format!("node-{index}"), ports[index]))
+        .collect();
+    let mut args = coordinator_arguments(ports[0], &state, &members);
+    let min_copies = args
+        .iter()
+        .position(|arg| arg == "--minimum-admitted-copies")
+        .unwrap();
+    args[min_copies + 1] = "2".into();
+    let min_healthy = args
+        .iter()
+        .position(|arg| arg == "--minimum-healthy-followers")
+        .unwrap();
+    args[min_healthy + 1] = "1".into();
+    let vnodes = args
+        .iter()
+        .position(|arg| arg == "--virtual-nodes")
+        .unwrap();
+    args[vnodes + 1] = "1".into();
+    args.extend(["--migration-timeout-ms".into(), "1500".into()]);
+    let _coordinator = spawn_process(&args);
+    wait_for_listener(ports[0]);
+    let client = HashringClient::connect(&endpoint, Duration::from_secs(10))
+        .await
+        .unwrap();
+    let _nodes: Vec<_> = members
+        .iter()
+        .map(|(node_id, port)| {
+            spawn_process(&[
+                "node".into(),
+                "--id".into(),
+                node_id.clone(),
+                "--listen".into(),
+                format!("127.0.0.1:{port}"),
+                "--coordinator".into(),
+                endpoint.clone(),
+            ])
+        })
+        .collect();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let mut coordinator = CoordinatorClient::connect(endpoint.clone()).await.unwrap();
+            let status = coordinator
+                .get_replica_status(Empty {})
+                .await
+                .unwrap()
+                .into_inner();
+            if !status.ranges.is_empty()
+                && status.ranges.iter().all(|range| {
+                    range
+                        .followers
+                        .iter()
+                        .any(|follower| follower.admitted && follower.lag_known)
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let original_epoch = client.topology().await.epoch;
+    let change = client
+        .begin_write_policy_change(WriteAckPolicy::AllReplicas)
+        .await
+        .unwrap();
+    assert!(
+        client
+            .execute_topology_change(
+                &change.change_id,
+                change.base_epoch,
+                change.target_topology.epoch
+            )
+            .await
+            .is_err()
+    );
+    let current = client.topology_change().await.unwrap().unwrap();
+    assert_eq!(current.phase, MigrationPhase::Aborted);
+    let mut coordinator = CoordinatorClient::connect(endpoint.clone()).await.unwrap();
+    assert_eq!(
+        coordinator
+            .get_topology(Empty {})
+            .await
+            .unwrap()
+            .into_inner()
+            .epoch,
+        original_epoch
+    );
+    client
+        .put(b"write-after-abort".to_vec(), b"value".to_vec())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

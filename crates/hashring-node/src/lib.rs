@@ -26,11 +26,11 @@ use hashring_core::{
         ChangelogPageResponse, DedupSnapshotPageResponse, DeduplicationRecord, DeleteRequest,
         DeleteResponse, ErrorCode, GetRequest, GetResponse, InstallTopologyRequest, JournalRecord,
         MigrationRecord, NodeInfoResponse, OperationError, PauseRangeResponse,
-        PrepareDestinationRangeResponse, PrepareRangeRequest, PrepareSourceRangeResponse,
-        PutRequest, PutResponse, RangeControlRequest, RangeDigestResponse, RecordVersion,
-        RegisterNodeRequest, ReplicateMutationResponse, ReplicationCheckpointRequest,
-        ReplicationEntry, ReplicationProgressRequest, ReplicationProgressResponse,
-        SnapshotPageRequest, SnapshotPageResponse, StopRequest,
+        PolicyWriteFenceRequest, PrepareDestinationRangeResponse, PrepareRangeRequest,
+        PrepareSourceRangeResponse, PutRequest, PutResponse, RangeControlRequest,
+        RangeDigestResponse, RecordVersion, RegisterNodeRequest, ReplicateMutationResponse,
+        ReplicationCheckpointRequest, ReplicationEntry, ReplicationProgressRequest,
+        ReplicationProgressResponse, SnapshotPageRequest, SnapshotPageResponse, StopRequest,
         coordinator_client::CoordinatorClient, data_node_client::DataNodeClient,
         data_node_server::DataNode,
     },
@@ -45,6 +45,9 @@ const MAX_REPLICATION_FINGERPRINTS: u64 = 4_096;
 const REPLICATION_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const IDEMPOTENCY_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 const MAX_DEDUP_BYTES: usize = 16 * 1024 * 1024;
+const REQUIRED_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+type RequiredAck = (u64, String, u64);
 
 struct DedupEntry {
     key: Arc<[u8]>,
@@ -53,6 +56,7 @@ struct DedupEntry {
     deleted: bool,
     retained_bytes: usize,
     expires_at: Instant,
+    required_acks: Vec<RequiredAck>,
 }
 
 #[derive(Clone)]
@@ -207,10 +211,12 @@ struct NodeState {
     next_sequence: u64,
     owner_stream_sequences: HashMap<(u64, String), u64>,
     owner_stream_unacked: HashMap<(u64, String), VecDeque<(u64, u64)>>,
+    ack_progress: HashMap<(u64, String), watch::Sender<u64>>,
     follower_streams: HashMap<(u64, String), FollowerStreamState>,
     sources: HashMap<(String, String), SourceMigration>,
     destinations: HashMap<(String, String), DestinationMigration>,
     journal_bytes_total: usize,
+    policy_write_fence: Option<(String, u64)>,
     dedup: HashMap<String, DedupEntry>,
     dedup_expirations: BinaryHeap<Reverse<(Instant, String)>>,
     dedup_bytes: usize,
@@ -267,6 +273,82 @@ pub struct DataNodeService {
 }
 
 impl DataNodeService {
+    async fn ready_followers(&self, key: &[u8]) -> Result<(u64, Vec<String>), OperationError> {
+        let topology = self.state.read().await.topology.clone();
+        let token = topology.key_token(key);
+        let guard = &topology.write_availability_guard;
+        let needs_status = guard.minimum_admitted_copies > 1
+            || guard.minimum_healthy_followers > 0
+            || topology.write_ack_policy != WriteAckPolicy::OwnerOnly;
+        let status = if needs_status {
+            let result = tokio::time::timeout(REPLICATION_RPC_TIMEOUT, async {
+                let mut client = configure_coordinator_client(
+                    CoordinatorClient::connect(self.coordinator_endpoint.clone())
+                        .await
+                        .map_err(|error| error.to_string())?,
+                );
+                client
+                    .get_replica_status(proto::Empty {})
+                    .await
+                    .map(Response::into_inner)
+                    .map_err(|error| error.to_string())
+            })
+            .await;
+            // Transport and RPC failures are deliberately indistinguishable at the
+            // write gate: neither proves that a required copy is ready.
+            match result {
+                Ok(Ok(status)) => Some(status),
+                _ => {
+                    return Err(temporarily_unavailable(
+                        topology.epoch,
+                        "replica readiness could not be verified",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let followers = required_followers(&topology, token, status.as_ref(), &self.node_id)?;
+        Ok((topology.epoch, followers))
+    }
+
+    async fn wait_required_acks(
+        &self,
+        required: &[RequiredAck],
+        epoch: u64,
+    ) -> Result<(), OperationError> {
+        if required.is_empty() {
+            return Ok(());
+        }
+        let mut receivers = {
+            let state = self.state.read().await;
+            required
+                .iter()
+                .map(|(stream_epoch, node_id, sequence)| {
+                    state
+                        .ack_progress
+                        .get(&(*stream_epoch, node_id.clone()))
+                        .map(|sender| (sender.subscribe(), *sequence))
+                })
+                .collect::<Option<Vec<_>>>()
+        }
+        .ok_or_else(|| outcome_unknown(epoch))?;
+        let wait = async {
+            for (receiver, sequence) in &mut receivers {
+                while *receiver.borrow_and_update() < *sequence {
+                    receiver
+                        .changed()
+                        .await
+                        .map_err(|_| outcome_unknown(epoch))?;
+                }
+            }
+            Ok(())
+        };
+        tokio::time::timeout(REQUIRED_ACK_TIMEOUT, wait)
+            .await
+            .unwrap_or_else(|_| Err(outcome_unknown(epoch)))
+    }
+
     pub async fn connect(node_id: String, coordinator_endpoint: String) -> anyhow::Result<Self> {
         let process_instance_id = uuid::Uuid::new_v4().to_string();
         let topology = fetch_topology(&coordinator_endpoint).await?;
@@ -302,10 +384,12 @@ impl DataNodeService {
             next_sequence: 0,
             owner_stream_sequences: HashMap::new(),
             owner_stream_unacked: HashMap::new(),
+            ack_progress: HashMap::new(),
             follower_streams: HashMap::new(),
             sources: HashMap::new(),
             destinations: HashMap::new(),
             journal_bytes_total: 0,
+            policy_write_fence: None,
             dedup: HashMap::new(),
             dedup_expirations: BinaryHeap::new(),
             dedup_bytes: 0,
@@ -365,6 +449,7 @@ impl DataNodeService {
             state
                 .follower_streams
                 .retain(|(stream_epoch, _), _| *stream_epoch == epoch);
+            prune_ack_progress(&mut state);
             self.replication_dispatch.prune_epoch(epoch);
         }
         Ok(())
@@ -477,8 +562,68 @@ impl DataNode for DataNodeService {
             }));
         }
         self.refresh_if_newer(request.topology_epoch).await?;
+        {
+            let state = self.state.read().await;
+            if let Some(error) = self.owner_error(&state, &request.key)? {
+                return Ok(Response::new(PutResponse {
+                    current_epoch: error.current_epoch,
+                    error: Some(error),
+                    ..Default::default()
+                }));
+            }
+            if let Some(existing) = state
+                .dedup
+                .get(&request.request_id)
+                .filter(|entry| entry.expires_at > Instant::now())
+            {
+                if existing.fingerprint != mutation_fingerprint(&request.key, &request.value, false)
+                    || existing.deleted
+                {
+                    return Ok(Response::new(PutResponse {
+                        current_epoch: state.topology.epoch,
+                        error: Some(operation_error(
+                            ErrorCode::MutationIdConflict,
+                            "mutation ID was reused with a different operation or payload",
+                            false,
+                        )),
+                        ..Default::default()
+                    }));
+                }
+                let version = existing.version.clone();
+                let required = existing.required_acks.clone();
+                let epoch = state.topology.epoch;
+                drop(state);
+                let error = self.wait_required_acks(&required, epoch).await.err();
+                return Ok(Response::new(PutResponse {
+                    version: error.is_none().then_some(version),
+                    current_epoch: epoch,
+                    error,
+                }));
+            }
+        }
+        let (readiness_epoch, ready_followers) = match self.ready_followers(&request.key).await {
+            Ok(ready) => ready,
+            Err(error) => {
+                return Ok(Response::new(PutResponse {
+                    current_epoch: error.current_epoch,
+                    error: Some(error),
+                    ..Default::default()
+                }));
+            }
+        };
         let mut state = self.state.write().await;
         if let Some(error) = self.owner_error(&state, &request.key)? {
+            return Ok(Response::new(PutResponse {
+                current_epoch: error.current_epoch,
+                error: Some(error),
+                ..Default::default()
+            }));
+        }
+        if state.topology.epoch != readiness_epoch {
+            let error = temporarily_unavailable(
+                state.topology.epoch,
+                "topology changed while checking replica readiness",
+            );
             return Ok(Response::new(PutResponse {
                 current_epoch: error.current_epoch,
                 error: Some(error),
@@ -490,10 +635,15 @@ impl DataNode for DataNodeService {
         let fingerprint = mutation_fingerprint(&request.key, &request.value, false);
         if let Some(existing) = state.dedup.get(&request.request_id) {
             if existing.fingerprint == fingerprint && !existing.deleted {
+                let version = existing.version.clone();
+                let required = existing.required_acks.clone();
+                let epoch = state.topology.epoch;
+                drop(state);
+                let error = self.wait_required_acks(&required, epoch).await.err();
                 return Ok(Response::new(PutResponse {
-                    version: Some(existing.version.clone()),
-                    current_epoch: state.topology.epoch,
-                    error: None,
+                    version: error.is_none().then_some(version),
+                    current_epoch: epoch,
+                    error,
                 }));
             }
             return Ok(Response::new(PutResponse {
@@ -506,8 +656,10 @@ impl DataNode for DataNodeService {
                 ..Default::default()
             }));
         }
+        let ack_cost = required_ack_retained_bytes(&ready_followers);
         let dedup_cost =
-            dedup_retained_bytes(&request.request_id, request.key.len(), self.node_id.len());
+            dedup_retained_bytes(&request.request_id, request.key.len(), self.node_id.len())
+                .saturating_add(ack_cost);
         if state.dedup_bytes.saturating_add(dedup_cost) > self.max_dedup_bytes {
             return Ok(Response::new(PutResponse {
                 current_epoch: state.topology.epoch,
@@ -519,14 +671,21 @@ impl DataNode for DataNodeService {
                 ..Default::default()
             }));
         }
-        if let Some(error) = unsupported_write_policy_error(&state) {
+
+        if state.policy_write_fence.is_some() {
             return Ok(Response::new(PutResponse {
-                current_epoch: error.current_epoch,
-                error: Some(error),
+                current_epoch: state.topology.epoch,
+                error: Some(OperationError {
+                    current_epoch: state.topology.epoch,
+                    ..operation_error(
+                        ErrorCode::RangeBusy,
+                        "writes are fenced for ACK-policy transition",
+                        true,
+                    )
+                }),
                 ..Default::default()
             }));
         }
-
         let token = state.topology.key_token(&request.key);
         let journal_record_bytes =
             request.key.len() + request.value.len() + request.request_id.len() + 128;
@@ -624,6 +783,17 @@ impl DataNode for DataNodeService {
                 }));
             }
         };
+        let required_acks: Vec<RequiredAck> = replications
+            .iter()
+            .filter(|entry| ready_followers.contains(&entry.follower_node_id))
+            .map(|entry| {
+                (
+                    entry.mutation.topology_epoch,
+                    entry.follower_node_id.clone(),
+                    entry.stream_sequence,
+                )
+            })
+            .collect();
         state.next_sequence = next_sequence;
         let now = now_unix_millis();
         for entry in &replications {
@@ -664,20 +834,32 @@ impl DataNode for DataNodeService {
         state.journal_bytes_total += journal_growth;
         insert_dedup(
             &mut state,
-            mutation_id,
+            mutation_id.clone(),
             Arc::from(request.key.as_slice()),
             fingerprint,
             version.clone(),
             false,
             Instant::now(),
         );
+        let dedup = state
+            .dedup
+            .get_mut(&mutation_id)
+            .expect("new retry record exists");
+        dedup.required_acks = required_acks.clone();
+        dedup.retained_bytes += ack_cost;
+        state.dedup_bytes += ack_cost;
         let current_epoch = state.topology.epoch;
         self.replication_dispatch
             .dispatch(replications, reservations);
+        drop(state);
+        let error = self
+            .wait_required_acks(&required_acks, current_epoch)
+            .await
+            .err();
         Ok(Response::new(PutResponse {
-            version: Some(version),
+            version: error.is_none().then_some(version),
             current_epoch,
-            error: None,
+            error,
         }))
     }
 
@@ -703,8 +885,62 @@ impl DataNode for DataNodeService {
             }));
         }
         self.refresh_if_newer(request.topology_epoch).await?;
+        {
+            let state = self.state.read().await;
+            if let Some(error) = self.owner_error(&state, &request.key)? {
+                return Ok(Response::new(DeleteResponse {
+                    current_epoch: error.current_epoch,
+                    error: Some(error),
+                }));
+            }
+            if let Some(existing) = state
+                .dedup
+                .get(&request.request_id)
+                .filter(|entry| entry.expires_at > Instant::now())
+            {
+                if existing.fingerprint != mutation_fingerprint(&request.key, &[], true)
+                    || !existing.deleted
+                {
+                    return Ok(Response::new(DeleteResponse {
+                        current_epoch: state.topology.epoch,
+                        error: Some(operation_error(
+                            ErrorCode::MutationIdConflict,
+                            "mutation ID was reused with a different operation or payload",
+                            false,
+                        )),
+                    }));
+                }
+                let required = existing.required_acks.clone();
+                let epoch = state.topology.epoch;
+                drop(state);
+                let error = self.wait_required_acks(&required, epoch).await.err();
+                return Ok(Response::new(DeleteResponse {
+                    current_epoch: epoch,
+                    error,
+                }));
+            }
+        }
+        let (readiness_epoch, ready_followers) = match self.ready_followers(&request.key).await {
+            Ok(ready) => ready,
+            Err(error) => {
+                return Ok(Response::new(DeleteResponse {
+                    current_epoch: error.current_epoch,
+                    error: Some(error),
+                }));
+            }
+        };
         let mut state = self.state.write().await;
         if let Some(error) = self.owner_error(&state, &request.key)? {
+            return Ok(Response::new(DeleteResponse {
+                current_epoch: error.current_epoch,
+                error: Some(error),
+            }));
+        }
+        if state.topology.epoch != readiness_epoch {
+            let error = temporarily_unavailable(
+                state.topology.epoch,
+                "topology changed while checking replica readiness",
+            );
             return Ok(Response::new(DeleteResponse {
                 current_epoch: error.current_epoch,
                 error: Some(error),
@@ -715,9 +951,13 @@ impl DataNode for DataNodeService {
         let fingerprint = mutation_fingerprint(&request.key, &[], true);
         if let Some(existing) = state.dedup.get(&request.request_id) {
             if existing.fingerprint == fingerprint && existing.deleted {
+                let required = existing.required_acks.clone();
+                let epoch = state.topology.epoch;
+                drop(state);
+                let error = self.wait_required_acks(&required, epoch).await.err();
                 return Ok(Response::new(DeleteResponse {
-                    current_epoch: state.topology.epoch,
-                    error: None,
+                    current_epoch: epoch,
+                    error,
                 }));
             }
             return Ok(Response::new(DeleteResponse {
@@ -729,8 +969,10 @@ impl DataNode for DataNodeService {
                 )),
             }));
         }
+        let ack_cost = required_ack_retained_bytes(&ready_followers);
         let dedup_cost =
-            dedup_retained_bytes(&request.request_id, request.key.len(), self.node_id.len());
+            dedup_retained_bytes(&request.request_id, request.key.len(), self.node_id.len())
+                .saturating_add(ack_cost);
         if state.dedup_bytes.saturating_add(dedup_cost) > self.max_dedup_bytes {
             return Ok(Response::new(DeleteResponse {
                 current_epoch: state.topology.epoch,
@@ -741,13 +983,20 @@ impl DataNode for DataNodeService {
                 )),
             }));
         }
-        if let Some(error) = unsupported_write_policy_error(&state) {
+
+        if state.policy_write_fence.is_some() {
             return Ok(Response::new(DeleteResponse {
-                current_epoch: error.current_epoch,
-                error: Some(error),
+                current_epoch: state.topology.epoch,
+                error: Some(OperationError {
+                    current_epoch: state.topology.epoch,
+                    ..operation_error(
+                        ErrorCode::RangeBusy,
+                        "writes are fenced for ACK-policy transition",
+                        true,
+                    )
+                }),
             }));
         }
-
         let token = state.topology.key_token(&request.key);
         for source in state
             .sources
@@ -830,6 +1079,17 @@ impl DataNode for DataNodeService {
                 }));
             }
         };
+        let required_acks: Vec<RequiredAck> = replications
+            .iter()
+            .filter(|entry| ready_followers.contains(&entry.follower_node_id))
+            .map(|entry| {
+                (
+                    entry.mutation.topology_epoch,
+                    entry.follower_node_id.clone(),
+                    entry.stream_sequence,
+                )
+            })
+            .collect();
         let reservations = match self.replication_dispatch.reserve(&replications) {
             Ok(reservations) => reservations,
             Err(()) => {
@@ -883,19 +1143,31 @@ impl DataNode for DataNodeService {
         state.journal_bytes_total += journal_growth;
         insert_dedup(
             &mut state,
-            mutation_id,
+            mutation_id.clone(),
             Arc::from(request.key.as_slice()),
             fingerprint,
             version.clone(),
             true,
             Instant::now(),
         );
+        let dedup = state
+            .dedup
+            .get_mut(&mutation_id)
+            .expect("new retry record exists");
+        dedup.required_acks = required_acks.clone();
+        dedup.retained_bytes += ack_cost;
+        state.dedup_bytes += ack_cost;
         let current_epoch = state.topology.epoch;
         self.replication_dispatch
             .dispatch(replications, reservations);
+        drop(state);
+        let error = self
+            .wait_required_acks(&required_acks, current_epoch)
+            .await
+            .err();
         Ok(Response::new(DeleteResponse {
             current_epoch,
-            error: None,
+            error,
         }))
     }
 
@@ -1827,7 +2099,47 @@ impl DataNode for DataNodeService {
         state
             .follower_streams
             .retain(|(stream_epoch, _), _| *stream_epoch == epoch);
+        prune_ack_progress(&mut state);
         self.replication_dispatch.prune_epoch(epoch);
+        Ok(Response::new(proto::Empty {}))
+    }
+
+    async fn pause_policy_writes(
+        &self,
+        request: Request<PolicyWriteFenceRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        let request = request.into_inner();
+        if request.change_id.is_empty() {
+            return Err(Status::invalid_argument("policy change ID is empty"));
+        }
+        let mut state = self.state.write().await;
+        if state.topology.epoch != request.base_epoch {
+            return Err(Status::failed_precondition(
+                "policy fence base epoch does not match installed topology",
+            ));
+        }
+        match &state.policy_write_fence {
+            Some((change_id, epoch))
+                if change_id != &request.change_id || *epoch != request.base_epoch =>
+            {
+                return Err(Status::failed_precondition(
+                    "another policy change has fenced writes",
+                ));
+            }
+            _ => state.policy_write_fence = Some((request.change_id, request.base_epoch)),
+        }
+        Ok(Response::new(proto::Empty {}))
+    }
+
+    async fn resume_policy_writes(
+        &self,
+        request: Request<PolicyWriteFenceRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        let request = request.into_inner();
+        let mut state = self.state.write().await;
+        if state.policy_write_fence.as_ref() == Some(&(request.change_id, request.base_epoch)) {
+            state.policy_write_fence = None;
+        }
         Ok(Response::new(proto::Empty {}))
     }
 
@@ -1877,15 +2189,120 @@ impl DataNode for DataNodeService {
     }
 }
 
-fn unsupported_write_policy_error(state: &NodeState) -> Option<OperationError> {
-    (state.topology.write_ack_policy != WriteAckPolicy::OwnerOnly).then(|| OperationError {
-        current_epoch: state.topology.epoch,
+fn temporarily_unavailable(epoch: u64, message: impl Into<String>) -> OperationError {
+    OperationError {
+        current_epoch: epoch,
+        ..operation_error(ErrorCode::TemporarilyUnavailable, message, true)
+    }
+}
+
+fn outcome_unknown(epoch: u64) -> OperationError {
+    OperationError {
+        current_epoch: epoch,
+        unknown_write_outcome: true,
         ..operation_error(
-            ErrorCode::Unavailable,
-            "committed write acknowledgement policy is not active yet",
+            ErrorCode::OutcomeUnknown,
+            "required replica acknowledgement is uncertain",
             true,
         )
-    })
+    }
+}
+
+fn range_contains(start: u64, end: u64, token: u64) -> bool {
+    if start < end {
+        token > start && token <= end
+    } else if start > end {
+        token > start || token <= end
+    } else {
+        true
+    }
+}
+
+fn required_followers(
+    topology: &TopologySnapshot,
+    token: u64,
+    status: Option<&proto::ReplicaStatusResponse>,
+    owner_node_id: &str,
+) -> Result<Vec<String>, OperationError> {
+    let epoch = topology.epoch;
+    let replicas = topology
+        .replica_node_ids_for_token(token)
+        .map_err(|error| temporarily_unavailable(epoch, error.to_string()))?;
+    let guard = &topology.write_availability_guard;
+    if topology.write_ack_policy == WriteAckPolicy::FirstSuccessor && replicas.len() < 2 {
+        return Err(temporarily_unavailable(
+            epoch,
+            "first successor is not in the desired placement",
+        ));
+    }
+    if topology.write_ack_policy == WriteAckPolicy::AllReplicas
+        && replicas.len() < topology.desired_replication_factor as usize
+    {
+        return Err(temporarily_unavailable(
+            epoch,
+            "complete desired replication factor is unavailable",
+        ));
+    }
+    if guard.minimum_admitted_copies <= 1
+        && guard.minimum_healthy_followers == 0
+        && topology.write_ack_policy == WriteAckPolicy::OwnerOnly
+    {
+        return Ok(Vec::new());
+    }
+    let range = status
+        .filter(|status| status.topology_epoch == epoch)
+        .and_then(|status| {
+            status.ranges.iter().find(|range| {
+                range.owner_node_id == owner_node_id
+                    && range_contains(range.start_exclusive, range.end_inclusive, token)
+            })
+        })
+        .ok_or_else(|| temporarily_unavailable(epoch, "replica admission status is unavailable"))?;
+    let admitted = range
+        .followers
+        .iter()
+        .filter(|follower| follower.admitted)
+        .count() as u32;
+    let healthy = range
+        .followers
+        .iter()
+        .filter(|follower| {
+            follower.admitted
+                && follower.lag_known
+                && follower.lag_millis <= guard.max_replica_lag_millis
+        })
+        .count() as u32;
+    if admitted.saturating_add(1) < guard.minimum_admitted_copies
+        || healthy < guard.minimum_healthy_followers
+    {
+        return Err(temporarily_unavailable(
+            epoch,
+            "minimum admitted-copy or healthy-follower guard is not satisfied",
+        ));
+    }
+    let desired: Vec<_> = match topology.write_ack_policy {
+        WriteAckPolicy::OwnerOnly => Vec::new(),
+        WriteAckPolicy::FirstSuccessor => replicas[1..2].to_vec(),
+        WriteAckPolicy::AllReplicas => replicas[1..].to_vec(),
+    };
+    for node_id in &desired {
+        if !range.followers.iter().any(|follower| {
+            follower.node_id == *node_id
+                && follower.admitted
+                && follower.lag_known
+                && follower.lag_millis <= guard.max_replica_lag_millis
+        }) {
+            return Err(OperationError {
+                current_epoch: epoch,
+                ..operation_error(
+                    ErrorCode::ReplicaNotReady,
+                    format!("required follower {node_id} is not healthy and admitted"),
+                    true,
+                )
+            });
+        }
+    }
+    Ok(desired.into_iter().map(str::to_owned).collect())
 }
 
 fn prepare_replication_entries(
@@ -1943,6 +2360,10 @@ fn prepare_replication_entries(
     Ok(followers
         .into_iter()
         .map(|(follower_node_id, follower_endpoint)| {
+            state
+                .ack_progress
+                .entry((state.topology.epoch, follower_node_id.clone()))
+                .or_insert_with(|| watch::channel(0).0);
             let sequence = state
                 .owner_stream_sequences
                 .entry((state.topology.epoch, follower_node_id.clone()))
@@ -2030,6 +2451,13 @@ fn dedup_retained_bytes(mutation_id: &str, key_len: usize, owner_len: usize) -> 
         + std::mem::size_of::<DeduplicationRecord>()
         + std::mem::size_of::<StagedDedup>()
         + 128 // hash-table buckets and allocator metadata
+}
+
+fn required_ack_retained_bytes(followers: &[String]) -> usize {
+    followers
+        .iter()
+        .map(|node_id| 2 * std::mem::size_of::<RequiredAck>() + node_id.len() + 64)
+        .sum()
 }
 
 fn dedup_record_size(record: &DeduplicationRecord) -> usize {
@@ -2125,12 +2553,33 @@ fn purge_expired_dedup(state: &mut NodeState, now: Instant) {
             .dedup_expirations
             .pop()
             .expect("expiration was checked above");
-        if state.dedup.get(&mutation_id).is_some_and(|entry| entry.expires_at <= now)
+        if state
+            .dedup
+            .get(&mutation_id)
+            .is_some_and(|entry| entry.expires_at <= now)
             && let Some(entry) = state.dedup.remove(&mutation_id)
         {
             state.dedup_bytes -= entry.retained_bytes;
         }
     }
+    prune_ack_progress(state);
+}
+
+fn prune_ack_progress(state: &mut NodeState) {
+    let live: HashSet<_> = state
+        .dedup
+        .values()
+        .flat_map(|entry| {
+            entry
+                .required_acks
+                .iter()
+                .map(|(epoch, node_id, _)| (*epoch, node_id.clone()))
+        })
+        .collect();
+    let current_epoch = state.topology.epoch;
+    state
+        .ack_progress
+        .retain(|key, _| key.0 == current_epoch || live.contains(key));
 }
 
 fn insert_dedup(
@@ -2176,6 +2625,7 @@ fn insert_dedup_until(
             deleted,
             retained_bytes,
             expires_at,
+            required_acks: Vec::new(),
         },
     );
     state.dedup_bytes += retained_bytes;
@@ -2339,6 +2789,19 @@ async fn deliver_replication_stream(
                     if response.applied_stream_sequence >= prepared.stream_sequence =>
                 {
                     let mut state = state.write().await;
+                    if let Some(progress) = state.ack_progress.get(&(
+                        prepared.mutation.topology_epoch,
+                        prepared.follower_node_id.clone(),
+                    )) {
+                        progress.send_if_modified(|sequence| {
+                            if *sequence < response.applied_stream_sequence {
+                                *sequence = response.applied_stream_sequence;
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                    }
                     if let Some(queue) = state.owner_stream_unacked.get_mut(&(
                         prepared.mutation.topology_epoch,
                         prepared.follower_node_id.clone(),
@@ -2561,7 +3024,7 @@ mod tests {
     use hashring_core::topology::{Member, TopologyConfig, WriteAvailabilityGuard};
 
     fn service() -> DataNodeService {
-        let topology = TopologySnapshot::new(
+        let topology = TopologySnapshot::new_with_config(
             1,
             42,
             8,
@@ -2569,6 +3032,15 @@ mod tests {
                 node_id: "node-1".into(),
                 endpoint: "http://127.0.0.1:5001".into(),
             }],
+            TopologyConfig {
+                desired_replication_factor: 1,
+                write_availability_guard: WriteAvailabilityGuard {
+                    minimum_admitted_copies: 1,
+                    minimum_healthy_followers: 0,
+                    ..WriteAvailabilityGuard::default()
+                },
+                ..TopologyConfig::default()
+            },
         )
         .unwrap();
         service_for("node-1", topology)
@@ -2582,10 +3054,12 @@ mod tests {
             next_sequence: 0,
             owner_stream_sequences: HashMap::new(),
             owner_stream_unacked: HashMap::new(),
+            ack_progress: HashMap::new(),
             follower_streams: HashMap::new(),
             sources: HashMap::new(),
             destinations: HashMap::new(),
             journal_bytes_total: 0,
+            policy_write_fence: None,
             dedup: HashMap::new(),
             dedup_expirations: BinaryHeap::new(),
             dedup_bytes: 0,
@@ -2630,8 +3104,8 @@ mod tests {
             TopologyConfig {
                 desired_replication_factor,
                 write_availability_guard: WriteAvailabilityGuard {
-                    minimum_admitted_copies: desired_replication_factor.min(2),
-                    minimum_healthy_followers: desired_replication_factor.saturating_sub(1).min(1),
+                    minimum_admitted_copies: 1,
+                    minimum_healthy_followers: 0,
                     ..WriteAvailabilityGuard::default()
                 },
                 ..TopologyConfig::default()
@@ -2942,10 +3416,12 @@ mod tests {
             next_sequence: 0,
             owner_stream_sequences: HashMap::new(),
             owner_stream_unacked: HashMap::new(),
+            ack_progress: HashMap::new(),
             follower_streams: HashMap::new(),
             sources: HashMap::new(),
             destinations: HashMap::new(),
             journal_bytes_total: 0,
+            policy_write_fence: None,
             dedup: HashMap::new(),
             dedup_expirations: BinaryHeap::new(),
             dedup_bytes: 0,
@@ -3009,6 +3485,11 @@ mod tests {
             ],
             TopologyConfig {
                 desired_replication_factor: 2,
+                write_availability_guard: WriteAvailabilityGuard {
+                    minimum_admitted_copies: 1,
+                    minimum_healthy_followers: 0,
+                    ..WriteAvailabilityGuard::default()
+                },
                 ..TopologyConfig::default()
             },
         )
@@ -3144,6 +3625,11 @@ mod tests {
             ],
             TopologyConfig {
                 desired_replication_factor: 2,
+                write_availability_guard: WriteAvailabilityGuard {
+                    minimum_admitted_copies: 1,
+                    minimum_healthy_followers: 0,
+                    ..WriteAvailabilityGuard::default()
+                },
                 ..TopologyConfig::default()
             },
         )
@@ -3332,6 +3818,11 @@ mod tests {
             ],
             TopologyConfig {
                 desired_replication_factor: 2,
+                write_availability_guard: WriteAvailabilityGuard {
+                    minimum_admitted_copies: 1,
+                    minimum_healthy_followers: 0,
+                    ..WriteAvailabilityGuard::default()
+                },
                 ..TopologyConfig::default()
             },
         )
@@ -3507,7 +3998,10 @@ mod tests {
                 .await
                 .unwrap()
                 .into_inner();
-            assert_eq!(put.error.unwrap().code, ErrorCode::Unavailable as i32);
+            assert_eq!(
+                put.error.unwrap().code,
+                ErrorCode::TemporarilyUnavailable as i32
+            );
             let delete = service
                 .delete(Request::new(DeleteRequest {
                     key: b"key".to_vec(),
@@ -3517,9 +4011,109 @@ mod tests {
                 .await
                 .unwrap()
                 .into_inner();
-            assert_eq!(delete.error.unwrap().code, ErrorCode::Unavailable as i32);
+            assert_eq!(
+                delete.error.unwrap().code,
+                ErrorCode::TemporarilyUnavailable as i32
+            );
             assert!(service.state.read().await.records.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn first_successor_requires_the_exact_healthy_follower_and_its_ack() {
+        let base = replication_topology(3);
+        let key = key_with_placement(&base, |replicas| replicas[0] == "node-1");
+        let token = base.key_token(&key);
+        let range = base
+            .derived_ranges()
+            .unwrap()
+            .into_iter()
+            .find(|range| {
+                range.owner_node_id == "node-1"
+                    && range_contains(range.start_exclusive, range.end_inclusive, token)
+            })
+            .unwrap();
+        let first = range.follower_node_ids[0].clone();
+        let second = range.follower_node_ids[1].clone();
+        let mut topology = TopologySnapshot::new_with_config(
+            1,
+            42,
+            8,
+            base.members.clone(),
+            TopologyConfig {
+                desired_replication_factor: 3,
+                write_ack_policy: WriteAckPolicy::FirstSuccessor,
+                write_availability_guard: WriteAvailabilityGuard {
+                    minimum_admitted_copies: 2,
+                    minimum_healthy_followers: 1,
+                    ..WriteAvailabilityGuard::default()
+                },
+            },
+        )
+        .unwrap();
+        let mut status = proto::ReplicaStatusResponse {
+            topology_epoch: 1,
+            ranges: vec![proto::RangeReplicaStatus {
+                start_exclusive: range.start_exclusive,
+                end_inclusive: range.end_inclusive,
+                owner_node_id: "node-1".into(),
+                desired_rf: 3,
+                current_rf: 3,
+                followers: vec![
+                    proto::FollowerReplicaStatus {
+                        node_id: first.clone(),
+                        admitted: true,
+                        lag_known: false,
+                        ..Default::default()
+                    },
+                    proto::FollowerReplicaStatus {
+                        node_id: second.clone(),
+                        admitted: true,
+                        lag_known: true,
+                        ..Default::default()
+                    },
+                ],
+            }],
+        };
+        assert!(required_followers(&topology, token, Some(&status), "node-1").is_err());
+        status.ranges[0].followers[0].lag_known = true;
+        assert_eq!(
+            required_followers(&topology, token, Some(&status), "node-1").unwrap(),
+            vec![first.clone()]
+        );
+        topology.write_ack_policy = WriteAckPolicy::AllReplicas;
+        assert_eq!(
+            required_followers(&topology, token, Some(&status), "node-1").unwrap(),
+            vec![first.clone(), second.clone()]
+        );
+        status.ranges[0].followers[1].admitted = false;
+        assert!(required_followers(&topology, token, Some(&status), "node-1").is_err());
+        topology.write_ack_policy = WriteAckPolicy::OwnerOnly;
+        assert!(
+            required_followers(&topology, token, Some(&status), "node-1")
+                .unwrap()
+                .is_empty()
+        );
+
+        let service = service();
+        let (first_sender, _) = watch::channel(0);
+        let (second_sender, _) = watch::channel(0);
+        {
+            let mut state = service.state.write().await;
+            state
+                .ack_progress
+                .insert((1, first.clone()), first_sender.clone());
+            state
+                .ack_progress
+                .insert((1, second), second_sender.clone());
+        }
+        let waiter =
+            tokio::spawn(async move { service.wait_required_acks(&[(1, first, 1)], 1).await });
+        second_sender.send_replace(1);
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        first_sender.send_replace(1);
+        assert!(waiter.await.unwrap().is_ok());
     }
 
     #[tokio::test]
@@ -3674,7 +4268,7 @@ mod tests {
             .commit_destination_range(Request::new(control.clone()))
             .await
             .unwrap();
-        let topology = TopologySnapshot::new(
+        let topology = TopologySnapshot::new_with_config(
             2,
             42,
             8,
@@ -3682,6 +4276,15 @@ mod tests {
                 node_id: "node-2".into(),
                 endpoint: "http://127.0.0.1:5002".into(),
             }],
+            TopologyConfig {
+                desired_replication_factor: 1,
+                write_availability_guard: WriteAvailabilityGuard {
+                    minimum_admitted_copies: 1,
+                    minimum_healthy_followers: 0,
+                    ..WriteAvailabilityGuard::default()
+                },
+                ..TopologyConfig::default()
+            },
         )
         .unwrap();
         destination
