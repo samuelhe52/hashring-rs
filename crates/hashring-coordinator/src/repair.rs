@@ -1,0 +1,701 @@
+use super::*;
+
+impl CoordinatorService {
+    pub fn new(
+        state: ClusterState,
+        repository: Arc<dyn CoordinatorRepository>,
+        migration_timeout: Duration,
+    ) -> Self {
+        let (repair_interrupt, _) = watch::channel(0);
+        Self {
+            state: Arc::new(RwLock::new(state)),
+            repository,
+            execution_lock: Arc::new(Mutex::new(())),
+            migration_timeout,
+            range_move_concurrency: DEFAULT_RANGE_MOVE_CONCURRENCY,
+            pre_publish_delay: Duration::ZERO,
+            lease_grants: Arc::new(Mutex::new(BTreeMap::new())),
+            peer_failures: Arc::new(Mutex::new(BTreeMap::new())),
+            status_channels: Arc::new(Mutex::new(BTreeMap::new())),
+            startup_at: Instant::now(),
+            repair_interrupt: Arc::new(repair_interrupt),
+        }
+    }
+
+    pub fn with_range_move_concurrency(mut self, concurrency: usize) -> Self {
+        assert!(concurrency > 0, "range move concurrency must be positive");
+        self.range_move_concurrency = concurrency;
+        self
+    }
+
+    pub fn with_pre_publish_delay(mut self, delay: Duration) -> Self {
+        self.pre_publish_delay = delay;
+        self
+    }
+
+    /// Run one failure-confirmation pass. A missed lease is sufficient evidence;
+    /// otherwise two independent, continuously failing peer probes are needed.
+    pub async fn run_failure_pass(&self) -> Result<(), Status> {
+        if let Some(change) = self.state.read().await.active_change.clone()
+            && !change.phase.is_terminal()
+        {
+            if change.failed_node_id.is_some() {
+                self.execute_change(change_identity(&change), true).await?;
+            }
+            return Ok(());
+        }
+        let state = self.state.read().await.clone();
+        if state.committed.members.len() <= 1 {
+            return Ok(());
+        }
+        let now = Instant::now();
+        if now < self.startup_at + NODE_LEASE_DURATION {
+            return Ok(());
+        }
+        let grants = self.lease_grants.lock().await;
+        let failures = self.peer_failures.lock().await;
+        let candidate = state.committed.members.iter().find(|member| {
+            if !state.process_instances.contains_key(&member.node_id)
+                || state.fenced_nodes.contains(&member.node_id)
+            {
+                return false;
+            }
+            failure_confirmed(&state, &grants, &failures, &member.node_id, now)
+        });
+        let Some(failed_node_id) = candidate.map(|member| member.node_id.clone()) else {
+            return Ok(());
+        };
+        drop(failures);
+        drop(grants);
+        let target_members = state
+            .committed
+            .members
+            .iter()
+            .filter(|member| member.node_id != failed_node_id)
+            .cloned()
+            .collect();
+        let mut change = TopologyChange::plan(&state.committed, target_members)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        change.failed_node_id = Some(failed_node_id.clone());
+        let mut current = self.state.write().await;
+        if current.committed != state.committed
+            || current
+                .active_change
+                .as_ref()
+                .is_some_and(|active| !active.phase.is_terminal())
+        {
+            return Ok(());
+        }
+        let mut next = current.clone();
+        next.fenced_nodes.insert(failed_node_id);
+        next.active_change = Some(change.clone());
+        self.repository
+            .store_state(&next)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        *current = next;
+        drop(current);
+        self.repair_interrupt
+            .send_modify(|generation| *generation += 1);
+        self.execute_change(change_identity(&change), true).await?;
+        Ok(())
+    }
+
+    /// Retry durable follower repairs when no topology transition is active.
+    /// A failed task remains pending; the next call can safely start it again.
+    pub async fn resume_replica_repairs(&self) -> Result<usize, Status> {
+        let _execution = self.execution_lock.lock().await;
+        let mut interrupt = self.repair_interrupt.subscribe();
+        let tasks = {
+            let mut state = self.state.write().await;
+            if state
+                .active_change
+                .as_ref()
+                .is_some_and(|change| !change.phase.is_terminal())
+            {
+                return Ok(0);
+            }
+            let mut next = state.clone();
+            reconcile_replica_repairs(&mut next)
+                .map_err(|error| Status::internal(error.to_string()))?;
+            for repair in &mut next.replica_repairs {
+                if repair.phase != ReplicaRepairPhase::Complete {
+                    repair.phase = ReplicaRepairPhase::Pending;
+                }
+            }
+            if next != *state {
+                self.repository
+                    .store_state(&next)
+                    .map_err(|error| Status::internal(error.to_string()))?;
+                *state = next;
+            }
+            let mut groups: BTreeMap<(String, String), Vec<ReplicaRepair>> = BTreeMap::new();
+            let now_unix_millis = unix_millis_now();
+            for repair in &state.replica_repairs {
+                if state.process_instances.contains_key(&repair.owner_node_id)
+                    && state.process_instances.contains_key(&repair.node_id)
+                {
+                    groups
+                        .entry((repair.owner_node_id.clone(), repair.node_id.clone()))
+                        .or_default()
+                        .push(repair.clone());
+                }
+            }
+            groups.retain(|_, repairs| {
+                repairs
+                    .iter()
+                    .any(|repair| repair.phase == ReplicaRepairPhase::Pending)
+                    && repairs.iter().all(|repair| {
+                        repair.phase == ReplicaRepairPhase::Complete
+                            || repair.next_attempt_unix_millis <= now_unix_millis
+                    })
+            });
+            // Bound one pass as well as in-flight work. Remaining groups stay
+            // durable and are considered on the next periodic pass.
+            let mut due = groups.into_values().collect::<Vec<_>>();
+            due.sort_by_key(|group| {
+                group
+                    .iter()
+                    .map(|repair| repair.retry_count)
+                    .max()
+                    .unwrap_or(0)
+            });
+            due.truncate(MAX_REPAIR_GROUPS_PER_PASS);
+            due
+        };
+        let work = try_map_bounded(
+            tasks,
+            self.range_move_concurrency.min(4),
+            |tasks| async move {
+                // Keep other ranges available if one destination is down. Failed
+                // tasks retain durable Pending state for the next retry.
+                match self.seed_replica_group(&tasks).await {
+                    Ok(()) => Ok::<_, Status>(tasks.len()),
+                    Err(error) => {
+                        self.record_repair_failure(&tasks, &error).await?;
+                        tracing::warn!(
+                            owner = %tasks[0].owner_node_id,
+                            follower = %tasks[0].node_id,
+                            %error,
+                            "replica seed remains pending"
+                        );
+                        Ok(0)
+                    }
+                }
+            },
+        );
+        let results = tokio::select! {
+            results = work => results?,
+            changed = interrupt.changed() => {
+                if changed.is_ok() {
+                    self.cleanup_interrupted_repairs().await?;
+                    return Ok(0);
+                }
+                return Err(Status::internal("repair interruption channel closed"));
+            }
+        };
+        Ok(results.into_iter().sum())
+    }
+
+    pub(super) async fn record_repair_failure(
+        &self,
+        tasks: &[ReplicaRepair],
+        error: &Status,
+    ) -> Result<(), Status> {
+        let mut state = self.state.write().await;
+        let mut next = state.clone();
+        let now = unix_millis_now();
+        for task in tasks {
+            if let Some(repair) = next.replica_repairs.iter_mut().find(|repair| {
+                repair.epoch == task.epoch
+                    && repair.start_exclusive == task.start_exclusive
+                    && repair.end_inclusive == task.end_inclusive
+                    && repair.owner_node_id == task.owner_node_id
+                    && repair.node_id == task.node_id
+                    && repair.phase != ReplicaRepairPhase::Complete
+            }) {
+                repair.retry_count = repair.retry_count.saturating_add(1);
+                let delay_secs = 1u64 << repair.retry_count.min(6);
+                repair.next_attempt_unix_millis = now.saturating_add(delay_secs.min(60) * 1000);
+                repair.last_error = error.message().chars().take(256).collect();
+            }
+        }
+        if next != *state {
+            self.repository
+                .store_state(&next)
+                .map_err(|error| Status::internal(error.to_string()))?;
+            *state = next;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn cleanup_interrupted_repairs(&self) -> Result<(), Status> {
+        let state = self.state.read().await.clone();
+        let affected: BTreeSet<_> = state
+            .replica_repairs
+            .iter()
+            .filter(|repair| {
+                matches!(
+                    repair.phase,
+                    ReplicaRepairPhase::Copying | ReplicaRepairPhase::Verifying
+                )
+            })
+            .flat_map(|repair| [repair.owner_node_id.clone(), repair.node_id.clone()])
+            .filter(|node_id| !state.fenced_nodes.contains(node_id))
+            .collect();
+        let members: Vec<_> = state
+            .committed
+            .members
+            .iter()
+            .filter(|member| affected.contains(&member.node_id))
+            .cloned()
+            .collect();
+        let epoch = state.committed.epoch;
+        let deadline = Instant::now() + self.migration_timeout;
+        try_map_bounded(members, self.range_move_concurrency, |member| async move {
+            let mut node = connect_node(&member.endpoint, deadline).await?;
+            rpc_before(
+                deadline,
+                node.abort_replica_repairs(proto::AbortReplicaRepairsRequest {
+                    topology_epoch: epoch,
+                }),
+            )
+            .await?;
+            Ok::<(), Status>(())
+        })
+        .await?;
+        Ok(())
+    }
+
+    // Called while the topology execution lock is held. Target-epoch owners
+    // remain unleased until the policy and minimum-copy barrier is verified.
+    pub(super) async fn seed_repairs_for_activation(&self) -> Result<(), Status> {
+        self.cleanup_interrupted_repairs().await?;
+        let (groups, required) = {
+            let state = self.state.read().await;
+            let topology = &state.committed;
+            let guard = &topology.write_availability_guard;
+            let policy_followers = match topology.write_ack_policy {
+                WriteAckPolicy::OwnerOnly => 0,
+                WriteAckPolicy::FirstSuccessor => 1,
+                WriteAckPolicy::AllReplicas => topology.desired_replication_factor as usize - 1,
+            };
+            let needed = policy_followers
+                .max(guard.minimum_admitted_copies.saturating_sub(1) as usize)
+                .max(guard.minimum_healthy_followers as usize);
+            let mut required = BTreeSet::new();
+            for range in topology
+                .derived_ranges()
+                .map_err(|error| Status::internal(error.to_string()))?
+            {
+                if range.follower_node_ids.len() < needed {
+                    return Err(Status::failed_precondition(
+                        "target range cannot satisfy the activation policy and copy guard",
+                    ));
+                }
+                for node_id in range.follower_node_ids.into_iter().take(needed) {
+                    required.insert((
+                        range.start_exclusive,
+                        range.end_inclusive,
+                        range.owner_node_id.clone(),
+                        node_id,
+                    ));
+                }
+            }
+            let mut groups: BTreeMap<(String, String), Vec<ReplicaRepair>> = BTreeMap::new();
+            for repair in &state.replica_repairs {
+                groups
+                    .entry((repair.owner_node_id.clone(), repair.node_id.clone()))
+                    .or_default()
+                    .push(repair.clone());
+            }
+            let pending = groups
+                .into_values()
+                .filter(|repairs| {
+                    repairs.iter().any(|repair| {
+                        repair.phase != ReplicaRepairPhase::Complete
+                            && required.contains(&(
+                                repair.start_exclusive,
+                                repair.end_inclusive,
+                                repair.owner_node_id.clone(),
+                                repair.node_id.clone(),
+                            ))
+                    })
+                })
+                .collect::<Vec<_>>();
+            (pending, required)
+        };
+        try_map_bounded(
+            groups,
+            self.range_move_concurrency.min(4),
+            |group| async move { self.seed_replica_group(&group).await },
+        )
+        .await?;
+        let state = self.state.read().await;
+        if required.iter().any(|(start, end, owner, follower)| {
+            !state.replica_admissions.iter().any(|admission| {
+                admission.epoch == state.committed.epoch
+                    && admission.start_exclusive == *start
+                    && admission.end_inclusive == *end
+                    && admission.owner_node_id == *owner
+                    && admission.node_id == *follower
+                    && state.process_instances.get(follower) == Some(&admission.process_instance_id)
+            })
+        }) {
+            return Err(Status::unavailable(
+                "required target followers are not all admitted",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) async fn copy_replica(
+        &self,
+        task: &ReplicaRepair,
+    ) -> Result<CopiedReplicaSeed, Status> {
+        let (topology, owner_instance, follower_instance) = {
+            let state = self.state.read().await;
+            if state.committed.epoch != task.epoch {
+                return Err(Status::failed_precondition("replica task epoch is stale"));
+            }
+            let owner_instance = state
+                .process_instances
+                .get(&task.owner_node_id)
+                .ok_or_else(|| Status::unavailable("owner process is not registered"))?
+                .clone();
+            let follower_instance = state
+                .process_instances
+                .get(&task.node_id)
+                .ok_or_else(|| Status::unavailable("follower process is not registered"))?
+                .clone();
+            (state.committed.clone(), owner_instance, follower_instance)
+        };
+        let owner = topology
+            .members
+            .iter()
+            .find(|member| member.node_id == task.owner_node_id)
+            .ok_or_else(|| Status::internal("repair owner is absent from topology"))?;
+        let follower = topology
+            .members
+            .iter()
+            .find(|member| member.node_id == task.node_id)
+            .ok_or_else(|| Status::internal("repair follower is absent from topology"))?;
+        let control = replica_repair_control(task);
+        let range = RangeMigration {
+            range_id: control.range_id.clone(),
+            start_exclusive: task.start_exclusive,
+            end_inclusive: task.end_inclusive,
+            source_node_id: task.owner_node_id.clone(),
+            destination_node_id: task.node_id.clone(),
+            source_endpoint: owner.endpoint.clone(),
+            destination_endpoint: follower.endpoint.clone(),
+            source_process_instance_id: String::new(),
+            destination_process_instance_id: String::new(),
+            source_cleaned: false,
+            snapshot_records: 0,
+            changelog_watermark: 0,
+            verified: false,
+        };
+        let change = TopologyChange {
+            change_id: control.change_id.clone(),
+            base_epoch: task.epoch,
+            target_topology: topology,
+            phase: MigrationPhase::CopyingSnapshot,
+            ranges: Vec::new(),
+            replica_obligations: Vec::new(),
+            stopped_node_ids: Vec::new(),
+            stopping_node_ids: Vec::new(),
+            stop_prepared_node_ids: Vec::new(),
+            failed_node_id: None,
+            activation_ready: false,
+        };
+        let deadline = Instant::now() + self.migration_timeout;
+        let mut source = connect_node(&range.source_endpoint, deadline).await?;
+        let mut destination = connect_node(&range.destination_endpoint, deadline).await?;
+        // A retry first releases any write fence left by an interrupted attempt.
+        rpc_before(deadline, source.abort_range_migration(control.clone())).await?;
+        rpc_before(deadline, destination.abort_range_migration(control.clone())).await?;
+        self.set_repair_phase(task, ReplicaRepairPhase::Copying)
+            .await?;
+        let copied = self.copy_range(&change, &range, deadline).await?;
+        if copied.source_process_instance_id != owner_instance
+            || copied.destination_process_instance_id != follower_instance
+        {
+            return Err(Status::failed_precondition(
+                "replica process changed during snapshot",
+            ));
+        }
+        Ok(CopiedReplicaSeed {
+            task: task.clone(),
+            change,
+            range: copied,
+            control,
+            follower_instance,
+        })
+    }
+
+    pub(super) async fn finish_replica(
+        &self,
+        copied: CopiedReplicaSeed,
+        final_watermark: u64,
+        deadline: Instant,
+    ) -> Result<PreparedReplicaSeed, Status> {
+        self.set_repair_phase(&copied.task, ReplicaRepairPhase::Verifying)
+            .await?;
+        let verified = self
+            .finalize_range(&copied.change, &copied.range, final_watermark, deadline)
+            .await?;
+        let mut source = connect_node(&copied.range.source_endpoint, deadline).await?;
+        let digest = rpc_before(deadline, source.source_range_digest(copied.control.clone()))
+            .await?
+            .into_inner()
+            .digest;
+        Ok(PreparedReplicaSeed {
+            task: copied.task.clone(),
+            control: copied.control,
+            admission: ReplicaAdmission {
+                epoch: copied.task.epoch,
+                start_exclusive: copied.task.start_exclusive,
+                end_inclusive: copied.task.end_inclusive,
+                owner_node_id: copied.task.owner_node_id,
+                node_id: copied.task.node_id,
+                process_instance_id: copied.follower_instance,
+                verified_watermark: verified.changelog_watermark,
+                stream_cursor: 0,
+                digest,
+            },
+        })
+    }
+
+    pub(super) async fn seed_replica_group(&self, tasks: &[ReplicaRepair]) -> Result<(), Status> {
+        let first = tasks
+            .first()
+            .ok_or_else(|| Status::invalid_argument("empty repair group"))?;
+        let (topology, owner_instance, follower_instance) = {
+            let state = self.state.read().await;
+            (
+                state.committed.clone(),
+                state.process_instances.get(&first.owner_node_id).cloned(),
+                state.process_instances.get(&first.node_id).cloned(),
+            )
+        };
+        if topology.epoch != first.epoch {
+            return Err(Status::failed_precondition("repair stream epoch is stale"));
+        }
+        let expected: BTreeSet<_> = topology
+            .derived_ranges()
+            .map_err(|error| Status::internal(error.to_string()))?
+            .into_iter()
+            .filter(|range| {
+                range.owner_node_id == first.owner_node_id
+                    && range.follower_node_ids.contains(&first.node_id)
+            })
+            .map(|range| (range.start_exclusive, range.end_inclusive))
+            .collect();
+        let actual: BTreeSet<_> = tasks
+            .iter()
+            .map(|task| (task.start_exclusive, task.end_inclusive))
+            .collect();
+        if expected.is_empty()
+            || expected != actual
+            || tasks.iter().any(|task| {
+                task.epoch != first.epoch
+                    || task.owner_node_id != first.owner_node_id
+                    || task.node_id != first.node_id
+            })
+        {
+            return Err(Status::failed_precondition(
+                "repair group does not cover its full stream",
+            ));
+        }
+        let owner_endpoint = topology
+            .members
+            .iter()
+            .find(|member| member.node_id == first.owner_node_id)
+            .ok_or_else(|| Status::internal("repair owner is absent"))?
+            .endpoint
+            .clone();
+        let follower_endpoint = topology
+            .members
+            .iter()
+            .find(|member| member.node_id == first.node_id)
+            .ok_or_else(|| Status::internal("repair follower is absent"))?
+            .endpoint
+            .clone();
+        let mut prepared = Vec::with_capacity(tasks.len());
+        let result = async {
+            // Snapshot all ranges while writes continue. Only the short final
+            // replay/checkpoint window fences writes for this stream.
+            let copied = try_map_bounded(
+                tasks.to_vec(),
+                self.range_move_concurrency.min(4),
+                |task| async move { self.copy_replica(&task).await },
+            )
+            .await?;
+            let deadline = Instant::now() + self.migration_timeout;
+            let paused =
+                try_map_bounded(copied, self.range_move_concurrency, |copied| async move {
+                    let watermark = self
+                        .pause_range(&copied.change, &copied.range, deadline)
+                        .await?;
+                    Ok::<_, Status>((copied, watermark))
+                })
+                .await?;
+            prepared = try_map_bounded(
+                paused,
+                self.range_move_concurrency.min(4),
+                |(copied, watermark)| async move {
+                    self.finish_replica(copied, watermark, deadline).await
+                },
+            )
+            .await?;
+            let deadline = Instant::now() + self.migration_timeout;
+            let mut source = connect_node(&owner_endpoint, deadline).await?;
+            let mut destination = connect_node(&follower_endpoint, deadline).await?;
+            let request = proto::ReplicationProgressRequest {
+                topology_epoch: first.epoch,
+                owner_node_id: first.owner_node_id.clone(),
+                follower_node_id: first.node_id.clone(),
+            };
+            let head = rpc_before(deadline, source.get_replication_progress(request))
+                .await?
+                .into_inner();
+            if Some(head.process_instance_id.as_str()) != owner_instance.as_deref() {
+                return Err(Status::failed_precondition(
+                    "owner process changed before checkpoint",
+                ));
+            }
+            let checkpoint = rpc_before(
+                deadline,
+                destination.install_replication_checkpoint(proto::ReplicationCheckpointRequest {
+                    topology_epoch: first.epoch,
+                    owner_node_id: first.owner_node_id.clone(),
+                    follower_node_id: first.node_id.clone(),
+                    stream_sequence: head.stream_sequence,
+                    verified_ranges: prepared.iter().map(|seed| seed.control.clone()).collect(),
+                }),
+            )
+            .await?
+            .into_inner();
+            if Some(checkpoint.process_instance_id.as_str()) != follower_instance.as_deref()
+                || checkpoint.stream_sequence < head.stream_sequence
+            {
+                return Err(Status::failed_precondition(
+                    "follower process changed before checkpoint",
+                ));
+            }
+            for seed in &mut prepared {
+                seed.admission.stream_cursor = checkpoint.stream_sequence;
+                rpc_before(deadline, source.cleanup_source_range(seed.control.clone())).await?;
+                rpc_before(
+                    deadline,
+                    destination.abort_range_migration(seed.control.clone()),
+                )
+                .await?;
+            }
+            for seed in &prepared {
+                self.store_repair_admission(&seed.task, seed.admission.clone())
+                    .await?;
+            }
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            let cleanup_deadline = Instant::now() + self.migration_timeout;
+            let controls: Vec<_> = tasks.iter().map(replica_repair_control).collect();
+            if let Ok(mut source) = connect_node(&owner_endpoint, cleanup_deadline).await {
+                for control in &controls {
+                    let _ = rpc_before(
+                        cleanup_deadline,
+                        source.abort_range_migration(control.clone()),
+                    )
+                    .await;
+                }
+            }
+            if let Ok(mut destination) = connect_node(&follower_endpoint, cleanup_deadline).await {
+                for control in &controls {
+                    let _ = rpc_before(
+                        cleanup_deadline,
+                        destination.abort_range_migration(control.clone()),
+                    )
+                    .await;
+                }
+            }
+            for task in tasks {
+                self.set_repair_phase(task, ReplicaRepairPhase::Pending)
+                    .await?;
+            }
+        }
+        result
+    }
+
+    pub(super) async fn set_repair_phase(
+        &self,
+        task: &ReplicaRepair,
+        phase: ReplicaRepairPhase,
+    ) -> Result<(), Status> {
+        let mut state = self.state.write().await;
+        let mut next = state.clone();
+        let repair = next
+            .replica_repairs
+            .iter_mut()
+            .find(|repair| {
+                repair == &task
+                    || (repair.epoch == task.epoch
+                        && repair.start_exclusive == task.start_exclusive
+                        && repair.end_inclusive == task.end_inclusive
+                        && repair.owner_node_id == task.owner_node_id
+                        && repair.node_id == task.node_id)
+            })
+            .ok_or_else(|| Status::failed_precondition("replica repair was invalidated"))?;
+        repair.phase = phase;
+        self.repository
+            .store_state(&next)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        *state = next;
+        Ok(())
+    }
+
+    pub(super) async fn store_repair_admission(
+        &self,
+        task: &ReplicaRepair,
+        admission: ReplicaAdmission,
+    ) -> Result<(), Status> {
+        let mut state = self.state.write().await;
+        let mut next = state.clone();
+        if next.committed.epoch != task.epoch
+            || next.process_instances.get(&task.node_id) != Some(&admission.process_instance_id)
+        {
+            return Err(Status::failed_precondition(
+                "replica changed before durable admission",
+            ));
+        }
+        let repair = next
+            .replica_repairs
+            .iter_mut()
+            .find(|repair| {
+                repair.epoch == task.epoch
+                    && repair.start_exclusive == task.start_exclusive
+                    && repair.end_inclusive == task.end_inclusive
+                    && repair.owner_node_id == task.owner_node_id
+                    && repair.node_id == task.node_id
+            })
+            .ok_or_else(|| Status::failed_precondition("replica repair was invalidated"))?;
+        repair.phase = ReplicaRepairPhase::Complete;
+        repair.retry_count = 0;
+        repair.next_attempt_unix_millis = 0;
+        repair.last_error.clear();
+        next.replica_admissions.retain(|existing| {
+            !(existing.epoch == task.epoch
+                && existing.start_exclusive == task.start_exclusive
+                && existing.end_inclusive == task.end_inclusive
+                && existing.owner_node_id == task.owner_node_id
+                && existing.node_id == task.node_id)
+        });
+        next.replica_admissions.push(admission);
+        self.repository
+            .store_state(&next)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        *state = next;
+        Ok(())
+    }
+}
