@@ -588,7 +588,7 @@ impl CoordinatorService {
             && !change.phase.is_terminal()
         {
             if change.failed_node_id.is_some() {
-                self.execute_change(change_identity(&change)).await?;
+                self.execute_change(change_identity(&change), true).await?;
             }
             return Ok(());
         }
@@ -644,7 +644,7 @@ impl CoordinatorService {
         drop(current);
         self.repair_interrupt
             .send_modify(|generation| *generation += 1);
-        self.execute_change(change_identity(&change)).await?;
+        self.execute_change(change_identity(&change), true).await?;
         Ok(())
     }
 
@@ -762,6 +762,88 @@ impl CoordinatorService {
             Ok::<(), Status>(())
         })
         .await?;
+        Ok(())
+    }
+
+    // Called while the topology execution lock is held. Target-epoch owners
+    // remain unleased until the policy and minimum-copy barrier is verified.
+    async fn seed_repairs_for_activation(&self) -> Result<(), Status> {
+        self.cleanup_interrupted_repairs().await?;
+        let (groups, required) = {
+            let state = self.state.read().await;
+            let topology = &state.committed;
+            let guard = &topology.write_availability_guard;
+            let policy_followers = match topology.write_ack_policy {
+                WriteAckPolicy::OwnerOnly => 0,
+                WriteAckPolicy::FirstSuccessor => 1,
+                WriteAckPolicy::AllReplicas => topology.desired_replication_factor as usize - 1,
+            };
+            let needed = policy_followers
+                .max(guard.minimum_admitted_copies.saturating_sub(1) as usize)
+                .max(guard.minimum_healthy_followers as usize);
+            let mut required = BTreeSet::new();
+            for range in topology
+                .derived_ranges()
+                .map_err(|error| Status::internal(error.to_string()))?
+            {
+                if range.follower_node_ids.len() < needed {
+                    return Err(Status::failed_precondition(
+                        "target range cannot satisfy the activation policy and copy guard",
+                    ));
+                }
+                for node_id in range.follower_node_ids.into_iter().take(needed) {
+                    required.insert((
+                        range.start_exclusive,
+                        range.end_inclusive,
+                        range.owner_node_id.clone(),
+                        node_id,
+                    ));
+                }
+            }
+            let mut groups: BTreeMap<(String, String), Vec<ReplicaRepair>> = BTreeMap::new();
+            for repair in &state.replica_repairs {
+                groups
+                    .entry((repair.owner_node_id.clone(), repair.node_id.clone()))
+                    .or_default()
+                    .push(repair.clone());
+            }
+            let pending = groups
+                .into_values()
+                .filter(|repairs| {
+                    repairs.iter().any(|repair| {
+                        repair.phase != ReplicaRepairPhase::Complete
+                            && required.contains(&(
+                                repair.start_exclusive,
+                                repair.end_inclusive,
+                                repair.owner_node_id.clone(),
+                                repair.node_id.clone(),
+                            ))
+                    })
+                })
+                .collect::<Vec<_>>();
+            (pending, required)
+        };
+        try_map_bounded(
+            groups,
+            self.range_move_concurrency.min(4),
+            |group| async move { self.seed_replica_group(&group).await },
+        )
+        .await?;
+        let state = self.state.read().await;
+        if required.iter().any(|(start, end, owner, follower)| {
+            !state.replica_admissions.iter().any(|admission| {
+                admission.epoch == state.committed.epoch
+                    && admission.start_exclusive == *start
+                    && admission.end_inclusive == *end
+                    && admission.owner_node_id == *owner
+                    && admission.node_id == *follower
+                    && state.process_instances.get(follower) == Some(&admission.process_instance_id)
+            })
+        }) {
+            return Err(Status::unavailable(
+                "required target followers are not all admitted",
+            ));
+        }
         Ok(())
     }
 
@@ -1123,13 +1205,17 @@ impl CoordinatorService {
             }
             None => Ok(None),
             Some(change) => self
-                .execute_change(change_identity(&change))
+                .execute_change(change_identity(&change), true)
                 .await
                 .map(Some),
         }
     }
 
-    async fn execute_change(&self, expected: ChangeIdentity) -> Result<TopologyChange, Status> {
+    async fn execute_change(
+        &self,
+        expected: ChangeIdentity,
+        retry_transient: bool,
+    ) -> Result<TopologyChange, Status> {
         let _execution = self.execution_lock.lock().await;
         let mut change = self
             .state
@@ -1180,7 +1266,7 @@ impl CoordinatorService {
             && change.target_topology.write_ack_policy
                 != self.state.read().await.committed.write_ack_policy
         {
-            return self.execute_policy_change(change).await;
+            return self.execute_policy_change(change, false).await;
         }
 
         let deadline = Instant::now() + self.migration_timeout;
@@ -1199,7 +1285,11 @@ impl CoordinatorService {
         .await
         {
             Ok(progresses) => progresses,
-            Err(error) => return self.abort_after_error(&change, error).await,
+            Err(error) => {
+                return self
+                    .abort_after_error(&change, error, retry_transient)
+                    .await;
+            }
         };
         for progress in progresses {
             replace_range_progress(&mut change, progress);
@@ -1221,11 +1311,17 @@ impl CoordinatorService {
         .await
         {
             Ok(watermarks) => watermarks.into_iter().collect::<BTreeMap<_, _>>(),
-            Err(error) => return self.abort_after_error(&change, error).await,
+            Err(error) => {
+                return self
+                    .abort_after_error(&change, error, retry_transient)
+                    .await;
+            }
         };
 
         if let Err(error) = self.set_phase(MigrationPhase::Verifying).await {
-            return self.abort_after_error(&change, error).await;
+            return self
+                .abort_after_error(&change, error, retry_transient)
+                .await;
         }
         change.phase = MigrationPhase::Verifying;
         let change_ref = &change;
@@ -1245,7 +1341,11 @@ impl CoordinatorService {
         .await
         {
             Ok(progresses) => progresses,
-            Err(error) => return self.abort_after_error(&change, error).await,
+            Err(error) => {
+                return self
+                    .abort_after_error(&change, error, retry_transient)
+                    .await;
+            }
         };
         for progress in progresses {
             replace_range_progress(&mut change, progress);
@@ -1257,7 +1357,9 @@ impl CoordinatorService {
             tokio::time::sleep(self.pre_publish_delay).await;
         }
         if let Err(error) = self.verify_destination_instances(&change, deadline).await {
-            return self.abort_after_error(&change, error).await;
+            return self
+                .abort_after_error(&change, error, retry_transient)
+                .await;
         }
         {
             let destinations = destination_instances(&change)?;
@@ -1275,7 +1377,9 @@ impl CoordinatorService {
                     "destination process changed before publication: {node_id}"
                 ));
                 drop(state);
-                return self.abort_after_error(&change, error).await;
+                return self
+                    .abort_after_error(&change, error, retry_transient)
+                    .await;
             }
             let active = next
                 .active_change
@@ -1303,7 +1407,27 @@ impl CoordinatorService {
         &self,
         change: &TopologyChange,
         original: Status,
+        retry_transient: bool,
     ) -> Result<TopologyChange, Status> {
+        if retry_transient
+            && matches!(
+                original.code(),
+                tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+            )
+        {
+            // Keep a network-interrupted change recoverable. Resetting is durable,
+            // and the next pass repeats cleanup before it copies anything.
+            self.set_phase(MigrationPhase::Resetting).await?;
+            if let Err(cleanup) = self
+                .clear_prepublication_nodes(change, Instant::now() + self.migration_timeout)
+                .await
+            {
+                return Err(Status::unavailable(format!(
+                    "migration interrupted ({original}); cleanup remains pending ({cleanup})"
+                )));
+            }
+            return Err(original);
+        }
         match self.abort_prepublication_change(change).await {
             Ok(()) => Err(original),
             Err(cleanup) => Err(Status::internal(format!(
@@ -1417,15 +1541,20 @@ impl CoordinatorService {
     async fn execute_policy_change(
         &self,
         mut change: TopologyChange,
+        retry_transient: bool,
     ) -> Result<TopologyChange, Status> {
         let deadline = Instant::now() + self.migration_timeout;
         self.set_phase(MigrationPhase::PausingWrites).await?;
         change.phase = MigrationPhase::PausingWrites;
         if let Err(error) = self.policy_fence_members(&change, true, deadline).await {
-            return self.abort_after_error(&change, error).await;
+            return self
+                .abort_after_error(&change, error, retry_transient)
+                .await;
         }
         if let Err(error) = self.set_phase(MigrationPhase::Verifying).await {
-            return self.abort_after_error(&change, error).await;
+            return self
+                .abort_after_error(&change, error, retry_transient)
+                .await;
         }
         change.phase = MigrationPhase::Verifying;
         {
@@ -1439,7 +1568,11 @@ impl CoordinatorService {
                 .and_then(|response| response.map(Response::into_inner));
                 let status = match status {
                     Ok(status) => status,
-                    Err(error) => return self.abort_after_error(&change, error).await,
+                    Err(error) => {
+                        return self
+                            .abort_after_error(&change, error, retry_transient)
+                            .await;
+                    }
                 };
                 if policy_readiness_verified(&change.target_topology, &status) {
                     break;
@@ -1451,6 +1584,7 @@ impl CoordinatorService {
                             Status::deadline_exceeded(
                                 "required followers did not catch up before policy publication",
                             ),
+                            false,
                         )
                         .await;
                 }
@@ -1458,7 +1592,9 @@ impl CoordinatorService {
             }
         }
         if let Err(error) = self.set_phase(MigrationPhase::ReadyToPublish).await {
-            return self.abort_after_error(&change, error).await;
+            return self
+                .abort_after_error(&change, error, retry_transient)
+                .await;
         }
         change.phase = MigrationPhase::ReadyToPublish;
         if !self.pre_publish_delay.is_zero() {
@@ -1475,13 +1611,18 @@ impl CoordinatorService {
             .and_then(|response| response.map(Response::into_inner));
             let status = match status {
                 Ok(status) => status,
-                Err(error) => return self.abort_after_error(&change, error).await,
+                Err(error) => {
+                    return self
+                        .abort_after_error(&change, error, retry_transient)
+                        .await;
+                }
             };
             if !policy_readiness_verified(&change.target_topology, &status) {
                 return self
                     .abort_after_error(
                         &change,
                         Status::failed_precondition("policy readiness was lost before publication"),
+                        retry_transient,
                     )
                     .await;
             }
@@ -1521,7 +1662,9 @@ impl CoordinatorService {
             })()
         };
         if let Err(error) = publication {
-            return self.abort_after_error(&change, error).await;
+            return self
+                .abort_after_error(&change, error, retry_transient)
+                .await;
         }
         change.phase = MigrationPhase::Published;
         self.finish_published_change(change, deadline).await
@@ -1776,9 +1919,11 @@ impl CoordinatorService {
     async fn finish_published_change(
         &self,
         mut change: TopologyChange,
-        deadline: Instant,
+        _deadline: Instant,
     ) -> Result<TopologyChange, Status> {
-        if !change.activation_ready {
+        let deadline = Instant::now() + self.migration_timeout;
+        let needs_activation = !change.activation_ready;
+        if needs_activation {
             let old_sources: Vec<_> = change
                 .ranges
                 .iter()
@@ -1794,8 +1939,6 @@ impl CoordinatorService {
                 false,
             )
             .await?;
-            self.set_activation_ready().await?;
-            change.activation_ready = true;
         }
         let destination_ids: BTreeSet<_> = change
             .ranges
@@ -1816,13 +1959,20 @@ impl CoordinatorService {
             .filter(|member| !destination_ids.contains(member.node_id.as_str()))
             .cloned()
             .collect();
-        self.install_on_members(&change.target_topology, &destinations, deadline)
-            .await?;
-        self.install_on_members(&change.target_topology, &other_targets, deadline)
-            .await?;
-        if change.ranges.is_empty() && change.replica_obligations.is_empty() {
-            self.policy_fence_members(&change, false, deadline).await?;
-        }
+        self.install_on_members_with_lease(
+            &change.target_topology,
+            &destinations,
+            deadline,
+            !needs_activation,
+        )
+        .await?;
+        self.install_on_members_with_lease(
+            &change.target_topology,
+            &other_targets,
+            deadline,
+            !needs_activation,
+        )
+        .await?;
         let target_ids: BTreeSet<String> = change
             .target_topology
             .members
@@ -1868,6 +2018,29 @@ impl CoordinatorService {
             },
         )
         .await?;
+        if needs_activation {
+            let guard = &change.target_topology.write_availability_guard;
+            let needs_replica_barrier = change.target_topology.write_ack_policy
+                != WriteAckPolicy::OwnerOnly
+                || guard.minimum_admitted_copies > 1
+                || guard.minimum_healthy_followers > 0;
+            if needs_replica_barrier
+                && (!change.ranges.is_empty() || !change.replica_obligations.is_empty())
+            {
+                self.seed_repairs_for_activation().await?;
+            }
+            self.set_activation_ready().await?;
+            change.activation_ready = true;
+            self.install_on_members(
+                &change.target_topology,
+                &change.target_topology.members,
+                Instant::now() + self.migration_timeout,
+            )
+            .await?;
+        }
+        if change.ranges.is_empty() && change.replica_obligations.is_empty() {
+            self.policy_fence_members(&change, false, deadline).await?;
+        }
         self.set_phase(MigrationPhase::CleaningUp).await?;
         change.phase = MigrationPhase::CleaningUp;
         let ranges_to_clean: Vec<_> = change
@@ -2501,6 +2674,20 @@ impl Coordinator for CoordinatorService {
             target_policy.unwrap_or(state.committed.write_ack_policy),
         )
         .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let target = &change.target_topology;
+        let member_count = target.members.len();
+        let guard = &target.write_availability_guard;
+        if target.members != state.committed.members
+            && (member_count < guard.minimum_admitted_copies as usize
+                || member_count.saturating_sub(1) < guard.minimum_healthy_followers as usize
+                || (target.write_ack_policy == WriteAckPolicy::FirstSuccessor && member_count < 2)
+                || (target.write_ack_policy == WriteAckPolicy::AllReplicas
+                    && member_count < target.desired_replication_factor as usize))
+        {
+            return Err(Status::failed_precondition(
+                "target membership cannot satisfy its write policy and availability guard",
+            ));
+        }
         let target_tasks: usize = change
             .target_topology
             .derived_ranges()
@@ -2548,7 +2735,7 @@ impl Coordinator for CoordinatorService {
         // Keep migration recovery running if the requesting client disconnects or
         // reaches its own deadline after the coordinator accepted the command.
         let service = self.clone();
-        let change = tokio::spawn(async move { service.execute_change(expected).await })
+        let change = tokio::spawn(async move { service.execute_change(expected, false).await })
             .await
             .map_err(|error| Status::internal(format!("migration task failed: {error}")))??;
         Ok(Response::new((&change).into()))
@@ -2627,12 +2814,7 @@ impl Coordinator for CoordinatorService {
             || state.process_instances.get(&request.node_id) != Some(&request.process_instance_id)
             || state.fenced_nodes.contains(&request.node_id)
             || state.active_change.as_ref().is_some_and(|change| {
-                change.phase == MigrationPhase::Published
-                    && !change.activation_ready
-                    && change
-                        .ranges
-                        .iter()
-                        .any(|range| range.destination_node_id == request.node_id)
+                change.phase == MigrationPhase::Published && !change.activation_ready
             })
         {
             return Err(Status::failed_precondition(

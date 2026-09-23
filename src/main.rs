@@ -321,18 +321,18 @@ async fn run_coordinator(args: CoordinatorArgs) -> Result<()> {
     .with_pre_publish_delay(Duration::from_millis(args.pre_publish_delay_ms));
     let recovery_service = service.clone();
     tokio::spawn(async move {
-        match recovery_service.resume_interrupted_change().await {
-            Ok(Some(change)) => {
-                tracing::info!(change_id = %change.change_id, phase = ?change.phase, "resumed topology change");
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::error!(%error, "failed to resume topology change");
-            }
-        }
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         loop {
             interval.tick().await;
+            match recovery_service.resume_interrupted_change().await {
+                Ok(Some(change)) => {
+                    tracing::info!(change_id = %change.change_id, phase = ?change.phase, "resumed topology change");
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "topology change recovery remains pending");
+                }
+            }
             if let Err(error) = recovery_service.resume_replica_repairs().await {
                 tracing::warn!(%error, "replica repair pass failed");
             }
