@@ -1,15 +1,5 @@
 use super::*;
 
-pub(super) fn token_in_range(start: u64, end: u64, token: u64) -> bool {
-    if start < end {
-        token > start && token <= end
-    } else if start > end {
-        token > start || token <= end
-    } else {
-        true
-    }
-}
-
 pub(super) fn failure_confirmed(
     state: &ClusterState,
     grants: &BTreeMap<String, NodeLeaseGrant>,
@@ -47,64 +37,8 @@ pub(super) fn prove_failure_coverage(
     grants: &BTreeMap<String, NodeLeaseGrant>,
     now: Instant,
 ) -> Result<(), Status> {
-    let old_ranges = state
-        .committed
-        .derived_ranges()
-        .map_err(|error| Status::internal(error.to_string()))?;
-    let target_ranges = target
-        .derived_ranges()
-        .map_err(|error| Status::internal(error.to_string()))?;
-    for target_range in target_ranges {
-        let owner = &target_range.owner_node_id;
-        let process_instance_id = state.process_instances.get(owner).ok_or_else(|| {
-            Status::failed_precondition(format!("promoted owner {owner} is not registered"))
-        })?;
-        if state.fenced_nodes.contains(owner)
-            || grants.get(owner).is_none_or(|grant| {
-                grant.epoch != state.committed.epoch
-                    || grant.process_instance_id != *process_instance_id
-                    || grant.expires_at <= now
-            })
-        {
-            return Err(Status::failed_precondition(format!(
-                "promoted owner {owner} has no current lease"
-            )));
-        }
-        let constituents: Vec<_> = old_ranges
-            .iter()
-            .filter(|range| {
-                token_in_range(
-                    target_range.start_exclusive,
-                    target_range.end_inclusive,
-                    range.end_inclusive,
-                )
-            })
-            .collect();
-        if constituents.is_empty() {
-            return Err(Status::data_loss("merged range has no old constituents"));
-        }
-        for old_range in constituents {
-            if old_range.owner_node_id == *owner {
-                continue;
-            }
-            if old_range.follower_node_ids.first() != Some(owner)
-                || !state.replica_admissions.iter().any(|admission| {
-                    admission.epoch == state.committed.epoch
-                        && admission.start_exclusive == old_range.start_exclusive
-                        && admission.end_inclusive == old_range.end_inclusive
-                        && admission.owner_node_id == old_range.owner_node_id
-                        && admission.node_id == *owner
-                        && admission.process_instance_id == *process_instance_id
-                })
-            {
-                return Err(Status::failed_precondition(format!(
-                    "promoted owner {owner} lacks first-successor coverage for ({}, {}]",
-                    old_range.start_exclusive, old_range.end_inclusive
-                )));
-            }
-        }
-    }
-    Ok(())
+    prove_removal_owner_leases(state, target, grants, now)?;
+    prove_removal_owner_coverage(state, target)
 }
 
 pub(super) async fn read_replication_pair(

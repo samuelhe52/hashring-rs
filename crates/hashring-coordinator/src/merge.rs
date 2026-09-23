@@ -1,38 +1,8 @@
 use super::*;
-use hashring_core::topology::DerivedRange;
 
 type StreamPair = (String, String);
 type CandidateAdmission = (ReplicaAdmission, BTreeSet<StreamPair>);
 type MergeProof = (BTreeSet<StreamPair>, Vec<CandidateAdmission>);
-
-fn constituents<'a>(old: &'a [DerivedRange], target: &DerivedRange) -> Vec<&'a DerivedRange> {
-    old.iter()
-        .filter(|range| {
-            token_in_range(
-                target.start_exclusive,
-                target.end_inclusive,
-                range.end_inclusive,
-            )
-        })
-        .collect()
-}
-
-fn admission_for<'a>(
-    state: &'a ClusterState,
-    range: &DerivedRange,
-    follower: &str,
-) -> Option<&'a ReplicaAdmission> {
-    let instance = state.process_instances.get(follower)?;
-    state.replica_admissions.iter().find(|admission| {
-        admission.epoch == state.committed.epoch
-            && admission.start_exclusive == range.start_exclusive
-            && admission.end_inclusive == range.end_inclusive
-            && admission.owner_node_id == range.owner_node_id
-            && admission.node_id == follower
-            && admission.process_instance_id == *instance
-            && !state.fenced_nodes.contains(follower)
-    })
-}
 
 pub(super) fn can_direct_merge(state: &ClusterState, change: &TopologyChange) -> bool {
     let old = &state.committed;
@@ -46,24 +16,11 @@ pub(super) fn can_direct_merge(state: &ClusterState, change: &TopologyChange) ->
     {
         return false;
     }
-    let Ok(old_ranges) = old.derived_ranges() else {
-        return false;
-    };
-    let Ok(target_ranges) = target.derived_ranges() else {
-        return false;
-    };
-    target_ranges.iter().all(|target_range| {
-        let parts = constituents(&old_ranges, target_range);
-        !parts.is_empty()
-            && parts.into_iter().all(|part| {
-                part.owner_node_id == target_range.owner_node_id
-                    || (part.follower_node_ids.first() == Some(&target_range.owner_node_id)
-                        && admission_for(state, part, &target_range.owner_node_id).is_some())
-            })
-    }) && merge_proof(state, change).is_ok()
+    merge_proof(state, change).is_ok()
 }
 
 fn merge_proof(state: &ClusterState, change: &TopologyChange) -> Result<MergeProof, Status> {
+    prove_removal_owner_coverage(state, &change.target_topology)?;
     let old_ranges = state
         .committed
         .derived_ranges()
@@ -81,13 +38,6 @@ fn merge_proof(state: &ClusterState, change: &TopologyChange) -> Result<MergePro
         }
         for part in &parts {
             if part.owner_node_id != target_range.owner_node_id {
-                if part.follower_node_ids.first() != Some(&target_range.owner_node_id)
-                    || admission_for(state, part, &target_range.owner_node_id).is_none()
-                {
-                    return Err(Status::failed_precondition(
-                        "natural successor lost admitted coverage",
-                    ));
-                }
                 required.insert((
                     part.owner_node_id.clone(),
                     target_range.owner_node_id.clone(),
@@ -271,30 +221,12 @@ impl CoordinatorService {
             }
             {
                 let grants = self.lease_grants.lock().await;
-                let now = Instant::now();
-                for range in change
-                    .target_topology
-                    .derived_ranges()
-                    .map_err(|error| Status::internal(error.to_string()))?
-                {
-                    let instance = snapshot
-                        .process_instances
-                        .get(&range.owner_node_id)
-                        .ok_or_else(|| {
-                            Status::failed_precondition("merged owner is not registered")
-                        })?;
-                    if snapshot.fenced_nodes.contains(&range.owner_node_id)
-                        || grants.get(&range.owner_node_id).is_none_or(|grant| {
-                            grant.epoch != snapshot.committed.epoch
-                                || grant.process_instance_id != *instance
-                                || grant.expires_at <= now
-                        })
-                    {
-                        return Err(Status::failed_precondition(
-                            "merged owner has no current lease",
-                        ));
-                    }
-                }
+                prove_removal_owner_leases(
+                    &snapshot,
+                    &change.target_topology,
+                    &grants,
+                    Instant::now(),
+                )?;
             }
             let (required, candidates) = merge_proof(&snapshot, &change)?;
             let mut caught_up = BTreeSet::new();
@@ -351,22 +283,13 @@ impl CoordinatorService {
                     "merge coverage changed before publication",
                 ));
             }
-            let mut next = state.clone();
-            next.committed = change.target_topology.clone();
-            next.replica_admissions = carried;
-            next.replica_repairs.clear();
-            let active = next
-                .active_change
-                .as_mut()
-                .expect("active change was checked");
-            active.phase = MigrationPhase::Published;
-            active.activation_ready = true;
-            reconcile_replica_repairs(&mut next)
-                .map_err(|error| Status::internal(error.to_string()))?;
-            self.repository
-                .store_state(&next)
-                .map_err(|error| Status::internal(error.to_string()))?;
-            *state = next;
+            self.publish_removed_topology(
+                &mut state,
+                &change,
+                RemovalPublication::Graceful {
+                    admissions: carried,
+                },
+            )?;
             Ok::<(), Status>(())
         }
         .await;
@@ -425,12 +348,8 @@ impl CoordinatorService {
                 Err(error) => return Err(error),
             }
         }
-        self.install_on_members(
-            &change.target_topology,
-            &change.target_topology.members,
-            deadline,
-        )
-        .await?;
+        self.install_removed_topology_survivors(&change, deadline)
+            .await?;
         self.set_direct_merge_fence(&change, false, false, deadline)
             .await?;
         self.set_phase(MigrationPhase::CleaningUp).await?;

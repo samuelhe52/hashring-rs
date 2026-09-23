@@ -611,12 +611,14 @@ mod failure;
 mod merge;
 mod migration_helpers;
 mod policy;
+mod removal;
 mod repair;
 mod rpc;
 
 use failure::*;
 use merge::*;
 use migration_helpers::*;
+use removal::*;
 
 #[cfg(test)]
 mod tests;

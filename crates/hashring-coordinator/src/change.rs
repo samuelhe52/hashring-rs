@@ -542,27 +542,9 @@ impl CoordinatorService {
                     "failure transition lost its durable fence",
                 ));
             }
-            let mut next = state.clone();
-            next.committed = change.target_topology.clone();
-            next.process_instances.remove(failed_node_id);
             // Old admissions are tied to old exact bounds and stream epoch.
             // Deterministic repairs will verify and re-admit new followers.
-            next.replica_admissions.clear();
-            next.replica_repairs.clear();
-            next.active_change
-                .as_mut()
-                .expect("active failure transition was checked")
-                .phase = MigrationPhase::Published;
-            next.active_change
-                .as_mut()
-                .expect("active failure transition was checked")
-                .activation_ready = true;
-            reconcile_replica_repairs(&mut next)
-                .map_err(|error| Status::internal(error.to_string()))?;
-            self.repository
-                .store_state(&next)
-                .map_err(|error| Status::internal(error.to_string()))?;
-            *state = next;
+            self.publish_removed_topology(&mut state, &change, RemovalPublication::Failed)?;
             Ok::<(), Status>(())
         };
         publication?;
@@ -575,12 +557,8 @@ impl CoordinatorService {
         mut change: TopologyChange,
     ) -> Result<TopologyChange, Status> {
         let deadline = Instant::now() + self.migration_timeout;
-        self.install_on_members(
-            &change.target_topology,
-            &change.target_topology.members,
-            deadline,
-        )
-        .await?;
+        self.install_removed_topology_survivors(&change, deadline)
+            .await?;
         self.set_phase(MigrationPhase::Complete).await?;
         change.phase = MigrationPhase::Complete;
         if let Some(failed_node_id) = &change.failed_node_id {
