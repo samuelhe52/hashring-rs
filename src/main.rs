@@ -186,6 +186,7 @@ struct ExecuteChangeArgs {
 enum ExperimentModeArg {
     Correctness,
     Performance,
+    Availability,
 }
 
 #[derive(Args)]
@@ -196,8 +197,8 @@ struct ExperimentArgs {
     #[arg(long)]
     output: PathBuf,
     /// Peak node count. Correctness mode starts with one fewer node, then scales out and in.
-    #[arg(long, default_value_t = 10)]
-    nodes: usize,
+    #[arg(long)]
+    nodes: Option<usize>,
     /// Logical keys. Defaults to 20,000 for correctness and 1,000,000 for performance.
     #[arg(long)]
     keys: Option<u64>,
@@ -222,6 +223,15 @@ struct ExperimentArgs {
     /// Refuse the run unless build and runtime source match the same clean commit.
     #[arg(long)]
     require_clean_source: bool,
+    #[arg(long, default_value_t = 3)]
+    desired_replication_factor: u32,
+    #[arg(long, default_value_t = 2)]
+    minimum_admitted_copies: u32,
+    #[arg(long, default_value_t = 1)]
+    minimum_healthy_followers: u32,
+    /// Defaults to FirstSuccessor for availability and OwnerOnly otherwise.
+    #[arg(long, value_enum)]
+    policy: Option<PolicyArg>,
 }
 
 #[tokio::main]
@@ -250,16 +260,24 @@ async fn run_local_experiment(args: ExperimentArgs) -> Result<()> {
     let mode = match args.mode {
         ExperimentModeArg::Correctness => ExperimentMode::Correctness,
         ExperimentModeArg::Performance => ExperimentMode::Performance,
+        ExperimentModeArg::Availability => ExperimentMode::Availability,
     };
     let key_count = args.keys.unwrap_or(match mode {
         ExperimentMode::Correctness => 20_000,
         ExperimentMode::Performance => 1_000_000,
+        ExperimentMode::Availability => 1_000,
     });
     let summary = run_experiment(
         ExperimentConfig {
             mode,
             output_dir: args.output,
-            node_count: args.nodes,
+            node_count: args
+                .nodes
+                .unwrap_or(if matches!(mode, ExperimentMode::Availability) {
+                    4
+                } else {
+                    10
+                }),
             key_count,
             value_bytes: args.value_bytes,
             concurrency: args.concurrency,
@@ -270,6 +288,20 @@ async fn run_local_experiment(args: ExperimentArgs) -> Result<()> {
             range_move_concurrency: args.range_move_concurrency,
             pre_publish_delay_ms: args.pre_publish_delay_ms,
             require_clean_source: args.require_clean_source,
+            desired_replication_factor: args.desired_replication_factor,
+            minimum_admitted_copies: args.minimum_admitted_copies,
+            minimum_healthy_followers: args.minimum_healthy_followers,
+            write_ack_policy: match args.policy.unwrap_or(
+                if matches!(mode, ExperimentMode::Availability) {
+                    PolicyArg::FirstSuccessor
+                } else {
+                    PolicyArg::OwnerOnly
+                },
+            ) {
+                PolicyArg::OwnerOnly => WriteAckPolicy::OwnerOnly,
+                PolicyArg::FirstSuccessor => WriteAckPolicy::FirstSuccessor,
+                PolicyArg::AllReplicas => WriteAckPolicy::AllReplicas,
+            },
         },
         std::env::current_exe()?,
     )
