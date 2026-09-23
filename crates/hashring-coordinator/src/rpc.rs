@@ -355,7 +355,7 @@ impl Coordinator for CoordinatorService {
         }
         let mut change = TopologyChange::plan_with_config(&state.committed, target_members, config)
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        if can_direct_merge(&state, &change) {
+        if can_prepare_direct_merge(&state.committed, &change) {
             change.direct_merge = true;
             change.ranges.clear();
         }

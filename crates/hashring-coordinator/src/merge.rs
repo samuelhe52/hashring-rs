@@ -5,7 +5,13 @@ type CandidateAdmission = (ReplicaAdmission, BTreeSet<StreamPair>);
 type MergeProof = (BTreeSet<StreamPair>, Vec<CandidateAdmission>);
 
 pub(super) fn can_direct_merge(state: &ClusterState, change: &TopologyChange) -> bool {
-    let old = &state.committed;
+    if !can_prepare_direct_merge(&state.committed, change) {
+        return false;
+    }
+    merge_proof(state, change).is_ok()
+}
+
+pub(super) fn can_prepare_direct_merge(old: &TopologySnapshot, change: &TopologyChange) -> bool {
     let target = &change.target_topology;
     if target.members.len() >= old.members.len()
         || target.config() != old.config()
@@ -16,7 +22,35 @@ pub(super) fn can_direct_merge(state: &ClusterState, change: &TopologyChange) ->
     {
         return false;
     }
-    merge_proof(state, change).is_ok()
+    let (Ok(old_ranges), Ok(target_ranges)) = (old.derived_ranges(), target.derived_ranges())
+    else {
+        return false;
+    };
+    let needed = required_merge_followers(target);
+    target_ranges.iter().all(|range| {
+        let parts = constituents(&old_ranges, range);
+        !parts.is_empty()
+            && range.follower_node_ids.len() >= needed
+            && parts.iter().all(|part| {
+                (part.owner_node_id == range.owner_node_id
+                    || part.follower_node_ids.first() == Some(&range.owner_node_id))
+                    && range.follower_node_ids.iter().take(needed).all(|follower| {
+                        part.owner_node_id == *follower || part.follower_node_ids.contains(follower)
+                    })
+            })
+    })
+}
+
+fn required_merge_followers(target: &TopologySnapshot) -> usize {
+    let guard = &target.write_availability_guard;
+    let policy_followers = match target.write_ack_policy {
+        WriteAckPolicy::OwnerOnly => 0,
+        WriteAckPolicy::FirstSuccessor => 1,
+        WriteAckPolicy::AllReplicas => target.desired_replication_factor as usize - 1,
+    };
+    policy_followers
+        .max(guard.minimum_admitted_copies.saturating_sub(1) as usize)
+        .max(guard.minimum_healthy_followers as usize)
 }
 
 fn merge_proof(state: &ClusterState, change: &TopologyChange) -> Result<MergeProof, Status> {
@@ -86,17 +120,7 @@ fn merge_proof(state: &ClusterState, change: &TopologyChange) -> Result<MergePro
             }
         }
     }
-    let guard = &change.target_topology.write_availability_guard;
-    let policy_followers = match change.target_topology.write_ack_policy {
-        WriteAckPolicy::OwnerOnly => 0,
-        WriteAckPolicy::FirstSuccessor => 1,
-        WriteAckPolicy::AllReplicas => {
-            change.target_topology.desired_replication_factor as usize - 1
-        }
-    };
-    let required_followers = policy_followers
-        .max(guard.minimum_admitted_copies.saturating_sub(1) as usize)
-        .max(guard.minimum_healthy_followers as usize);
+    let required_followers = required_merge_followers(&change.target_topology);
     for range in &target_ranges {
         if range.follower_node_ids.len() < required_followers {
             return Err(Status::failed_precondition(
@@ -119,7 +143,93 @@ fn merge_proof(state: &ClusterState, change: &TopologyChange) -> Result<MergePro
     Ok((required, candidates))
 }
 
+fn missing_merge_streams(
+    state: &ClusterState,
+    change: &TopologyChange,
+) -> Result<BTreeSet<StreamPair>, Status> {
+    let old_ranges = state
+        .committed
+        .derived_ranges()
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let target_ranges = change
+        .target_topology
+        .derived_ranges()
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let needed = required_merge_followers(&change.target_topology);
+    let mut missing = BTreeSet::new();
+    for target in &target_ranges {
+        for part in constituents(&old_ranges, target) {
+            if part.owner_node_id != target.owner_node_id
+                && admission_for(state, part, &target.owner_node_id).is_none()
+            {
+                missing.insert((part.owner_node_id.clone(), target.owner_node_id.clone()));
+            }
+            for follower in target.follower_node_ids.iter().take(needed) {
+                if part.owner_node_id != *follower && admission_for(state, part, follower).is_none()
+                {
+                    missing.insert((part.owner_node_id.clone(), follower.clone()));
+                }
+            }
+        }
+    }
+    Ok(missing)
+}
+
 impl CoordinatorService {
+    async fn prepare_direct_merge_coverage(
+        &self,
+        change: &mut TopologyChange,
+    ) -> Result<(), Status> {
+        self.cleanup_interrupted_repairs().await?;
+        let snapshot = self.state.read().await.clone();
+        if !can_prepare_direct_merge(&snapshot.committed, change) {
+            return Err(Status::failed_precondition(
+                "removal can no longer use the natural successor merge",
+            ));
+        }
+        let missing = missing_merge_streams(&snapshot, change)?;
+        if missing.is_empty() {
+            return Ok(());
+        }
+        self.set_phase(MigrationPhase::CopyingSnapshot).await?;
+        change.phase = MigrationPhase::CopyingSnapshot;
+        let groups = missing
+            .into_iter()
+            .map(|(owner, follower)| {
+                let tasks: Vec<_> = snapshot
+                    .replica_repairs
+                    .iter()
+                    .filter(|task| {
+                        task.epoch == snapshot.committed.epoch
+                            && task.owner_node_id == owner
+                            && task.node_id == follower
+                    })
+                    .cloned()
+                    .collect();
+                if tasks.is_empty() {
+                    Err(Status::failed_precondition(format!(
+                        "missing old-topology repair stream from {owner} to {follower}"
+                    )))
+                } else {
+                    Ok(tasks)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        try_map_bounded(
+            groups,
+            self.range_move_concurrency.min(4),
+            |tasks| async move { self.seed_replica_group(&tasks).await },
+        )
+        .await?;
+        let state = self.state.read().await;
+        if !can_direct_merge(&state, change) {
+            return Err(Status::failed_precondition(
+                "prepared successor coverage is incomplete",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) async fn set_direct_merge_fence(
         &self,
         change: &TopologyChange,
@@ -205,6 +315,21 @@ impl CoordinatorService {
         mut change: TopologyChange,
         retry_transient: bool,
     ) -> Result<TopologyChange, Status> {
+        if let Err(error) = self.prepare_direct_merge_coverage(&mut change).await {
+            // Coverage preparation never installs the cutover fence. Clean up
+            // any interrupted seed without asking unavailable old members to
+            // acknowledge a fence release they never received.
+            self.cleanup_interrupted_repairs().await?;
+            if !(retry_transient
+                && matches!(
+                    error.code(),
+                    tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+                ))
+            {
+                self.set_phase(MigrationPhase::Aborted).await?;
+            }
+            return Err(error);
+        }
         let deadline = Instant::now() + self.migration_timeout;
         self.set_phase(MigrationPhase::PausingWrites).await?;
         change.phase = MigrationPhase::PausingWrites;

@@ -1,6 +1,111 @@
 use super::*;
 
 #[tokio::test]
+async fn graceful_removal_seeds_missing_successor_before_merge() {
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("repair-before-merge.redb");
+    let ports = unused_ports(3);
+    let endpoint = format!("http://127.0.0.1:{}", ports[0]);
+    let members: Vec<_> = (1..=2)
+        .map(|index| (format!("node-{index}"), ports[index]))
+        .collect();
+    let _coordinator = spawn_process(&coordinator_arguments(ports[0], &state, &members));
+    wait_for_listener(ports[0]);
+    let client = connect_eventually(&endpoint).await;
+    let old = client.topology().await;
+    let key = (0_u64..10_000)
+        .map(|value| value.to_be_bytes().to_vec())
+        .find(|key| old.owner(key).unwrap().node_id == members[0].0.as_str())
+        .unwrap();
+
+    // Planning before nodes register leaves the successor without admission.
+    let plan = client
+        .begin_topology_change(promoted_members(&members[1..]))
+        .await
+        .unwrap();
+    assert!(plan.direct_merge);
+    assert!(plan.ranges.is_empty());
+
+    let _nodes: Vec<_> = members
+        .iter()
+        .map(|(node_id, port)| {
+            spawn_process(&[
+                "node".into(),
+                "--id".into(),
+                node_id.clone(),
+                "--listen".into(),
+                format!("127.0.0.1:{port}"),
+                "--coordinator".into(),
+                endpoint.clone(),
+            ])
+        })
+        .collect();
+    for (_, port) in &members {
+        wait_for_listener(*port);
+    }
+    client.put(key.clone(), b"before".to_vec()).await.unwrap();
+    let completed = client
+        .execute_topology_change(&plan.change_id, plan.base_epoch, plan.target_topology.epoch)
+        .await
+        .unwrap();
+    assert_eq!(completed.phase, MigrationPhase::Complete);
+    assert_eq!(client.get(key.clone()).await.unwrap().value, b"before");
+    client.put(key.clone(), b"after".to_vec()).await.unwrap();
+    assert_eq!(client.get(key).await.unwrap().value, b"after");
+}
+
+#[tokio::test]
+async fn failed_successor_seed_leaves_old_owner_writable() {
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("failed-merge-seed.redb");
+    let ports = unused_ports(3);
+    let endpoint = format!("http://127.0.0.1:{}", ports[0]);
+    let members: Vec<_> = (1..=2)
+        .map(|index| (format!("node-{index}"), ports[index]))
+        .collect();
+    let _coordinator = spawn_process(&coordinator_arguments(ports[0], &state, &members));
+    wait_for_listener(ports[0]);
+    let client = connect_eventually(&endpoint).await;
+    let old = client.topology().await;
+    let key = (0_u64..10_000)
+        .map(|value| value.to_be_bytes().to_vec())
+        .find(|key| old.owner(key).unwrap().node_id == members[0].0.as_str())
+        .unwrap();
+    let plan = client
+        .begin_topology_change(promoted_members(&members[1..]))
+        .await
+        .unwrap();
+    assert!(plan.direct_merge);
+
+    let _owner = spawn_process(&[
+        "node".into(),
+        "--id".into(),
+        members[0].0.clone(),
+        "--listen".into(),
+        format!("127.0.0.1:{}", members[0].1),
+        "--coordinator".into(),
+        endpoint.clone(),
+    ]);
+    wait_for_listener(members[0].1);
+    client.put(key.clone(), b"before".to_vec()).await.unwrap();
+    assert!(
+        client
+            .execute_topology_change(&plan.change_id, plan.base_epoch, plan.target_topology.epoch)
+            .await
+            .is_err()
+    );
+    assert_eq!(client.topology().await.epoch, old.epoch);
+    assert_eq!(
+        client.topology_change().await.unwrap().unwrap().phase,
+        MigrationPhase::Aborted
+    );
+    client.put(key.clone(), b"after".to_vec()).await.unwrap();
+    assert_eq!(client.get(key).await.unwrap().value, b"after");
+}
+
+#[tokio::test]
 async fn published_direct_merge_resumes_after_coordinator_restart() {
     let _guard = process_test_lock().lock().await;
     let directory = tempfile::tempdir().unwrap();

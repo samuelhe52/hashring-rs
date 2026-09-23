@@ -136,6 +136,7 @@ fn direct_merge_requires_admitted_natural_successor_coverage() {
             format!("{}-process", member.node_id),
         );
     }
+    assert!(can_prepare_direct_merge(&old, &change));
     assert!(!can_direct_merge(&state, &change));
     for range in old.derived_ranges().unwrap() {
         let follower = range.follower_node_ids.first().unwrap();
@@ -156,6 +157,36 @@ fn direct_merge_requires_admitted_natural_successor_coverage() {
         .replica_admissions
         .retain(|admission| admission.owner_node_id != "n1");
     assert!(!can_direct_merge(&state, &change));
+}
+
+#[test]
+fn removal_without_an_old_successor_keeps_the_copy_fallback() {
+    let members: Vec<_> = (1..=3)
+        .map(|index| Member {
+            node_id: format!("n{index}"),
+            endpoint: format!("http://127.0.0.1:500{index}"),
+        })
+        .collect();
+    let config = hashring_core::topology::TopologyConfig {
+        desired_replication_factor: 1,
+        write_availability_guard: hashring_core::topology::WriteAvailabilityGuard {
+            minimum_admitted_copies: 1,
+            minimum_healthy_followers: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let old = TopologySnapshot::new_with_config(1, 7, 4, members.clone(), config).unwrap();
+    let change = TopologyChange::plan(
+        &old,
+        members
+            .into_iter()
+            .filter(|member| member.node_id != "n1")
+            .collect(),
+    )
+    .unwrap();
+    assert!(!can_prepare_direct_merge(&old, &change));
+    assert!(!change.ranges.is_empty());
 }
 
 #[test]

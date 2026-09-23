@@ -192,6 +192,19 @@ fn moving_key_indexes(
         .collect()
 }
 
+fn changing_owner_key_indexes(
+    old: &TopologySnapshot,
+    target: &TopologySnapshot,
+    keys: &[Vec<u8>],
+) -> Vec<usize> {
+    keys.iter()
+        .enumerate()
+        .filter_map(|(index, key)| {
+            (old.owner(key).unwrap().node_id != target.owner(key).unwrap().node_id).then_some(index)
+        })
+        .collect()
+}
+
 async fn execute_while_writing_moving_keys(
     observer: &HashringClient,
     executor: HashringClient,
@@ -201,18 +214,25 @@ async fn execute_while_writing_moving_keys(
     label: &str,
 ) -> TopologyChange {
     let old_topology = observer.topology().await;
-    let indexes = moving_key_indexes(&old_topology, keys, &plan.ranges);
+    let indexes = if plan.direct_merge {
+        changing_owner_key_indexes(&old_topology, &plan.target_topology, keys)
+    } else {
+        moving_key_indexes(&old_topology, keys, &plan.ranges)
+    };
     assert!(!indexes.is_empty(), "test has no keys in moving ranges");
     let read_index = indexes[0];
     let read_key = keys[read_index].clone();
     let read_token = old_topology.key_token(&read_key);
-    let read_source_endpoint = plan
-        .ranges
-        .iter()
-        .find(|range| token_in_range(read_token, range))
-        .unwrap()
-        .source_endpoint
-        .clone();
+    let read_source_endpoint = if plan.direct_merge {
+        old_topology.owner(&read_key).unwrap().endpoint.clone()
+    } else {
+        plan.ranges
+            .iter()
+            .find(|range| token_in_range(read_token, range))
+            .unwrap()
+            .source_endpoint
+            .clone()
+    };
     let read_epoch = plan.base_epoch;
     let identity = (
         plan.change_id.clone(),
@@ -226,24 +246,33 @@ async fn execute_while_writing_moving_keys(
             .unwrap()
     });
 
-    let mut observed_copy = false;
+    let mut observed_transition = false;
     for _ in 0..2_000 {
         if let Some(change) = observer.topology_change().await.unwrap()
-            && matches!(
+            && (matches!(
                 change.phase,
                 MigrationPhase::CopyingSnapshot | MigrationPhase::ReplayingChangelog
-            )
+            ) || (plan.direct_merge
+                && matches!(
+                    change.phase,
+                    MigrationPhase::PausingWrites
+                        | MigrationPhase::Verifying
+                        | MigrationPhase::ReadyToPublish
+                )))
         {
-            observed_copy = true;
+            observed_transition = true;
             break;
         }
         assert!(
             !execution.is_finished(),
-            "{label} completed before copy overlap"
+            "{label} completed before transition overlap"
         );
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
-    assert!(observed_copy, "{label} never entered its online copy phase");
+    assert!(
+        observed_transition,
+        "{label} never entered its transition phase"
+    );
 
     let direct_reader = tokio::spawn(async move {
         let mut source = DataNodeClient::connect(read_source_endpoint).await.unwrap();

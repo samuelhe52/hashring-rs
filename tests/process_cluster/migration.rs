@@ -460,8 +460,11 @@ async fn online_scale_out_and_scale_in_preserve_concurrent_writes() {
         .await
         .unwrap();
     let stale_client = connect_without_polling(&coordinator_endpoint, Duration::from_secs(2)).await;
-    let stale_key =
-        moving_key_indexes(&stale_client.topology().await, &keys, &scale_in_plan.ranges)[0];
+    let stale_key = changing_owner_key_indexes(
+        &stale_client.topology().await,
+        &scale_in_plan.target_topology,
+        &keys,
+    )[0];
     let executor = HashringClient::connect(coordinator_endpoint.clone(), Duration::from_secs(60))
         .await
         .unwrap();
