@@ -83,8 +83,7 @@ impl CoordinatorService {
         if change.ranges.is_empty()
             && change.replica_obligations.is_empty()
             && change.target_topology.members == self.state.read().await.committed.members
-            && change.target_topology.write_ack_policy
-                != self.state.read().await.committed.write_ack_policy
+            && change.target_topology.config() != self.state.read().await.committed.config()
         {
             return self.execute_policy_change(change, false).await;
         }

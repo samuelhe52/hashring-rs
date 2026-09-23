@@ -156,6 +156,8 @@ message ReplicaObligation {
 message BeginTopologyChangeRequest {
   repeated Member target_members = 1;
   optional WriteAckPolicy target_write_ack_policy = 2;
+  optional uint32 target_desired_replication_factor = 3;
+  WriteAvailabilityGuard target_write_availability_guard = 4;
 }
 
 message ExecuteTopologyChangeRequest {

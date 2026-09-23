@@ -43,6 +43,8 @@ enum Command {
     BeginChange(ChangeArgs),
     /// Stage a committed-topology ACK policy transition.
     BeginPolicyChange(PolicyChangeArgs),
+    /// Stage an RF or write-availability guard transition.
+    BeginConfigChange(ConfigChangeArgs),
     /// Print the active topology change, if any.
     ChangeStatus(ClientArgs),
     /// Print per-range admission, liveness, write readiness, and repair state.
@@ -171,6 +173,20 @@ struct PolicyChangeArgs {
 }
 
 #[derive(Args)]
+struct ConfigChangeArgs {
+    #[command(flatten)]
+    client: ClientArgs,
+    #[arg(long)]
+    desired_replication_factor: Option<u32>,
+    #[arg(long)]
+    minimum_admitted_copies: Option<u32>,
+    #[arg(long)]
+    minimum_healthy_followers: Option<u32>,
+    #[arg(long)]
+    max_replica_lag_ms: Option<u64>,
+}
+
+#[derive(Args)]
 struct ExecuteChangeArgs {
     #[arg(long, default_value = "http://127.0.0.1:50050")]
     coordinator: String,
@@ -251,6 +267,7 @@ async fn main() -> Result<()> {
         Command::Topology(args) => run_topology(args).await,
         Command::BeginChange(args) => run_begin_change(args).await,
         Command::BeginPolicyChange(args) => run_begin_policy_change(args).await,
+        Command::BeginConfigChange(args) => run_begin_config_change(args).await,
         Command::ChangeStatus(args) => run_change_status(args).await,
         Command::ReplicaStatus(args) => run_replica_status(args).await,
         Command::ExecuteChange(args) => run_execute_change(args).await,
@@ -495,6 +512,26 @@ async fn run_begin_policy_change(args: PolicyChangeArgs) -> Result<()> {
         PolicyArg::AllReplicas => WriteAckPolicy::AllReplicas,
     };
     let change = client.begin_write_policy_change(policy).await?;
+    println!("{}", serde_json::to_string_pretty(&change)?);
+    Ok(())
+}
+
+async fn run_begin_config_change(args: ConfigChangeArgs) -> Result<()> {
+    let client = connect_client(&args.client).await?;
+    let mut config = client.topology().await.config();
+    if let Some(rf) = args.desired_replication_factor {
+        config.desired_replication_factor = rf;
+    }
+    if let Some(copies) = args.minimum_admitted_copies {
+        config.write_availability_guard.minimum_admitted_copies = copies;
+    }
+    if let Some(followers) = args.minimum_healthy_followers {
+        config.write_availability_guard.minimum_healthy_followers = followers;
+    }
+    if let Some(lag) = args.max_replica_lag_ms {
+        config.write_availability_guard.max_replica_lag_millis = lag;
+    }
+    let change = client.begin_topology_config_change(config).await?;
     println!("{}", serde_json::to_string_pretty(&change)?);
     Ok(())
 }

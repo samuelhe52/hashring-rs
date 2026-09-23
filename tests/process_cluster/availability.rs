@@ -1,6 +1,108 @@
 use super::*;
 
 #[tokio::test]
+async fn rf_and_guard_transitions_publish_and_preserve_data() {
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let ports = unused_ports(4);
+    let endpoint = format!("http://127.0.0.1:{}", ports[0]);
+    let members: Vec<_> = (1..=3)
+        .map(|index| (format!("node-{index}"), ports[index]))
+        .collect();
+    let mut args = coordinator_arguments(ports[0], &directory.path().join("config.redb"), &members);
+    args.extend(["--desired-replication-factor".into(), "2".into()]);
+    let _coordinator = spawn_process(&args);
+    wait_for_listener(ports[0]);
+    let client = HashringClient::connect(&endpoint, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let _nodes: Vec<_> = members
+        .iter()
+        .map(|(node_id, port)| {
+            spawn_process(&[
+                "node".into(),
+                "--id".into(),
+                node_id.clone(),
+                "--listen".into(),
+                format!("127.0.0.1:{port}"),
+                "--coordinator".into(),
+                endpoint.clone(),
+            ])
+        })
+        .collect();
+    wait_for_full_rf(&endpoint, 1, 2).await;
+    client
+        .put(b"config-key".to_vec(), b"value".to_vec())
+        .await
+        .unwrap();
+
+    let mut config = client.topology().await.config();
+    config.desired_replication_factor = 3;
+    let increase = client
+        .begin_topology_config_change(config.clone())
+        .await
+        .unwrap();
+    assert!(increase.ranges.is_empty());
+    assert!(!increase.replica_obligations.is_empty());
+    let applied = client
+        .execute_topology_change(
+            &increase.change_id,
+            increase.base_epoch,
+            increase.target_topology.epoch,
+        )
+        .await
+        .unwrap();
+    assert_eq!(applied.phase, MigrationPhase::Complete);
+    wait_for_full_rf(&endpoint, 2, 3).await;
+
+    config.write_availability_guard.minimum_admitted_copies = 2;
+    config.write_availability_guard.minimum_healthy_followers = 1;
+    let guard_change = client
+        .begin_topology_config_change(config.clone())
+        .await
+        .unwrap();
+    assert!(guard_change.ranges.is_empty());
+    let applied = client
+        .execute_topology_change(
+            &guard_change.change_id,
+            guard_change.base_epoch,
+            guard_change.target_topology.epoch,
+        )
+        .await
+        .unwrap();
+    assert_eq!(applied.target_topology.config(), config);
+    assert_eq!(
+        client.get(b"config-key".to_vec()).await.unwrap().value,
+        b"value"
+    );
+
+    let mut invalid = config.clone();
+    invalid.desired_replication_factor = 1;
+    assert!(client.begin_topology_config_change(invalid).await.is_err());
+
+    config.write_availability_guard.minimum_admitted_copies = 1;
+    config.write_availability_guard.minimum_healthy_followers = 0;
+    config.desired_replication_factor = 2;
+    let decrease = client
+        .begin_topology_config_change(config.clone())
+        .await
+        .unwrap();
+    let applied = client
+        .execute_topology_change(
+            &decrease.change_id,
+            decrease.base_epoch,
+            decrease.target_topology.epoch,
+        )
+        .await
+        .unwrap();
+    assert_eq!(applied.target_topology.config(), config);
+    assert_eq!(
+        client.get(b"config-key".to_vec()).await.unwrap().value,
+        b"value"
+    );
+}
+
+#[tokio::test]
 async fn policy_strengthening_waits_for_admitted_caught_up_followers() {
     let _guard = process_test_lock().lock().await;
     let directory = tempfile::tempdir().unwrap();

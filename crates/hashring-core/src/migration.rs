@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::topology::{Member, TopologyError, TopologySnapshot, WriteAckPolicy};
+use crate::topology::{Member, TopologyConfig, TopologyError, TopologySnapshot, WriteAckPolicy};
 
 pub const MAX_MIGRATION_RANGES: usize = 16_384;
 pub const MAX_REPLICA_OBLIGATIONS: usize = 16_384;
@@ -91,8 +91,8 @@ pub struct TopologyChange {
 pub enum MigrationError {
     #[error("invalid target topology: {0}")]
     Topology(#[from] TopologyError),
-    #[error("target membership and write policy are identical to committed topology")]
-    NoMembershipChange,
+    #[error("target topology is identical to committed topology")]
+    NoTopologyChange,
     #[error("changing the endpoint of existing node {0} is not supported for in-memory nodes")]
     EndpointChangeUnsupported(String),
     #[error("topology epoch overflow")]
@@ -120,6 +120,16 @@ impl TopologyChange {
         target_members: Vec<Member>,
         target_policy: WriteAckPolicy,
     ) -> Result<Self, MigrationError> {
+        let mut config = committed.config();
+        config.write_ack_policy = target_policy;
+        Self::plan_with_config(committed, target_members, config)
+    }
+
+    pub fn plan_with_config(
+        committed: &TopologySnapshot,
+        target_members: Vec<Member>,
+        config: TopologyConfig,
+    ) -> Result<Self, MigrationError> {
         for current in &committed.members {
             if let Some(target) = target_members
                 .iter()
@@ -135,8 +145,6 @@ impl TopologyChange {
             .epoch
             .checked_add(1)
             .ok_or(MigrationError::EpochOverflow)?;
-        let mut config = committed.config();
-        config.write_ack_policy = target_policy;
         let target_topology = TopologySnapshot::new_with_config(
             target_epoch,
             committed.hash_seed,
@@ -145,9 +153,9 @@ impl TopologyChange {
             config,
         )?;
         if target_topology.members == committed.members
-            && target_policy == committed.write_ack_policy
+            && target_topology.config() == committed.config()
         {
-            return Err(MigrationError::NoMembershipChange);
+            return Err(MigrationError::NoTopologyChange);
         }
 
         let (ranges, replica_obligations) = topology_delta(committed, &target_topology)?;
@@ -479,8 +487,39 @@ mod tests {
         let committed = TopologySnapshot::new(1, 42, 16, vec![member("a", 1)]).unwrap();
         assert!(matches!(
             TopologyChange::plan(&committed, committed.members.clone()),
-            Err(MigrationError::NoMembershipChange)
+            Err(MigrationError::NoTopologyChange)
         ));
+    }
+
+    #[test]
+    fn rf_and_guard_changes_are_committed_topology_changes() {
+        let committed = TopologySnapshot::new(
+            1,
+            42,
+            16,
+            vec![member("a", 1), member("b", 2), member("c", 3)],
+        )
+        .unwrap();
+        let mut config = committed.config();
+        config.desired_replication_factor = 2;
+        config.write_availability_guard.minimum_healthy_followers = 0;
+        let decrease =
+            TopologyChange::plan_with_config(&committed, committed.members.clone(), config.clone())
+                .unwrap();
+        assert_eq!(decrease.target_topology.config(), config);
+        assert_ne!(decrease.target_topology.digest, committed.digest);
+        assert!(decrease.ranges.is_empty());
+        assert!(decrease.replica_obligations.is_empty());
+
+        config.desired_replication_factor = 3;
+        let increase = TopologyChange::plan_with_config(
+            &decrease.target_topology,
+            decrease.target_topology.members.clone(),
+            config,
+        )
+        .unwrap();
+        assert!(increase.ranges.is_empty());
+        assert!(!increase.replica_obligations.is_empty());
     }
 
     #[test]

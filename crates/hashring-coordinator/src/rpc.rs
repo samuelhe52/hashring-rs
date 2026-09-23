@@ -312,6 +312,14 @@ impl Coordinator for CoordinatorService {
             .map(WriteAckPolicy::try_from)
             .transpose()
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let target_rf = request.target_desired_replication_factor;
+        let target_guard = request.target_write_availability_guard.map(|guard| {
+            hashring_core::topology::WriteAvailabilityGuard {
+                minimum_admitted_copies: guard.minimum_admitted_copies,
+                minimum_healthy_followers: guard.minimum_healthy_followers,
+                max_replica_lag_millis: guard.max_replica_lag_millis,
+            }
+        });
         let target_members = request
             .target_members
             .into_iter()
@@ -330,28 +338,35 @@ impl Coordinator for CoordinatorService {
                 "another topology change is already active",
             ));
         }
-        if target_policy.is_some_and(|policy| policy != state.committed.write_ack_policy)
-            && target_members != state.committed.members
-        {
+        let mut config = state.committed.config();
+        if let Some(policy) = target_policy {
+            config.write_ack_policy = policy;
+        }
+        if let Some(rf) = target_rf {
+            config.desired_replication_factor = rf;
+        }
+        if let Some(guard) = target_guard {
+            config.write_availability_guard = guard;
+        }
+        if config != state.committed.config() && target_members != state.committed.members {
             return Err(Status::invalid_argument(
-                "change membership and ACK policy in separate topology transitions",
+                "change membership and topology configuration in separate transitions",
             ));
         }
-        let change = TopologyChange::plan_with_policy(
-            &state.committed,
-            target_members,
-            target_policy.unwrap_or(state.committed.write_ack_policy),
-        )
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+        let change = TopologyChange::plan_with_config(&state.committed, target_members, config)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let target = &change.target_topology;
         let member_count = target.members.len();
         let guard = &target.write_availability_guard;
-        if target.members != state.committed.members
-            && (member_count < guard.minimum_admitted_copies as usize
-                || member_count.saturating_sub(1) < guard.minimum_healthy_followers as usize
-                || (target.write_ack_policy == WriteAckPolicy::FirstSuccessor && member_count < 2)
-                || (target.write_ack_policy == WriteAckPolicy::AllReplicas
-                    && member_count < target.desired_replication_factor as usize))
+        if member_count < guard.minimum_admitted_copies as usize
+            || member_count.saturating_sub(1) < guard.minimum_healthy_followers as usize
+            || target.desired_replication_factor < guard.minimum_admitted_copies
+            || target.desired_replication_factor.saturating_sub(1) < guard.minimum_healthy_followers
+            || (target.write_ack_policy == WriteAckPolicy::FirstSuccessor && member_count < 2)
+            || ((target.members != state.committed.members
+                || target.desired_replication_factor != state.committed.desired_replication_factor)
+                && target.write_ack_policy == WriteAckPolicy::AllReplicas
+                && member_count < target.desired_replication_factor as usize)
         {
             return Err(Status::failed_precondition(
                 "target membership cannot satisfy its write policy and availability guard",

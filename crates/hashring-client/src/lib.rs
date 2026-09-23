@@ -23,7 +23,7 @@ use hashring_core::{
         GetRequest, OperationError, PutRequest, RecordVersion,
         coordinator_client::CoordinatorClient, data_node_client::DataNodeClient,
     },
-    topology::{Member, TopologyError, TopologySnapshot, WriteAckPolicy},
+    topology::{Member, TopologyConfig, TopologyError, TopologySnapshot, WriteAckPolicy},
     transport::{configure_coordinator_client, fetch_topology},
 };
 
@@ -208,7 +208,7 @@ impl HashringClient {
         &self,
         target_members: Vec<Member>,
     ) -> Result<TopologyChange, ClientError> {
-        self.begin_topology_change_with_policy(target_members, None)
+        self.begin_topology_change_with_config(target_members, None)
             .await
     }
 
@@ -217,14 +217,25 @@ impl HashringClient {
         target_policy: WriteAckPolicy,
     ) -> Result<TopologyChange, ClientError> {
         let members = self.topology().await.members;
-        self.begin_topology_change_with_policy(members, Some(target_policy))
+        let mut config = self.topology().await.config();
+        config.write_ack_policy = target_policy;
+        self.begin_topology_change_with_config(members, Some(config))
             .await
     }
 
-    async fn begin_topology_change_with_policy(
+    pub async fn begin_topology_config_change(
+        &self,
+        target_config: TopologyConfig,
+    ) -> Result<TopologyChange, ClientError> {
+        let members = self.topology().await.members;
+        self.begin_topology_change_with_config(members, Some(target_config))
+            .await
+    }
+
+    async fn begin_topology_change_with_config(
         &self,
         target_members: Vec<Member>,
-        target_policy: Option<WriteAckPolicy>,
+        target_config: Option<TopologyConfig>,
     ) -> Result<TopologyChange, ClientError> {
         let deadline = Instant::now() + self.inner.operation_timeout;
         let mut client = match tokio::time::timeout(
@@ -242,8 +253,15 @@ impl HashringClient {
             }
         };
         let request = BeginTopologyChangeRequest {
-            target_write_ack_policy: target_policy
-                .map(|policy| proto::WriteAckPolicy::from(policy).into()),
+            target_write_ack_policy: target_config
+                .as_ref()
+                .map(|config| proto::WriteAckPolicy::from(config.write_ack_policy).into()),
+            target_desired_replication_factor: target_config
+                .as_ref()
+                .map(|config| config.desired_replication_factor),
+            target_write_availability_guard: target_config
+                .as_ref()
+                .map(|config| (&config.write_availability_guard).into()),
             target_members: target_members.iter().map(proto::Member::from).collect(),
         };
         let response = match tokio::time::timeout(
