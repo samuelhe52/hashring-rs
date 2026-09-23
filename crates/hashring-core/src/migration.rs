@@ -77,6 +77,10 @@ pub struct TopologyChange {
     pub stopping_node_ids: Vec<String>,
     #[serde(default)]
     pub stop_prepared_node_ids: Vec<String>,
+    #[serde(default)]
+    pub failed_node_id: Option<String>,
+    #[serde(default)]
+    pub activation_ready: bool,
 }
 
 #[derive(Debug, Error)]
@@ -153,6 +157,8 @@ impl TopologyChange {
             stopped_node_ids: Vec::new(),
             stopping_node_ids: Vec::new(),
             stop_prepared_node_ids: Vec::new(),
+            failed_node_id: None,
+            activation_ready: false,
         })
     }
 }
@@ -359,6 +365,8 @@ impl From<&TopologyChange> for crate::proto::TopologyChangeSnapshot {
             stopped_node_ids: change.stopped_node_ids.clone(),
             stopping_node_ids: change.stopping_node_ids.clone(),
             stop_prepared_node_ids: change.stop_prepared_node_ids.clone(),
+            failed_node_id: change.failed_node_id.clone().unwrap_or_default(),
+            activation_ready: change.activation_ready,
         }
     }
 }
@@ -384,6 +392,8 @@ impl TryFrom<crate::proto::TopologyChangeSnapshot> for TopologyChange {
             stopped_node_ids: change.stopped_node_ids,
             stopping_node_ids: change.stopping_node_ids,
             stop_prepared_node_ids: change.stop_prepared_node_ids,
+            failed_node_id: (!change.failed_node_id.is_empty()).then_some(change.failed_node_id),
+            activation_ready: change.activation_ready,
         })
     }
 }

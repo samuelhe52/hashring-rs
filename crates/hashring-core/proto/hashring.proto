@@ -48,6 +48,8 @@ service Coordinator {
   rpc GetTopologyChange(Empty) returns (GetTopologyChangeResponse);
   rpc ExecuteTopologyChange(ExecuteTopologyChangeRequest) returns (TopologyChangeSnapshot);
   rpc RegisterNode(RegisterNodeRequest) returns (Empty);
+  rpc RenewNodeLease(RenewNodeLeaseRequest) returns (RenewNodeLeaseResponse);
+  rpc ReportPeerHealth(ReportPeerHealthRequest) returns (Empty);
   rpc IsStopConfirmed(StopRequest) returns (StopConfirmationResponse);
   rpc GetReplicaStatus(Empty) returns (ReplicaStatusResponse);
 }
@@ -126,6 +128,8 @@ message TopologyChangeSnapshot {
   repeated string stopping_node_ids = 7;
   repeated string stop_prepared_node_ids = 8;
   repeated ReplicaObligation replica_obligations = 9;
+  string failed_node_id = 10;
+  bool activation_ready = 11;
 }
 
 message ReplicaObligation {
@@ -149,6 +153,25 @@ message ExecuteTopologyChangeRequest {
 message RegisterNodeRequest {
   string node_id = 1;
   string process_instance_id = 2;
+}
+
+message RenewNodeLeaseRequest {
+  string node_id = 1;
+  string process_instance_id = 2;
+  uint64 topology_epoch = 3;
+}
+
+message RenewNodeLeaseResponse {
+  uint64 topology_epoch = 1;
+  uint64 lease_duration_millis = 2;
+}
+
+message ReportPeerHealthRequest {
+  string reporter_node_id = 1;
+  string reporter_process_instance_id = 2;
+  string peer_node_id = 3;
+  uint64 topology_epoch = 4;
+  bool reachable = 5;
 }
 
 message StopConfirmationResponse {
@@ -274,6 +297,11 @@ message RangeDigestResponse {
 
 message InstallTopologyRequest {
   TopologySnapshot topology = 1;
+  bool require_lease = 2;
+}
+
+message AbortReplicaRepairsRequest {
+  uint64 topology_epoch = 1;
 }
 
 message StopRequest {
@@ -407,6 +435,7 @@ service DataNode {
   rpc ActivateDestinationRange(RangeControlRequest) returns (Empty);
   rpc CleanupSourceRange(RangeControlRequest) returns (Empty);
   rpc AbortRangeMigration(RangeControlRequest) returns (Empty);
+  rpc AbortReplicaRepairs(AbortReplicaRepairsRequest) returns (Empty);
   rpc InstallTopology(InstallTopologyRequest) returns (Empty);
   rpc PausePolicyWrites(PolicyWriteFenceRequest) returns (Empty);
   rpc ResumePolicyWrites(PolicyWriteFenceRequest) returns (Empty);

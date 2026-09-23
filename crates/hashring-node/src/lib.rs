@@ -46,6 +46,7 @@ const REPLICATION_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 const IDEMPOTENCY_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 const MAX_DEDUP_BYTES: usize = 16 * 1024 * 1024;
 const REQUIRED_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const PEER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 type RequiredAck = (u64, String, u64);
 
@@ -216,6 +217,7 @@ struct NodeState {
     sources: HashMap<(String, String), SourceMigration>,
     destinations: HashMap<(String, String), DestinationMigration>,
     journal_bytes_total: usize,
+    lease: Option<(u64, Instant)>,
     policy_write_fence: Option<(String, u64)>,
     dedup: HashMap<String, DedupEntry>,
     dedup_expirations: BinaryHeap<Reverse<(Instant, String)>>,
@@ -317,36 +319,42 @@ impl DataNodeService {
         required: &[RequiredAck],
         epoch: u64,
     ) -> Result<(), OperationError> {
-        if required.is_empty() {
-            return Ok(());
-        }
-        let mut receivers = {
-            let state = self.state.read().await;
-            required
-                .iter()
-                .map(|(stream_epoch, node_id, sequence)| {
-                    state
-                        .ack_progress
-                        .get(&(*stream_epoch, node_id.clone()))
-                        .map(|sender| (sender.subscribe(), *sequence))
-                })
-                .collect::<Option<Vec<_>>>()
-        }
-        .ok_or_else(|| outcome_unknown(epoch))?;
-        let wait = async {
-            for (receiver, sequence) in &mut receivers {
-                while *receiver.borrow_and_update() < *sequence {
-                    receiver
-                        .changed()
-                        .await
-                        .map_err(|_| outcome_unknown(epoch))?;
-                }
+        if !required.is_empty() {
+            let mut receivers = {
+                let state = self.state.read().await;
+                required
+                    .iter()
+                    .map(|(stream_epoch, node_id, sequence)| {
+                        state
+                            .ack_progress
+                            .get(&(*stream_epoch, node_id.clone()))
+                            .map(|sender| (sender.subscribe(), *sequence))
+                    })
+                    .collect::<Option<Vec<_>>>()
             }
-            Ok(())
-        };
-        tokio::time::timeout(REQUIRED_ACK_TIMEOUT, wait)
-            .await
-            .unwrap_or_else(|_| Err(outcome_unknown(epoch)))
+            .ok_or_else(|| outcome_unknown(epoch))?;
+            let wait = async {
+                for (receiver, sequence) in &mut receivers {
+                    while *receiver.borrow_and_update() < *sequence {
+                        receiver
+                            .changed()
+                            .await
+                            .map_err(|_| outcome_unknown(epoch))?;
+                    }
+                }
+                Ok(())
+            };
+            tokio::time::timeout(REQUIRED_ACK_TIMEOUT, wait)
+                .await
+                .unwrap_or_else(|_| Err(outcome_unknown(epoch)))?;
+        }
+        let state = self.state.read().await;
+        if state.lease.is_none_or(|(lease_epoch, expires_at)| {
+            lease_epoch != epoch || state.topology.epoch != epoch || Instant::now() >= expires_at
+        }) {
+            return Err(outcome_unknown(epoch));
+        }
+        Ok(())
     }
 
     pub async fn connect(node_id: String, coordinator_endpoint: String) -> anyhow::Result<Self> {
@@ -389,13 +397,14 @@ impl DataNodeService {
             sources: HashMap::new(),
             destinations: HashMap::new(),
             journal_bytes_total: 0,
+            lease: None,
             policy_write_fence: None,
             dedup: HashMap::new(),
             dedup_expirations: BinaryHeap::new(),
             dedup_bytes: 0,
         }));
         let replication_dispatch = start_replication_dispatch(state.clone());
-        Ok(Self {
+        let service = Self {
             node_id,
             process_instance_id,
             coordinator_endpoint,
@@ -409,7 +418,150 @@ impl DataNodeService {
             stop_response_delay: std::time::Duration::ZERO,
             stop_prepared: Arc::new(AtomicBool::new(false)),
             shutdown,
+        };
+        if is_committed_member {
+            service.renew_lease_once().await?;
+        }
+        service.start_lease_renewal();
+        service.start_peer_probes();
+        Ok(service)
+    }
+
+    async fn renew_lease_once(&self) -> anyhow::Result<()> {
+        let epoch = self.state.read().await.topology.epoch;
+        // Discount the entire RPC round trip from the granted lifetime. This
+        // makes local authority expire no later than the coordinator's grant.
+        let sent_at = Instant::now();
+        let response = tokio::time::timeout(REPLICATION_RPC_TIMEOUT, async {
+            let mut client = configure_coordinator_client(
+                CoordinatorClient::connect(self.coordinator_endpoint.clone()).await?,
+            );
+            Ok::<_, anyhow::Error>(
+                client
+                    .renew_node_lease(proto::RenewNodeLeaseRequest {
+                        node_id: self.node_id.clone(),
+                        process_instance_id: self.process_instance_id.clone(),
+                        topology_epoch: epoch,
+                    })
+                    .await?
+                    .into_inner(),
+            )
         })
+        .await??;
+        if response.topology_epoch == epoch && response.lease_duration_millis > 0 {
+            let mut state = self.state.write().await;
+            if state.topology.epoch == epoch {
+                state.lease = Some((
+                    epoch,
+                    sent_at + std::time::Duration::from_millis(response.lease_duration_millis),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn start_lease_renewal(&self) {
+        let service = self.clone();
+        let mut shutdown = self.shutdown.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if service.renew_lease_once().await.is_err() {
+                            // The coordinator may have published a new epoch.
+                            let _ = service.refresh_topology().await;
+                        }
+                    }
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() { break; }
+                    }
+                }
+            }
+        });
+    }
+
+    fn start_peer_probes(&self) {
+        let service = self.clone();
+        let mut shutdown = self.shutdown.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => service.probe_peers().await,
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() { break; }
+                    }
+                }
+            }
+        });
+    }
+
+    async fn probe_peers(&self) {
+        let (topology, leased) = {
+            let state = self.state.read().await;
+            let leased = state.lease.is_some_and(|(epoch, expires_at)| {
+                epoch == state.topology.epoch && Instant::now() < expires_at
+            });
+            (state.topology.clone(), leased)
+        };
+        if !leased {
+            return;
+        }
+        let selected = peer_probe_targets(&topology, &self.node_id);
+        if selected.is_empty() {
+            return;
+        }
+        let coordinator = match tokio::time::timeout(
+            PEER_PROBE_TIMEOUT,
+            CoordinatorClient::connect(self.coordinator_endpoint.clone()),
+        )
+        .await
+        {
+            Ok(Ok(client)) => configure_coordinator_client(client),
+            _ => return,
+        };
+        let mut probes = tokio::task::JoinSet::new();
+        for member in selected {
+            let mut coordinator = coordinator.clone();
+            let reporter_node_id = self.node_id.clone();
+            let reporter_process_instance_id = self.process_instance_id.clone();
+            let topology_epoch = topology.epoch;
+            probes.spawn(async move {
+                let reachable = tokio::time::timeout(PEER_PROBE_TIMEOUT, async {
+                    let mut client = configure_data_node_client(
+                        DataNodeClient::connect(member.endpoint.clone())
+                            .await
+                            .ok()?,
+                    );
+                    let info = client
+                        .get_process_info(proto::Empty {})
+                        .await
+                        .ok()?
+                        .into_inner();
+                    Some(info.node_id == member.node_id)
+                })
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(false);
+                let report = proto::ReportPeerHealthRequest {
+                    reporter_node_id,
+                    reporter_process_instance_id,
+                    peer_node_id: member.node_id.clone(),
+                    topology_epoch,
+                    reachable,
+                };
+                let _ = tokio::time::timeout(
+                    PEER_PROBE_TIMEOUT,
+                    coordinator.report_peer_health(report),
+                )
+                .await;
+            });
+        }
+        while probes.join_next().await.is_some() {}
     }
 
     pub fn with_stop_response_delay(mut self, delay: std::time::Duration) -> Self {
@@ -433,12 +585,20 @@ impl DataNodeService {
         if self.state.read().await.topology.epoch >= request_epoch {
             return Ok(());
         }
+        self.refresh_topology().await
+    }
+
+    async fn refresh_topology(&self) -> Result<(), Status> {
         let topology = fetch_topology(&self.coordinator_endpoint)
             .await
             .map_err(|error| Status::unavailable(error.to_string()))?;
         let mut state = self.state.write().await;
         if topology.epoch >= state.topology.epoch {
             let epoch = topology.epoch;
+            if epoch != state.topology.epoch {
+                state.lease = None;
+                clear_replica_repair_staging(&mut state);
+            }
             state.topology = topology;
             state
                 .owner_stream_sequences
@@ -479,6 +639,14 @@ impl DataNodeService {
             .owner(key)
             .map_err(|error| Status::internal(error.to_string()))?;
         if owner.node_id == self.node_id {
+            if state.lease.is_none_or(|(epoch, expires_at)| {
+                epoch != state.topology.epoch || Instant::now() >= expires_at
+            }) {
+                return Ok(Some(OperationError {
+                    current_epoch: state.topology.epoch,
+                    ..operation_error(ErrorCode::LeaseExpired, "owner lease has expired", true)
+                }));
+            }
             return Ok(None);
         }
         Ok(Some(OperationError {
@@ -2070,12 +2238,27 @@ impl DataNode for DataNodeService {
         Ok(Response::new(proto::Empty {}))
     }
 
+    async fn abort_replica_repairs(
+        &self,
+        request: Request<proto::AbortReplicaRepairsRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        let epoch = request.into_inner().topology_epoch;
+        let mut state = self.state.write().await;
+        if state.topology.epoch != epoch {
+            return Err(Status::failed_precondition(
+                "repair cleanup epoch does not match installed topology",
+            ));
+        }
+        clear_replica_repair_staging(&mut state);
+        Ok(Response::new(proto::Empty {}))
+    }
+
     async fn install_topology(
         &self,
         request: Request<InstallTopologyRequest>,
     ) -> Result<Response<proto::Empty>, Status> {
+        let request = request.into_inner();
         let topology: TopologySnapshot = request
-            .into_inner()
             .topology
             .ok_or_else(|| Status::invalid_argument("missing topology"))?
             .try_into()
@@ -2089,6 +2272,10 @@ impl DataNode for DataNodeService {
             ));
         }
         let epoch = topology.epoch;
+        if epoch != state.topology.epoch {
+            state.lease = None;
+            clear_replica_repair_staging(&mut state);
+        }
         state.topology = topology;
         state
             .owner_stream_sequences
@@ -2101,6 +2288,21 @@ impl DataNode for DataNodeService {
             .retain(|(stream_epoch, _), _| *stream_epoch == epoch);
         prune_ack_progress(&mut state);
         self.replication_dispatch.prune_epoch(epoch);
+        drop(state);
+        if request.require_lease
+            && self
+                .state
+                .read()
+                .await
+                .topology
+                .members
+                .iter()
+                .any(|member| member.node_id == self.node_id)
+        {
+            self.renew_lease_once().await.map_err(|error| {
+                Status::unavailable(format!("new-epoch lease is unavailable: {error}"))
+            })?;
+        }
         Ok(Response::new(proto::Empty {}))
     }
 
@@ -2194,6 +2396,56 @@ fn temporarily_unavailable(epoch: u64, message: impl Into<String>) -> OperationE
         current_epoch: epoch,
         ..operation_error(ErrorCode::TemporarilyUnavailable, message, true)
     }
+}
+
+fn peer_probe_targets(
+    topology: &TopologySnapshot,
+    node_id: &str,
+) -> Vec<hashring_core::topology::Member> {
+    let Some(index) = topology
+        .members
+        .iter()
+        .position(|member| member.node_id == node_id)
+    else {
+        return Vec::new();
+    };
+    let count = topology.members.len();
+    let mut targets = Vec::new();
+    // Four stable reporters per physical node give each reachable reporter a
+    // one-second cadence independent of cluster size. With three nodes, both
+    // peers report; one broken link alone can never confirm a failure.
+    for offset in [1, 2, count.saturating_sub(1), count.saturating_sub(2)] {
+        let member = &topology.members[(index + offset) % count];
+        if member.node_id != node_id
+            && !targets
+                .iter()
+                .any(|existing: &hashring_core::topology::Member| {
+                    existing.node_id == member.node_id
+                })
+        {
+            targets.push(member.clone());
+        }
+    }
+    targets
+}
+
+fn clear_replica_repair_staging(state: &mut NodeState) {
+    let keys: Vec<_> = state
+        .sources
+        .keys()
+        .filter(|(change_id, _)| change_id.starts_with("repair-"))
+        .cloned()
+        .collect();
+    for key in keys {
+        if let Some(source) = state.sources.remove(&key) {
+            state.journal_bytes_total = state
+                .journal_bytes_total
+                .saturating_sub(source.journal_bytes);
+        }
+    }
+    state
+        .destinations
+        .retain(|(change_id, _), _| !change_id.starts_with("repair-"));
 }
 
 fn outcome_unknown(epoch: u64) -> OperationError {
@@ -3048,6 +3300,7 @@ mod tests {
 
     fn service_for(node_id: &str, topology: TopologySnapshot) -> DataNodeService {
         let (shutdown, _) = watch::channel(false);
+        let test_epoch = topology.epoch;
         let state = Arc::new(RwLock::new(NodeState {
             topology,
             records: HashMap::new(),
@@ -3059,6 +3312,10 @@ mod tests {
             sources: HashMap::new(),
             destinations: HashMap::new(),
             journal_bytes_total: 0,
+            lease: Some((
+                test_epoch,
+                Instant::now() + std::time::Duration::from_secs(3600),
+            )),
             policy_write_fence: None,
             dedup: HashMap::new(),
             dedup_expirations: BinaryHeap::new(),
@@ -3112,6 +3369,29 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn peer_probes_keep_two_independent_reporters_at_large_membership() {
+        let members = (0..128)
+            .map(|index| Member {
+                node_id: format!("node-{index:03}"),
+                endpoint: format!("http://127.0.0.1:{}", 6000 + index),
+            })
+            .collect();
+        let topology = TopologySnapshot::new(1, 42, 1, members).unwrap();
+        let mut reporters: HashMap<String, HashSet<String>> = HashMap::new();
+        for member in &topology.members {
+            let targets = peer_probe_targets(&topology, &member.node_id);
+            assert_eq!(targets.len(), 4);
+            for target in targets {
+                reporters
+                    .entry(target.node_id)
+                    .or_default()
+                    .insert(member.node_id.clone());
+            }
+        }
+        assert!(reporters.values().all(|reporters| reporters.len() == 4));
     }
 
     fn key_with_placement(
@@ -3421,6 +3701,7 @@ mod tests {
             sources: HashMap::new(),
             destinations: HashMap::new(),
             journal_bytes_total: 0,
+            lease: Some((1, Instant::now() + std::time::Duration::from_secs(3600))),
             policy_write_fence: None,
             dedup: HashMap::new(),
             dedup_expirations: BinaryHeap::new(),
@@ -3984,9 +4265,12 @@ mod tests {
             service
                 .install_topology(Request::new(InstallTopologyRequest {
                     topology: Some((&topology).into()),
+                    require_lease: false,
                 }))
                 .await
                 .unwrap();
+            service.state.write().await.lease =
+                Some((2, Instant::now() + std::time::Duration::from_secs(3600)));
 
             let put = service
                 .put(Request::new(PutRequest {
@@ -4213,6 +4497,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interrupted_repair_cleanup_unpauses_only_repair_ranges() {
+        let service = service();
+        let mut repair = range(0);
+        repair.change_id = "repair-interrupted".into();
+        repair.range_id = "repair-range".into();
+        service
+            .prepare_source_range(Request::new(PrepareRangeRequest {
+                range: Some(repair),
+            }))
+            .await
+            .unwrap();
+        service
+            .pause_range_writes(Request::new(RangeControlRequest {
+                change_id: "repair-interrupted".into(),
+                range_id: "repair-range".into(),
+            }))
+            .await
+            .unwrap();
+        let busy = service
+            .put(Request::new(PutRequest {
+                key: b"key".to_vec(),
+                value: b"value".to_vec(),
+                topology_epoch: 1,
+                request_id: "before-cleanup".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(busy.error.unwrap().code, ErrorCode::RangeBusy as i32);
+        service
+            .abort_replica_repairs(Request::new(proto::AbortReplicaRepairsRequest {
+                topology_epoch: 1,
+            }))
+            .await
+            .unwrap();
+        assert!(service.state.read().await.sources.is_empty());
+        let write = service
+            .put(Request::new(PutRequest {
+                key: b"key".to_vec(),
+                value: b"value".to_vec(),
+                topology_epoch: 1,
+                request_id: "after-cleanup".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(write.error.is_none());
+    }
+
+    #[tokio::test]
     async fn committed_destination_fences_writes_until_idempotent_activation() {
         let mut destination = service();
         destination.node_id = "node-2".into();
@@ -4290,9 +4624,12 @@ mod tests {
         destination
             .install_topology(Request::new(InstallTopologyRequest {
                 topology: Some((&topology).into()),
+                require_lease: false,
             }))
             .await
             .unwrap();
+        destination.state.write().await.lease =
+            Some((2, Instant::now() + std::time::Duration::from_secs(3600)));
 
         let readable = destination
             .get(Request::new(GetRequest {

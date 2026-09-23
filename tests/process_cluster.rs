@@ -228,6 +228,255 @@ async fn policy_strengthening_waits_for_admitted_caught_up_followers() {
 }
 
 #[tokio::test]
+async fn first_successor_failover_promotes_admitted_copy_without_bulk_copy() {
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("failover-coordinator.redb");
+    let ports = unused_ports(4);
+    let endpoint = format!("http://127.0.0.1:{}", ports[0]);
+    let members: Vec<_> = (1..=3)
+        .map(|index| (format!("node-{index}"), ports[index]))
+        .collect();
+    let mut args = coordinator_arguments(ports[0], &state, &members);
+    let min_copies = args
+        .iter()
+        .position(|arg| arg == "--minimum-admitted-copies")
+        .unwrap();
+    args[min_copies + 1] = "2".into();
+    let min_healthy = args
+        .iter()
+        .position(|arg| arg == "--minimum-healthy-followers")
+        .unwrap();
+    args[min_healthy + 1] = "1".into();
+    let vnodes = args
+        .iter()
+        .position(|arg| arg == "--virtual-nodes")
+        .unwrap();
+    args[vnodes + 1] = "4".into();
+    let _coordinator = spawn_process(&args);
+    wait_for_listener(ports[0]);
+    let client = HashringClient::connect(&endpoint, Duration::from_secs(15))
+        .await
+        .unwrap();
+    let mut nodes: Vec<_> = members
+        .iter()
+        .map(|(node_id, port)| {
+            spawn_process(&[
+                "node".into(),
+                "--id".into(),
+                node_id.clone(),
+                "--listen".into(),
+                format!("127.0.0.1:{port}"),
+                "--coordinator".into(),
+                endpoint.clone(),
+            ])
+        })
+        .collect();
+    let admitted = tokio::time::timeout(Duration::from_secs(25), async {
+        loop {
+            let mut admin = CoordinatorClient::connect(endpoint.clone()).await.unwrap();
+            let status = admin
+                .get_replica_status(Empty {})
+                .await
+                .unwrap()
+                .into_inner();
+            if !status.ranges.is_empty()
+                && status.ranges.iter().all(|range| {
+                    range.followers.iter().all(|follower| {
+                        follower.admitted
+                            && follower.lag_known
+                            && follower.stream_head == follower.stream_cursor
+                    })
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(admitted.is_ok(), "replicas did not become admitted");
+    let change = client
+        .begin_write_policy_change(WriteAckPolicy::FirstSuccessor)
+        .await
+        .unwrap();
+    let completed = client
+        .execute_topology_change(
+            &change.change_id,
+            change.base_epoch,
+            change.target_topology.epoch,
+        )
+        .await
+        .unwrap();
+    assert_eq!(completed.phase, MigrationPhase::Complete);
+    let topology = completed.target_topology.clone();
+    let keys: Vec<_> = (0_u64..100_000)
+        .map(|candidate| candidate.to_be_bytes().to_vec())
+        .filter(|key| topology.owner(key).unwrap().node_id == "node-1")
+        .take(20)
+        .collect();
+    assert_eq!(keys.len(), 20);
+    for (index, key) in keys.iter().enumerate() {
+        client.put(key.clone(), vec![index as u8]).await.unwrap();
+    }
+    nodes[0].stop();
+    let promoted = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let mut admin = CoordinatorClient::connect(endpoint.clone()).await.unwrap();
+            let current: TopologySnapshot = admin
+                .get_topology(Empty {})
+                .await
+                .unwrap()
+                .into_inner()
+                .try_into()
+                .unwrap();
+            if current.epoch == topology.epoch + 1 {
+                assert!(
+                    current
+                        .members
+                        .iter()
+                        .all(|member| member.node_id != "node-1"),
+                    "unexpected failover membership: {:?}",
+                    current.members
+                );
+                break current;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("failed owner was not removed");
+    let reader = HashringClient::connect(&endpoint, Duration::from_secs(5))
+        .await
+        .unwrap();
+    for (index, key) in keys.iter().enumerate() {
+        assert_eq!(
+            reader.get(key.clone()).await.unwrap().value,
+            vec![index as u8]
+        );
+        assert_ne!(promoted.owner(key).unwrap().node_id, "node-1");
+    }
+    let admin = HashringClient::connect(&endpoint, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let rejoin = admin
+        .begin_topology_change(promoted_members(&members))
+        .await
+        .unwrap();
+    nodes[0] = spawn_process(&[
+        "node".into(),
+        "--id".into(),
+        "node-1".into(),
+        "--listen".into(),
+        format!("127.0.0.1:{}", ports[1]),
+        "--coordinator".into(),
+        endpoint.clone(),
+    ]);
+    wait_for_listener(ports[1]);
+    let rejoined = admin
+        .execute_topology_change(
+            &rejoin.change_id,
+            rejoin.base_epoch,
+            rejoin.target_topology.epoch,
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejoined.phase, MigrationPhase::Complete);
+    for (index, key) in keys.iter().enumerate() {
+        assert_eq!(
+            admin.get(key.clone()).await.unwrap().value,
+            vec![index as u8]
+        );
+    }
+    let repaired = tokio::time::timeout(Duration::from_secs(25), async {
+        loop {
+            let mut coordinator = CoordinatorClient::connect(endpoint.clone()).await.unwrap();
+            let status = coordinator
+                .get_replica_status(Empty {})
+                .await
+                .unwrap()
+                .into_inner();
+            if status.topology_epoch == rejoined.target_topology.epoch
+                && status.ranges.iter().all(|range| {
+                    range.current_rf == 3 && range.followers.iter().all(|f| f.admitted)
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        repaired.is_ok(),
+        "returned node was not re-seeded and admitted"
+    );
+}
+
+fn promoted_members(members: &[(String, u16)]) -> Vec<Member> {
+    members
+        .iter()
+        .map(|(node_id, port)| Member {
+            node_id: node_id.clone(),
+            endpoint: format!("http://127.0.0.1:{port}"),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn node_self_fences_client_operations_when_coordinator_lease_expires() {
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("lease-coordinator.redb");
+    let ports = unused_ports(2);
+    let endpoint = format!("http://127.0.0.1:{}", ports[0]);
+    let members = vec![("node-1".to_owned(), ports[1])];
+    let mut coordinator = spawn_process(&coordinator_arguments(ports[0], &state, &members));
+    wait_for_listener(ports[0]);
+    let client = connect_eventually(&endpoint).await;
+    let _node = spawn_process(&[
+        "node".into(),
+        "--id".into(),
+        "node-1".into(),
+        "--listen".into(),
+        format!("127.0.0.1:{}", ports[1]),
+        "--coordinator".into(),
+        endpoint.clone(),
+    ]);
+    wait_for_listener(ports[1]);
+    client
+        .put(b"lease-key".to_vec(), b"value".to_vec())
+        .await
+        .unwrap();
+    coordinator.stop();
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let mut node = DataNodeClient::connect(format!("http://127.0.0.1:{}", ports[1]))
+        .await
+        .unwrap();
+    let get = node
+        .get(GetRequest {
+            key: b"lease-key".to_vec(),
+            topology_epoch: 1,
+            request_id: "expired-get".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(get.error.unwrap().code, ErrorCode::LeaseExpired as i32);
+    let put = node
+        .put(hashring_rs::proto::PutRequest {
+            key: b"lease-key".to_vec(),
+            value: b"new".to_vec(),
+            topology_epoch: 1,
+            request_id: "expired-put".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(put.error.unwrap().code, ErrorCode::LeaseExpired as i32);
+}
+
+#[tokio::test]
 async fn all_replicas_policy_cannot_publish_under_replicated_and_unfences_on_abort() {
     let _guard = process_test_lock().lock().await;
     let directory = tempfile::tempdir().unwrap();

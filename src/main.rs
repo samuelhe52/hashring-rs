@@ -338,6 +338,16 @@ async fn run_coordinator(args: CoordinatorArgs) -> Result<()> {
             }
         }
     });
+    let failure_service = service.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            if let Err(error) = failure_service.run_failure_pass().await {
+                tracing::warn!(%error, "automatic failure transition is pending");
+            }
+        }
+    });
     Server::builder()
         .add_service(
             CoordinatorServer::new(service)

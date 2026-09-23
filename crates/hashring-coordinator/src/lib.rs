@@ -15,7 +15,7 @@ use redb::{Database, TableDefinition};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
-    sync::{Mutex, RwLock},
+    sync::{Mutex, RwLock, watch},
     time::Instant,
 };
 use tonic::{Request, Response, Status};
@@ -39,6 +39,7 @@ const TOPOLOGY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("topol
 const COMMITTED_KEY: &str = "committed";
 const CLUSTER_STATE_KEY: &str = "cluster-state-v1";
 pub const DEFAULT_RANGE_MOVE_CONCURRENCY: usize = 16;
+pub const NODE_LEASE_DURATION: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterState {
@@ -52,6 +53,8 @@ pub struct ClusterState {
     pub replica_admissions: Vec<ReplicaAdmission>,
     #[serde(default)]
     pub replica_repairs: Vec<ReplicaRepair>,
+    #[serde(default)]
+    pub fenced_nodes: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -165,6 +168,11 @@ impl ClusterState {
         {
             return Err(RepositoryError::InvalidState(
                 "registered process identities must not be empty".into(),
+            ));
+        }
+        if self.fenced_nodes.iter().any(String::is_empty) {
+            return Err(RepositoryError::InvalidState(
+                "fenced node identities must not be empty".into(),
             ));
         }
         if self.stop_confirmations.iter().any(|(node_id, instances)| {
@@ -412,6 +420,7 @@ impl CoordinatorRepository for RedbTopologyRepository {
                 stop_confirmations: BTreeMap::new(),
                 replica_admissions: Vec::new(),
                 replica_repairs: Vec::new(),
+                fenced_nodes: BTreeSet::new(),
             };
             reconcile_replica_repairs(&mut state)?;
             state.validate()?;
@@ -506,6 +515,7 @@ pub fn load_or_initialize(
         stop_confirmations: BTreeMap::new(),
         replica_admissions: Vec::new(),
         replica_repairs: Vec::new(),
+        fenced_nodes: BTreeSet::new(),
     };
     reconcile_replica_repairs(&mut state)?;
     repository.store_state(&state)?;
@@ -520,6 +530,23 @@ pub struct CoordinatorService {
     migration_timeout: Duration,
     range_move_concurrency: usize,
     pre_publish_delay: Duration,
+    lease_grants: Arc<Mutex<BTreeMap<String, NodeLeaseGrant>>>,
+    peer_failures: Arc<Mutex<BTreeMap<(String, String), PeerFailure>>>,
+    startup_at: Instant,
+    repair_interrupt: Arc<watch::Sender<u64>>,
+}
+
+#[derive(Clone)]
+struct NodeLeaseGrant {
+    process_instance_id: String,
+    epoch: u64,
+    expires_at: Instant,
+}
+
+#[derive(Clone)]
+struct PeerFailure {
+    first_seen: Instant,
+    last_seen: Instant,
 }
 
 impl CoordinatorService {
@@ -528,6 +555,7 @@ impl CoordinatorService {
         repository: Arc<dyn CoordinatorRepository>,
         migration_timeout: Duration,
     ) -> Self {
+        let (repair_interrupt, _) = watch::channel(0);
         Self {
             state: Arc::new(RwLock::new(state)),
             repository,
@@ -535,6 +563,10 @@ impl CoordinatorService {
             migration_timeout,
             range_move_concurrency: DEFAULT_RANGE_MOVE_CONCURRENCY,
             pre_publish_delay: Duration::ZERO,
+            lease_grants: Arc::new(Mutex::new(BTreeMap::new())),
+            peer_failures: Arc::new(Mutex::new(BTreeMap::new())),
+            startup_at: Instant::now(),
+            repair_interrupt: Arc::new(repair_interrupt),
         }
     }
 
@@ -549,10 +581,78 @@ impl CoordinatorService {
         self
     }
 
+    /// Run one failure-confirmation pass. A missed lease is sufficient evidence;
+    /// otherwise two independent, continuously failing peer probes are needed.
+    pub async fn run_failure_pass(&self) -> Result<(), Status> {
+        if let Some(change) = self.state.read().await.active_change.clone()
+            && !change.phase.is_terminal()
+        {
+            if change.failed_node_id.is_some() {
+                self.execute_change(change_identity(&change)).await?;
+            }
+            return Ok(());
+        }
+        let state = self.state.read().await.clone();
+        if state.committed.members.len() <= 1 {
+            return Ok(());
+        }
+        let now = Instant::now();
+        if now < self.startup_at + NODE_LEASE_DURATION {
+            return Ok(());
+        }
+        let grants = self.lease_grants.lock().await;
+        let failures = self.peer_failures.lock().await;
+        let candidate = state.committed.members.iter().find(|member| {
+            if !state.process_instances.contains_key(&member.node_id)
+                || state.fenced_nodes.contains(&member.node_id)
+            {
+                return false;
+            }
+            failure_confirmed(&state, &grants, &failures, &member.node_id, now)
+        });
+        let Some(failed_node_id) = candidate.map(|member| member.node_id.clone()) else {
+            return Ok(());
+        };
+        drop(failures);
+        drop(grants);
+        let target_members = state
+            .committed
+            .members
+            .iter()
+            .filter(|member| member.node_id != failed_node_id)
+            .cloned()
+            .collect();
+        let mut change = TopologyChange::plan(&state.committed, target_members)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        change.failed_node_id = Some(failed_node_id.clone());
+        let mut current = self.state.write().await;
+        if current.committed != state.committed
+            || current
+                .active_change
+                .as_ref()
+                .is_some_and(|active| !active.phase.is_terminal())
+        {
+            return Ok(());
+        }
+        let mut next = current.clone();
+        next.fenced_nodes.insert(failed_node_id);
+        next.active_change = Some(change.clone());
+        self.repository
+            .store_state(&next)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        *current = next;
+        drop(current);
+        self.repair_interrupt
+            .send_modify(|generation| *generation += 1);
+        self.execute_change(change_identity(&change)).await?;
+        Ok(())
+    }
+
     /// Retry durable follower repairs when no topology transition is active.
     /// A failed task remains pending; the next call can safely start it again.
     pub async fn resume_replica_repairs(&self) -> Result<usize, Status> {
         let _execution = self.execution_lock.lock().await;
+        let mut interrupt = self.repair_interrupt.subscribe();
         let tasks = {
             let mut state = self.state.write().await;
             if state
@@ -594,7 +694,7 @@ impl CoordinatorService {
             });
             groups.into_values().collect::<Vec<_>>()
         };
-        let results = try_map_bounded(
+        let work = try_map_bounded(
             tasks,
             self.range_move_concurrency.min(4),
             |tasks| async move {
@@ -613,9 +713,56 @@ impl CoordinatorService {
                     }
                 }
             },
-        )
-        .await?;
+        );
+        let results = tokio::select! {
+            results = work => results?,
+            changed = interrupt.changed() => {
+                if changed.is_ok() {
+                    self.cleanup_interrupted_repairs().await?;
+                    return Ok(0);
+                }
+                return Err(Status::internal("repair interruption channel closed"));
+            }
+        };
         Ok(results.into_iter().sum())
+    }
+
+    async fn cleanup_interrupted_repairs(&self) -> Result<(), Status> {
+        let state = self.state.read().await.clone();
+        let affected: BTreeSet<_> = state
+            .replica_repairs
+            .iter()
+            .filter(|repair| {
+                matches!(
+                    repair.phase,
+                    ReplicaRepairPhase::Copying | ReplicaRepairPhase::Verifying
+                )
+            })
+            .flat_map(|repair| [repair.owner_node_id.clone(), repair.node_id.clone()])
+            .filter(|node_id| !state.fenced_nodes.contains(node_id))
+            .collect();
+        let members: Vec<_> = state
+            .committed
+            .members
+            .iter()
+            .filter(|member| affected.contains(&member.node_id))
+            .cloned()
+            .collect();
+        let epoch = state.committed.epoch;
+        let deadline = Instant::now() + self.migration_timeout;
+        try_map_bounded(members, self.range_move_concurrency, |member| async move {
+            let mut node = connect_node(&member.endpoint, deadline).await?;
+            rpc_before(
+                deadline,
+                node.abort_replica_repairs(proto::AbortReplicaRepairsRequest {
+                    topology_epoch: epoch,
+                }),
+            )
+            .await?;
+            Ok::<(), Status>(())
+        })
+        .await?;
+        Ok(())
     }
 
     async fn copy_replica(&self, task: &ReplicaRepair) -> Result<CopiedReplicaSeed, Status> {
@@ -672,6 +819,8 @@ impl CoordinatorService {
             stopped_node_ids: Vec::new(),
             stopping_node_ids: Vec::new(),
             stop_prepared_node_ids: Vec::new(),
+            failed_node_id: None,
+            activation_ready: false,
         };
         let deadline = Instant::now() + self.migration_timeout;
         let mut source = connect_node(&range.source_endpoint, deadline).await?;
@@ -994,6 +1143,9 @@ impl CoordinatorService {
                 "active topology change does not match the execute request",
             ));
         }
+        if change.failed_node_id.is_some() {
+            return self.execute_failed_change(change).await;
+        }
         match change.phase {
             MigrationPhase::Complete => return Ok(change),
             MigrationPhase::Aborted => {
@@ -1158,6 +1310,108 @@ impl CoordinatorService {
                 "migration failed ({original}); cleanup remains pending ({cleanup})"
             ))),
         }
+    }
+
+    async fn execute_failed_change(
+        &self,
+        mut change: TopologyChange,
+    ) -> Result<TopologyChange, Status> {
+        let failed_node_id = change
+            .failed_node_id
+            .as_ref()
+            .ok_or_else(|| Status::internal("failure transition omitted node identity"))?;
+        if change.phase == MigrationPhase::Complete {
+            return Ok(change);
+        }
+        if matches!(
+            change.phase,
+            MigrationPhase::Published | MigrationPhase::CleaningUp
+        ) {
+            return self.finish_failed_change(change).await;
+        }
+        if change.phase == MigrationPhase::Aborted {
+            return Err(Status::failed_precondition(
+                "failure transition was aborted",
+            ));
+        }
+        self.cleanup_interrupted_repairs().await?;
+        // A coordinator restart loses the old in-memory grant deadline. A full
+        // startup quarantine covers a grant issued immediately before restart.
+        let last_grant = self
+            .lease_grants
+            .lock()
+            .await
+            .get(failed_node_id)
+            .map(|grant| grant.expires_at)
+            .unwrap_or(self.startup_at);
+        let safe_at = last_grant.max(self.startup_at + NODE_LEASE_DURATION);
+        tokio::time::sleep_until(safe_at).await;
+
+        let publication = {
+            let mut state = self.state.write().await;
+            let grants = self.lease_grants.lock().await;
+            prove_failure_coverage(&state, &change.target_topology, &grants, Instant::now())?;
+            if !state.fenced_nodes.contains(failed_node_id)
+                || state
+                    .active_change
+                    .as_ref()
+                    .is_none_or(|active| change_identity(active) != change_identity(&change))
+            {
+                return Err(Status::failed_precondition(
+                    "failure transition lost its durable fence",
+                ));
+            }
+            let mut next = state.clone();
+            next.committed = change.target_topology.clone();
+            next.process_instances.remove(failed_node_id);
+            // Old admissions are tied to old exact bounds and stream epoch.
+            // Deterministic repairs will verify and re-admit new followers.
+            next.replica_admissions.clear();
+            next.replica_repairs.clear();
+            next.active_change
+                .as_mut()
+                .expect("active failure transition was checked")
+                .phase = MigrationPhase::Published;
+            next.active_change
+                .as_mut()
+                .expect("active failure transition was checked")
+                .activation_ready = true;
+            reconcile_replica_repairs(&mut next)
+                .map_err(|error| Status::internal(error.to_string()))?;
+            self.repository
+                .store_state(&next)
+                .map_err(|error| Status::internal(error.to_string()))?;
+            *state = next;
+            Ok::<(), Status>(())
+        };
+        publication?;
+        change.phase = MigrationPhase::Published;
+        self.finish_failed_change(change).await
+    }
+
+    async fn finish_failed_change(
+        &self,
+        mut change: TopologyChange,
+    ) -> Result<TopologyChange, Status> {
+        let deadline = Instant::now() + self.migration_timeout;
+        self.install_on_members(
+            &change.target_topology,
+            &change.target_topology.members,
+            deadline,
+        )
+        .await?;
+        self.set_phase(MigrationPhase::Complete).await?;
+        change.phase = MigrationPhase::Complete;
+        if let Some(failed_node_id) = &change.failed_node_id {
+            self.lease_grants.lock().await.remove(failed_node_id);
+            self.peer_failures
+                .lock()
+                .await
+                .retain(|(target, reporter), _| {
+                    target != failed_node_id && reporter != failed_node_id
+                });
+        }
+        Ok(change)
     }
 
     async fn execute_policy_change(
@@ -1524,6 +1778,25 @@ impl CoordinatorService {
         mut change: TopologyChange,
         deadline: Instant,
     ) -> Result<TopologyChange, Status> {
+        if !change.activation_ready {
+            let old_sources: Vec<_> = change
+                .ranges
+                .iter()
+                .map(|range| (range.source_node_id.clone(), range.source_endpoint.clone()))
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .map(|(node_id, endpoint)| Member { node_id, endpoint })
+                .collect();
+            self.install_on_members_with_lease(
+                &change.target_topology,
+                &old_sources,
+                deadline,
+                false,
+            )
+            .await?;
+            self.set_activation_ready().await?;
+            change.activation_ready = true;
+        }
         let destination_ids: BTreeSet<_> = change
             .ranges
             .iter()
@@ -1754,16 +2027,48 @@ impl CoordinatorService {
         members: &[Member],
         deadline: Instant,
     ) -> Result<(), Status> {
+        self.install_on_members_with_lease(topology, members, deadline, true)
+            .await
+    }
+
+    async fn install_on_members_with_lease(
+        &self,
+        topology: &TopologySnapshot,
+        members: &[Member],
+        deadline: Instant,
+        require_lease: bool,
+    ) -> Result<(), Status> {
         for member in members {
             let mut client = connect_node(&member.endpoint, deadline).await?;
             rpc_before(
                 deadline,
                 client.install_topology(InstallTopologyRequest {
                     topology: Some(topology.into()),
+                    require_lease,
                 }),
             )
             .await?;
         }
+        Ok(())
+    }
+
+    async fn set_activation_ready(&self) -> Result<(), Status> {
+        let mut state = self.state.write().await;
+        let mut next = state.clone();
+        let change = next
+            .active_change
+            .as_mut()
+            .ok_or_else(|| Status::failed_precondition("no topology change is active"))?;
+        if change.phase != MigrationPhase::Published {
+            return Err(Status::failed_precondition(
+                "topology is not waiting for owner activation",
+            ));
+        }
+        change.activation_ready = true;
+        self.repository
+            .store_state(&next)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        *state = next;
         Ok(())
     }
 
@@ -1988,6 +2293,20 @@ impl Coordinator for CoordinatorService {
     ) -> Result<Response<proto::ReplicaStatusResponse>, Status> {
         let state = self.state.read().await.clone();
         let epoch = state.committed.epoch;
+        let now = Instant::now();
+        let live_nodes: BTreeSet<_> = self
+            .lease_grants
+            .lock()
+            .await
+            .iter()
+            .filter(|(node_id, grant)| {
+                grant.epoch == epoch
+                    && grant.expires_at > now
+                    && state.process_instances.get(*node_id) == Some(&grant.process_instance_id)
+                    && !state.fenced_nodes.contains(*node_id)
+            })
+            .map(|(node_id, _)| node_id.clone())
+            .collect();
         let members: BTreeMap<_, _> = state
             .committed
             .members
@@ -2002,8 +2321,14 @@ impl Coordinator for CoordinatorService {
         let progress = try_map_bounded(pairs, self.range_move_concurrency, |(owner, follower)| {
             let source_endpoint = members.get(&owner).cloned();
             let destination_endpoint = members.get(&follower).cloned();
-            let owner_instance = state.process_instances.get(&owner).cloned();
-            let follower_instance = state.process_instances.get(&follower).cloned();
+            let owner_instance = live_nodes
+                .contains(&owner)
+                .then(|| state.process_instances.get(&owner).cloned())
+                .flatten();
+            let follower_instance = live_nodes
+                .contains(&follower)
+                .then(|| state.process_instances.get(&follower).cloned())
+                .flatten();
             async move {
                 let current = match (
                     source_endpoint,
@@ -2085,6 +2410,7 @@ impl Coordinator for CoordinatorService {
                         let admission = admissions.get(&key).copied().filter(|admission| {
                             state.process_instances.get(node_id)
                                 == Some(&admission.process_instance_id)
+                                && !state.fenced_nodes.contains(node_id)
                         });
                         let repair = repairs.get(&key).copied();
                         let live = progress
@@ -2118,7 +2444,8 @@ impl Coordinator for CoordinatorService {
                     owner_node_id: range.owner_node_id.clone(),
                     desired_rf: state.committed.desired_replication_factor,
                     current_rf: u32::from(
-                        state.process_instances.contains_key(&range.owner_node_id),
+                        state.process_instances.contains_key(&range.owner_node_id)
+                            && !state.fenced_nodes.contains(&range.owner_node_id),
                     ) + followers
                         .iter()
                         .filter(|follower| follower.admitted)
@@ -2256,6 +2583,9 @@ impl Coordinator for CoordinatorService {
                 "node is not present in committed or pending membership",
             ));
         }
+        if is_committed && state.fenced_nodes.contains(&request.node_id) {
+            return Err(Status::failed_precondition("node has been fenced"));
+        }
         if let Some(existing) = state.process_instances.get(&request.node_id) {
             if existing == &request.process_instance_id {
                 return Ok(Response::new(proto::Empty {}));
@@ -2268,12 +2598,112 @@ impl Coordinator for CoordinatorService {
             }
         }
         let mut next = state.clone();
+        if !is_committed {
+            next.fenced_nodes.remove(&request.node_id);
+        }
         next.process_instances
             .insert(request.node_id, request.process_instance_id);
         self.repository
             .store_state(&next)
             .map_err(|error| Status::internal(error.to_string()))?;
         *state = next;
+        Ok(Response::new(proto::Empty {}))
+    }
+
+    async fn renew_node_lease(
+        &self,
+        request: Request<proto::RenewNodeLeaseRequest>,
+    ) -> Result<Response<proto::RenewNodeLeaseResponse>, Status> {
+        let request = request.into_inner();
+        let state = self.state.read().await;
+        if request.node_id.is_empty()
+            || request.process_instance_id.is_empty()
+            || state.committed.epoch != request.topology_epoch
+            || !state
+                .committed
+                .members
+                .iter()
+                .any(|member| member.node_id == request.node_id)
+            || state.process_instances.get(&request.node_id) != Some(&request.process_instance_id)
+            || state.fenced_nodes.contains(&request.node_id)
+            || state.active_change.as_ref().is_some_and(|change| {
+                change.phase == MigrationPhase::Published
+                    && !change.activation_ready
+                    && change
+                        .ranges
+                        .iter()
+                        .any(|range| range.destination_node_id == request.node_id)
+            })
+        {
+            return Err(Status::failed_precondition(
+                "lease identity, epoch, or membership is no longer valid",
+            ));
+        }
+        let epoch = state.committed.epoch;
+        let mut grants = self.lease_grants.lock().await;
+        grants.insert(
+            request.node_id,
+            NodeLeaseGrant {
+                process_instance_id: request.process_instance_id,
+                epoch,
+                expires_at: Instant::now() + NODE_LEASE_DURATION,
+            },
+        );
+        Ok(Response::new(proto::RenewNodeLeaseResponse {
+            topology_epoch: epoch,
+            lease_duration_millis: NODE_LEASE_DURATION.as_millis() as u64,
+        }))
+    }
+
+    async fn report_peer_health(
+        &self,
+        request: Request<proto::ReportPeerHealthRequest>,
+    ) -> Result<Response<proto::Empty>, Status> {
+        let request = request.into_inner();
+        let state = self.state.read().await;
+        if request.reporter_node_id == request.peer_node_id
+            || request.peer_node_id.is_empty()
+            || request.topology_epoch != state.committed.epoch
+            || state.process_instances.get(&request.reporter_node_id)
+                != Some(&request.reporter_process_instance_id)
+            || state.fenced_nodes.contains(&request.reporter_node_id)
+            || !state
+                .committed
+                .members
+                .iter()
+                .any(|member| member.node_id == request.peer_node_id)
+        {
+            return Err(Status::failed_precondition(
+                "peer report does not match active membership",
+            ));
+        }
+        let now = Instant::now();
+        let grants = self.lease_grants.lock().await;
+        if grants.get(&request.reporter_node_id).is_none_or(|grant| {
+            grant.epoch != request.topology_epoch
+                || grant.process_instance_id != request.reporter_process_instance_id
+                || grant.expires_at <= now
+        }) {
+            return Err(Status::failed_precondition("reporter has no valid lease"));
+        }
+        let mut failures = self.peer_failures.lock().await;
+        let key = (request.peer_node_id, request.reporter_node_id);
+        if request.reachable {
+            failures.remove(&key);
+        } else {
+            failures
+                .entry(key)
+                .and_modify(|failure| {
+                    if failure.last_seen + Duration::from_secs(2) < now {
+                        failure.first_seen = now;
+                    }
+                    failure.last_seen = now;
+                })
+                .or_insert(PeerFailure {
+                    first_seen: now,
+                    last_seen: now,
+                });
+        }
         Ok(Response::new(proto::Empty {}))
     }
 
@@ -2512,6 +2942,113 @@ fn policy_readiness_verified(
     })
 }
 
+fn token_in_range(start: u64, end: u64, token: u64) -> bool {
+    if start < end {
+        token > start && token <= end
+    } else if start > end {
+        token > start || token <= end
+    } else {
+        true
+    }
+}
+
+fn failure_confirmed(
+    state: &ClusterState,
+    grants: &BTreeMap<String, NodeLeaseGrant>,
+    reports: &BTreeMap<(String, String), PeerFailure>,
+    target: &str,
+    now: Instant,
+) -> bool {
+    let has_lease = |node_id: &str| {
+        grants.get(node_id).is_some_and(|grant| {
+            grant.epoch == state.committed.epoch
+                && state.process_instances.get(node_id) == Some(&grant.process_instance_id)
+                && grant.expires_at > now
+                && !state.fenced_nodes.contains(node_id)
+        })
+    };
+    if !has_lease(target) {
+        return true;
+    }
+    reports
+        .iter()
+        .filter(|((reported_target, reporter), report)| {
+            reported_target == target
+                && reporter != reported_target
+                && has_lease(reporter)
+                && report.first_seen + NODE_LEASE_DURATION <= now
+                && report.last_seen + Duration::from_secs(2) >= now
+        })
+        .count()
+        >= 2
+}
+
+fn prove_failure_coverage(
+    state: &ClusterState,
+    target: &TopologySnapshot,
+    grants: &BTreeMap<String, NodeLeaseGrant>,
+    now: Instant,
+) -> Result<(), Status> {
+    let old_ranges = state
+        .committed
+        .derived_ranges()
+        .map_err(|error| Status::internal(error.to_string()))?;
+    let target_ranges = target
+        .derived_ranges()
+        .map_err(|error| Status::internal(error.to_string()))?;
+    for target_range in target_ranges {
+        let owner = &target_range.owner_node_id;
+        let process_instance_id = state.process_instances.get(owner).ok_or_else(|| {
+            Status::failed_precondition(format!("promoted owner {owner} is not registered"))
+        })?;
+        if state.fenced_nodes.contains(owner)
+            || grants.get(owner).is_none_or(|grant| {
+                grant.epoch != state.committed.epoch
+                    || grant.process_instance_id != *process_instance_id
+                    || grant.expires_at <= now
+            })
+        {
+            return Err(Status::failed_precondition(format!(
+                "promoted owner {owner} has no current lease"
+            )));
+        }
+        let constituents: Vec<_> = old_ranges
+            .iter()
+            .filter(|range| {
+                token_in_range(
+                    target_range.start_exclusive,
+                    target_range.end_inclusive,
+                    range.end_inclusive,
+                )
+            })
+            .collect();
+        if constituents.is_empty() {
+            return Err(Status::data_loss("merged range has no old constituents"));
+        }
+        for old_range in constituents {
+            if old_range.owner_node_id == *owner {
+                continue;
+            }
+            if old_range.follower_node_ids.first() != Some(owner)
+                || !state.replica_admissions.iter().any(|admission| {
+                    admission.epoch == state.committed.epoch
+                        && admission.start_exclusive == old_range.start_exclusive
+                        && admission.end_inclusive == old_range.end_inclusive
+                        && admission.owner_node_id == old_range.owner_node_id
+                        && admission.node_id == *owner
+                        && admission.process_instance_id == *process_instance_id
+                })
+            {
+                return Err(Status::failed_precondition(format!(
+                    "promoted owner {owner} lacks first-successor coverage for ({}, {}]",
+                    old_range.start_exclusive, old_range.end_inclusive
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn read_replication_pair(
     epoch: u64,
     owner: &str,
@@ -2632,6 +3169,190 @@ mod tests {
             }],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn failover_requires_admitted_coverage_for_every_old_interval() {
+        let members: Vec<_> = (1..=3)
+            .map(|index| Member {
+                node_id: format!("n{index}"),
+                endpoint: format!("http://127.0.0.1:500{index}"),
+            })
+            .collect();
+        let old = TopologySnapshot::new(1, 7, 4, members.clone()).unwrap();
+        let target = TopologyChange::plan(
+            &old,
+            members
+                .into_iter()
+                .filter(|member| member.node_id != "n1")
+                .collect(),
+        )
+        .unwrap()
+        .target_topology;
+        let repo = MemoryRepository::default();
+        let mut state = load_or_initialize(&repo, Some(old.clone())).unwrap();
+        for node_id in ["n1", "n2", "n3"] {
+            state
+                .process_instances
+                .insert(node_id.into(), format!("{node_id}-process"));
+        }
+        for range in old.derived_ranges().unwrap() {
+            let Some(follower) = range.follower_node_ids.first() else {
+                continue;
+            };
+            state.replica_admissions.push(ReplicaAdmission {
+                epoch: old.epoch,
+                start_exclusive: range.start_exclusive,
+                end_inclusive: range.end_inclusive,
+                owner_node_id: range.owner_node_id,
+                node_id: follower.clone(),
+                process_instance_id: format!("{follower}-process"),
+                verified_watermark: 0,
+                stream_cursor: 0,
+                digest: "verified".into(),
+            });
+        }
+        let now = Instant::now();
+        let grants = ["n2", "n3"]
+            .into_iter()
+            .map(|node_id| {
+                (
+                    node_id.into(),
+                    NodeLeaseGrant {
+                        process_instance_id: format!("{node_id}-process"),
+                        epoch: old.epoch,
+                        expires_at: now + NODE_LEASE_DURATION,
+                    },
+                )
+            })
+            .collect();
+        assert!(prove_failure_coverage(&state, &target, &grants, now).is_ok());
+        let missing = state
+            .replica_admissions
+            .iter()
+            .position(|admission| admission.owner_node_id == "n1")
+            .expect("failed owner has at least one range");
+        state.replica_admissions.remove(missing);
+        assert!(prove_failure_coverage(&state, &target, &grants, now).is_err());
+    }
+
+    #[test]
+    fn a_single_failed_peer_link_never_confirms_node_failure() {
+        let members: Vec<_> = (1..=3)
+            .map(|index| Member {
+                node_id: format!("n{index}"),
+                endpoint: format!("http://127.0.0.1:500{index}"),
+            })
+            .collect();
+        let topology = TopologySnapshot::new(1, 7, 1, members).unwrap();
+        let repo = MemoryRepository::default();
+        let mut state = load_or_initialize(&repo, Some(topology)).unwrap();
+        let now = Instant::now();
+        let mut grants = BTreeMap::new();
+        for node_id in ["n1", "n2", "n3"] {
+            let process = format!("{node_id}-process");
+            state
+                .process_instances
+                .insert(node_id.into(), process.clone());
+            grants.insert(
+                node_id.into(),
+                NodeLeaseGrant {
+                    process_instance_id: process,
+                    epoch: 1,
+                    expires_at: now + NODE_LEASE_DURATION,
+                },
+            );
+        }
+        let failure = PeerFailure {
+            first_seen: now - Duration::from_secs(6),
+            last_seen: now,
+        };
+        let mut reports = BTreeMap::from([(("n1".into(), "n2".into()), failure.clone())]);
+        assert!(!failure_confirmed(&state, &grants, &reports, "n1", now));
+        reports.insert(("n1".into(), "n3".into()), failure);
+        assert!(failure_confirmed(&state, &grants, &reports, "n1", now));
+        reports.clear();
+        grants.remove("n1");
+        assert!(failure_confirmed(&state, &grants, &reports, "n1", now));
+    }
+
+    #[tokio::test]
+    async fn confirmed_failure_fences_before_waiting_for_repair_serialization() {
+        let members: Vec<_> = (1..=3)
+            .map(|index| Member {
+                node_id: format!("n{index}"),
+                endpoint: format!("http://127.0.0.1:500{index}"),
+            })
+            .collect();
+        let topology = TopologySnapshot::new(1, 7, 1, members).unwrap();
+        let repository = Arc::new(MemoryRepository::default());
+        let mut state = load_or_initialize(repository.as_ref(), Some(topology)).unwrap();
+        for node_id in ["n1", "n2", "n3"] {
+            state
+                .process_instances
+                .insert(node_id.into(), format!("{node_id}-process"));
+        }
+        let mut service = CoordinatorService::new(state, repository, Duration::from_secs(1));
+        service.startup_at = Instant::now() - NODE_LEASE_DURATION;
+        let held_repair_lock = service.execution_lock.lock().await;
+        let mut interrupt = service.repair_interrupt.subscribe();
+        let runner = service.clone();
+        let task = tokio::spawn(async move { runner.run_failure_pass().await });
+        tokio::time::timeout(Duration::from_secs(1), interrupt.changed())
+            .await
+            .expect("fencing should interrupt a repair without waiting for its lock")
+            .unwrap();
+        let state = service.state.read().await;
+        assert!(state.fenced_nodes.contains("n1"));
+        assert_eq!(
+            state
+                .active_change
+                .as_ref()
+                .unwrap()
+                .failed_node_id
+                .as_deref(),
+            Some("n1")
+        );
+        drop(state);
+        task.abort();
+        drop(held_repair_lock);
+    }
+
+    #[test]
+    fn failed_owner_vnodes_promote_to_multiple_clockwise_successors() {
+        let members: Vec<_> = (1..=4)
+            .map(|index| Member {
+                node_id: format!("n{index}"),
+                endpoint: format!("http://127.0.0.1:500{index}"),
+            })
+            .collect();
+        let old = TopologySnapshot::new(1, 7, 32, members.clone()).unwrap();
+        let target = TopologyChange::plan(
+            &old,
+            members
+                .into_iter()
+                .filter(|member| member.node_id != "n1")
+                .collect(),
+        )
+        .unwrap()
+        .target_topology;
+        let successors: BTreeSet<_> = old
+            .derived_ranges()
+            .unwrap()
+            .into_iter()
+            .filter(|range| range.owner_node_id == "n1")
+            .map(|range| {
+                target
+                    .owner_for_token(range.end_inclusive)
+                    .unwrap()
+                    .node_id
+                    .clone()
+            })
+            .collect();
+        assert!(
+            successors.len() > 1,
+            "vnode failover should distribute ownership"
+        );
     }
 
     #[test]
@@ -2791,6 +3512,7 @@ mod tests {
             stop_confirmations: BTreeMap::new(),
             replica_admissions: Vec::new(),
             replica_repairs: Vec::new(),
+            fenced_nodes: BTreeSet::new(),
         };
         let mut old = serde_json::to_value(state).unwrap();
         old.as_object_mut().unwrap().remove("process_instances");
@@ -2839,6 +3561,7 @@ mod tests {
                 stop_confirmations: BTreeMap::new(),
                 replica_admissions: Vec::new(),
                 replica_repairs: Vec::new(),
+                fenced_nodes: BTreeSet::new(),
             },
             repository,
             Duration::from_secs(1),

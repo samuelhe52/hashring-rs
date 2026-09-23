@@ -624,7 +624,6 @@ impl HashringClient {
             | ErrorCode::TemporarilyUnavailable
             | ErrorCode::ReplicaNotReady
             | ErrorCode::OutcomeUnknown
-            | ErrorCode::LeaseExpired
                 if error.retryable =>
             {
                 if error.current_epoch > attempted_epoch {
@@ -635,6 +634,13 @@ impl HashringClient {
                     )
                     .await?;
                 }
+                self.retry_delay(deadline, attempt, unknown_write_outcome)
+                    .await?;
+                Ok(true)
+            }
+            ErrorCode::LeaseExpired if error.retryable => {
+                self.refresh_topology_before(deadline, unknown_write_outcome, None)
+                    .await?;
                 self.retry_delay(deadline, attempt, unknown_write_outcome)
                     .await?;
                 Ok(true)
@@ -1101,6 +1107,20 @@ mod tests {
         async fn register_node(
             &self,
             _request: Request<proto::RegisterNodeRequest>,
+        ) -> Result<Response<proto::Empty>, Status> {
+            Err(Status::unimplemented("unused by client tests"))
+        }
+
+        async fn renew_node_lease(
+            &self,
+            _request: Request<proto::RenewNodeLeaseRequest>,
+        ) -> Result<Response<proto::RenewNodeLeaseResponse>, Status> {
+            Err(Status::unimplemented("unused by client tests"))
+        }
+
+        async fn report_peer_health(
+            &self,
+            _request: Request<proto::ReportPeerHealthRequest>,
         ) -> Result<Response<proto::Empty>, Status> {
             Err(Status::unimplemented("unused by client tests"))
         }
