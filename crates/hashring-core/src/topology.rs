@@ -356,10 +356,18 @@ fn validate_config(config: &TopologyConfig) -> Result<(), TopologyError> {
         return Err(TopologyError::NoMaximumReplicaLag);
     }
     let guard = &config.write_availability_guard;
-    if guard.minimum_admitted_copies > config.desired_replication_factor {
+    // Before the lenient default, RF=1 with the 2/1 default guard was a
+    // supported read-only topology. Keep stored snapshots loadable.
+    let legacy_rf_one_read_only = config.desired_replication_factor == 1
+        && guard.minimum_admitted_copies == 2
+        && guard.minimum_healthy_followers == 1;
+    if !legacy_rf_one_read_only && guard.minimum_admitted_copies > config.desired_replication_factor
+    {
         return Err(TopologyError::MinimumAdmittedCopiesExceedReplicationFactor);
     }
-    if guard.minimum_healthy_followers > config.desired_replication_factor.saturating_sub(1) {
+    if !legacy_rf_one_read_only
+        && guard.minimum_healthy_followers > config.desired_replication_factor.saturating_sub(1)
+    {
         return Err(TopologyError::MinimumHealthyFollowersExceedReplicationFactor);
     }
     Ok(())
@@ -715,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn impossible_write_guards_are_rejected_including_rf_one() {
+    fn impossible_write_guards_are_rejected_and_legacy_rf_one_loads() {
         let mut config = TopologyConfig::default();
         config.write_availability_guard.minimum_admitted_copies = 4;
         assert!(matches!(
@@ -740,6 +748,7 @@ mod tests {
             desired_replication_factor: 1,
             write_availability_guard: WriteAvailabilityGuard {
                 minimum_admitted_copies: 2,
+                minimum_healthy_followers: 0,
                 ..WriteAvailabilityGuard::default()
             },
             ..TopologyConfig::default()
@@ -748,6 +757,19 @@ mod tests {
             TopologySnapshot::new_with_config(1, 42, 16, members(), impossible_rf_one),
             Err(TopologyError::MinimumAdmittedCopiesExceedReplicationFactor)
         ));
+
+        let legacy_rf_one = TopologyConfig {
+            desired_replication_factor: 1,
+            write_availability_guard: WriteAvailabilityGuard {
+                minimum_admitted_copies: 2,
+                minimum_healthy_followers: 1,
+                ..WriteAvailabilityGuard::default()
+            },
+            ..TopologyConfig::default()
+        };
+        let legacy =
+            TopologySnapshot::new_with_config(1, 42, 16, members(), legacy_rf_one).unwrap();
+        legacy.validate().unwrap();
     }
 
     #[test]
