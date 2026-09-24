@@ -91,7 +91,8 @@ async fn experiment_runner_preserves_reproducibility_artifacts() {
     let coordinator_log =
         std::fs::read_to_string(output_directory.join("process-logs/coordinator.stdout.log"))
             .unwrap();
-    assert!(coordinator_log.contains("replica activation seeding planned"));
+    assert!(coordinator_log.contains("topology activation ready"));
+    assert!(!coordinator_log.contains("replica activation seeding planned"));
 }
 
 #[tokio::test]
