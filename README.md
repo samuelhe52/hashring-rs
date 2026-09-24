@@ -39,10 +39,11 @@ absent.
 
 Each virtual-node range has one owner and up to `desired_replication_factor-1`
 clockwise, distinct physical followers. The default is RF=3, `OwnerOnly`
-acknowledgements, at least two admitted copies, and at least one healthy
-follower. A follower is admitted only after a verified snapshot/stream catch-up;
-the guard prevents writes while those minimums are not met. It is a readiness
-gate, not a durability or zero-loss promise.
+acknowledgements, with a write guard requiring only the owner. Replication and
+follower repair continue asynchronously. A stricter guard can require admitted
+copies and healthy followers before writes; follower admission requires a
+verified snapshot/stream catch-up. The guard is a readiness gate, not a
+durability or zero-loss promise.
 
 ## Workspace architecture
 
@@ -258,7 +259,8 @@ acknowledged writes not yet applied by the promoted follower can be lost**,
 including an acknowledged update reverting to an older value even when the
 key remains present.
 There is no fixed time-based maximum loss window: the configured 5-second lag
-threshold is a health check, not an RPO bound. `FirstSuccessor` closes that
+threshold applies only to a guard that requires healthy followers; it is not an
+RPO bound. `FirstSuccessor` closes that
 single-owner-loss window for acknowledged writes that reached its required
 follower, but not for simultaneous/correlated node losses. Data nodes are
 in-memory; neither policy provides crash durability. During degraded placement,

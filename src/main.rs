@@ -67,9 +67,9 @@ struct CoordinatorArgs {
     virtual_nodes: u32,
     #[arg(long, default_value_t = 3)]
     desired_replication_factor: u32,
-    #[arg(long, default_value_t = 2)]
-    minimum_admitted_copies: u32,
     #[arg(long, default_value_t = 1)]
+    minimum_admitted_copies: u32,
+    #[arg(long, default_value_t = 0)]
     minimum_healthy_followers: u32,
     #[arg(long, default_value_t = 5_000)]
     max_replica_lag_ms: u64,
@@ -246,9 +246,9 @@ struct ExperimentArgs {
     verbose: bool,
     #[arg(long, default_value_t = 3)]
     desired_replication_factor: u32,
-    #[arg(long, default_value_t = 2)]
-    minimum_admitted_copies: u32,
     #[arg(long, default_value_t = 1)]
+    minimum_admitted_copies: u32,
+    #[arg(long, default_value_t = 0)]
     minimum_healthy_followers: u32,
     /// Defaults to FirstSuccessor for availability and OwnerOnly otherwise.
     #[arg(long, value_enum)]
