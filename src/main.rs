@@ -564,6 +564,7 @@ async fn run_replica_status(args: ClientArgs) -> Result<()> {
                         "verified_watermark": follower.verified_watermark,
                         "stream_cursor": follower.stream_cursor,
                         "stream_head": follower.stream_head,
+                        "last_ack_sequence": follower.last_ack_known.then_some(follower.last_ack_sequence),
                         "lag_millis": follower.lag_known.then_some(follower.lag_millis),
                         "repair_state": follower.repair_state,
                         "repair_retry_count": follower.repair_retry_count,
@@ -592,7 +593,29 @@ async fn run_replica_status(args: ClientArgs) -> Result<()> {
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "topology_epoch": status.topology_epoch,
+            "topology_digest": status.topology_digest,
+            "desired_rf": status.desired_rf,
+            "write_ack_policy": hashring_core::proto::WriteAckPolicy::try_from(status.write_ack_policy)
+                .map(|policy| policy.as_str_name())
+                .unwrap_or("WRITE_ACK_POLICY_UNSPECIFIED"),
+            "active_change_id": status.active_change_id,
+            "active_change_phase": hashring_core::proto::MigrationPhase::try_from(status.active_change_phase)
+                .map(|phase| phase.as_str_name())
+                .unwrap_or("MIGRATION_PHASE_UNSPECIFIED"),
+            "recovery_block_reason": status.recovery_block_reason,
             "activation_pending": status.activation_pending,
+            "nodes": status.nodes.into_iter().map(|node| serde_json::json!({
+                "node_id": node.node_id,
+                "process_instance_id": node.process_instance_id,
+                "leased": node.leased,
+                "suspected": node.suspected,
+                "fenced": node.fenced,
+                "joining": node.joining,
+                "lease_expires_unix_millis": (node.lease_expires_unix_millis != 0)
+                    .then_some(node.lease_expires_unix_millis),
+                "last_renewal_unix_millis": (node.last_renewal_unix_millis != 0)
+                    .then_some(node.last_renewal_unix_millis),
+            })).collect::<Vec<_>>(),
             "ranges": ranges,
         }))?
     );

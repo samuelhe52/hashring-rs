@@ -181,8 +181,12 @@ to abort after source cleanup. Restore
 the same live process where possible. Coordinator consensus/failover is not
 provided.
 
-`replica-status` reports each range's nominal `current_rf`, leased `live_rf`,
-owner lease, follower admission/lag/health, `writable` and its block reason,
+`replica-status` reports the committed epoch, digest, desired RF, ACK policy,
+per-node process identity, lease expiry and last renewal, current suspicion and
+fencing, whether a node is joining, and the active change phase. It also
+reports each range's nominal `current_rf`, leased `live_rf`, owner lease,
+follower admission/lag/health,
+last known owner ACK sequence, `writable` and its block reason,
 under-replication, repair phase, retry count, next attempt time, and last error.
 `current_rf` alone does not prove liveness. During a cutover fence, status
 conservatively marks affected ranges as potentially blocked. Leases last five

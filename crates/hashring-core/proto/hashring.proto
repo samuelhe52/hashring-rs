@@ -58,6 +58,24 @@ message ReplicaStatusResponse {
   uint64 topology_epoch = 1;
   repeated RangeReplicaStatus ranges = 2;
   bool activation_pending = 3;
+  string topology_digest = 4;
+  uint32 desired_rf = 5;
+  WriteAckPolicy write_ack_policy = 6;
+  repeated NodeReplicaStatus nodes = 7;
+  string active_change_id = 8;
+  MigrationPhase active_change_phase = 9;
+  string recovery_block_reason = 10;
+}
+
+message NodeReplicaStatus {
+  string node_id = 1;
+  string process_instance_id = 2;
+  bool leased = 3;
+  bool suspected = 4;
+  bool fenced = 5;
+  bool joining = 6;
+  uint64 lease_expires_unix_millis = 7;
+  uint64 last_renewal_unix_millis = 8;
 }
 
 message RangeReplicaStatus {
@@ -92,6 +110,8 @@ message FollowerReplicaStatus {
   uint32 repair_retry_count = 12;
   uint64 repair_next_attempt_unix_millis = 13;
   string repair_last_error = 14;
+  uint64 last_ack_sequence = 15;
+  bool last_ack_known = 16;
 }
 
 message CurrentEpochResponse {
@@ -357,6 +377,8 @@ message ReplicationProgressResponse {
   string process_instance_id = 1;
   uint64 stream_sequence = 2;
   uint64 oldest_unacked_unix_millis = 3;
+  uint64 last_ack_sequence = 4;
+  bool last_ack_known = 5;
 }
 
 message ReplicationCheckpointRequest {

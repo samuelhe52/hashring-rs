@@ -25,10 +25,8 @@ impl Coordinator for CoordinatorService {
         let state = self.state.read().await.clone();
         let epoch = state.committed.epoch;
         let now = Instant::now();
-        let live_nodes: BTreeSet<_> = self
-            .lease_grants
-            .lock()
-            .await
+        let grants = self.lease_grants.lock().await.clone();
+        let live_nodes: BTreeSet<_> = grants
             .iter()
             .filter(|(node_id, grant)| {
                 grant.epoch == epoch
@@ -37,6 +35,63 @@ impl Coordinator for CoordinatorService {
                     && !state.fenced_nodes.contains(*node_id)
             })
             .map(|(node_id, _)| node_id.clone())
+            .collect();
+        let failures = self.peer_failures.lock().await.clone();
+        let mut node_ids: BTreeSet<_> = state
+            .committed
+            .members
+            .iter()
+            .map(|member| member.node_id.clone())
+            .collect();
+        node_ids.extend(state.process_instances.keys().cloned());
+        node_ids.extend(state.fenced_nodes.iter().cloned());
+        if let Some(change) = &state.active_change {
+            node_ids.extend(
+                change
+                    .target_topology
+                    .members
+                    .iter()
+                    .map(|member| member.node_id.clone()),
+            );
+        }
+        let nodes = node_ids
+            .into_iter()
+            .map(|node_id| {
+                let grant = grants.get(&node_id).filter(|grant| {
+                    state.process_instances.get(&node_id) == Some(&grant.process_instance_id)
+                        && grant.epoch == epoch
+                });
+                proto::NodeReplicaStatus {
+                    process_instance_id: state
+                        .process_instances
+                        .get(&node_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                    leased: live_nodes.contains(&node_id),
+                    suspected: failures.iter().any(|((target, reporter), failure)| {
+                        target == &node_id
+                            && live_nodes.contains(reporter)
+                            && failure.last_seen + Duration::from_secs(2) >= now
+                    }),
+                    fenced: state.fenced_nodes.contains(&node_id),
+                    joining: !state
+                        .committed
+                        .members
+                        .iter()
+                        .any(|member| member.node_id == node_id)
+                        && state.active_change.as_ref().is_some_and(|change| {
+                            change
+                                .target_topology
+                                .members
+                                .iter()
+                                .any(|member| member.node_id == node_id)
+                        }),
+                    lease_expires_unix_millis: grant.map_or(0, |grant| grant.expires_unix_millis),
+                    last_renewal_unix_millis: grant
+                        .map_or(0, |grant| grant.last_renewal_unix_millis),
+                    node_id,
+                }
+            })
             .collect();
         let members: BTreeMap<_, _> = state
             .committed
@@ -177,7 +232,9 @@ impl Coordinator for CoordinatorService {
                         let leased = live_nodes.contains(node_id);
                         let healthy = admission.is_some()
                             && leased
-                            && live.is_some_and(|(_, _, lag)| *lag <= guard.max_replica_lag_millis);
+                            && live.is_some_and(|(_, _, lag, _, _)| {
+                                *lag <= guard.max_replica_lag_millis
+                            });
                         proto::FollowerReplicaStatus {
                             node_id: node_id.clone(),
                             admitted: admission.is_some(),
@@ -188,12 +245,12 @@ impl Coordinator for CoordinatorService {
                                 .map(|admission| admission.verified_watermark)
                                 .unwrap_or_default(),
                             stream_cursor: live
-                                .map(|(_, cursor, _)| *cursor)
+                                .map(|(_, cursor, _, _, _)| *cursor)
                                 .or_else(|| admission.map(|admission| admission.stream_cursor))
                                 .unwrap_or_default(),
-                            lag_millis: live.map(|(_, _, lag)| *lag).unwrap_or_default(),
+                            lag_millis: live.map(|(_, _, lag, _, _)| *lag).unwrap_or_default(),
                             lag_known: live.is_some(),
-                            stream_head: live.map(|(head, _, _)| *head).unwrap_or_default(),
+                            stream_head: live.map(|(head, _, _, _, _)| *head).unwrap_or_default(),
                             repair_state: repair
                                 .map(|repair| format!("{:?}", repair.phase))
                                 .unwrap_or_default(),
@@ -204,6 +261,10 @@ impl Coordinator for CoordinatorService {
                                 .map_or(0, |repair| repair.next_attempt_unix_millis),
                             repair_last_error: repair
                                 .map_or(String::new(), |repair| repair.last_error.clone()),
+                            last_ack_sequence: live
+                                .map(|(_, _, _, ack, _)| *ack)
+                                .unwrap_or_default(),
+                            last_ack_known: live.is_some_and(|(_, _, _, _, known)| *known),
                         }
                     })
                     .collect();
@@ -299,6 +360,21 @@ impl Coordinator for CoordinatorService {
             topology_epoch: epoch,
             ranges,
             activation_pending,
+            topology_digest: state.committed.digest.clone(),
+            desired_rf: state.committed.desired_replication_factor,
+            write_ack_policy: proto::WriteAckPolicy::from(state.committed.write_ack_policy).into(),
+            nodes,
+            active_change_id: state
+                .active_change
+                .as_ref()
+                .map_or(String::new(), |change| change.change_id.clone()),
+            active_change_phase: state
+                .active_change
+                .as_ref()
+                .map_or(proto::MigrationPhase::Unspecified as i32, |change| {
+                    proto::MigrationPhase::from(change.phase) as i32
+                }),
+            recovery_block_reason: state.recovery_block_reason.clone(),
         }))
     }
 
@@ -512,12 +588,17 @@ impl Coordinator for CoordinatorService {
         }
         let epoch = state.committed.epoch;
         let mut grants = self.lease_grants.lock().await;
+        let granted_at = Instant::now();
+        let renewed_unix_millis = unix_millis_now();
         grants.insert(
             request.node_id,
             NodeLeaseGrant {
                 process_instance_id: request.process_instance_id,
                 epoch,
-                expires_at: Instant::now() + NODE_LEASE_DURATION,
+                expires_at: granted_at + NODE_LEASE_DURATION,
+                expires_unix_millis: renewed_unix_millis
+                    .saturating_add(NODE_LEASE_DURATION.as_millis() as u64),
+                last_renewal_unix_millis: renewed_unix_millis,
             },
         );
         Ok(Response::new(proto::RenewNodeLeaseResponse {

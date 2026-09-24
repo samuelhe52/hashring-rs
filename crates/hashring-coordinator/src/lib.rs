@@ -598,6 +598,8 @@ struct NodeLeaseGrant {
     process_instance_id: String,
     epoch: u64,
     expires_at: Instant,
+    expires_unix_millis: u64,
+    last_renewal_unix_millis: u64,
 }
 
 #[derive(Clone)]

@@ -94,6 +94,8 @@ fn failover_requires_admitted_coverage_for_every_old_interval() {
                     process_instance_id: format!("{node_id}-process"),
                     epoch: old.epoch,
                     expires_at: now + NODE_LEASE_DURATION,
+                    expires_unix_millis: 0,
+                    last_renewal_unix_millis: 0,
                 },
             )
         })
@@ -213,6 +215,8 @@ fn a_single_failed_peer_link_never_confirms_node_failure() {
                 process_instance_id: process,
                 epoch: 1,
                 expires_at: now + NODE_LEASE_DURATION,
+                expires_unix_millis: 0,
+                last_renewal_unix_millis: 0,
             },
         );
     }
@@ -646,6 +650,15 @@ async fn replica_status_only_counts_verified_current_processes() {
         .await
         .unwrap()
         .into_inner();
+    assert_eq!(status.topology_digest, state.committed.digest);
+    assert_eq!(
+        status.desired_rf,
+        state.committed.desired_replication_factor
+    );
+    assert_eq!(
+        status.write_ack_policy,
+        proto::WriteAckPolicy::OwnerOnly as i32
+    );
     let range = status
         .ranges
         .iter()
@@ -667,6 +680,45 @@ async fn replica_status_only_counts_verified_current_processes() {
             .iter()
             .any(|follower| follower.node_id == repair.node_id && follower.admitted)
     );
+    let now = Instant::now();
+    service.lease_grants.lock().await.insert(
+        repair.owner_node_id.clone(),
+        NodeLeaseGrant {
+            process_instance_id: "owner-1".into(),
+            epoch: repair.epoch,
+            expires_at: now + NODE_LEASE_DURATION,
+            expires_unix_millis: 12_345,
+            last_renewal_unix_millis: 7_345,
+        },
+    );
+    service.peer_failures.lock().await.insert(
+        (repair.node_id.clone(), repair.owner_node_id.clone()),
+        PeerFailure {
+            first_seen: now,
+            last_seen: now,
+        },
+    );
+    let status = service
+        .get_replica_status(Request::new(proto::Empty {}))
+        .await
+        .unwrap()
+        .into_inner();
+    let owner = status
+        .nodes
+        .iter()
+        .find(|node| node.node_id == repair.owner_node_id)
+        .unwrap();
+    assert!(owner.leased);
+    assert_eq!(owner.process_instance_id, "owner-1");
+    assert_eq!(owner.lease_expires_unix_millis, 12_345);
+    assert_eq!(owner.last_renewal_unix_millis, 7_345);
+    let follower = status
+        .nodes
+        .iter()
+        .find(|node| node.node_id == repair.node_id)
+        .unwrap();
+    assert!(follower.suspected);
+    assert!(!follower.leased);
     service
         .state
         .write()

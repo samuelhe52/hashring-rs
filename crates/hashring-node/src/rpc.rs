@@ -712,7 +712,7 @@ impl DataNode for DataNodeService {
                     "owner replication stream is terminal",
                 ));
             }
-            let key = (request.topology_epoch, request.follower_node_id);
+            let key = (request.topology_epoch, request.follower_node_id.clone());
             (
                 state
                     .owner_stream_sequences
@@ -726,7 +726,7 @@ impl DataNode for DataNodeService {
                     .unwrap_or_default(),
             )
         } else if self.node_id == request.follower_node_id {
-            let key = (request.topology_epoch, request.owner_node_id);
+            let key = (request.topology_epoch, request.owner_node_id.clone());
             state
                 .follower_streams
                 .get(&key)
@@ -740,6 +740,19 @@ impl DataNode for DataNodeService {
             process_instance_id: self.process_instance_id.clone(),
             stream_sequence,
             oldest_unacked_unix_millis,
+            last_ack_sequence: if self.node_id == request.owner_node_id {
+                state
+                    .ack_progress
+                    .get(&(request.topology_epoch, request.follower_node_id.clone()))
+                    .map_or(0, |progress| *progress.borrow())
+            } else {
+                0
+            },
+            last_ack_known: self.node_id == request.owner_node_id
+                && (stream_sequence == 0
+                    || state
+                        .ack_progress
+                        .contains_key(&(request.topology_epoch, request.follower_node_id))),
         }))
     }
 
@@ -811,6 +824,8 @@ impl DataNode for DataNodeService {
             process_instance_id: self.process_instance_id.clone(),
             stream_sequence: stream.applied_sequence,
             oldest_unacked_unix_millis: 0,
+            last_ack_sequence: 0,
+            last_ack_known: false,
         }))
     }
 

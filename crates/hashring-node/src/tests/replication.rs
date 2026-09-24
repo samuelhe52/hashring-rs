@@ -1,6 +1,45 @@
 use super::*;
 
 #[tokio::test]
+async fn replication_progress_reports_owner_ack_only_when_known() {
+    let topology = replication_topology(3);
+    let service = service_for("node-1", topology.clone());
+    let request = ReplicationProgressRequest {
+        topology_epoch: topology.epoch,
+        owner_node_id: "node-1".into(),
+        follower_node_id: "node-2".into(),
+    };
+    {
+        let mut state = service.state.write().await;
+        state
+            .owner_stream_sequences
+            .insert((topology.epoch, "node-2".into()), 3);
+    }
+    let unknown = service
+        .get_replication_progress(Request::new(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(unknown.stream_sequence, 3);
+    assert!(!unknown.last_ack_known);
+
+    let (ack, _) = watch::channel(2);
+    service
+        .state
+        .write()
+        .await
+        .ack_progress
+        .insert((topology.epoch, "node-2".into()), ack);
+    let known = service
+        .get_replication_progress(Request::new(request))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(known.last_ack_known);
+    assert_eq!(known.last_ack_sequence, 2);
+}
+
+#[tokio::test]
 async fn follower_applies_only_contiguous_authorized_replication() {
     let topology = replication_topology(3);
     let key = key_with_placement(&topology, |replicas| replicas[1..].contains(&"node-2"));

@@ -49,7 +49,7 @@ pub(super) async fn read_replication_pair(
     follower_channel: Channel,
     owner_instance: &str,
     follower_instance: &str,
-) -> Option<(u64, u64, u64)> {
+) -> Option<(u64, u64, u64, u64, bool)> {
     let deadline = Instant::now() + Duration::from_millis(500);
     let mut source = configure_data_node_client(DataNodeClient::new(owner_channel));
     let mut destination = configure_data_node_client(DataNodeClient::new(follower_channel));
@@ -86,5 +86,11 @@ pub(super) async fn read_replication_pair(
             .try_into()
             .unwrap_or(u64::MAX)
     };
-    Some((head.stream_sequence, applied.stream_sequence, lag))
+    Some((
+        head.stream_sequence,
+        applied.stream_sequence,
+        lag,
+        head.last_ack_sequence,
+        head.last_ack_known,
+    ))
 }
