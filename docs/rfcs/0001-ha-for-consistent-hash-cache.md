@@ -201,8 +201,11 @@ The client:
 - refreshes topology before retrying when a newer epoch is advertised;
 - otherwise retries retryable errors with jittered exponential backoff;
 - keeps one end-to-end operation deadline across connection, refresh, backoff, and RPC attempts;
-- returns `TemporarilyUnavailable` or `OutcomeUnknown` distinctly if the deadline expires;
+- retains `DeadlineExceeded` as the cause when the end-to-end deadline expires, with a typed mutation outcome: `KnownNotApplied` only when the client knows the mutation was not applied, or `MayHaveApplied` when it may have applied;
+- preserves `MayHaveApplied` across later retries, topology refreshes, and backoff; callers can distinguish the two outcomes without losing the deadline cause;
 - never retries indefinitely.
+
+The Rust client exposes the mutation outcome as a named type on operation, RPC, refresh, and deadline errors. It maps the protocol's `unknown_write_outcome` flag to that type while retaining the original error cause.
 
 ## Control Plane
 

@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use hashring_rs::client::{ClientConfig, ClientError, HashringClient};
+use hashring_rs::client::{ClientConfig, ClientError, HashringClient, MutationOutcome};
 use hashring_rs::{
     migration::{MigrationPhase, RangeMigration, TopologyChange},
     proto::{

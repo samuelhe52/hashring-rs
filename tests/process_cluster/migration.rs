@@ -154,7 +154,7 @@ async fn permanent_grpc_status_is_returned_without_deadline_retry() {
         error,
         ClientError::Rpc {
             code: Code::Unimplemented,
-            unknown_write_outcome: false,
+            outcome: MutationOutcome::KnownNotApplied,
             ..
         }
     ));
@@ -304,7 +304,7 @@ async fn moved_request_retries_a_transient_coordinator_outage_until_deadline() {
     assert!(matches!(
         deadline_client.get(moved_key).await,
         Err(ClientError::DeadlineExceeded {
-            unknown_write_outcome: false
+            outcome: MutationOutcome::KnownNotApplied
         })
     ));
     assert!(started.elapsed() >= Duration::from_millis(200));

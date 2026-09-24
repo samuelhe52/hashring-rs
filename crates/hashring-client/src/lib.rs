@@ -45,22 +45,42 @@ pub struct DeleteOutput {
     pub topology_epoch: u64,
 }
 
+/// Whether a mutation can be ruled out after an unsuccessful attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutationOutcome {
+    /// The client knows the mutation was not applied.
+    KnownNotApplied,
+    /// The mutation may have been applied; retrying requires the same mutation ID.
+    MayHaveApplied,
+}
+
+impl From<bool> for MutationOutcome {
+    fn from(unknown_write_outcome: bool) -> Self {
+        if unknown_write_outcome {
+            Self::MayHaveApplied
+        } else {
+            Self::KnownNotApplied
+        }
+    }
+}
+
 #[derive(Clone, Debug, Error)]
 #[error("{code:?}: {message}")]
 pub struct OperationFailure {
     pub code: ErrorCode,
     pub message: String,
     pub retryable: bool,
-    pub unknown_write_outcome: bool,
+    pub outcome: MutationOutcome,
 }
 
 impl From<OperationError> for OperationFailure {
     fn from(error: OperationError) -> Self {
+        let may_have_applied = operation_may_have_applied(&error);
         Self {
             code: ErrorCode::try_from(error.code).unwrap_or(ErrorCode::Unspecified),
             message: error.message,
             retryable: error.retryable,
-            unknown_write_outcome: error.unknown_write_outcome,
+            outcome: may_have_applied.into(),
         }
     }
 }
@@ -69,25 +89,31 @@ impl From<OperationError> for OperationFailure {
 pub enum ClientError {
     #[error("failed to fetch or validate topology: {0}")]
     Topology(#[from] anyhow::Error),
-    #[error("topology refresh failed: {source} (unknown_write_outcome={unknown_write_outcome})")]
+    #[error("topology refresh failed: {source} (outcome={outcome:?})")]
     TopologyRefresh {
         source: anyhow::Error,
-        unknown_write_outcome: bool,
+        outcome: MutationOutcome,
     },
     #[error(transparent)]
     Operation(#[from] OperationFailure),
-    #[error("logical operation deadline exceeded (unknown_write_outcome={unknown_write_outcome})")]
-    DeadlineExceeded { unknown_write_outcome: bool },
+    #[error("logical operation deadline exceeded (outcome={outcome:?})")]
+    DeadlineExceeded { outcome: MutationOutcome },
     #[error("protocol response omitted record version")]
     MissingVersion,
-    #[error(
-        "node RPC failed with {code:?}: {message} (unknown_write_outcome={unknown_write_outcome})"
-    )]
+    #[error("node RPC failed with {code:?}: {message} (outcome={outcome:?})")]
     Rpc {
         code: Code,
         message: String,
-        unknown_write_outcome: bool,
+        outcome: MutationOutcome,
     },
+}
+
+impl ClientError {
+    fn deadline(unknown_write_outcome: bool) -> Self {
+        Self::DeadlineExceeded {
+            outcome: unknown_write_outcome.into(),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -171,9 +197,7 @@ impl HashringClient {
             fetch_topology(&coordinator_endpoint),
         )
         .await
-        .map_err(|_| ClientError::DeadlineExceeded {
-            unknown_write_outcome: false,
-        })??;
+        .map_err(|_| ClientError::deadline(false))??;
         let inner = Arc::new(ClientInner {
             coordinator_endpoint,
             topology: RwLock::new(topology),
@@ -247,9 +271,7 @@ impl HashringClient {
             Ok(Ok(client)) => configure_coordinator_client(client),
             Ok(Err(error)) => return Err(ClientError::Topology(error.into())),
             Err(_) => {
-                return Err(ClientError::DeadlineExceeded {
-                    unknown_write_outcome: false,
-                });
+                return Err(ClientError::deadline(false));
             }
         };
         let request = BeginTopologyChangeRequest {
@@ -276,9 +298,7 @@ impl HashringClient {
                 return Err(rpc_error(status, unknown_write_outcome));
             }
             Err(_) => {
-                return Err(ClientError::DeadlineExceeded {
-                    unknown_write_outcome: true,
-                });
+                return Err(ClientError::deadline(true));
             }
         };
         Ok(response.try_into().map_err(anyhow::Error::from)?)
@@ -296,9 +316,7 @@ impl HashringClient {
             Ok::<_, anyhow::Error>(response)
         })
         .await
-        .map_err(|_| ClientError::DeadlineExceeded {
-            unknown_write_outcome: false,
-        })??;
+        .map_err(|_| ClientError::deadline(false))??;
         response
             .change
             .map(TryInto::try_into)
@@ -320,9 +338,7 @@ impl HashringClient {
             )
         })
         .await
-        .map_err(|_| ClientError::DeadlineExceeded {
-            unknown_write_outcome: false,
-        })?
+        .map_err(|_| ClientError::deadline(false))?
         .map_err(ClientError::from)
     }
 
@@ -342,9 +358,7 @@ impl HashringClient {
             Ok(Ok(client)) => configure_coordinator_client(client),
             Ok(Err(error)) => return Err(ClientError::Topology(error.into())),
             Err(_) => {
-                return Err(ClientError::DeadlineExceeded {
-                    unknown_write_outcome: false,
-                });
+                return Err(ClientError::deadline(false));
             }
         };
         let response = match tokio::time::timeout(
@@ -363,9 +377,7 @@ impl HashringClient {
                 return Err(rpc_error(status, unknown_write_outcome));
             }
             Err(_) => {
-                return Err(ClientError::DeadlineExceeded {
-                    unknown_write_outcome: true,
-                });
+                return Err(ClientError::deadline(true));
             }
         };
         Ok(response.try_into().map_err(anyhow::Error::from)?)
@@ -383,9 +395,7 @@ impl HashringClient {
             let mut client = match self.data_node_client(&owner.endpoint, deadline).await {
                 Ok(client) => client,
                 Err(ClientError::DeadlineExceeded { .. }) => {
-                    return Err(ClientError::DeadlineExceeded {
-                        unknown_write_outcome: false,
-                    });
+                    return Err(ClientError::deadline(false));
                 }
                 Err(_) => {
                     self.refresh_after_unavailable(topology.epoch, deadline, false)
@@ -417,9 +427,7 @@ impl HashringClient {
                     return Err(rpc_error(status, false));
                 }
                 Err(_) => {
-                    return Err(ClientError::DeadlineExceeded {
-                        unknown_write_outcome: false,
-                    });
+                    return Err(ClientError::deadline(false));
                 }
             };
 
@@ -462,9 +470,7 @@ impl HashringClient {
             let mut client = match self.data_node_client(&owner.endpoint, deadline).await {
                 Ok(client) => client,
                 Err(ClientError::DeadlineExceeded { .. }) => {
-                    return Err(ClientError::DeadlineExceeded {
-                        unknown_write_outcome,
-                    });
+                    return Err(ClientError::deadline(unknown_write_outcome));
                 }
                 Err(_) => {
                     self.refresh_after_unavailable(topology.epoch, deadline, unknown_write_outcome)
@@ -505,15 +511,13 @@ impl HashringClient {
                     return Err(rpc_error(status, unknown_write_outcome));
                 }
                 Err(_) => {
-                    return Err(ClientError::DeadlineExceeded {
-                        unknown_write_outcome: true,
-                    });
+                    return Err(ClientError::deadline(true));
                 }
             };
 
             if let Some(error) = response.error {
                 let error_unknown_write_outcome =
-                    unknown_write_outcome || error.unknown_write_outcome;
+                    unknown_write_outcome || operation_may_have_applied(&error);
                 if self
                     .handle_retryable(
                         error.clone(),
@@ -527,7 +531,7 @@ impl HashringClient {
                     continue;
                 }
                 let mut failure = OperationFailure::from(error);
-                failure.unknown_write_outcome = error_unknown_write_outcome;
+                failure.outcome = error_unknown_write_outcome.into();
                 return Err(failure.into());
             }
             let output = PutOutput {
@@ -554,9 +558,7 @@ impl HashringClient {
             let mut client = match self.data_node_client(&owner.endpoint, deadline).await {
                 Ok(client) => client,
                 Err(ClientError::DeadlineExceeded { .. }) => {
-                    return Err(ClientError::DeadlineExceeded {
-                        unknown_write_outcome,
-                    });
+                    return Err(ClientError::deadline(unknown_write_outcome));
                 }
                 Err(_) => {
                     self.refresh_after_unavailable(topology.epoch, deadline, unknown_write_outcome)
@@ -596,15 +598,13 @@ impl HashringClient {
                     return Err(rpc_error(status, unknown_write_outcome));
                 }
                 Err(_) => {
-                    return Err(ClientError::DeadlineExceeded {
-                        unknown_write_outcome: true,
-                    });
+                    return Err(ClientError::deadline(true));
                 }
             };
 
             if let Some(error) = response.error {
                 let error_unknown_write_outcome =
-                    unknown_write_outcome || error.unknown_write_outcome;
+                    unknown_write_outcome || operation_may_have_applied(&error);
                 if self
                     .handle_retryable(
                         error.clone(),
@@ -618,7 +618,7 @@ impl HashringClient {
                     continue;
                 }
                 let mut failure = OperationFailure::from(error);
-                failure.unknown_write_outcome = error_unknown_write_outcome;
+                failure.outcome = error_unknown_write_outcome.into();
                 return Err(failure.into());
             }
             let output = DeleteOutput {
@@ -721,9 +721,7 @@ impl HashringClient {
             self.inner.refresh_lock.lock(),
         )
         .await
-        .map_err(|_| ClientError::DeadlineExceeded {
-            unknown_write_outcome,
-        })?;
+        .map_err(|_| ClientError::deadline(unknown_write_outcome))?;
         if self.inner.topology.read().await.epoch > observed_epoch
             || self.inner.refresh_generation.load(Ordering::SeqCst) != generation
         {
@@ -747,16 +745,14 @@ impl HashringClient {
                             fetched_digest: topology.digest,
                         }
                         .into(),
-                        unknown_write_outcome,
+                        outcome: unknown_write_outcome.into(),
                     });
                 }
                 self.inner.refresh_generation.fetch_add(1, Ordering::SeqCst);
             }
             Ok(Err(_)) => {}
             Err(_) => {
-                return Err(ClientError::DeadlineExceeded {
-                    unknown_write_outcome,
-                });
+                return Err(ClientError::deadline(unknown_write_outcome));
             }
         }
         Ok(())
@@ -803,9 +799,7 @@ impl HashringClient {
             .map_err(ClientError::from)?;
         let channel = tokio::time::timeout(remaining(deadline, false)?, transport.connect())
             .await
-            .map_err(|_| ClientError::DeadlineExceeded {
-                unknown_write_outcome: false,
-            })?
+            .map_err(|_| ClientError::deadline(false))?
             .map_err(anyhow::Error::from)
             .map_err(ClientError::from)?;
         self.inner
@@ -834,9 +828,7 @@ async fn refresh_topology_for_inner(
         inner.refresh_lock.lock(),
     )
     .await
-    .map_err(|_| ClientError::DeadlineExceeded {
-        unknown_write_outcome,
-    })?;
+    .map_err(|_| ClientError::deadline(unknown_write_outcome))?;
     if let Some(minimum_epoch) = minimum_epoch
         && inner.topology.read().await.epoch >= minimum_epoch
     {
@@ -862,7 +854,7 @@ async fn refresh_topology_for_inner(
                             fetched_digest: topology.digest,
                         }
                         .into(),
-                        unknown_write_outcome,
+                        outcome: unknown_write_outcome.into(),
                     });
                 }
                 inner.refresh_generation.fetch_add(1, Ordering::SeqCst);
@@ -878,13 +870,11 @@ async fn refresh_topology_for_inner(
             Ok(Err(error)) => {
                 return Err(ClientError::TopologyRefresh {
                     source: error.into(),
-                    unknown_write_outcome,
+                    outcome: unknown_write_outcome.into(),
                 });
             }
             Err(_) => {
-                return Err(ClientError::DeadlineExceeded {
-                    unknown_write_outcome,
-                });
+                return Err(ClientError::deadline(unknown_write_outcome));
             }
         }
     }
@@ -902,9 +892,7 @@ async fn retry_delay(
     let available = remaining(deadline, unknown_write_outcome)?;
     if delay >= available {
         tokio::time::sleep(available).await;
-        return Err(ClientError::DeadlineExceeded {
-            unknown_write_outcome,
-        });
+        return Err(ClientError::deadline(unknown_write_outcome));
     }
     tokio::time::sleep(delay).await;
     Ok(())
@@ -1026,11 +1014,15 @@ fn accumulated_write_ambiguity(already_unknown: bool, status: &tonic::Status) ->
     already_unknown || status_may_have_applied(status)
 }
 
+fn operation_may_have_applied(error: &OperationError) -> bool {
+    error.unknown_write_outcome || error.code == ErrorCode::OutcomeUnknown as i32
+}
+
 fn rpc_error(status: tonic::Status, unknown_write_outcome: bool) -> ClientError {
     ClientError::Rpc {
         code: status.code(),
         message: status.message().to_owned(),
-        unknown_write_outcome,
+        outcome: unknown_write_outcome.into(),
     }
 }
 
@@ -1048,7 +1040,7 @@ fn size_failure(message: String) -> ClientError {
         code: ErrorCode::TooLarge,
         message,
         retryable: false,
-        unknown_write_outcome: false,
+        outcome: MutationOutcome::KnownNotApplied,
     }
     .into()
 }
@@ -1057,9 +1049,7 @@ fn remaining(deadline: Instant, unknown_write_outcome: bool) -> Result<Duration,
     deadline
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
-        .ok_or(ClientError::DeadlineExceeded {
-            unknown_write_outcome,
-        })
+        .ok_or(ClientError::deadline(unknown_write_outcome))
 }
 
 #[cfg(test)]
@@ -1220,6 +1210,34 @@ mod tests {
     }
 
     #[test]
+    fn outcome_unknown_code_is_ambiguous_even_without_the_wire_flag() {
+        let failure = OperationFailure::from(OperationError {
+            code: ErrorCode::OutcomeUnknown.into(),
+            unknown_write_outcome: false,
+            ..Default::default()
+        });
+        assert_eq!(failure.outcome, MutationOutcome::MayHaveApplied);
+    }
+
+    #[tokio::test]
+    async fn write_deadline_before_owner_contact_is_known_not_applied() {
+        let (endpoint, _, server) = start_fake_coordinator(Duration::ZERO).await;
+        let mut config = ClientConfig::new(Duration::from_millis(250));
+        config.topology_poll_interval = None;
+        let client = HashringClient::connect_with_config(endpoint, config)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            client.put(b"key".to_vec(), b"value".to_vec()).await,
+            Err(ClientError::DeadlineExceeded {
+                outcome: MutationOutcome::KnownNotApplied
+            })
+        ));
+        server.abort();
+    }
+
+    #[test]
     fn topology_refresh_retries_only_transient_rpc_failures() {
         assert!(
             TopologyRefreshError::Rpc(Box::new(tonic::Status::unavailable(
@@ -1331,7 +1349,7 @@ mod tests {
                 .refresh_after_unavailable(1, Instant::now() + Duration::from_secs(1), true)
                 .await,
             Err(ClientError::TopologyRefresh {
-                unknown_write_outcome: true,
+                outcome: MutationOutcome::MayHaveApplied,
                 ..
             })
         ));
@@ -1370,7 +1388,7 @@ mod tests {
         assert!(matches!(
             error,
             ClientError::TopologyRefresh {
-                unknown_write_outcome: true,
+                outcome: MutationOutcome::MayHaveApplied,
                 ..
             }
         ));
@@ -1421,7 +1439,7 @@ mod tests {
         assert!(matches!(
             error,
             ClientError::DeadlineExceeded {
-                unknown_write_outcome: true
+                outcome: MutationOutcome::MayHaveApplied
             }
         ));
     }
