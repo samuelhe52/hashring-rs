@@ -498,6 +498,7 @@ impl HashringClient {
                     unknown_write_outcome =
                         accumulated_write_ambiguity(unknown_write_outcome, &status);
                     if retryable_status(&status) {
+                        tracing::debug!(operation = "put", request_id, attempt, epoch = topology.epoch, code = ?status.code(), message = status.message(), "retrying node RPC status");
                         self.refresh_after_unavailable(
                             topology.epoch,
                             deadline,
@@ -518,6 +519,9 @@ impl HashringClient {
             if let Some(error) = response.error {
                 let error_unknown_write_outcome =
                     unknown_write_outcome || operation_may_have_applied(&error);
+                if error.retryable {
+                    tracing::debug!(operation = "put", request_id, attempt, epoch = topology.epoch, code = ?ErrorCode::try_from(error.code).unwrap_or(ErrorCode::Unspecified), message = error.message, "retrying operation response");
+                }
                 if self
                     .handle_retryable(
                         error.clone(),
@@ -585,6 +589,7 @@ impl HashringClient {
                     unknown_write_outcome =
                         accumulated_write_ambiguity(unknown_write_outcome, &status);
                     if retryable_status(&status) {
+                        tracing::debug!(operation = "delete", request_id, attempt, epoch = topology.epoch, code = ?status.code(), message = status.message(), "retrying node RPC status");
                         self.refresh_after_unavailable(
                             topology.epoch,
                             deadline,
@@ -605,6 +610,9 @@ impl HashringClient {
             if let Some(error) = response.error {
                 let error_unknown_write_outcome =
                     unknown_write_outcome || operation_may_have_applied(&error);
+                if error.retryable {
+                    tracing::debug!(operation = "delete", request_id, attempt, epoch = topology.epoch, code = ?ErrorCode::try_from(error.code).unwrap_or(ErrorCode::Unspecified), message = error.message, "retrying operation response");
+                }
                 if self
                     .handle_retryable(
                         error.clone(),

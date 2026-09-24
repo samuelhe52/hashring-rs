@@ -428,6 +428,11 @@ impl CoordinatorService {
                 .collect::<Vec<_>>();
             (pending, required)
         };
+        tracing::debug!(
+            groups = groups.len(),
+            required_followers = required.len(),
+            "replica activation seeding planned"
+        );
         try_map_bounded(
             groups,
             self.range_move_concurrency.min(4),
@@ -577,6 +582,8 @@ impl CoordinatorService {
         let first = tasks
             .first()
             .ok_or_else(|| Status::invalid_argument("empty repair group"))?;
+        let started = Instant::now();
+        tracing::debug!(owner = %first.owner_node_id, follower = %first.node_id, ranges = tasks.len(), "replica seed group started");
         let (topology, owner_instance, follower_instance) = {
             let state = self.state.read().await;
             (
@@ -732,6 +739,7 @@ impl CoordinatorService {
                     .await?;
             }
         }
+        tracing::debug!(owner = %first.owner_node_id, follower = %first.node_id, ranges = tasks.len(), elapsed_ms = started.elapsed().as_millis(), success = result.is_ok(), "replica seed group finished");
         result
     }
 

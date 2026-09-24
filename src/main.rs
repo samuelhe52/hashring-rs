@@ -241,6 +241,9 @@ struct ExperimentArgs {
     /// Refuse the run unless build and runtime source match the same clean commit.
     #[arg(long)]
     require_clean_source: bool,
+    /// Log client retries and migration/repair progress for diagnosis.
+    #[arg(long)]
+    verbose: bool,
     #[arg(long, default_value_t = 3)]
     desired_replication_factor: u32,
     #[arg(long, default_value_t = 2)]
@@ -254,11 +257,15 @@ struct ExperimentArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("hashring_rs=info".parse()?))
-        .init();
+    let cli = Cli::parse();
+    let verbose_experiment = matches!(&cli.command, Command::Experiment(args) if args.verbose);
+    let mut filter = EnvFilter::from_default_env().add_directive("hashring_rs=info".parse()?);
+    if verbose_experiment {
+        filter = filter.add_directive("hashring_client=debug".parse()?);
+    }
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    match Cli::parse().command {
+    match cli.command {
         Command::Coordinator(args) => run_coordinator(args).await,
         Command::Node(args) => run_node(args).await,
         Command::Put(args) => run_put(args).await,
@@ -307,6 +314,7 @@ async fn run_local_experiment(args: ExperimentArgs) -> Result<()> {
             range_move_concurrency: args.range_move_concurrency,
             pre_publish_delay_ms: args.pre_publish_delay_ms,
             require_clean_source: args.require_clean_source,
+            verbose: args.verbose,
             desired_replication_factor: args.desired_replication_factor,
             minimum_admitted_copies: args.minimum_admitted_copies,
             minimum_healthy_followers: args.minimum_healthy_followers,

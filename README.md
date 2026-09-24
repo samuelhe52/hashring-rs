@@ -81,6 +81,13 @@ target/release/hashring-rs experiment \
   --mode correctness --require-clean-source \
   --output results/correctness-10-node
 
+# Diagnostic run: print client retry reasons and retain coordinator
+# migration/repair progress in the process logs. A longer deadline is
+# diagnostic only; it does not establish the default 30-second deadline is met.
+target/release/hashring-rs experiment \
+  --mode correctness --verbose --operation-timeout-ms 120000 \
+  --output results/correctness-10-node-diagnostic
+
 # Nominal acceptance profile: 10 data nodes and 1,000,000 logical keys.
 target/release/hashring-rs experiment \
   --mode performance --require-clean-source \
@@ -103,6 +110,12 @@ runtime source status and diff, and a BLAKE3 digest of the executable. The
 the runner never overwrites a non-empty result directory. Formal runs use
 `--require-clean-source`; dirty ad hoc runs remain available but are explicitly
 marked `source_reproducible=false` in the manifest.
+`--verbose` is recorded in the manifest. It prints client retry details to the
+experiment command's stderr and adds coordinator phase and replica-seeding
+progress to the retained process logs. Capture the command's stderr separately
+when keeping a complete diagnostic record.
+If a concurrent writer fails, the runner records its error and waits for the
+migration outcome before writing the summary.
 The summary records initial-put throughput plus sampled end-to-end client `PUT`
 and direct owner-RPC `PUT` round-trip latency distributions (microseconds,
 p50/p95/p99/max). The latter includes the network hop and owner processing,
