@@ -374,7 +374,7 @@ impl CoordinatorService {
     // remain unleased until the policy and minimum-copy barrier is verified.
     pub(super) async fn seed_repairs_for_activation(&self) -> Result<(), Status> {
         self.cleanup_interrupted_repairs().await?;
-        let (groups, required) = {
+        let (groups, required_count) = {
             let state = self.state.read().await;
             let topology = &state.committed;
             let guard = &topology.write_availability_guard;
@@ -386,25 +386,33 @@ impl CoordinatorService {
             let needed = policy_followers
                 .max(guard.minimum_admitted_copies.saturating_sub(1) as usize)
                 .max(guard.minimum_healthy_followers as usize);
-            let mut required = BTreeSet::new();
-            for range in topology
+            let ranges = topology
                 .derived_ranges()
-                .map_err(|error| Status::internal(error.to_string()))?
-            {
+                .map_err(|error| Status::internal(error.to_string()))?;
+            for range in &ranges {
                 if range.follower_node_ids.len() < needed {
                     return Err(Status::failed_precondition(
                         "target range cannot satisfy the activation policy and copy guard",
                     ));
                 }
-                for node_id in range.follower_node_ids.into_iter().take(needed) {
-                    required.insert((
-                        range.start_exclusive,
-                        range.end_inclusive,
-                        range.owner_node_id.clone(),
-                        node_id,
-                    ));
-                }
             }
+            let admitted: BTreeSet<_> = state
+                .replica_admissions
+                .iter()
+                .filter(|admission| {
+                    admission.epoch == topology.epoch
+                        && state.process_instances.get(&admission.node_id)
+                            == Some(&admission.process_instance_id)
+                })
+                .map(|admission| {
+                    (
+                        admission.start_exclusive,
+                        admission.end_inclusive,
+                        admission.owner_node_id.clone(),
+                        admission.node_id.clone(),
+                    )
+                })
+                .collect();
             let mut groups: BTreeMap<(String, String), Vec<ReplicaRepair>> = BTreeMap::new();
             for repair in &state.replica_repairs {
                 groups
@@ -412,22 +420,69 @@ impl CoordinatorService {
                     .or_default()
                     .push(repair.clone());
             }
-            let pending = groups
-                .into_values()
-                .filter(|repairs| {
-                    repairs.iter().any(|repair| {
-                        repair.phase != ReplicaRepairPhase::Complete
-                            && required.contains(&(
-                                repair.start_exclusive,
-                                repair.end_inclusive,
-                                repair.owner_node_id.clone(),
-                                repair.node_id.clone(),
-                            ))
+            let mut selected = BTreeSet::new();
+            for range in &ranges {
+                let owner = &range.owner_node_id;
+                let is_admitted = |follower: &String| {
+                    admitted.contains(&(
+                        range.start_exclusive,
+                        range.end_inclusive,
+                        owner.clone(),
+                        follower.clone(),
+                    ))
+                };
+                // ACK policies name exact followers. The availability guard
+                // only requires a count, so existing admissions and any
+                // desired follower can satisfy its remaining quota.
+                for follower in range.follower_node_ids.iter().take(policy_followers) {
+                    if !is_admitted(follower) {
+                        selected.insert((owner.clone(), follower.clone()));
+                    }
+                }
+                let mut covered = range
+                    .follower_node_ids
+                    .iter()
+                    .filter(|follower| {
+                        is_admitted(follower)
+                            || selected.contains(&(owner.clone(), (*follower).clone()))
+                    })
+                    .count();
+                while covered < needed {
+                    let candidate = range
+                        .follower_node_ids
+                        .iter()
+                        .filter(|follower| {
+                            !is_admitted(follower)
+                                && !selected.contains(&(owner.clone(), (*follower).clone()))
+                        })
+                        .filter_map(|follower| {
+                            let key = (owner.clone(), follower.clone());
+                            groups.get(&key).map(|tasks| (key, tasks.len()))
+                        })
+                        .max_by_key(|(_, group_size)| *group_size)
+                        .map(|(key, _)| key)
+                        .ok_or_else(|| {
+                            Status::unavailable("required target follower repair is unavailable")
+                        })?;
+                    selected.insert(candidate);
+                    covered += 1;
+                }
+            }
+            let pending = selected
+                .into_iter()
+                .map(|key| {
+                    groups.remove(&key).ok_or_else(|| {
+                        Status::unavailable("required target follower repair is unavailable")
                     })
                 })
-                .collect::<Vec<_>>();
-            (pending, required)
+                .collect::<Result<Vec<_>, _>>()?;
+            (pending, ranges.len() * needed)
         };
+        tracing::debug!(
+            groups = groups.len(),
+            required_followers = required_count,
+            "replica activation seeding planned"
+        );
         try_map_bounded(
             groups,
             self.range_move_concurrency.min(4),
@@ -435,19 +490,49 @@ impl CoordinatorService {
         )
         .await?;
         let state = self.state.read().await;
-        if required.iter().any(|(start, end, owner, follower)| {
-            !state.replica_admissions.iter().any(|admission| {
-                admission.epoch == state.committed.epoch
-                    && admission.start_exclusive == *start
-                    && admission.end_inclusive == *end
-                    && admission.owner_node_id == *owner
-                    && admission.node_id == *follower
-                    && state.process_instances.get(follower) == Some(&admission.process_instance_id)
-            })
-        }) {
-            return Err(Status::unavailable(
-                "required target followers are not all admitted",
-            ));
+        let topology = &state.committed;
+        let policy_followers = match topology.write_ack_policy {
+            WriteAckPolicy::OwnerOnly => 0,
+            WriteAckPolicy::FirstSuccessor => 1,
+            WriteAckPolicy::AllReplicas => topology.desired_replication_factor as usize - 1,
+        };
+        let guard = &topology.write_availability_guard;
+        let needed = policy_followers
+            .max(guard.minimum_admitted_copies.saturating_sub(1) as usize)
+            .max(guard.minimum_healthy_followers as usize);
+        for range in topology
+            .derived_ranges()
+            .map_err(|error| Status::internal(error.to_string()))?
+        {
+            let admitted: BTreeSet<_> = state
+                .replica_admissions
+                .iter()
+                .filter(|admission| {
+                    admission.epoch == topology.epoch
+                        && admission.start_exclusive == range.start_exclusive
+                        && admission.end_inclusive == range.end_inclusive
+                        && admission.owner_node_id == range.owner_node_id
+                        && state.process_instances.get(&admission.node_id)
+                            == Some(&admission.process_instance_id)
+                })
+                .map(|admission| admission.node_id.as_str())
+                .collect();
+            if range
+                .follower_node_ids
+                .iter()
+                .filter(|follower| admitted.contains(follower.as_str()))
+                .count()
+                < needed
+                || range
+                    .follower_node_ids
+                    .iter()
+                    .take(policy_followers)
+                    .any(|follower| !admitted.contains(follower.as_str()))
+            {
+                return Err(Status::unavailable(
+                    "required target followers are not all admitted",
+                ));
+            }
         }
         Ok(())
     }
@@ -577,6 +662,8 @@ impl CoordinatorService {
         let first = tasks
             .first()
             .ok_or_else(|| Status::invalid_argument("empty repair group"))?;
+        let started = Instant::now();
+        tracing::debug!(owner = %first.owner_node_id, follower = %first.node_id, ranges = tasks.len(), "replica seed group started");
         let (topology, owner_instance, follower_instance) = {
             let state = self.state.read().await;
             (
@@ -732,6 +819,7 @@ impl CoordinatorService {
                     .await?;
             }
         }
+        tracing::debug!(owner = %first.owner_node_id, follower = %first.node_id, ranges = tasks.len(), elapsed_ms = started.elapsed().as_millis(), success = result.is_ok(), "replica seed group finished");
         result
     }
 

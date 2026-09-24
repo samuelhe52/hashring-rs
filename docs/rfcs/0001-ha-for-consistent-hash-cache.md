@@ -95,19 +95,23 @@ When topology changes merge ranges, a successor is admitted for the merged range
 
 - Desired RF is configurable; RF=3 is the normal example, not a hard-coded constant.
 - Desired RF may temporarily exceed the number of live physical nodes. The range is then under-replicated and repair remains pending until capacity exists.
-- A writable cluster normally requires at least two admitted copies and one healthy follower.
+- By default, an `OwnerOnly` write requires only a leased owner. Operators can
+  configure a stricter admission and health guard when reduced data-loss risk
+  matters more than write availability.
 - With two admitted copies of desired RF=3:
   - `OwnerOnly` may write if the health guard passes;
   - `FirstSuccessor` may write if the admitted healthy copy is the first successor and acknowledges;
   - `AllReplicas` rejects writes because the complete desired RF is unavailable.
-- With only one admitted copy, reads may continue under a valid owner lease, but writes are rejected.
-- `desired_rf=1` with `FirstSuccessor` is invalid. An RF=1 topology is not a normally writable configuration under the default minimum-copy guard.
+- With only one admitted copy, `OwnerOnly` writes remain available under the
+  default guard and a valid owner lease. Stricter guards may reject them.
+- `desired_rf=1` with `FirstSuccessor` is invalid. RF=1 with `OwnerOnly` is
+  writable under the default guard, with no replica to survive owner failure.
 - Repair always selects the next required distinct physical node clockwise. If no eligible node exists, the range remains visibly under-replicated.
 
 Initial defaults:
 
-- `minimum_admitted_copies = 2`;
-- `minimum_healthy_followers = 1`;
+- `minimum_admitted_copies = 1`;
+- `minimum_healthy_followers = 0`;
 - `max_replica_lag = 5s`, configurable and subject to validation by process tests.
 
 ### 5. Consistency contract

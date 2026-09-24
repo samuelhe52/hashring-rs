@@ -224,6 +224,7 @@ impl CoordinatorService {
                 .map_err(|error| Status::internal(error.to_string()))?;
             *state = next;
         }
+        tracing::debug!(change_id = %change.change_id, epoch = change.target_topology.epoch, moved_ranges = change.ranges.len(), replica_obligations = change.replica_obligations.len(), "topology published; activation pending");
         change.phase = MigrationPhase::Published;
         if !self.post_publish_delay.is_zero() {
             tokio::time::sleep(self.post_publish_delay).await;
@@ -898,9 +899,12 @@ impl CoordinatorService {
             if needs_replica_barrier
                 && (!change.ranges.is_empty() || !change.replica_obligations.is_empty())
             {
+                tracing::debug!(change_id = %change.change_id, "starting replica activation barrier");
                 self.seed_repairs_for_activation().await?;
+                tracing::debug!(change_id = %change.change_id, "replica activation barrier satisfied");
             }
             self.set_activation_ready().await?;
+            tracing::debug!(change_id = %change.change_id, "topology activation ready");
             change.activation_ready = true;
             self.install_on_members(
                 &change.target_topology,
@@ -1287,10 +1291,12 @@ impl CoordinatorService {
     pub(super) async fn set_phase(&self, phase: MigrationPhase) -> Result<(), Status> {
         let mut state = self.state.write().await;
         let mut next = state.clone();
-        next.active_change
+        let change = next
+            .active_change
             .as_mut()
-            .ok_or_else(|| Status::internal("active change disappeared"))?
-            .phase = phase;
+            .ok_or_else(|| Status::internal("active change disappeared"))?;
+        change.phase = phase;
+        let change_id = change.change_id.clone();
         if phase.is_terminal() {
             next.recovery_block_reason.clear();
         }
@@ -1298,6 +1304,7 @@ impl CoordinatorService {
             .store_state(&next)
             .map_err(|error| Status::internal(error.to_string()))?;
         *state = next;
+        tracing::debug!(%change_id, ?phase, "topology change phase updated");
         Ok(())
     }
 

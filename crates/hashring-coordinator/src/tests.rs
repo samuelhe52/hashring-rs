@@ -43,6 +43,55 @@ fn topology() -> TopologySnapshot {
     .unwrap()
 }
 
+#[tokio::test]
+async fn activation_guard_accepts_an_existing_nonfirst_follower() {
+    let members: Vec<_> = (1..=3)
+        .map(|index| Member {
+            node_id: format!("n{index}"),
+            endpoint: format!("http://127.0.0.1:500{index}"),
+        })
+        .collect();
+    let mut config = hashring_core::topology::TopologyConfig::default();
+    config.write_availability_guard.minimum_admitted_copies = 2;
+    config.write_availability_guard.minimum_healthy_followers = 1;
+    let topology = TopologySnapshot::new_with_config(1, 7, 4, members, config).unwrap();
+    let repository = Arc::new(MemoryRepository::default());
+    let mut state = load_or_initialize(repository.as_ref(), Some(topology.clone())).unwrap();
+    for member in &topology.members {
+        state.process_instances.insert(
+            member.node_id.clone(),
+            format!("{}-process", member.node_id),
+        );
+    }
+    for range in topology.derived_ranges().unwrap() {
+        let follower = range.follower_node_ids[1].clone();
+        state.replica_admissions.push(ReplicaAdmission {
+            epoch: topology.epoch,
+            start_exclusive: range.start_exclusive,
+            end_inclusive: range.end_inclusive,
+            owner_node_id: range.owner_node_id,
+            process_instance_id: format!("{follower}-process"),
+            node_id: follower,
+            verified_watermark: 0,
+            stream_cursor: 0,
+            digest: "verified".into(),
+        });
+    }
+    let service = CoordinatorService::new(state, repository, Duration::from_secs(1));
+    service.seed_repairs_for_activation().await.unwrap();
+
+    // The ACK policy still requires its exact successor even if the guard's
+    // admitted-copy threshold is satisfied by another follower.
+    let mut state = service.state.read().await.clone();
+    state.committed.write_ack_policy = WriteAckPolicy::FirstSuccessor;
+    let strict_service = CoordinatorService::new(
+        state,
+        Arc::new(MemoryRepository::default()),
+        Duration::from_secs(1),
+    );
+    assert!(strict_service.seed_repairs_for_activation().await.is_err());
+}
+
 #[test]
 fn failover_requires_admitted_coverage_for_every_old_interval() {
     let members: Vec<_> = (1..=3)

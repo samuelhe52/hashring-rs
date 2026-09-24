@@ -49,6 +49,7 @@ pub struct ExperimentConfig {
     pub range_move_concurrency: usize,
     pub pre_publish_delay_ms: u64,
     pub require_clean_source: bool,
+    pub verbose: bool,
     pub desired_replication_factor: u32,
     pub minimum_admitted_copies: u32,
     pub minimum_healthy_followers: u32,
@@ -170,14 +171,16 @@ struct ManagedProcess {
 struct ProcessGroup {
     executable: PathBuf,
     log_dir: PathBuf,
+    verbose: bool,
     processes: Vec<ManagedProcess>,
 }
 
 impl ProcessGroup {
-    fn new(executable: PathBuf, log_dir: PathBuf) -> Self {
+    fn new(executable: PathBuf, log_dir: PathBuf, verbose: bool) -> Self {
         Self {
             executable,
             log_dir,
+            verbose,
             processes: Vec::new(),
         }
     }
@@ -191,7 +194,14 @@ impl ProcessGroup {
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
-            .env("RUST_LOG", "hashring_rs=info")
+            .env(
+                "RUST_LOG",
+                if self.verbose {
+                    "hashring_rs=info,hashring_coordinator=debug,hashring_node=info"
+                } else {
+                    "hashring_rs=info"
+                },
+            )
             .spawn()
             .with_context(|| format!("spawning {name}"))?;
         self.processes.push(ManagedProcess { name, child });
@@ -402,7 +412,7 @@ async fn run_cluster(
         ExperimentMode::Availability => 3,
     };
     let initial_members = &members[..initial_count];
-    let mut processes = ProcessGroup::new(executable, log_dir);
+    let mut processes = ProcessGroup::new(executable, log_dir, config.verbose);
     let state_path = config.output_dir.join("coordinator.redb");
     let mut coordinator_args = vec![
         "coordinator".into(),
@@ -1108,8 +1118,31 @@ async fn migrate_while_mutating(
             }),
         )?;
     }
-    let mutations = writer.await.context("joining concurrent mutator")??;
-    let completed = execution.await.context("joining migration execution")??;
+    let writer_result = writer.await.context("joining concurrent mutator")?;
+    if let Err(error) = &writer_result {
+        events.record(
+            "migration_writer_failed",
+            json!({
+                "label": label,
+                "error": format!("{error:#}"),
+                "completed_mutations": completed_mutations.load(AtomicOrdering::Acquire),
+                "change_phase": admin_client.topology_change().await.ok().flatten().map(|change| format!("{:?}", change.phase)),
+            }),
+        )?;
+    }
+    let execution_result = execution.await.context("joining migration execution")?;
+    events.record(
+        "migration_execution_finished",
+        json!({
+            "label": label,
+            "result": match &execution_result {
+                Ok(change) => format!("{:?}", change.phase),
+                Err(error) => format!("error: {error}"),
+            },
+        }),
+    )?;
+    let mutations = writer_result?;
+    let completed = execution_result?;
     ensure!(
         completed.phase == MigrationPhase::Complete,
         "migration ended in {:?}",

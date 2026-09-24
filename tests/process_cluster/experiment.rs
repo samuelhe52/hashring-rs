@@ -26,6 +26,7 @@ async fn experiment_runner_preserves_reproducibility_artifacts() {
             "10000",
             "--migration-timeout-ms",
             "60000",
+            "--verbose",
         ])
         .output()
         .unwrap();
@@ -45,6 +46,7 @@ async fn experiment_runner_preserves_reproducibility_artifacts() {
     assert!(manifest["build"]["git_commit"].is_string());
     assert_eq!(manifest["config"]["pre_publish_delay_ms"], 250);
     assert_eq!(manifest["config"]["range_move_concurrency"], 16);
+    assert_eq!(manifest["config"]["verbose"], true);
     assert_eq!(
         manifest["build"]["source_tree_blake3"],
         manifest["runtime_source"]["source_tree_blake3"]
@@ -86,6 +88,11 @@ async fn experiment_runner_preserves_reproducibility_artifacts() {
             .join("process-logs/coordinator.stderr.log")
             .is_file()
     );
+    let coordinator_log =
+        std::fs::read_to_string(output_directory.join("process-logs/coordinator.stdout.log"))
+            .unwrap();
+    assert!(coordinator_log.contains("topology activation ready"));
+    assert!(!coordinator_log.contains("replica activation seeding planned"));
 }
 
 #[tokio::test]

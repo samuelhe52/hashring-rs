@@ -12,8 +12,8 @@ pub const MAX_TOKEN_ASSIGNMENTS: usize = 1_048_576;
 pub const MAX_NODE_ID_BYTES: usize = 32;
 pub const MAX_ENDPOINT_BYTES: usize = 256;
 pub const DEFAULT_DESIRED_REPLICATION_FACTOR: u32 = 3;
-pub const DEFAULT_MINIMUM_ADMITTED_COPIES: u32 = 2;
-pub const DEFAULT_MINIMUM_HEALTHY_FOLLOWERS: u32 = 1;
+pub const DEFAULT_MINIMUM_ADMITTED_COPIES: u32 = 1;
+pub const DEFAULT_MINIMUM_HEALTHY_FOLLOWERS: u32 = 0;
 pub const DEFAULT_MAX_REPLICA_LAG_MILLIS: u64 = 5_000;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -356,17 +356,10 @@ fn validate_config(config: &TopologyConfig) -> Result<(), TopologyError> {
         return Err(TopologyError::NoMaximumReplicaLag);
     }
     let guard = &config.write_availability_guard;
-    let intentional_rf_one_read_only = config.desired_replication_factor == 1
-        && guard.minimum_admitted_copies == DEFAULT_MINIMUM_ADMITTED_COPIES
-        && guard.minimum_healthy_followers == DEFAULT_MINIMUM_HEALTHY_FOLLOWERS;
-    if !intentional_rf_one_read_only
-        && guard.minimum_admitted_copies > config.desired_replication_factor
-    {
+    if guard.minimum_admitted_copies > config.desired_replication_factor {
         return Err(TopologyError::MinimumAdmittedCopiesExceedReplicationFactor);
     }
-    if !intentional_rf_one_read_only
-        && guard.minimum_healthy_followers > config.desired_replication_factor.saturating_sub(1)
-    {
+    if guard.minimum_healthy_followers > config.desired_replication_factor.saturating_sub(1) {
         return Err(TopologyError::MinimumHealthyFollowersExceedReplicationFactor);
     }
     Ok(())
@@ -722,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn impossible_write_guards_are_rejected_except_for_default_rf_one_read_only() {
+    fn impossible_write_guards_are_rejected_including_rf_one() {
         let mut config = TopologyConfig::default();
         config.write_availability_guard.minimum_admitted_copies = 4;
         assert!(matches!(
@@ -743,16 +736,19 @@ mod tests {
         };
         TopologySnapshot::new_with_config(1, 42, 16, members(), rf_one).unwrap();
 
-        let writable_rf_one = TopologyConfig {
+        let impossible_rf_one = TopologyConfig {
             desired_replication_factor: 1,
             write_availability_guard: WriteAvailabilityGuard {
-                minimum_admitted_copies: 1,
-                minimum_healthy_followers: 0,
+                minimum_admitted_copies: 2,
+                minimum_healthy_followers: 1,
                 ..WriteAvailabilityGuard::default()
             },
             ..TopologyConfig::default()
         };
-        TopologySnapshot::new_with_config(1, 42, 16, members(), writable_rf_one).unwrap();
+        assert!(matches!(
+            TopologySnapshot::new_with_config(1, 42, 16, members(), impossible_rf_one),
+            Err(TopologyError::MinimumAdmittedCopiesExceedReplicationFactor)
+        ));
     }
 
     #[test]

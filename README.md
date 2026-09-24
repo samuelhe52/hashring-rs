@@ -39,10 +39,11 @@ absent.
 
 Each virtual-node range has one owner and up to `desired_replication_factor-1`
 clockwise, distinct physical followers. The default is RF=3, `OwnerOnly`
-acknowledgements, at least two admitted copies, and at least one healthy
-follower. A follower is admitted only after a verified snapshot/stream catch-up;
-the guard prevents writes while those minimums are not met. It is a readiness
-gate, not a durability or zero-loss promise.
+acknowledgements, with a write guard requiring only the owner. Replication and
+follower repair continue asynchronously. A stricter guard can require admitted
+copies and healthy followers before writes; follower admission requires a
+verified snapshot/stream catch-up. The guard is a readiness gate, not a
+durability or zero-loss promise.
 
 ## Workspace architecture
 
@@ -81,6 +82,13 @@ target/release/hashring-rs experiment \
   --mode correctness --require-clean-source \
   --output results/correctness-10-node
 
+# Diagnostic run: print client retry reasons and retain coordinator
+# migration/repair progress in the process logs. A longer deadline is
+# diagnostic only; it does not establish the default 30-second deadline is met.
+target/release/hashring-rs experiment \
+  --mode correctness --verbose --operation-timeout-ms 120000 \
+  --output results/correctness-10-node-diagnostic
+
 # Nominal acceptance profile: 10 data nodes and 1,000,000 logical keys.
 target/release/hashring-rs experiment \
   --mode performance --require-clean-source \
@@ -103,6 +111,12 @@ runtime source status and diff, and a BLAKE3 digest of the executable. The
 the runner never overwrites a non-empty result directory. Formal runs use
 `--require-clean-source`; dirty ad hoc runs remain available but are explicitly
 marked `source_reproducible=false` in the manifest.
+`--verbose` is recorded in the manifest. It prints client retry details to the
+experiment command's stderr and adds coordinator phase and replica-seeding
+progress to the retained process logs. Capture the command's stderr separately
+when keeping a complete diagnostic record.
+If a concurrent writer fails, the runner records its error and waits for the
+migration outcome before writing the summary.
 The summary records initial-put throughput plus sampled end-to-end client `PUT`
 and direct owner-RPC `PUT` round-trip latency distributions (microseconds,
 p50/p95/p99/max). The latter includes the network hop and owner processing,
@@ -245,7 +259,8 @@ acknowledged writes not yet applied by the promoted follower can be lost**,
 including an acknowledged update reverting to an older value even when the
 key remains present.
 There is no fixed time-based maximum loss window: the configured 5-second lag
-threshold is a health check, not an RPO bound. `FirstSuccessor` closes that
+threshold applies only to a guard that requires healthy followers; it is not an
+RPO bound. `FirstSuccessor` closes that
 single-owner-loss window for acknowledged writes that reached its required
 follower, but not for simultaneous/correlated node losses. Data nodes are
 in-memory; neither policy provides crash durability. During degraded placement,
