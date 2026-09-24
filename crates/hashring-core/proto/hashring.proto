@@ -283,6 +283,14 @@ message PrepareDestinationRangeResponse {
 message NodeInfoResponse {
   string node_id = 1;
   string process_instance_id = 2;
+  uint64 dedup_bytes = 3;
+  uint64 dedup_peak_bytes = 4;
+  uint64 dedup_capacity_bytes = 5;
+  uint64 owner_dedup_rejections = 6;
+  uint64 follower_dedup_rejections = 7;
+  uint64 replication_reservation_rejections = 8;
+  uint64 replication_rpc_retries = 9;
+  uint64 replication_stream_peak_pending = 10;
 }
 
 message SnapshotPageRequest {
@@ -413,6 +421,7 @@ message OperationError {
   string owner_endpoint = 4;
   bool retryable = 5;
   bool unknown_write_outcome = 6;
+  uint64 retry_after_millis = 7;
 }
 
 message GetRequest {

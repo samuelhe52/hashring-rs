@@ -333,6 +333,7 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
         dedup: HashMap::new(),
         dedup_expirations: BinaryHeap::new(),
         dedup_bytes: 0,
+        dedup_peak_bytes: 0,
         ack_progress_needs_prune: false,
         next_ack_prune_at: Instant::now(),
     };
@@ -758,6 +759,16 @@ async fn unavailable_follower_backpressures_before_unbounded_queue_growth() {
     };
 
     assert_eq!(rejected.code, ErrorCode::ResourceExhausted as i32);
+    let pressure = owner
+        .get_process_info(Request::new(proto::Empty {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(pressure.replication_reservation_rejections, 1);
+    assert_eq!(
+        pressure.replication_stream_peak_pending,
+        REPLICATION_STREAM_QUEUE_CAPACITY as u64
+    );
     let state = owner.state.read().await;
     assert_eq!(state.next_sequence, successful as u64);
     assert_eq!(

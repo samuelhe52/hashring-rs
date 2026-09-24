@@ -171,11 +171,7 @@ impl DataNode for DataNodeService {
         if state.dedup_bytes.saturating_add(dedup_cost) > self.max_dedup_bytes {
             return Ok(Response::new(PutResponse {
                 current_epoch: state.topology.epoch,
-                error: Some(operation_error(
-                    ErrorCode::ResourceExhausted,
-                    "mutation retry window is full; retry with backoff",
-                    true,
-                )),
+                error: Some(self.owner_dedup_full_error(&state)),
                 ..Default::default()
             }));
         }
@@ -356,6 +352,7 @@ impl DataNode for DataNodeService {
         dedup.required_acks = required_acks.clone();
         dedup.retained_bytes += ack_cost;
         state.dedup_bytes += ack_cost;
+        state.dedup_peak_bytes = state.dedup_peak_bytes.max(state.dedup_bytes);
         let current_epoch = state.topology.epoch;
         self.replication_dispatch
             .dispatch(replications, reservations);
@@ -484,11 +481,7 @@ impl DataNode for DataNodeService {
         if state.dedup_bytes.saturating_add(dedup_cost) > self.max_dedup_bytes {
             return Ok(Response::new(DeleteResponse {
                 current_epoch: state.topology.epoch,
-                error: Some(operation_error(
-                    ErrorCode::ResourceExhausted,
-                    "mutation retry window is full; retry with backoff",
-                    true,
-                )),
+                error: Some(self.owner_dedup_full_error(&state)),
             }));
         }
 
@@ -665,6 +658,7 @@ impl DataNode for DataNodeService {
         dedup.required_acks = required_acks.clone();
         dedup.retained_bytes += ack_cost;
         state.dedup_bytes += ack_cost;
+        state.dedup_peak_bytes = state.dedup_peak_bytes.max(state.dedup_bytes);
         let current_epoch = state.topology.epoch;
         self.replication_dispatch
             .dispatch(replications, reservations);
@@ -948,6 +942,7 @@ impl DataNode for DataNodeService {
             version.owner_node_id.len(),
         )) > self.max_dedup_bytes
         {
+            self.record_follower_dedup_rejection(&state);
             return Err(Status::resource_exhausted(
                 "follower mutation retry window is full",
             ));
@@ -1132,9 +1127,33 @@ impl DataNode for DataNodeService {
         &self,
         _request: Request<proto::Empty>,
     ) -> Result<Response<NodeInfoResponse>, Status> {
+        let state = self.state.read().await;
         Ok(Response::new(NodeInfoResponse {
             node_id: self.node_id.clone(),
             process_instance_id: self.process_instance_id.clone(),
+            dedup_bytes: state.dedup_bytes as u64,
+            dedup_peak_bytes: state.dedup_peak_bytes as u64,
+            dedup_capacity_bytes: self.max_dedup_bytes as u64,
+            owner_dedup_rejections: self
+                .pressure
+                .owner_dedup_rejections
+                .load(AtomicOrdering::Relaxed),
+            follower_dedup_rejections: self
+                .pressure
+                .follower_dedup_rejections
+                .load(AtomicOrdering::Relaxed),
+            replication_reservation_rejections: self
+                .pressure
+                .replication_reservation_rejections
+                .load(AtomicOrdering::Relaxed),
+            replication_rpc_retries: self
+                .pressure
+                .replication_rpc_retries
+                .load(AtomicOrdering::Relaxed),
+            replication_stream_peak_pending: self
+                .pressure
+                .replication_stream_peak_pending
+                .load(AtomicOrdering::Relaxed),
         }))
     }
 

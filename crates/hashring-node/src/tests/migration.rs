@@ -421,10 +421,21 @@ async fn dedup_budget_rejects_before_apply_and_expired_records_free_capacity() {
         .await
         .unwrap()
         .into_inner();
+    let error = rejected.error.unwrap();
+    assert_eq!(error.code, ErrorCode::ResourceExhausted as i32);
+    assert!(error.retry_after_millis > 0);
+    assert!(error.retry_after_millis <= 60_000);
+    let pressure = service
+        .get_process_info(Request::new(proto::Empty {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(pressure.owner_dedup_rejections, 1);
     assert_eq!(
-        rejected.error.unwrap().code,
-        ErrorCode::ResourceExhausted as i32
+        pressure.dedup_capacity_bytes,
+        service.max_dedup_bytes as u64
     );
+    assert!(pressure.dedup_peak_bytes > 0);
     assert_eq!(service.state.read().await.next_sequence, 1);
     assert!(
         !service

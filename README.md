@@ -119,7 +119,15 @@ migration outcome before writing the summary.
 The summary records initial-put throughput plus sampled end-to-end client `PUT`
 and direct owner-RPC `PUT` round-trip latency distributions (microseconds,
 p50/p95/p99/max). The latter includes the network hop and owner processing,
-not CPU-only service time. Correctness runs record time to
+not CPU-only service time. After initial writes, `node_pressure_after_initial_put`
+records each node's current and peak mutation-retry-window bytes, its capacity,
+owner and follower budget rejections, replication reservation rejections,
+replication RPC retries, and peak pending entries in one replication stream.
+The same sample is retained as a `node_pressure_sampled` event, including when
+initial writes fail. These counters are per process and reset on node restart;
+the stream peak excludes the replication RPC currently in flight. A full owner
+retry window returns a retry delay hint, which the client observes within its
+existing logical-operation deadline. Correctness runs record time to
 full RF measured from each transition's execution start. Availability runs
 record failover publication and first recovered read times, sampled
 read-unavailability probes, acknowledged key preservation/loss (including a

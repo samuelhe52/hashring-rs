@@ -233,17 +233,38 @@ pub(super) fn prune_ack_progress(state: &mut NodeState) {
         .retain(|key, _| key.0 == current_epoch || live.contains(key));
 }
 
-pub(super) fn start_replication_dispatch(state: Arc<RwLock<NodeState>>) -> ReplicationDispatcher {
+pub(super) fn start_replication_dispatch(
+    state: Arc<RwLock<NodeState>>,
+    pressure: Arc<NodePressureStats>,
+) -> ReplicationDispatcher {
     ReplicationDispatcher {
         state,
         streams: Arc::new(StdMutex::new(HashMap::new())),
         failed_streams: Arc::new(StdMutex::new(HashSet::new())),
         retained_budget: Arc::new(Semaphore::new(MAX_PENDING_REPLICATION_BYTES)),
         active_rpc_budget: Arc::new(Semaphore::new(MAX_PENDING_REPLICATION_BYTES)),
+        pressure,
     }
 }
 
 impl ReplicationDispatcher {
+    fn record_reservation_rejection(&self, reason: &'static str, stream: &ReplicationStreamKey) {
+        let count = self
+            .pressure
+            .replication_reservation_rejections
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            + 1;
+        if count.is_power_of_two() {
+            tracing::info!(
+                owner = %stream.1,
+                follower = %stream.2,
+                reason,
+                count,
+                "replication reservation rejected"
+            );
+        }
+    }
+
     pub(super) fn prune_epoch(&self, epoch: u64) {
         if let Ok(mut streams) = self.streams.lock() {
             streams.retain(|(stream_epoch, _, _), sender| {
@@ -272,12 +293,18 @@ impl ReplicationDispatcher {
                     .try_acquire_many_owned(bytes)
                     .map(ReplicationBudget)
                     .map(Arc::new)
-                    .map_err(|_| ())
+                    .map_err(|_| {
+                        self.record_reservation_rejection(
+                            "retained_budget",
+                            &replication_stream_key(entry),
+                        );
+                    })
             })
             .transpose()?;
         for entry in entries {
             let stream_key = replication_stream_key(entry);
             if failed.contains(&stream_key) {
+                self.record_reservation_rejection("failed_stream", &stream_key);
                 return Err(());
             }
             let sender = streams.entry(stream_key.clone()).or_insert_with(|| {
@@ -286,12 +313,19 @@ impl ReplicationDispatcher {
                     self.state.clone(),
                     self.failed_streams.clone(),
                     self.active_rpc_budget.clone(),
-                    stream_key,
+                    self.pressure.clone(),
+                    stream_key.clone(),
                     receiver,
                 ));
                 sender
             });
-            let queue = sender.clone().try_reserve_owned().map_err(|_| ())?;
+            let queue = sender.clone().try_reserve_owned().map_err(|_| {
+                self.record_reservation_rejection("stream_queue", &stream_key);
+            })?;
+            self.pressure.replication_stream_peak_pending.fetch_max(
+                (sender.max_capacity() - sender.capacity()) as u64,
+                AtomicOrdering::Relaxed,
+            );
             reservations.push(ReplicationReservation {
                 queue,
                 budget: budget.clone().expect("non-empty replication has a budget"),
@@ -335,6 +369,7 @@ pub(super) async fn deliver_replication_stream(
     state: Arc<RwLock<NodeState>>,
     failed_streams: Arc<StdMutex<HashSet<ReplicationStreamKey>>>,
     active_rpc_budget: Arc<Semaphore>,
+    pressure: Arc<NodePressureStats>,
     stream_key: ReplicationStreamKey,
     mut entries: mpsc::Receiver<PendingReplication>,
 ) {
@@ -411,11 +446,21 @@ pub(super) async fn deliver_replication_stream(
                     break;
                 }
                 Ok(Err(status)) if retryable_replication_status(status.code()) => {
+                    let count = pressure
+                        .replication_rpc_retries
+                        .fetch_add(1, AtomicOrdering::Relaxed)
+                        + 1;
+                    if count.is_power_of_two() {
+                        tracing::info!(owner = %stream_key.1, follower = %stream_key.2, code = ?status.code(), message = status.message(), count, "replication RPC retrying");
+                    }
                     client = None;
                     tokio::time::sleep(retry_delay).await;
                     retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(1));
                 }
                 Err(_) => {
+                    pressure
+                        .replication_rpc_retries
+                        .fetch_add(1, AtomicOrdering::Relaxed);
                     client = None;
                     tokio::time::sleep(retry_delay).await;
                     retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(1));

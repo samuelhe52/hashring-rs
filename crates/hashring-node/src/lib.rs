@@ -6,7 +6,7 @@ use std::{
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
     },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -210,6 +210,16 @@ struct ReplicationDispatcher {
     failed_streams: Arc<StdMutex<HashSet<ReplicationStreamKey>>>,
     retained_budget: Arc<Semaphore>,
     active_rpc_budget: Arc<Semaphore>,
+    pressure: Arc<NodePressureStats>,
+}
+
+#[derive(Default)]
+struct NodePressureStats {
+    owner_dedup_rejections: AtomicU64,
+    follower_dedup_rejections: AtomicU64,
+    replication_reservation_rejections: AtomicU64,
+    replication_rpc_retries: AtomicU64,
+    replication_stream_peak_pending: AtomicU64,
 }
 
 struct NodeState {
@@ -228,6 +238,7 @@ struct NodeState {
     dedup: HashMap<String, DedupEntry>,
     dedup_expirations: BinaryHeap<Reverse<(Instant, String)>>,
     dedup_bytes: usize,
+    dedup_peak_bytes: usize,
     ack_progress_needs_prune: bool,
     next_ack_prune_at: Instant,
 }
@@ -273,6 +284,7 @@ pub struct DataNodeService {
     coordinator_channel: Channel,
     state: Arc<RwLock<NodeState>>,
     replication_dispatch: ReplicationDispatcher,
+    pressure: Arc<NodePressureStats>,
     refresh_lock: Arc<Mutex<()>>,
     max_key_bytes: usize,
     max_value_bytes: usize,

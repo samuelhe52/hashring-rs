@@ -679,8 +679,17 @@ impl HashringClient {
                     )
                     .await?;
                 }
-                self.retry_delay(deadline, attempt, unknown_write_outcome)
-                    .await?;
+                retry_delay_with_hint(
+                    deadline,
+                    attempt,
+                    unknown_write_outcome,
+                    if code == ErrorCode::ResourceExhausted {
+                        Duration::from_millis(error.retry_after_millis)
+                    } else {
+                        Duration::ZERO
+                    },
+                )
+                .await?;
                 Ok(true)
             }
             ErrorCode::LeaseExpired if error.retryable => {
@@ -893,10 +902,19 @@ async fn retry_delay(
     attempt: &mut u32,
     unknown_write_outcome: bool,
 ) -> Result<(), ClientError> {
+    retry_delay_with_hint(deadline, attempt, unknown_write_outcome, Duration::ZERO).await
+}
+
+async fn retry_delay_with_hint(
+    deadline: Instant,
+    attempt: &mut u32,
+    unknown_write_outcome: bool,
+    minimum_delay: Duration,
+) -> Result<(), ClientError> {
     let base_ms = 5_u64.saturating_mul(1_u64 << (*attempt).min(5));
     let jitter_ms = rand::random::<u64>() % (base_ms + 1);
     *attempt = attempt.saturating_add(1);
-    let delay = Duration::from_millis((base_ms + jitter_ms).min(200));
+    let delay = Duration::from_millis((base_ms + jitter_ms).min(200)).max(minimum_delay);
     let available = remaining(deadline, unknown_write_outcome)?;
     if delay >= available {
         tokio::time::sleep(available).await;
@@ -1489,6 +1507,38 @@ mod tests {
             coordinator.topology_calls.load(Ordering::SeqCst),
             initial_calls
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn capacity_retry_hint_waits_within_the_logical_deadline() {
+        let (endpoint, _, server) = start_fake_coordinator(Duration::ZERO).await;
+        let client = HashringClient::connect(endpoint, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let mut attempt = 0;
+        let error = client
+            .handle_retryable(
+                OperationError {
+                    code: ErrorCode::ResourceExhausted.into(),
+                    retryable: true,
+                    retry_after_millis: 100,
+                    ..Default::default()
+                },
+                1,
+                Instant::now() + Duration::from_millis(30),
+                &mut attempt,
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::DeadlineExceeded {
+                outcome: MutationOutcome::KnownNotApplied
+            }
+        ));
+        assert_eq!(attempt, 1);
         server.abort();
     }
 }

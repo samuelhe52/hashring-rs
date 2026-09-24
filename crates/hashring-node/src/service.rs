@@ -1,6 +1,52 @@
 use super::*;
 
 impl DataNodeService {
+    pub(super) fn owner_dedup_full_error(&self, state: &NodeState) -> OperationError {
+        let count = self
+            .pressure
+            .owner_dedup_rejections
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            + 1;
+        let retry_after_millis = dedup_retry_after_millis(state, Instant::now());
+        if count.is_power_of_two() {
+            tracing::info!(
+                node = %self.node_id,
+                count,
+                dedup_bytes = state.dedup_bytes,
+                capacity_bytes = self.max_dedup_bytes,
+                retry_after_millis,
+                "owner mutation retry window is full"
+            );
+        }
+        OperationError {
+            current_epoch: state.topology.epoch,
+            retry_after_millis,
+            ..operation_error(
+                ErrorCode::ResourceExhausted,
+                "mutation retry window is full; retry after capacity returns",
+                true,
+            )
+        }
+    }
+
+    pub(super) fn record_follower_dedup_rejection(&self, state: &NodeState) {
+        let count = self
+            .pressure
+            .follower_dedup_rejections
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            + 1;
+        if count.is_power_of_two() {
+            tracing::info!(
+                node = %self.node_id,
+                count,
+                dedup_bytes = state.dedup_bytes,
+                capacity_bytes = self.max_dedup_bytes,
+                retry_after_millis = dedup_retry_after_millis(state, Instant::now()),
+                "follower mutation retry window is full"
+            );
+        }
+    }
+
     pub(super) async fn ready_followers(
         &self,
         key: &[u8],
@@ -133,10 +179,12 @@ impl DataNodeService {
             dedup: HashMap::new(),
             dedup_expirations: BinaryHeap::new(),
             dedup_bytes: 0,
+            dedup_peak_bytes: 0,
             ack_progress_needs_prune: false,
             next_ack_prune_at: Instant::now(),
         }));
-        let replication_dispatch = start_replication_dispatch(state.clone());
+        let pressure = Arc::new(NodePressureStats::default());
+        let replication_dispatch = start_replication_dispatch(state.clone(), pressure.clone());
         let service = Self {
             node_id,
             process_instance_id,
@@ -144,6 +192,7 @@ impl DataNodeService {
             coordinator_channel,
             state,
             replication_dispatch,
+            pressure,
             refresh_lock: Arc::new(Mutex::new(())),
             max_key_bytes: DEFAULT_MAX_KEY_BYTES,
             max_value_bytes: DEFAULT_MAX_VALUE_BYTES,
@@ -387,6 +436,7 @@ impl DataNodeService {
             owner_endpoint: owner.endpoint.clone(),
             retryable: true,
             unknown_write_outcome: false,
+            retry_after_millis: 0,
         }))
     }
 }

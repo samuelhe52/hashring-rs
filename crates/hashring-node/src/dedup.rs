@@ -188,6 +188,15 @@ pub(super) fn insert_dedup_until(
         },
     );
     state.dedup_bytes += retained_bytes;
+    state.dedup_peak_bytes = state.dedup_peak_bytes.max(state.dedup_bytes);
+}
+
+pub(super) fn dedup_retry_after_millis(state: &NodeState, now: Instant) -> u64 {
+    state
+        .dedup_expirations
+        .peek()
+        .map(|Reverse((expires_at, _))| remaining_window_millis(*expires_at, now).max(1))
+        .unwrap_or(1)
 }
 
 pub(super) fn now_unix_millis() -> u64 {

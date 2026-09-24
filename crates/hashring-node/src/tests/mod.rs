@@ -46,10 +46,12 @@ fn service_for(node_id: &str, topology: TopologySnapshot) -> DataNodeService {
         dedup: HashMap::new(),
         dedup_expirations: BinaryHeap::new(),
         dedup_bytes: 0,
+        dedup_peak_bytes: 0,
         ack_progress_needs_prune: false,
         next_ack_prune_at: Instant::now(),
     }));
-    let replication_dispatch = start_replication_dispatch(state.clone());
+    let pressure = Arc::new(NodePressureStats::default());
+    let replication_dispatch = start_replication_dispatch(state.clone(), pressure.clone());
     DataNodeService {
         node_id: node_id.into(),
         process_instance_id: "instance-1".into(),
@@ -57,6 +59,7 @@ fn service_for(node_id: &str, topology: TopologySnapshot) -> DataNodeService {
         coordinator_channel: Endpoint::from_static("http://127.0.0.1:5000").connect_lazy(),
         state,
         replication_dispatch,
+        pressure,
         refresh_lock: Arc::new(Mutex::new(())),
         max_key_bytes: DEFAULT_MAX_KEY_BYTES,
         max_value_bytes: DEFAULT_MAX_VALUE_BYTES,
