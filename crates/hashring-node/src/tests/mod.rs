@@ -46,6 +46,8 @@ fn service_for(node_id: &str, topology: TopologySnapshot) -> DataNodeService {
         dedup: HashMap::new(),
         dedup_expirations: BinaryHeap::new(),
         dedup_bytes: 0,
+        ack_progress_needs_prune: false,
+        next_ack_prune_at: Instant::now(),
     }));
     let replication_dispatch = start_replication_dispatch(state.clone());
     DataNodeService {

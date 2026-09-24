@@ -113,6 +113,7 @@ pub(super) fn remaining_window_millis(expires_at: Instant, now: Instant) -> u64 
 }
 
 pub(super) fn purge_expired_dedup(state: &mut NodeState, now: Instant) {
+    let mut removed = false;
     while state
         .dedup_expirations
         .peek()
@@ -129,9 +130,15 @@ pub(super) fn purge_expired_dedup(state: &mut NodeState, now: Instant) {
             && let Some(entry) = state.dedup.remove(&mutation_id)
         {
             state.dedup_bytes -= entry.retained_bytes;
+            removed = true;
         }
     }
-    prune_ack_progress(state);
+    state.ack_progress_needs_prune |= removed;
+    if state.ack_progress_needs_prune && now >= state.next_ack_prune_at {
+        prune_ack_progress(state);
+        state.ack_progress_needs_prune = false;
+        state.next_ack_prune_at = now + std::time::Duration::from_secs(1);
+    }
 }
 
 pub(super) fn insert_dedup(

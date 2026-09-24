@@ -47,7 +47,10 @@ const REPLICATION_STREAM_QUEUE_CAPACITY: usize = 8;
 const MAX_REPLICATION_FINGERPRINTS: u64 = 4_096;
 const REPLICATION_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const IDEMPOTENCY_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
-const MAX_DEDUP_BYTES: usize = 16 * 1024 * 1024;
+// A node retains mutation IDs for the full retry window on both owner and
+// follower paths. The million-key, RF=3 profile can place well over 16 MiB of
+// live retry records on one node before the oldest records expire.
+const MAX_DEDUP_BYTES: usize = 128 * 1024 * 1024;
 const REQUIRED_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const PEER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -225,6 +228,8 @@ struct NodeState {
     dedup: HashMap<String, DedupEntry>,
     dedup_expirations: BinaryHeap<Reverse<(Instant, String)>>,
     dedup_bytes: usize,
+    ack_progress_needs_prune: bool,
+    next_ack_prune_at: Instant,
 }
 
 struct SnapshotPreparationGuard {

@@ -281,6 +281,38 @@ async fn follower_rejects_stale_wrong_owner_and_out_of_coverage_entries() {
     );
 }
 
+#[tokio::test]
+async fn expired_mutation_ids_eventually_release_old_ack_progress() {
+    let service = service();
+    let mut state = service.state.write().await;
+    let now = Instant::now();
+    let (sender, _) = watch::channel(0);
+    state
+        .ack_progress
+        .insert((0, "old-follower".into()), sender);
+    insert_dedup_until(
+        &mut state,
+        "expired".into(),
+        Arc::from(&b"key"[..]),
+        [0; 32],
+        RecordVersion {
+            topology_epoch: 0,
+            owner_sequence: 1,
+            owner_node_id: "node-1".into(),
+        },
+        false,
+        now - std::time::Duration::from_millis(1),
+    );
+    state.next_ack_prune_at = now + std::time::Duration::from_secs(1);
+
+    purge_expired_dedup(&mut state, now);
+    assert!(state.dedup.is_empty());
+    assert!(state.ack_progress.contains_key(&(0, "old-follower".into())));
+
+    purge_expired_dedup(&mut state, now + std::time::Duration::from_secs(1));
+    assert!(!state.ack_progress.contains_key(&(0, "old-follower".into())));
+}
+
 #[test]
 fn owner_assigns_independent_contiguous_sequences_per_follower() {
     let topology = replication_topology(3);
@@ -301,6 +333,8 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
         dedup: HashMap::new(),
         dedup_expirations: BinaryHeap::new(),
         dedup_bytes: 0,
+        ack_progress_needs_prune: false,
+        next_ack_prune_at: Instant::now(),
     };
     let version = RecordVersion {
         topology_epoch: 1,
