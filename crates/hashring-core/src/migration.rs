@@ -38,15 +38,10 @@ pub struct RangeMigration {
     pub end_inclusive: u64,
     pub source_node_id: String,
     pub destination_node_id: String,
-    #[serde(default)]
     pub source_endpoint: String,
-    #[serde(default)]
     pub destination_endpoint: String,
-    #[serde(default)]
     pub source_process_instance_id: String,
-    #[serde(default)]
     pub destination_process_instance_id: String,
-    #[serde(default)]
     pub source_cleaned: bool,
     pub snapshot_records: u64,
     pub changelog_watermark: u64,
@@ -66,26 +61,17 @@ pub struct ReplicaObligation {
 pub struct TopologyChange {
     pub change_id: String,
     pub base_epoch: u64,
-    #[serde(default)]
     pub base_topology: Option<TopologySnapshot>,
-    #[serde(default)]
     pub supersedes_change_id: Option<String>,
     pub target_topology: TopologySnapshot,
     pub phase: MigrationPhase,
     pub ranges: Vec<RangeMigration>,
-    #[serde(default)]
     pub replica_obligations: Vec<ReplicaObligation>,
-    #[serde(default)]
     pub stopped_node_ids: Vec<String>,
-    #[serde(default)]
     pub stopping_node_ids: Vec<String>,
-    #[serde(default)]
     pub stop_prepared_node_ids: Vec<String>,
-    #[serde(default)]
     pub failed_node_id: Option<String>,
-    #[serde(default)]
     pub activation_ready: bool,
-    #[serde(default)]
     pub direct_merge: bool,
 }
 

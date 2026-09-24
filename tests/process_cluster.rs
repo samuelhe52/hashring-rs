@@ -9,8 +9,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use hashring_rs::client::{ClientConfig, ClientError, HashringClient, MutationOutcome};
-use hashring_rs::{
+use hashring_client::{ClientConfig, ClientError, HashringClient, MutationOutcome};
+use hashring_core::{
     migration::{MigrationPhase, RangeMigration, TopologyChange},
     proto::{
         Empty, ErrorCode, GetRequest, coordinator_client::CoordinatorClient,

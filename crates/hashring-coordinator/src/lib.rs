@@ -40,7 +40,6 @@ use hashring_core::{
 };
 
 const TOPOLOGY_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("topology");
-const COMMITTED_KEY: &str = "committed";
 const CLUSTER_STATE_KEY: &str = "cluster-state-v1";
 fn unix_millis_now() -> u64 {
     SystemTime::now()
@@ -60,19 +59,12 @@ pub const NODE_LEASE_DURATION: Duration = Duration::from_secs(5);
 pub struct ClusterState {
     pub committed: TopologySnapshot,
     pub active_change: Option<TopologyChange>,
-    #[serde(default)]
     pub superseded_change: Option<TopologyChange>,
-    #[serde(default)]
     pub process_instances: BTreeMap<String, String>,
-    #[serde(default)]
     pub stop_confirmations: BTreeMap<String, BTreeSet<String>>,
-    #[serde(default)]
     pub replica_admissions: Vec<ReplicaAdmission>,
-    #[serde(default)]
     pub replica_repairs: Vec<ReplicaRepair>,
-    #[serde(default)]
     pub fenced_nodes: BTreeSet<String>,
-    #[serde(default)]
     pub recovery_block_reason: String,
 }
 
@@ -105,11 +97,8 @@ pub struct ReplicaRepair {
     pub owner_node_id: String,
     pub node_id: String,
     pub phase: ReplicaRepairPhase,
-    #[serde(default)]
     pub retry_count: u32,
-    #[serde(default)]
     pub next_attempt_unix_millis: u64,
-    #[serde(default)]
     pub last_error: String,
 }
 
@@ -453,26 +442,6 @@ impl CoordinatorRepository for RedbTopologyRepository {
         };
         if let Some(bytes) = table.get(CLUSTER_STATE_KEY)? {
             let mut state: ClusterState = serde_json::from_slice(bytes.value())?;
-            upgrade_persisted_state(&mut state)?;
-            reconcile_replica_repairs(&mut state)?;
-            state.validate()?;
-            return Ok(Some(state));
-        }
-        // Stores created by the first implementation contain only the committed
-        // topology. Promote them in memory; the next state write upgrades them.
-        if let Some(bytes) = table.get(COMMITTED_KEY)? {
-            let committed: TopologySnapshot = serde_json::from_slice(bytes.value())?;
-            let mut state = ClusterState {
-                committed,
-                active_change: None,
-                superseded_change: None,
-                process_instances: BTreeMap::new(),
-                stop_confirmations: BTreeMap::new(),
-                replica_admissions: Vec::new(),
-                replica_repairs: Vec::new(),
-                fenced_nodes: BTreeSet::new(),
-                recovery_block_reason: String::new(),
-            };
             reconcile_replica_repairs(&mut state)?;
             state.validate()?;
             return Ok(Some(state));
@@ -491,58 +460,6 @@ impl CoordinatorRepository for RedbTopologyRepository {
         write.commit()?;
         Ok(())
     }
-}
-
-fn upgrade_persisted_state(state: &mut ClusterState) -> Result<(), RepositoryError> {
-    let Some(change) = &mut state.active_change else {
-        return Ok(());
-    };
-    for range in &mut change.ranges {
-        if range.source_endpoint.is_empty() {
-            range.source_endpoint = state
-                .committed
-                .members
-                .iter()
-                .find(|member| member.node_id == range.source_node_id)
-                .map(|member| member.endpoint.clone())
-                .ok_or_else(|| {
-                    RepositoryError::InvalidState(format!(
-                        "missing source member {} for persisted range",
-                        range.source_node_id
-                    ))
-                })?;
-        }
-        if range.destination_endpoint.is_empty() {
-            range.destination_endpoint = change
-                .target_topology
-                .members
-                .iter()
-                .find(|member| member.node_id == range.destination_node_id)
-                .map(|member| member.endpoint.clone())
-                .ok_or_else(|| {
-                    RepositoryError::InvalidState(format!(
-                        "missing destination member {} for persisted range",
-                        range.destination_node_id
-                    ))
-                })?;
-        }
-    }
-    for node_id in &change.stop_prepared_node_ids {
-        if let Some(instance_id) = change
-            .ranges
-            .iter()
-            .find(|range| range.source_node_id == *node_id)
-            .map(|range| range.source_process_instance_id.as_str())
-            .filter(|instance_id| !instance_id.is_empty())
-        {
-            state
-                .stop_confirmations
-                .entry(node_id.clone())
-                .or_default()
-                .insert(instance_id.to_owned());
-        }
-    }
-    Ok(())
 }
 
 pub fn load_or_initialize(

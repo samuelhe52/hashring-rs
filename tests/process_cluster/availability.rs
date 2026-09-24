@@ -1063,7 +1063,7 @@ async fn node_self_fences_client_operations_when_coordinator_lease_expires() {
         .into_inner();
     assert_eq!(get.error.unwrap().code, ErrorCode::LeaseExpired as i32);
     let put = node
-        .put(hashring_rs::proto::PutRequest {
+        .put(hashring_core::proto::PutRequest {
             key: b"lease-key".to_vec(),
             value: b"new".to_vec(),
             topology_epoch: 1,

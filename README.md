@@ -47,9 +47,8 @@ durability or zero-loss promise.
 
 ## Workspace architecture
 
-The root package contains the operational binary and a compatibility facade for
-the original public module paths. Implementation responsibilities are separated
-into five workspace crates:
+The root package contains the operational binary. Implementation
+responsibilities are separated into five workspace crates:
 
 - `hashring-core` owns the protobuf contract, topology and migration domain
   types, shared protocol limits, and coordinator transport configuration;
