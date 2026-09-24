@@ -12,7 +12,7 @@ use hashring_rs::{
     limits::MAX_CONTROL_MESSAGE_BYTES,
     node::DataNodeService,
     proto::{coordinator_server::CoordinatorServer, data_node_server::DataNodeServer},
-    topology::{Member, TopologySnapshot},
+    topology::{Member, TopologyConfig, TopologySnapshot, WriteAckPolicy, WriteAvailabilityGuard},
 };
 use tonic::transport::Server;
 use tracing::info;
@@ -41,8 +41,14 @@ enum Command {
     Topology(ClientArgs),
     /// Persist a pending target topology and its moving-range plan.
     BeginChange(ChangeArgs),
+    /// Stage a committed-topology ACK policy transition.
+    BeginPolicyChange(PolicyChangeArgs),
+    /// Stage an RF or write-availability guard transition.
+    BeginConfigChange(ConfigChangeArgs),
     /// Print the active topology change, if any.
     ChangeStatus(ClientArgs),
+    /// Print per-range admission, liveness, write readiness, and repair state.
+    ReplicaStatus(ClientArgs),
     /// Execute the active migration through publication and cleanup.
     ExecuteChange(ExecuteChangeArgs),
     /// Run a reproducible separate-process correctness or performance experiment.
@@ -59,6 +65,14 @@ struct CoordinatorArgs {
     seed: u64,
     #[arg(long, default_value_t = 128)]
     virtual_nodes: u32,
+    #[arg(long, default_value_t = 3)]
+    desired_replication_factor: u32,
+    #[arg(long, default_value_t = 2)]
+    minimum_admitted_copies: u32,
+    #[arg(long, default_value_t = 1)]
+    minimum_healthy_followers: u32,
+    #[arg(long, default_value_t = 5_000)]
+    max_replica_lag_ms: u64,
     #[arg(long, default_value_t = 120_000)]
     migration_timeout_ms: u64,
     /// Maximum number of disjoint ranges moved concurrently within one topology change.
@@ -66,6 +80,8 @@ struct CoordinatorArgs {
     range_move_concurrency: NonZeroUsize,
     #[arg(long, default_value_t = 0, hide = true)]
     pre_publish_delay_ms: u64,
+    #[arg(long, default_value_t = 0, hide = true)]
+    post_publish_delay_ms: u64,
     /// Bootstrap member in NODE_ID=HTTP_ENDPOINT form. Required only for a new store.
     #[arg(long = "member")]
     members: Vec<String>,
@@ -141,6 +157,35 @@ struct ChangeArgs {
     members: Vec<String>,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum PolicyArg {
+    OwnerOnly,
+    FirstSuccessor,
+    AllReplicas,
+}
+
+#[derive(Args)]
+struct PolicyChangeArgs {
+    #[command(flatten)]
+    client: ClientArgs,
+    #[arg(long, value_enum)]
+    policy: PolicyArg,
+}
+
+#[derive(Args)]
+struct ConfigChangeArgs {
+    #[command(flatten)]
+    client: ClientArgs,
+    #[arg(long)]
+    desired_replication_factor: Option<u32>,
+    #[arg(long)]
+    minimum_admitted_copies: Option<u32>,
+    #[arg(long)]
+    minimum_healthy_followers: Option<u32>,
+    #[arg(long)]
+    max_replica_lag_ms: Option<u64>,
+}
+
 #[derive(Args)]
 struct ExecuteChangeArgs {
     #[arg(long, default_value = "http://127.0.0.1:50050")]
@@ -159,6 +204,7 @@ struct ExecuteChangeArgs {
 enum ExperimentModeArg {
     Correctness,
     Performance,
+    Availability,
 }
 
 #[derive(Args)]
@@ -169,8 +215,8 @@ struct ExperimentArgs {
     #[arg(long)]
     output: PathBuf,
     /// Peak node count. Correctness mode starts with one fewer node, then scales out and in.
-    #[arg(long, default_value_t = 10)]
-    nodes: usize,
+    #[arg(long)]
+    nodes: Option<usize>,
     /// Logical keys. Defaults to 20,000 for correctness and 1,000,000 for performance.
     #[arg(long)]
     keys: Option<u64>,
@@ -195,6 +241,15 @@ struct ExperimentArgs {
     /// Refuse the run unless build and runtime source match the same clean commit.
     #[arg(long)]
     require_clean_source: bool,
+    #[arg(long, default_value_t = 3)]
+    desired_replication_factor: u32,
+    #[arg(long, default_value_t = 2)]
+    minimum_admitted_copies: u32,
+    #[arg(long, default_value_t = 1)]
+    minimum_healthy_followers: u32,
+    /// Defaults to FirstSuccessor for availability and OwnerOnly otherwise.
+    #[arg(long, value_enum)]
+    policy: Option<PolicyArg>,
 }
 
 #[tokio::main]
@@ -211,7 +266,10 @@ async fn main() -> Result<()> {
         Command::Delete(args) => run_delete(args).await,
         Command::Topology(args) => run_topology(args).await,
         Command::BeginChange(args) => run_begin_change(args).await,
+        Command::BeginPolicyChange(args) => run_begin_policy_change(args).await,
+        Command::BeginConfigChange(args) => run_begin_config_change(args).await,
         Command::ChangeStatus(args) => run_change_status(args).await,
+        Command::ReplicaStatus(args) => run_replica_status(args).await,
         Command::ExecuteChange(args) => run_execute_change(args).await,
         Command::Experiment(args) => run_local_experiment(args).await,
     }
@@ -221,16 +279,24 @@ async fn run_local_experiment(args: ExperimentArgs) -> Result<()> {
     let mode = match args.mode {
         ExperimentModeArg::Correctness => ExperimentMode::Correctness,
         ExperimentModeArg::Performance => ExperimentMode::Performance,
+        ExperimentModeArg::Availability => ExperimentMode::Availability,
     };
     let key_count = args.keys.unwrap_or(match mode {
         ExperimentMode::Correctness => 20_000,
         ExperimentMode::Performance => 1_000_000,
+        ExperimentMode::Availability => 1_000,
     });
     let summary = run_experiment(
         ExperimentConfig {
             mode,
             output_dir: args.output,
-            node_count: args.nodes,
+            node_count: args
+                .nodes
+                .unwrap_or(if matches!(mode, ExperimentMode::Availability) {
+                    4
+                } else {
+                    10
+                }),
             key_count,
             value_bytes: args.value_bytes,
             concurrency: args.concurrency,
@@ -241,6 +307,20 @@ async fn run_local_experiment(args: ExperimentArgs) -> Result<()> {
             range_move_concurrency: args.range_move_concurrency,
             pre_publish_delay_ms: args.pre_publish_delay_ms,
             require_clean_source: args.require_clean_source,
+            desired_replication_factor: args.desired_replication_factor,
+            minimum_admitted_copies: args.minimum_admitted_copies,
+            minimum_healthy_followers: args.minimum_healthy_followers,
+            write_ack_policy: match args.policy.unwrap_or(
+                if matches!(mode, ExperimentMode::Availability) {
+                    PolicyArg::FirstSuccessor
+                } else {
+                    PolicyArg::OwnerOnly
+                },
+            ) {
+                PolicyArg::OwnerOnly => WriteAckPolicy::OwnerOnly,
+                PolicyArg::FirstSuccessor => WriteAckPolicy::FirstSuccessor,
+                PolicyArg::AllReplicas => WriteAckPolicy::AllReplicas,
+            },
         },
         std::env::current_exe()?,
     )
@@ -257,7 +337,7 @@ async fn run_coordinator(args: CoordinatorArgs) -> Result<()> {
     let bootstrap = if args.members.is_empty() {
         None
     } else {
-        Some(TopologySnapshot::new(
+        Some(TopologySnapshot::new_with_config(
             1,
             args.seed,
             args.virtual_nodes,
@@ -265,6 +345,15 @@ async fn run_coordinator(args: CoordinatorArgs) -> Result<()> {
                 .iter()
                 .map(|member| parse_member(member))
                 .collect::<Result<Vec<_>>>()?,
+            TopologyConfig {
+                desired_replication_factor: args.desired_replication_factor,
+                write_availability_guard: WriteAvailabilityGuard {
+                    minimum_admitted_copies: args.minimum_admitted_copies,
+                    minimum_healthy_followers: args.minimum_healthy_followers,
+                    max_replica_lag_millis: args.max_replica_lag_ms,
+                },
+                ..TopologyConfig::default()
+            },
         )?)
     };
     let state = load_or_initialize(repository.as_ref(), bootstrap)?;
@@ -283,16 +372,34 @@ async fn run_coordinator(args: CoordinatorArgs) -> Result<()> {
         Duration::from_millis(args.migration_timeout_ms),
     )
     .with_range_move_concurrency(args.range_move_concurrency.get())
-    .with_pre_publish_delay(Duration::from_millis(args.pre_publish_delay_ms));
+    .with_pre_publish_delay(Duration::from_millis(args.pre_publish_delay_ms))
+    .with_post_publish_delay(Duration::from_millis(args.post_publish_delay_ms));
     let recovery_service = service.clone();
     tokio::spawn(async move {
-        match recovery_service.resume_interrupted_change().await {
-            Ok(Some(change)) => {
-                tracing::info!(change_id = %change.change_id, phase = ?change.phase, "resumed topology change");
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            match recovery_service.resume_interrupted_change().await {
+                Ok(Some(change)) => {
+                    tracing::info!(change_id = %change.change_id, phase = ?change.phase, "resumed topology change");
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "topology change recovery remains pending");
+                }
             }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::error!(%error, "failed to resume topology change");
+            if let Err(error) = recovery_service.resume_replica_repairs().await {
+                tracing::warn!(%error, "replica repair pass failed");
+            }
+        }
+    });
+    let failure_service = service.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            if let Err(error) = failure_service.run_failure_pass().await {
+                tracing::warn!(%error, "automatic failure transition is pending");
             }
         }
     });
@@ -397,11 +504,120 @@ async fn run_begin_change(args: ChangeArgs) -> Result<()> {
     Ok(())
 }
 
+async fn run_begin_policy_change(args: PolicyChangeArgs) -> Result<()> {
+    let client = connect_client(&args.client).await?;
+    let policy = match args.policy {
+        PolicyArg::OwnerOnly => WriteAckPolicy::OwnerOnly,
+        PolicyArg::FirstSuccessor => WriteAckPolicy::FirstSuccessor,
+        PolicyArg::AllReplicas => WriteAckPolicy::AllReplicas,
+    };
+    let change = client.begin_write_policy_change(policy).await?;
+    println!("{}", serde_json::to_string_pretty(&change)?);
+    Ok(())
+}
+
+async fn run_begin_config_change(args: ConfigChangeArgs) -> Result<()> {
+    let client = connect_client(&args.client).await?;
+    let mut config = client.topology().await.config();
+    if let Some(rf) = args.desired_replication_factor {
+        config.desired_replication_factor = rf;
+    }
+    if let Some(copies) = args.minimum_admitted_copies {
+        config.write_availability_guard.minimum_admitted_copies = copies;
+    }
+    if let Some(followers) = args.minimum_healthy_followers {
+        config.write_availability_guard.minimum_healthy_followers = followers;
+    }
+    if let Some(lag) = args.max_replica_lag_ms {
+        config.write_availability_guard.max_replica_lag_millis = lag;
+    }
+    let change = client.begin_topology_config_change(config).await?;
+    println!("{}", serde_json::to_string_pretty(&change)?);
+    Ok(())
+}
+
 async fn run_change_status(args: ClientArgs) -> Result<()> {
     let client = connect_client(&args).await?;
     println!(
         "{}",
         serde_json::to_string_pretty(&client.topology_change().await?)?
+    );
+    Ok(())
+}
+
+async fn run_replica_status(args: ClientArgs) -> Result<()> {
+    let status = connect_client(&args).await?.replica_status().await?;
+    let ranges: Vec<_> = status
+        .ranges
+        .into_iter()
+        .map(|range| {
+            let followers: Vec<_> = range
+                .followers
+                .into_iter()
+                .map(|follower| {
+                    serde_json::json!({
+                        "node_id": follower.node_id,
+                        "admitted": follower.admitted,
+                        "leased": follower.leased,
+                        "healthy": follower.healthy,
+                        "process_instance_id": follower.process_instance_id,
+                        "verified_watermark": follower.verified_watermark,
+                        "stream_cursor": follower.stream_cursor,
+                        "stream_head": follower.stream_head,
+                        "last_ack_sequence": follower.last_ack_known.then_some(follower.last_ack_sequence),
+                        "lag_millis": follower.lag_known.then_some(follower.lag_millis),
+                        "repair_state": follower.repair_state,
+                        "repair_retry_count": follower.repair_retry_count,
+                        "repair_next_attempt_unix_millis": follower.repair_next_attempt_unix_millis,
+                        "repair_last_error": follower.repair_last_error,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "start_exclusive": range.start_exclusive,
+                "end_inclusive": range.end_inclusive,
+                "owner_node_id": range.owner_node_id,
+                "desired_rf": range.desired_rf,
+                "current_rf": range.current_rf,
+                "live_rf": range.live_rf,
+                "owner_leased": range.owner_leased,
+                "writable": range.writable,
+                "write_block_reason": range.write_block_reason,
+                "under_replicated": range.under_replicated,
+                "repairing": range.repairing,
+                "followers": followers,
+            })
+        })
+        .collect();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "topology_epoch": status.topology_epoch,
+            "topology_digest": status.topology_digest,
+            "desired_rf": status.desired_rf,
+            "write_ack_policy": hashring_core::proto::WriteAckPolicy::try_from(status.write_ack_policy)
+                .map(|policy| policy.as_str_name())
+                .unwrap_or("WRITE_ACK_POLICY_UNSPECIFIED"),
+            "active_change_id": status.active_change_id,
+            "active_change_phase": hashring_core::proto::MigrationPhase::try_from(status.active_change_phase)
+                .map(|phase| phase.as_str_name())
+                .unwrap_or("MIGRATION_PHASE_UNSPECIFIED"),
+            "recovery_block_reason": status.recovery_block_reason,
+            "activation_pending": status.activation_pending,
+            "nodes": status.nodes.into_iter().map(|node| serde_json::json!({
+                "node_id": node.node_id,
+                "process_instance_id": node.process_instance_id,
+                "leased": node.leased,
+                "suspected": node.suspected,
+                "fenced": node.fenced,
+                "joining": node.joining,
+                "lease_expires_unix_millis": (node.lease_expires_unix_millis != 0)
+                    .then_some(node.lease_expires_unix_millis),
+                "last_renewal_unix_millis": (node.last_renewal_unix_millis != 0)
+                    .then_some(node.last_renewal_unix_millis),
+            })).collect::<Vec<_>>(),
+            "ranges": ranges,
+        }))?
     );
     Ok(())
 }

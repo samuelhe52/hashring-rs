@@ -23,6 +23,22 @@ message TopologySnapshot {
   repeated Member members = 6;
   repeated TokenAssignment assignments = 7;
   string digest = 8;
+  uint32 desired_replication_factor = 9;
+  WriteAckPolicy write_ack_policy = 10;
+  WriteAvailabilityGuard write_availability_guard = 11;
+}
+
+enum WriteAckPolicy {
+  WRITE_ACK_POLICY_UNSPECIFIED = 0;
+  OWNER_ONLY = 1;
+  FIRST_SUCCESSOR = 2;
+  ALL_REPLICAS = 3;
+}
+
+message WriteAvailabilityGuard {
+  uint32 minimum_admitted_copies = 1;
+  uint32 minimum_healthy_followers = 2;
+  uint64 max_replica_lag_millis = 3;
 }
 
 service Coordinator {
@@ -32,7 +48,70 @@ service Coordinator {
   rpc GetTopologyChange(Empty) returns (GetTopologyChangeResponse);
   rpc ExecuteTopologyChange(ExecuteTopologyChangeRequest) returns (TopologyChangeSnapshot);
   rpc RegisterNode(RegisterNodeRequest) returns (Empty);
+  rpc RenewNodeLease(RenewNodeLeaseRequest) returns (RenewNodeLeaseResponse);
+  rpc ReportPeerHealth(ReportPeerHealthRequest) returns (Empty);
   rpc IsStopConfirmed(StopRequest) returns (StopConfirmationResponse);
+  rpc GetReplicaStatus(Empty) returns (ReplicaStatusResponse);
+}
+
+message ReplicaStatusResponse {
+  uint64 topology_epoch = 1;
+  repeated RangeReplicaStatus ranges = 2;
+  bool activation_pending = 3;
+  string topology_digest = 4;
+  uint32 desired_rf = 5;
+  WriteAckPolicy write_ack_policy = 6;
+  repeated NodeReplicaStatus nodes = 7;
+  string active_change_id = 8;
+  MigrationPhase active_change_phase = 9;
+  string recovery_block_reason = 10;
+}
+
+message NodeReplicaStatus {
+  string node_id = 1;
+  string process_instance_id = 2;
+  bool leased = 3;
+  bool suspected = 4;
+  bool fenced = 5;
+  bool joining = 6;
+  uint64 lease_expires_unix_millis = 7;
+  uint64 last_renewal_unix_millis = 8;
+}
+
+message RangeReplicaStatus {
+  uint64 start_exclusive = 1;
+  uint64 end_inclusive = 2;
+  string owner_node_id = 3;
+  uint32 desired_rf = 4;
+  // Registered owner plus durable admissions for their recorded process IDs.
+  // This is not a liveness or write-eligibility signal; inspect lag_known/lag.
+  uint32 current_rf = 5;
+  repeated FollowerReplicaStatus followers = 6;
+  bool owner_leased = 7;
+  uint32 live_rf = 8;
+  bool writable = 9;
+  string write_block_reason = 10;
+  bool under_replicated = 11;
+  bool repairing = 12;
+}
+
+message FollowerReplicaStatus {
+  string node_id = 1;
+  bool admitted = 2;
+  string process_instance_id = 3;
+  uint64 verified_watermark = 4;
+  uint64 stream_cursor = 5;
+  uint64 lag_millis = 6;
+  bool lag_known = 7;
+  string repair_state = 8;
+  uint64 stream_head = 9;
+  bool leased = 10;
+  bool healthy = 11;
+  uint32 repair_retry_count = 12;
+  uint64 repair_next_attempt_unix_millis = 13;
+  string repair_last_error = 14;
+  uint64 last_ack_sequence = 15;
+  bool last_ack_known = 16;
 }
 
 message CurrentEpochResponse {
@@ -80,10 +159,26 @@ message TopologyChangeSnapshot {
   repeated string stopped_node_ids = 6;
   repeated string stopping_node_ids = 7;
   repeated string stop_prepared_node_ids = 8;
+  repeated ReplicaObligation replica_obligations = 9;
+  string failed_node_id = 10;
+  bool activation_ready = 11;
+  TopologySnapshot base_topology = 12;
+  string supersedes_change_id = 13;
+  bool direct_merge = 14;
+}
+
+message ReplicaObligation {
+  uint64 start_exclusive = 1;
+  uint64 end_inclusive = 2;
+  string source_node_id = 3;
+  string destination_node_id = 4;
 }
 
 message BeginTopologyChangeRequest {
   repeated Member target_members = 1;
+  optional WriteAckPolicy target_write_ack_policy = 2;
+  optional uint32 target_desired_replication_factor = 3;
+  WriteAvailabilityGuard target_write_availability_guard = 4;
 }
 
 message ExecuteTopologyChangeRequest {
@@ -97,8 +192,32 @@ message RegisterNodeRequest {
   string process_instance_id = 2;
 }
 
+message RenewNodeLeaseRequest {
+  string node_id = 1;
+  string process_instance_id = 2;
+  uint64 topology_epoch = 3;
+}
+
+message RenewNodeLeaseResponse {
+  uint64 topology_epoch = 1;
+  uint64 lease_duration_millis = 2;
+}
+
+message ReportPeerHealthRequest {
+  string reporter_node_id = 1;
+  string reporter_process_instance_id = 2;
+  string peer_node_id = 3;
+  uint64 topology_epoch = 4;
+  bool reachable = 5;
+}
+
 message StopConfirmationResponse {
   bool confirmed = 1;
+}
+
+message PolicyWriteFenceRequest {
+  string change_id = 1;
+  uint64 base_epoch = 2;
 }
 
 message GetTopologyChangeResponse {
@@ -119,6 +238,29 @@ message MigrationRecord {
   bytes value = 2;
   RecordVersion version = 3;
   bool deleted = 4;
+  string mutation_id = 5;
+  uint64 remaining_window_millis = 6;
+}
+
+message DeduplicationRecord {
+  string mutation_id = 1;
+  bytes key = 2;
+  bytes fingerprint = 3;
+  RecordVersion version = 4;
+  bool deleted = 5;
+  uint64 remaining_window_millis = 6;
+}
+
+message DedupSnapshotPageResponse {
+  repeated DeduplicationRecord records = 1;
+  uint64 next_cursor = 2;
+  bool done = 3;
+}
+
+message ApplyDedupBatchRequest {
+  string change_id = 1;
+  string range_id = 2;
+  repeated DeduplicationRecord records = 3;
 }
 
 message JournalRecord {
@@ -192,6 +334,11 @@ message RangeDigestResponse {
 
 message InstallTopologyRequest {
   TopologySnapshot topology = 1;
+  bool require_lease = 2;
+}
+
+message AbortReplicaRepairsRequest {
+  uint64 topology_epoch = 1;
 }
 
 message StopRequest {
@@ -205,6 +352,43 @@ message RecordVersion {
   string owner_node_id = 3;
 }
 
+message ReplicationEntry {
+  uint64 topology_epoch = 1;
+  string owner_node_id = 2;
+  uint64 stream_sequence = 3;
+  bytes key = 4;
+  bytes value = 5;
+  bool deleted = 6;
+  RecordVersion version = 7;
+  string mutation_id = 8;
+}
+
+message ReplicateMutationResponse {
+  uint64 applied_stream_sequence = 1;
+}
+
+message ReplicationProgressRequest {
+  uint64 topology_epoch = 1;
+  string owner_node_id = 2;
+  string follower_node_id = 3;
+}
+
+message ReplicationProgressResponse {
+  string process_instance_id = 1;
+  uint64 stream_sequence = 2;
+  uint64 oldest_unacked_unix_millis = 3;
+  uint64 last_ack_sequence = 4;
+  bool last_ack_known = 5;
+}
+
+message ReplicationCheckpointRequest {
+  uint64 topology_epoch = 1;
+  string owner_node_id = 2;
+  string follower_node_id = 3;
+  uint64 stream_sequence = 4;
+  repeated RangeControlRequest verified_ranges = 5;
+}
+
 enum ErrorCode {
   ERROR_CODE_UNSPECIFIED = 0;
   NOT_FOUND = 1;
@@ -215,6 +399,11 @@ enum ErrorCode {
   TOO_LARGE = 6;
   RESOURCE_EXHAUSTED = 7;
   INVALID_ARGUMENT = 8;
+  MUTATION_ID_CONFLICT = 9;
+  TEMPORARILY_UNAVAILABLE = 10;
+  OUTCOME_UNKNOWN = 11;
+  REPLICA_NOT_READY = 12;
+  LEASE_EXPIRED = 13;
 }
 
 message OperationError {
@@ -267,12 +456,17 @@ service DataNode {
   rpc Get(GetRequest) returns (GetResponse);
   rpc Put(PutRequest) returns (PutResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc ReplicateMutation(ReplicationEntry) returns (ReplicateMutationResponse);
+  rpc GetReplicationProgress(ReplicationProgressRequest) returns (ReplicationProgressResponse);
+  rpc InstallReplicationCheckpoint(ReplicationCheckpointRequest) returns (ReplicationProgressResponse);
   rpc PrepareSourceRange(PrepareRangeRequest) returns (PrepareSourceRangeResponse);
   rpc PrepareDestinationRange(PrepareRangeRequest) returns (PrepareDestinationRangeResponse);
   rpc GetProcessInfo(Empty) returns (NodeInfoResponse);
   rpc ReadSnapshotPage(SnapshotPageRequest) returns (SnapshotPageResponse);
+  rpc ReadDedupSnapshotPage(SnapshotPageRequest) returns (DedupSnapshotPageResponse);
   rpc ReadChangelogPage(ChangelogPageRequest) returns (ChangelogPageResponse);
   rpc ApplyMigrationBatch(ApplyMigrationBatchRequest) returns (Empty);
+  rpc ApplyDedupBatch(ApplyDedupBatchRequest) returns (Empty);
   rpc PauseRangeWrites(RangeControlRequest) returns (PauseRangeResponse);
   rpc SourceRangeDigest(RangeControlRequest) returns (RangeDigestResponse);
   rpc DestinationRangeDigest(RangeControlRequest) returns (RangeDigestResponse);
@@ -280,7 +474,10 @@ service DataNode {
   rpc ActivateDestinationRange(RangeControlRequest) returns (Empty);
   rpc CleanupSourceRange(RangeControlRequest) returns (Empty);
   rpc AbortRangeMigration(RangeControlRequest) returns (Empty);
+  rpc AbortReplicaRepairs(AbortReplicaRepairsRequest) returns (Empty);
   rpc InstallTopology(InstallTopologyRequest) returns (Empty);
+  rpc PausePolicyWrites(PolicyWriteFenceRequest) returns (Empty);
+  rpc ResumePolicyWrites(PolicyWriteFenceRequest) returns (Empty);
   rpc PrepareStop(StopRequest) returns (Empty);
   rpc Stop(StopRequest) returns (Empty);
 }
