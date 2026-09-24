@@ -49,7 +49,6 @@ pub struct ExperimentConfig {
     pub range_move_concurrency: usize,
     pub pre_publish_delay_ms: u64,
     pub require_clean_source: bool,
-    #[serde(default)]
     pub verbose: bool,
     pub desired_replication_factor: u32,
     pub minimum_admitted_copies: u32,
