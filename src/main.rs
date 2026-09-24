@@ -6,8 +6,8 @@ use hashring_experiment::{ExperimentConfig, ExperimentMode, run_experiment};
 use hashring_rs::{
     client::HashringClient,
     coordinator::{
-        CoordinatorService, DEFAULT_RANGE_MOVE_CONCURRENCY, RedbTopologyRepository,
-        load_or_initialize,
+        CoordinatorRepository, CoordinatorService, DEFAULT_RANGE_MOVE_CONCURRENCY,
+        RedbTopologyRepository, load_or_initialize,
     },
     limits::MAX_CONTROL_MESSAGE_BYTES,
     node::DataNodeService,
@@ -67,10 +67,10 @@ struct CoordinatorArgs {
     virtual_nodes: u32,
     #[arg(long, default_value_t = 3)]
     desired_replication_factor: u32,
-    #[arg(long, default_value_t = 1)]
-    minimum_admitted_copies: u32,
-    #[arg(long, default_value_t = 0)]
-    minimum_healthy_followers: u32,
+    #[arg(long)]
+    minimum_admitted_copies: Option<u32>,
+    #[arg(long)]
+    minimum_healthy_followers: Option<u32>,
     #[arg(long, default_value_t = 5_000)]
     max_replica_lag_ms: u64,
     #[arg(long, default_value_t = 120_000)]
@@ -355,11 +355,7 @@ async fn run_coordinator(args: CoordinatorArgs) -> Result<()> {
                 .collect::<Result<Vec<_>>>()?,
             TopologyConfig {
                 desired_replication_factor: args.desired_replication_factor,
-                write_availability_guard: WriteAvailabilityGuard {
-                    minimum_admitted_copies: args.minimum_admitted_copies,
-                    minimum_healthy_followers: args.minimum_healthy_followers,
-                    max_replica_lag_millis: args.max_replica_lag_ms,
-                },
+                write_availability_guard: coordinator_bootstrap_guard(&args, repository.as_ref())?,
                 ..TopologyConfig::default()
             },
         )?)
@@ -420,6 +416,38 @@ async fn run_coordinator(args: CoordinatorArgs) -> Result<()> {
         .serve_with_shutdown(args.listen, shutdown_signal())
         .await?;
     Ok(())
+}
+
+fn coordinator_bootstrap_guard(
+    args: &CoordinatorArgs,
+    repository: &impl CoordinatorRepository,
+) -> Result<WriteAvailabilityGuard> {
+    let persisted_guard =
+        if args.minimum_admitted_copies.is_none() || args.minimum_healthy_followers.is_none() {
+            repository
+                .load_state()?
+                .map(|state| state.committed.write_availability_guard)
+        } else {
+            None
+        };
+    let default_guard = WriteAvailabilityGuard::default();
+    Ok(WriteAvailabilityGuard {
+        minimum_admitted_copies: args.minimum_admitted_copies.unwrap_or_else(|| {
+            persisted_guard
+                .as_ref()
+                .map_or(default_guard.minimum_admitted_copies, |guard| {
+                    guard.minimum_admitted_copies
+                })
+        }),
+        minimum_healthy_followers: args.minimum_healthy_followers.unwrap_or_else(|| {
+            persisted_guard
+                .as_ref()
+                .map_or(default_guard.minimum_healthy_followers, |guard| {
+                    guard.minimum_healthy_followers
+                })
+        }),
+        max_replica_lag_millis: args.max_replica_lag_ms,
+    })
 }
 
 async fn run_node(args: NodeArgs) -> Result<()> {
@@ -671,5 +699,109 @@ fn bytes_arg(text: Option<String>, encoded: Option<String>, name: &str) -> Resul
 async fn shutdown_signal() {
     if let Err(error) = tokio::signal::ctrl_c().await {
         tracing::error!(%error, "failed to install shutdown signal handler");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn omitted_bootstrap_guard_preserves_existing_topology() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository =
+            RedbTopologyRepository::open(directory.path().join("coordinator.redb")).unwrap();
+        let command = [
+            "hashring-rs",
+            "coordinator",
+            "--member",
+            "n1=http://127.0.0.1:5001",
+            "--desired-replication-factor",
+            "1",
+        ];
+        let Cli {
+            command: Command::Coordinator(args),
+        } = Cli::try_parse_from(command).unwrap()
+        else {
+            unreachable!();
+        };
+        assert_eq!(
+            coordinator_bootstrap_guard(&args, &repository).unwrap(),
+            WriteAvailabilityGuard::default()
+        );
+
+        let legacy = WriteAvailabilityGuard {
+            minimum_admitted_copies: 2,
+            minimum_healthy_followers: 1,
+            ..WriteAvailabilityGuard::default()
+        };
+        let members = vec![parse_member(&args.members[0]).unwrap()];
+        let persisted = TopologySnapshot::new_with_config(
+            1,
+            args.seed,
+            args.virtual_nodes,
+            members.clone(),
+            TopologyConfig {
+                desired_replication_factor: 1,
+                write_availability_guard: legacy.clone(),
+                ..TopologyConfig::default()
+            },
+        )
+        .unwrap();
+        load_or_initialize(&repository, Some(persisted.clone())).unwrap();
+
+        let resolved = coordinator_bootstrap_guard(&args, &repository).unwrap();
+        assert_eq!(resolved, legacy);
+        let bootstrap = TopologySnapshot::new_with_config(
+            1,
+            args.seed,
+            args.virtual_nodes,
+            members.clone(),
+            TopologyConfig {
+                desired_replication_factor: 1,
+                write_availability_guard: resolved,
+                ..TopologyConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            load_or_initialize(&repository, Some(bootstrap))
+                .unwrap()
+                .committed,
+            persisted
+        );
+
+        let Cli {
+            command: Command::Coordinator(explicit),
+        } = Cli::try_parse_from([
+            "hashring-rs",
+            "coordinator",
+            "--member",
+            "n1=http://127.0.0.1:5001",
+            "--desired-replication-factor",
+            "1",
+            "--minimum-admitted-copies",
+            "1",
+            "--minimum-healthy-followers",
+            "0",
+        ])
+        .unwrap()
+        else {
+            unreachable!();
+        };
+        let conflicting = TopologySnapshot::new_with_config(
+            1,
+            explicit.seed,
+            explicit.virtual_nodes,
+            members,
+            TopologyConfig {
+                desired_replication_factor: 1,
+                write_availability_guard: coordinator_bootstrap_guard(&explicit, &repository)
+                    .unwrap(),
+                ..TopologyConfig::default()
+            },
+        )
+        .unwrap();
+        assert!(load_or_initialize(&repository, Some(conflicting)).is_err());
     }
 }
