@@ -2,18 +2,17 @@ use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf, sync::Arc, time::Du
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use hashring_experiment::{ExperimentConfig, ExperimentMode, run_experiment};
-use hashring_rs::{
-    client::HashringClient,
-    coordinator::{
-        CoordinatorService, DEFAULT_RANGE_MOVE_CONCURRENCY, RedbTopologyRepository,
-        load_or_initialize,
-    },
+use hashring_client::HashringClient;
+use hashring_coordinator::{
+    CoordinatorService, DEFAULT_RANGE_MOVE_CONCURRENCY, RedbTopologyRepository, load_or_initialize,
+};
+use hashring_core::{
     limits::MAX_CONTROL_MESSAGE_BYTES,
-    node::DataNodeService,
     proto::{coordinator_server::CoordinatorServer, data_node_server::DataNodeServer},
     topology::{Member, TopologyConfig, TopologySnapshot, WriteAckPolicy, WriteAvailabilityGuard},
 };
+use hashring_experiment::{ExperimentConfig, ExperimentMode, run_experiment};
+use hashring_node::DataNodeService;
 use tonic::transport::Server;
 use tracing::info;
 use tracing_subscriber::EnvFilter;

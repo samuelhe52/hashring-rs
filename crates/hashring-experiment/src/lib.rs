@@ -63,7 +63,6 @@ pub struct ExperimentSummary {
     pub elapsed_seconds: f64,
     pub final_epoch: Option<u64>,
     pub measurements: BTreeMap<String, Measurement>,
-    #[serde(default)]
     pub observations: BTreeMap<String, Value>,
 }
 

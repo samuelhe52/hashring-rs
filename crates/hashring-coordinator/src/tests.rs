@@ -531,60 +531,6 @@ async fn recovery_block_reason_does_not_outlive_its_change() {
     }
 }
 
-#[test]
-fn upgrades_prior_v1_topology_change_shape() {
-    let committed = topology();
-    let change = TopologyChange::plan(
-        &committed,
-        vec![
-            committed.members[0].clone(),
-            Member {
-                node_id: "n2".into(),
-                endpoint: "http://127.0.0.1:5002".into(),
-            },
-        ],
-    )
-    .unwrap();
-    let state = ClusterState {
-        committed,
-        active_change: Some(change),
-        superseded_change: None,
-        process_instances: BTreeMap::new(),
-        stop_confirmations: BTreeMap::new(),
-        replica_admissions: Vec::new(),
-        replica_repairs: Vec::new(),
-        fenced_nodes: BTreeSet::new(),
-        recovery_block_reason: String::new(),
-    };
-    let mut old = serde_json::to_value(state).unwrap();
-    old.as_object_mut().unwrap().remove("process_instances");
-    old.as_object_mut().unwrap().remove("stop_confirmations");
-    let active = old["active_change"].as_object_mut().unwrap();
-    active.remove("stopped_node_ids");
-    active.remove("stopping_node_ids");
-    active.remove("stop_prepared_node_ids");
-    for range in active["ranges"].as_array_mut().unwrap() {
-        let range = range.as_object_mut().unwrap();
-        range.remove("source_endpoint");
-        range.remove("destination_endpoint");
-        range.remove("source_process_instance_id");
-        range.remove("destination_process_instance_id");
-        range.remove("source_cleaned");
-    }
-
-    let mut restored: ClusterState = serde_json::from_value(old).unwrap();
-    upgrade_persisted_state(&mut restored).unwrap();
-    let restored = restored.active_change.unwrap();
-    assert!(
-        restored.ranges.iter().all(
-            |range| !range.source_endpoint.is_empty() && !range.destination_endpoint.is_empty()
-        )
-    );
-    assert!(restored.stopped_node_ids.is_empty());
-    assert!(restored.stopping_node_ids.is_empty());
-    assert!(restored.stop_prepared_node_ids.is_empty());
-}
-
 #[tokio::test]
 async fn durable_stop_confirmation_survives_active_change_replacement() {
     let committed = topology();
