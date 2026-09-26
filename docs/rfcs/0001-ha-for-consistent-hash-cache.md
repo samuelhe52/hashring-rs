@@ -1,5 +1,9 @@
 # RFC 0001: HA for Consistent-Hash Cache
 
+For a visual introduction and a 15-minute team presentation, start with
+[How the HA cache fits together](0001-ha-walkthrough.md). This RFC contains the
+detailed design contract, implementation plan, and acceptance criteria.
+
 ## Goal
 
 Extend the current in-memory consistent-hash cache with range-level replication, configurable write acknowledgement, automatic node failover, and asynchronous replication repair without replacing classic consistent hashing with fixed slots.
