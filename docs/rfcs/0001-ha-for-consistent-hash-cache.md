@@ -1,5 +1,9 @@
 # RFC 0001: HA for Consistent-Hash Cache
 
+For a visual introduction and a 15-minute team presentation, start with
+[How the HA cache fits together](0001-ha-walkthrough.md). This RFC contains the
+detailed design contract, implementation plan, and acceptance criteria.
+
 ## Goal
 
 Extend the current in-memory consistent-hash cache with range-level replication, configurable write acknowledgement, automatic node failover, and asynchronous replication repair without replacing classic consistent hashing with fixed slots.
@@ -179,13 +183,13 @@ If a required follower is unavailable before the owner applies the mutation, ret
 ### 3. Mutation idempotency
 
 - The client generates one globally unique mutation ID and reuses it for every retry of the same logical mutation.
-- The owner stores the mutation fingerprint and original result.
+- The owner stores a deduplication receipt with the mutation fingerprint, assigned version, delete flag, and expiry.
 - Deduplication records are replicated with the mutation so a promoted successor can answer the retry consistently.
-- `idempotency_window` defaults to 60 seconds and is part of the public retry contract.
-- Entries must not be silently evicted before the window expires.
+- The receipt retention period is 60 seconds and is part of the public retry contract.
+- Receipts must not be silently evicted before their retention period ends.
 - If the deduplication budget cannot retain the guarantee, reject new writes with retryable backpressure before applying them.
 - A repeated ID with a different fingerprint is a non-retryable conflict.
-- The guarantee is at-most-once within the configured window, not indefinite exactly-once execution.
+- The guarantee is at-most-once during the receipt retention period, not indefinite exactly-once execution.
 
 ### 4. Error and retry semantics
 
@@ -387,7 +391,7 @@ Exit criteria:
 
 - `FirstSuccessor` waits for that exact replica, never an arbitrary follower;
 - `AllReplicas` never degrades to the admitted subset;
-- ambiguous RPC retries execute once within the idempotency window;
+- ambiguous RPC retries execute once during the receipt retention period;
 - `OwnerOnly` latency does not wait for a follower ACK;
 - policy-strengthening tests prove the readiness barrier occurs before publication.
 
@@ -451,10 +455,10 @@ Exit criteria:
 
 ### Idempotency and retry
 
-- the same mutation ID and fingerprint returns the original result;
+- the same mutation ID and fingerprint reuses the assigned version without reapplying the mutation;
 - the same ID with different content is rejected;
 - deduplication state survives first-successor promotion;
-- entries remain protected for the full idempotency window;
+- receipts remain protected for the full receipt retention period;
 - budget exhaustion backpressures before mutation application;
 - client retries preserve mutation ID and end-to-end deadline;
 - stale topology triggers refresh; unchanged degraded topology triggers jittered backoff;

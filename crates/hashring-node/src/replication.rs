@@ -217,6 +217,29 @@ pub(super) fn replication_fingerprint(entry: &ReplicationEntry) -> String {
 }
 
 pub(super) fn prune_ack_progress(state: &mut NodeState) {
+    let started = diagnostics::enabled().then(Instant::now);
+    if started.is_some() {
+        state.cleanup_timing.ack_prune_calls += 1;
+    }
+    let current_epoch = state.topology.epoch;
+    // Current-epoch streams must always remain available for replication and
+    // ACK waiters. Receipt references matter only when retiring older streams.
+    // Checking the small stream tables avoids scanning every live receipt on
+    // each expiry tick during steady-state writes.
+    if state
+        .ack_progress
+        .keys()
+        .chain(state.ack_process_instances.keys())
+        .all(|(epoch, _)| *epoch == current_epoch)
+    {
+        if let Some(started) = started {
+            state.cleanup_timing.ack_prune_nanos += diagnostics::nanos(started.elapsed());
+        }
+        return;
+    }
+    if started.is_some() {
+        state.cleanup_timing.ack_prune_scanned_receipts += state.dedup.len() as u64;
+    }
     let live: HashSet<_> = state
         .dedup
         .values()
@@ -227,23 +250,49 @@ pub(super) fn prune_ack_progress(state: &mut NodeState) {
                 .map(|(epoch, node_id, _)| (*epoch, node_id.clone()))
         })
         .collect();
-    let current_epoch = state.topology.epoch;
     state
         .ack_progress
         .retain(|key, _| key.0 == current_epoch || live.contains(key));
+    state
+        .ack_process_instances
+        .retain(|key, _| key.0 == current_epoch || live.contains(key));
+    if let Some(started) = started {
+        state.cleanup_timing.ack_prune_nanos += diagnostics::nanos(started.elapsed());
+    }
 }
 
-pub(super) fn start_replication_dispatch(state: Arc<RwLock<NodeState>>) -> ReplicationDispatcher {
+pub(super) fn start_replication_dispatch(
+    state: Arc<RwLock<NodeState>>,
+    pressure: Arc<NodePressureStats>,
+) -> ReplicationDispatcher {
     ReplicationDispatcher {
         state,
         streams: Arc::new(StdMutex::new(HashMap::new())),
         failed_streams: Arc::new(StdMutex::new(HashSet::new())),
         retained_budget: Arc::new(Semaphore::new(MAX_PENDING_REPLICATION_BYTES)),
         active_rpc_budget: Arc::new(Semaphore::new(MAX_PENDING_REPLICATION_BYTES)),
+        pressure,
     }
 }
 
 impl ReplicationDispatcher {
+    fn record_reservation_rejection(&self, reason: &'static str, stream: &ReplicationStreamKey) {
+        let count = self
+            .pressure
+            .replication_reservation_rejections
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            + 1;
+        if count.is_power_of_two() {
+            tracing::info!(
+                owner = %stream.1,
+                follower = %stream.2,
+                reason,
+                count,
+                "replication reservation rejected"
+            );
+        }
+    }
+
     pub(super) fn prune_epoch(&self, epoch: u64) {
         if let Ok(mut streams) = self.streams.lock() {
             streams.retain(|(stream_epoch, _, _), sender| {
@@ -272,12 +321,18 @@ impl ReplicationDispatcher {
                     .try_acquire_many_owned(bytes)
                     .map(ReplicationBudget)
                     .map(Arc::new)
-                    .map_err(|_| ())
+                    .map_err(|_| {
+                        self.record_reservation_rejection(
+                            "retained_budget",
+                            &replication_stream_key(entry),
+                        );
+                    })
             })
             .transpose()?;
         for entry in entries {
             let stream_key = replication_stream_key(entry);
             if failed.contains(&stream_key) {
+                self.record_reservation_rejection("failed_stream", &stream_key);
                 return Err(());
             }
             let sender = streams.entry(stream_key.clone()).or_insert_with(|| {
@@ -286,12 +341,19 @@ impl ReplicationDispatcher {
                     self.state.clone(),
                     self.failed_streams.clone(),
                     self.active_rpc_budget.clone(),
-                    stream_key,
+                    self.pressure.clone(),
+                    stream_key.clone(),
                     receiver,
                 ));
                 sender
             });
-            let queue = sender.clone().try_reserve_owned().map_err(|_| ())?;
+            let queue = sender.clone().try_reserve_owned().map_err(|_| {
+                self.record_reservation_rejection("stream_queue", &stream_key);
+            })?;
+            self.pressure.replication_stream_peak_pending.fetch_max(
+                (sender.max_capacity() - sender.capacity()) as u64,
+                AtomicOrdering::Relaxed,
+            );
             reservations.push(ReplicationReservation {
                 queue,
                 budget: budget.clone().expect("non-empty replication has a budget"),
@@ -335,6 +397,7 @@ pub(super) async fn deliver_replication_stream(
     state: Arc<RwLock<NodeState>>,
     failed_streams: Arc<StdMutex<HashSet<ReplicationStreamKey>>>,
     active_rpc_budget: Arc<Semaphore>,
+    pressure: Arc<NodePressureStats>,
     stream_key: ReplicationStreamKey,
     mut entries: mpsc::Receiver<PendingReplication>,
 ) {
@@ -382,15 +445,25 @@ pub(super) async fn deliver_replication_stream(
             drop(active_budget);
             match result {
                 Ok(Ok(response))
-                    if response.applied_stream_sequence >= prepared.stream_sequence =>
+                    if !response.process_instance_id.is_empty()
+                        && response.applied_stream_sequence >= prepared.stream_sequence =>
                 {
-                    let mut state = state.write().await;
+                    let mut state = diagnostics::write(&state, &pressure.ack_write_timing).await;
+                    let stream = (
+                        prepared.mutation.topology_epoch,
+                        prepared.follower_node_id.clone(),
+                    );
+                    let previous_instance = state
+                        .ack_process_instances
+                        .insert(stream, response.process_instance_id.clone());
+                    let instance_changed =
+                        previous_instance.as_ref() != Some(&response.process_instance_id);
                     if let Some(progress) = state.ack_progress.get(&(
                         prepared.mutation.topology_epoch,
                         prepared.follower_node_id.clone(),
                     )) {
                         progress.send_if_modified(|sequence| {
-                            if *sequence < response.applied_stream_sequence {
+                            if instance_changed || *sequence < response.applied_stream_sequence {
                                 *sequence = response.applied_stream_sequence;
                                 true
                             } else {
@@ -411,11 +484,21 @@ pub(super) async fn deliver_replication_stream(
                     break;
                 }
                 Ok(Err(status)) if retryable_replication_status(status.code()) => {
+                    let count = pressure
+                        .replication_rpc_retries
+                        .fetch_add(1, AtomicOrdering::Relaxed)
+                        + 1;
+                    if count.is_power_of_two() {
+                        tracing::info!(owner = %stream_key.1, follower = %stream_key.2, code = ?status.code(), message = status.message(), count, "replication RPC retrying");
+                    }
                     client = None;
                     tokio::time::sleep(retry_delay).await;
                     retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(1));
                 }
                 Err(_) => {
+                    pressure
+                        .replication_rpc_retries
+                        .fetch_add(1, AtomicOrdering::Relaxed);
                     client = None;
                     tokio::time::sleep(retry_delay).await;
                     retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(1));

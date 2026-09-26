@@ -162,20 +162,30 @@ pub(super) async fn replay_changelog(
     }
 }
 
-pub(super) async fn connect_node(
-    endpoint: &str,
-    deadline: Instant,
-) -> Result<DataNodeClient<tonic::transport::Channel>, Status> {
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .ok_or_else(|| Status::deadline_exceeded("migration deadline exceeded"))?;
-    let client = tokio::time::timeout(remaining, DataNodeClient::connect(endpoint.to_owned()))
-        .await
-        .map_err(|_| Status::deadline_exceeded("migration deadline exceeded"))?
-        .map_err(|error| Status::unavailable(error.to_string()))?;
-    Ok(client
-        .max_decoding_message_size(MAX_CONTROL_MESSAGE_BYTES)
-        .max_encoding_message_size(MAX_CONTROL_MESSAGE_BYTES))
+impl CoordinatorService {
+    pub(super) async fn connect_node(
+        &self,
+        endpoint: &str,
+        deadline: Instant,
+    ) -> Result<DataNodeClient<tonic::transport::Channel>, Status> {
+        if Instant::now() >= deadline {
+            return Err(Status::deadline_exceeded("migration deadline exceeded"));
+        }
+        let mut channels = self.node_channels.lock().await;
+        if !channels.contains_key(endpoint) {
+            let channel = Endpoint::from_shared(endpoint.to_owned())
+                .map_err(|error| {
+                    Status::invalid_argument(format!("invalid node endpoint: {error:?}"))
+                })?
+                .connect_lazy();
+            channels.insert(endpoint.to_owned(), channel);
+        }
+        // Channel clones share one reconnecting HTTP/2 connection. The caller's
+        // rpc_before deadline bounds connection establishment and the RPC.
+        Ok(DataNodeClient::new(channels[endpoint].clone())
+            .max_decoding_message_size(hashring_core::limits::MAX_CONTROL_MESSAGE_BYTES)
+            .max_encoding_message_size(hashring_core::limits::MAX_CONTROL_MESSAGE_BYTES))
+    }
 }
 
 pub(super) async fn rpc_before<T, F>(deadline: Instant, future: F) -> Result<Response<T>, Status>

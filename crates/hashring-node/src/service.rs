@@ -1,16 +1,112 @@
 use super::*;
 
 impl DataNodeService {
+    pub(super) fn owner_dedup_full_error(&self, state: &NodeState) -> OperationError {
+        let count = self
+            .pressure
+            .owner_dedup_rejections
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            + 1;
+        let retry_after_millis = dedup_retry_after_millis(state, Instant::now());
+        if count.is_power_of_two() {
+            tracing::info!(
+                node = %self.node_id,
+                count,
+                dedup_bytes = state.dedup_bytes,
+                capacity_bytes = self.max_dedup_bytes,
+                retry_after_millis,
+                "owner deduplication receipt store is full"
+            );
+        }
+        OperationError {
+            current_epoch: state.topology.epoch,
+            retry_after_millis,
+            ..operation_error(
+                ErrorCode::ResourceExhausted,
+                "owner deduplication receipt store is full; retry after capacity returns",
+                true,
+            )
+        }
+    }
+
+    pub(super) fn record_follower_dedup_rejection(&self, state: &NodeState) {
+        let count = self
+            .pressure
+            .follower_dedup_rejections
+            .fetch_add(1, AtomicOrdering::Relaxed)
+            + 1;
+        if count.is_power_of_two() {
+            tracing::info!(
+                node = %self.node_id,
+                count,
+                dedup_bytes = state.dedup_bytes,
+                capacity_bytes = self.max_dedup_bytes,
+                retry_after_millis = dedup_retry_after_millis(state, Instant::now()),
+                "follower deduplication receipt store is full"
+            );
+        }
+    }
+
     pub(super) async fn ready_followers(
         &self,
         key: &[u8],
     ) -> Result<(u64, Vec<String>), OperationError> {
-        let topology = self.state.read().await.topology.clone();
+        let state = self.state.read().await;
+        let topology = &state.topology;
         let token = topology.key_token(key);
         let guard = &topology.write_availability_guard;
         let needs_status = guard.minimum_admitted_copies > 1
             || guard.minimum_healthy_followers > 0
             || topology.write_ack_policy != WriteAckPolicy::OwnerOnly;
+        // The lease carries policy-required admissions bound to follower process
+        // identities. Actual mutation ACKs validate those identities below.
+        if guard.minimum_admitted_copies <= 1 && guard.minimum_healthy_followers == 0 {
+            let replicas = topology
+                .replica_node_ids_for_token(token)
+                .map_err(|error| temporarily_unavailable(topology.epoch, error.to_string()))?;
+            let count = match topology.write_ack_policy {
+                WriteAckPolicy::OwnerOnly => 0,
+                WriteAckPolicy::FirstSuccessor => 1,
+                WriteAckPolicy::AllReplicas => topology.desired_replication_factor as usize - 1,
+            };
+            if replicas.len() < count + 1 {
+                return Err(temporarily_unavailable(
+                    topology.epoch,
+                    "required replica placement is unavailable",
+                ));
+            }
+            let followers = replicas.iter().skip(1).take(count);
+            if followers
+                .clone()
+                .any(|node_id| !state.admitted_followers.contains_key(*node_id))
+            {
+                return Err(temporarily_unavailable(
+                    topology.epoch,
+                    "required follower admission is unavailable",
+                ));
+            }
+            let now = now_unix_millis();
+            if followers.clone().any(|node_id| {
+                state
+                    .owner_stream_unacked
+                    .get(&(topology.epoch, (*node_id).to_owned()))
+                    .and_then(|queue| queue.front())
+                    .is_some_and(|(_, sent_at)| {
+                        now.saturating_sub(*sent_at) > guard.max_replica_lag_millis
+                    })
+            }) {
+                return Err(temporarily_unavailable(
+                    topology.epoch,
+                    "required follower exceeds the replication lag bound",
+                ));
+            }
+            return Ok((
+                topology.epoch,
+                followers.map(|node_id| (*node_id).to_owned()).collect(),
+            ));
+        }
+        let topology = topology.clone();
+        drop(state);
         let status = if needs_status {
             let result = tokio::time::timeout(REPLICATION_RPC_TIMEOUT, async {
                 let mut client = configure_coordinator_client(CoordinatorClient::new(
@@ -45,6 +141,8 @@ impl DataNodeService {
         &self,
         required: &[RequiredAck],
         epoch: u64,
+        mutation_id: &str,
+        version: &RecordVersion,
     ) -> Result<(), OperationError> {
         if !required.is_empty() {
             let mut receivers = {
@@ -75,12 +173,37 @@ impl DataNodeService {
                 .await
                 .unwrap_or_else(|_| Err(outcome_unknown(epoch)))?;
         }
-        let state = self.state.read().await;
+        if required.is_empty() {
+            let state = self.state.read().await;
+            if state.lease.is_none_or(|(lease_epoch, expires_at)| {
+                lease_epoch != epoch
+                    || state.topology.epoch != epoch
+                    || Instant::now() >= expires_at
+            }) {
+                return Err(outcome_unknown(epoch));
+            }
+            return Ok(());
+        }
+        let mut state = self.state.write().await;
         if state.lease.is_none_or(|(lease_epoch, expires_at)| {
             lease_epoch != epoch || state.topology.epoch != epoch || Instant::now() >= expires_at
         }) {
             return Err(outcome_unknown(epoch));
         }
+        for (stream_epoch, node_id, sequence) in required {
+            let stream = (*stream_epoch, node_id.clone());
+            let admitted = state.admitted_followers.get(node_id);
+            if admitted.is_none()
+                || state.ack_process_instances.get(&stream) != admitted
+                || state
+                    .ack_progress
+                    .get(&stream)
+                    .is_none_or(|progress| *progress.borrow() < *sequence)
+            {
+                return Err(outcome_unknown(epoch));
+            }
+        }
+        complete_required_acks(&mut state, mutation_id, version);
         Ok(())
     }
 
@@ -124,6 +247,8 @@ impl DataNodeService {
             owner_stream_sequences: HashMap::new(),
             owner_stream_unacked: HashMap::new(),
             ack_progress: HashMap::new(),
+            ack_process_instances: HashMap::new(),
+            admitted_followers: HashMap::new(),
             follower_streams: HashMap::new(),
             sources: HashMap::new(),
             destinations: HashMap::new(),
@@ -133,8 +258,13 @@ impl DataNodeService {
             dedup: HashMap::new(),
             dedup_expirations: BinaryHeap::new(),
             dedup_bytes: 0,
+            dedup_peak_bytes: 0,
+            ack_progress_needs_prune: false,
+            next_ack_prune_at: Instant::now(),
+            cleanup_timing: proto::ReceiptCleanupTiming::default(),
         }));
-        let replication_dispatch = start_replication_dispatch(state.clone());
+        let pressure = Arc::new(NodePressureStats::default());
+        let replication_dispatch = start_replication_dispatch(state.clone(), pressure.clone());
         let service = Self {
             node_id,
             process_instance_id,
@@ -142,6 +272,7 @@ impl DataNodeService {
             coordinator_channel,
             state,
             replication_dispatch,
+            pressure,
             refresh_lock: Arc::new(Mutex::new(())),
             max_key_bytes: DEFAULT_MAX_KEY_BYTES,
             max_value_bytes: DEFAULT_MAX_VALUE_BYTES,
@@ -183,6 +314,11 @@ impl DataNodeService {
         if response.topology_epoch == epoch && response.lease_duration_millis > 0 {
             let mut state = self.state.write().await;
             if state.topology.epoch == epoch {
+                state.admitted_followers = response
+                    .admitted_followers
+                    .into_iter()
+                    .map(|follower| (follower.node_id, follower.process_instance_id))
+                    .collect();
                 state.lease = Some((
                     epoch,
                     sent_at + std::time::Duration::from_millis(response.lease_duration_millis),
@@ -322,6 +458,7 @@ impl DataNodeService {
             let epoch = topology.epoch;
             if epoch != state.topology.epoch {
                 state.lease = None;
+                state.admitted_followers.clear();
                 clear_replica_repair_staging(&mut state);
             }
             state.topology = topology;
@@ -385,6 +522,7 @@ impl DataNodeService {
             owner_endpoint: owner.endpoint.clone(),
             retryable: true,
             unknown_write_outcome: false,
+            retry_after_millis: 0,
         }))
     }
 }

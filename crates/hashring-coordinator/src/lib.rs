@@ -24,7 +24,7 @@ use tonic::{
 };
 
 use hashring_core::{
-    limits::{MAX_CONTROL_MESSAGE_BYTES, MAX_MIGRATION_PAGE_BYTES},
+    limits::MAX_MIGRATION_PAGE_BYTES,
     migration::{
         MAX_MIGRATION_RANGES, MAX_REPLICA_OBLIGATIONS, MigrationError, MigrationPhase,
         RangeMigration, TopologyChange,
@@ -505,7 +505,7 @@ pub struct CoordinatorService {
     peer_failures: Arc<Mutex<BTreeMap<(String, String), PeerFailure>>>,
     pending_change_outages: Arc<Mutex<BTreeMap<String, Instant>>>,
     pending_change_probe_cursor: Arc<Mutex<usize>>,
-    status_channels: Arc<Mutex<BTreeMap<String, Channel>>>,
+    node_channels: Arc<Mutex<BTreeMap<String, Channel>>>,
     startup_at: Instant,
     repair_interrupt: Arc<watch::Sender<u64>>,
 }

@@ -223,6 +223,14 @@ impl HashringClient {
         self.inner.topology.read().await.clone()
     }
 
+    // Request routing needs only the epoch and selected endpoint. Keep them
+    // from one snapshot without cloning every token assignment on each attempt.
+    async fn route(&self, key: &[u8]) -> Result<(u64, String), ClientError> {
+        let topology = self.inner.topology.read().await;
+        let owner = topology.owner(key).map_err(anyhow::Error::from)?;
+        Ok((topology.epoch, owner.endpoint.clone()))
+    }
+
     pub async fn refresh_topology(&self) -> Result<TopologySnapshot, ClientError> {
         self.refresh_topology_for(self.inner.operation_timeout, false, None)
             .await
@@ -390,15 +398,14 @@ impl HashringClient {
         let mut attempt = 0_u32;
 
         loop {
-            let topology = self.topology().await;
-            let owner = topology.owner(&key).map_err(anyhow::Error::from)?.clone();
-            let mut client = match self.data_node_client(&owner.endpoint, deadline).await {
+            let (epoch, endpoint) = self.route(&key).await?;
+            let mut client = match self.data_node_client(&endpoint, deadline).await {
                 Ok(client) => client,
                 Err(ClientError::DeadlineExceeded { .. }) => {
                     return Err(ClientError::deadline(false));
                 }
                 Err(_) => {
-                    self.refresh_after_unavailable(topology.epoch, deadline, false)
+                    self.refresh_after_unavailable(epoch, deadline, false)
                         .await?;
                     self.retry_delay(deadline, &mut attempt, false).await?;
                     continue;
@@ -407,7 +414,7 @@ impl HashringClient {
 
             let request = GetRequest {
                 key: key.clone(),
-                topology_epoch: topology.epoch,
+                topology_epoch: epoch,
                 request_id: request_id.clone(),
             };
             let response = match tokio::time::timeout(
@@ -419,7 +426,7 @@ impl HashringClient {
                 Ok(Ok(response)) => response.into_inner(),
                 Ok(Err(status)) => {
                     if retryable_status(&status) {
-                        self.refresh_after_unavailable(topology.epoch, deadline, false)
+                        self.refresh_after_unavailable(epoch, deadline, false)
                             .await?;
                         self.retry_delay(deadline, &mut attempt, false).await?;
                         continue;
@@ -433,7 +440,7 @@ impl HashringClient {
 
             if let Some(error) = response.error {
                 if self
-                    .handle_retryable(error.clone(), topology.epoch, deadline, &mut attempt, false)
+                    .handle_retryable(error.clone(), epoch, deadline, &mut attempt, false)
                     .await?
                 {
                     continue;
@@ -445,7 +452,7 @@ impl HashringClient {
                 version: response.version.ok_or(ClientError::MissingVersion)?,
                 topology_epoch: response.current_epoch,
             };
-            if response.current_epoch > topology.epoch {
+            if response.current_epoch > epoch {
                 self.trigger_background_refresh(response.current_epoch);
             }
             return Ok(output);
@@ -465,15 +472,14 @@ impl HashringClient {
         let mut unknown_write_outcome = false;
 
         loop {
-            let topology = self.topology().await;
-            let owner = topology.owner(&key).map_err(anyhow::Error::from)?.clone();
-            let mut client = match self.data_node_client(&owner.endpoint, deadline).await {
+            let (epoch, endpoint) = self.route(&key).await?;
+            let mut client = match self.data_node_client(&endpoint, deadline).await {
                 Ok(client) => client,
                 Err(ClientError::DeadlineExceeded { .. }) => {
                     return Err(ClientError::deadline(unknown_write_outcome));
                 }
                 Err(_) => {
-                    self.refresh_after_unavailable(topology.epoch, deadline, unknown_write_outcome)
+                    self.refresh_after_unavailable(epoch, deadline, unknown_write_outcome)
                         .await?;
                     self.retry_delay(deadline, &mut attempt, unknown_write_outcome)
                         .await?;
@@ -484,7 +490,7 @@ impl HashringClient {
             let request = PutRequest {
                 key: key.clone(),
                 value: value.clone(),
-                topology_epoch: topology.epoch,
+                topology_epoch: epoch,
                 request_id: request_id.clone(),
             };
             let response = match tokio::time::timeout(
@@ -498,13 +504,9 @@ impl HashringClient {
                     unknown_write_outcome =
                         accumulated_write_ambiguity(unknown_write_outcome, &status);
                     if retryable_status(&status) {
-                        tracing::debug!(operation = "put", request_id, attempt, epoch = topology.epoch, code = ?status.code(), message = status.message(), "retrying node RPC status");
-                        self.refresh_after_unavailable(
-                            topology.epoch,
-                            deadline,
-                            unknown_write_outcome,
-                        )
-                        .await?;
+                        tracing::debug!(operation = "put", request_id, attempt, epoch = epoch, code = ?status.code(), message = status.message(), "retrying node RPC status");
+                        self.refresh_after_unavailable(epoch, deadline, unknown_write_outcome)
+                            .await?;
                         self.retry_delay(deadline, &mut attempt, unknown_write_outcome)
                             .await?;
                         continue;
@@ -520,12 +522,12 @@ impl HashringClient {
                 let error_unknown_write_outcome =
                     unknown_write_outcome || operation_may_have_applied(&error);
                 if error.retryable {
-                    tracing::debug!(operation = "put", request_id, attempt, epoch = topology.epoch, code = ?ErrorCode::try_from(error.code).unwrap_or(ErrorCode::Unspecified), message = error.message, "retrying operation response");
+                    tracing::debug!(operation = "put", request_id, attempt, epoch = epoch, code = ?ErrorCode::try_from(error.code).unwrap_or(ErrorCode::Unspecified), message = error.message, "retrying operation response");
                 }
                 if self
                     .handle_retryable(
                         error.clone(),
-                        topology.epoch,
+                        epoch,
                         deadline,
                         &mut attempt,
                         error_unknown_write_outcome,
@@ -542,7 +544,7 @@ impl HashringClient {
                 version: response.version.ok_or(ClientError::MissingVersion)?,
                 topology_epoch: response.current_epoch,
             };
-            if response.current_epoch > topology.epoch {
+            if response.current_epoch > epoch {
                 self.trigger_background_refresh(response.current_epoch);
             }
             return Ok(output);
@@ -557,15 +559,14 @@ impl HashringClient {
         let mut unknown_write_outcome = false;
 
         loop {
-            let topology = self.topology().await;
-            let owner = topology.owner(&key).map_err(anyhow::Error::from)?.clone();
-            let mut client = match self.data_node_client(&owner.endpoint, deadline).await {
+            let (epoch, endpoint) = self.route(&key).await?;
+            let mut client = match self.data_node_client(&endpoint, deadline).await {
                 Ok(client) => client,
                 Err(ClientError::DeadlineExceeded { .. }) => {
                     return Err(ClientError::deadline(unknown_write_outcome));
                 }
                 Err(_) => {
-                    self.refresh_after_unavailable(topology.epoch, deadline, unknown_write_outcome)
+                    self.refresh_after_unavailable(epoch, deadline, unknown_write_outcome)
                         .await?;
                     self.retry_delay(deadline, &mut attempt, unknown_write_outcome)
                         .await?;
@@ -575,7 +576,7 @@ impl HashringClient {
 
             let request = DeleteRequest {
                 key: key.clone(),
-                topology_epoch: topology.epoch,
+                topology_epoch: epoch,
                 request_id: request_id.clone(),
             };
             let response = match tokio::time::timeout(
@@ -589,13 +590,9 @@ impl HashringClient {
                     unknown_write_outcome =
                         accumulated_write_ambiguity(unknown_write_outcome, &status);
                     if retryable_status(&status) {
-                        tracing::debug!(operation = "delete", request_id, attempt, epoch = topology.epoch, code = ?status.code(), message = status.message(), "retrying node RPC status");
-                        self.refresh_after_unavailable(
-                            topology.epoch,
-                            deadline,
-                            unknown_write_outcome,
-                        )
-                        .await?;
+                        tracing::debug!(operation = "delete", request_id, attempt, epoch = epoch, code = ?status.code(), message = status.message(), "retrying node RPC status");
+                        self.refresh_after_unavailable(epoch, deadline, unknown_write_outcome)
+                            .await?;
                         self.retry_delay(deadline, &mut attempt, unknown_write_outcome)
                             .await?;
                         continue;
@@ -611,12 +608,12 @@ impl HashringClient {
                 let error_unknown_write_outcome =
                     unknown_write_outcome || operation_may_have_applied(&error);
                 if error.retryable {
-                    tracing::debug!(operation = "delete", request_id, attempt, epoch = topology.epoch, code = ?ErrorCode::try_from(error.code).unwrap_or(ErrorCode::Unspecified), message = error.message, "retrying operation response");
+                    tracing::debug!(operation = "delete", request_id, attempt, epoch = epoch, code = ?ErrorCode::try_from(error.code).unwrap_or(ErrorCode::Unspecified), message = error.message, "retrying operation response");
                 }
                 if self
                     .handle_retryable(
                         error.clone(),
-                        topology.epoch,
+                        epoch,
                         deadline,
                         &mut attempt,
                         error_unknown_write_outcome,
@@ -632,7 +629,7 @@ impl HashringClient {
             let output = DeleteOutput {
                 topology_epoch: response.current_epoch,
             };
-            if response.current_epoch > topology.epoch {
+            if response.current_epoch > epoch {
                 self.trigger_background_refresh(response.current_epoch);
             }
             return Ok(output);
@@ -679,8 +676,17 @@ impl HashringClient {
                     )
                     .await?;
                 }
-                self.retry_delay(deadline, attempt, unknown_write_outcome)
-                    .await?;
+                retry_delay_with_hint(
+                    deadline,
+                    attempt,
+                    unknown_write_outcome,
+                    if code == ErrorCode::ResourceExhausted {
+                        Duration::from_millis(error.retry_after_millis)
+                    } else {
+                        Duration::ZERO
+                    },
+                )
+                .await?;
                 Ok(true)
             }
             ErrorCode::LeaseExpired if error.retryable => {
@@ -893,10 +899,19 @@ async fn retry_delay(
     attempt: &mut u32,
     unknown_write_outcome: bool,
 ) -> Result<(), ClientError> {
+    retry_delay_with_hint(deadline, attempt, unknown_write_outcome, Duration::ZERO).await
+}
+
+async fn retry_delay_with_hint(
+    deadline: Instant,
+    attempt: &mut u32,
+    unknown_write_outcome: bool,
+    minimum_delay: Duration,
+) -> Result<(), ClientError> {
     let base_ms = 5_u64.saturating_mul(1_u64 << (*attempt).min(5));
     let jitter_ms = rand::random::<u64>() % (base_ms + 1);
     *attempt = attempt.saturating_add(1);
-    let delay = Duration::from_millis((base_ms + jitter_ms).min(200));
+    let delay = Duration::from_millis((base_ms + jitter_ms).min(200)).max(minimum_delay);
     let available = remaining(deadline, unknown_write_outcome)?;
     if delay >= available {
         tokio::time::sleep(available).await;
@@ -1489,6 +1504,38 @@ mod tests {
             coordinator.topology_calls.load(Ordering::SeqCst),
             initial_calls
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn capacity_retry_hint_waits_within_the_logical_deadline() {
+        let (endpoint, _, server) = start_fake_coordinator(Duration::ZERO).await;
+        let client = HashringClient::connect(endpoint, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let mut attempt = 0;
+        let error = client
+            .handle_retryable(
+                OperationError {
+                    code: ErrorCode::ResourceExhausted.into(),
+                    retryable: true,
+                    retry_after_millis: 100,
+                    ..Default::default()
+                },
+                1,
+                Instant::now() + Duration::from_millis(30),
+                &mut attempt,
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::DeadlineExceeded {
+                outcome: MutationOutcome::KnownNotApplied
+            }
+        ));
+        assert_eq!(attempt, 1);
         server.abort();
     }
 }

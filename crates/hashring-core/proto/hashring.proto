@@ -198,9 +198,15 @@ message RenewNodeLeaseRequest {
   uint64 topology_epoch = 3;
 }
 
+message AdmittedFollower {
+  string node_id = 1;
+  string process_instance_id = 2;
+}
+
 message RenewNodeLeaseResponse {
   uint64 topology_epoch = 1;
   uint64 lease_duration_millis = 2;
+  repeated AdmittedFollower admitted_followers = 3;
 }
 
 message ReportPeerHealthRequest {
@@ -239,7 +245,7 @@ message MigrationRecord {
   RecordVersion version = 3;
   bool deleted = 4;
   string mutation_id = 5;
-  uint64 remaining_window_millis = 6;
+  uint64 remaining_retention_millis = 6;
 }
 
 message DeduplicationRecord {
@@ -248,7 +254,7 @@ message DeduplicationRecord {
   bytes fingerprint = 3;
   RecordVersion version = 4;
   bool deleted = 5;
-  uint64 remaining_window_millis = 6;
+  uint64 remaining_retention_millis = 6;
 }
 
 message DedupSnapshotPageResponse {
@@ -283,6 +289,38 @@ message PrepareDestinationRangeResponse {
 message NodeInfoResponse {
   string node_id = 1;
   string process_instance_id = 2;
+  uint64 dedup_bytes = 3;
+  uint64 dedup_peak_bytes = 4;
+  uint64 dedup_capacity_bytes = 5;
+  uint64 owner_dedup_rejections = 6;
+  uint64 follower_dedup_rejections = 7;
+  uint64 replication_reservation_rejections = 8;
+  uint64 replication_rpc_retries = 9;
+  uint64 replication_stream_peak_pending = 10;
+  // Present only when HASHRING_PROFILE_WRITES=1 on this node.
+  StateWriteTiming owner_write_timing = 11;
+  StateWriteTiming follower_write_timing = 12;
+  StateWriteTiming ack_write_timing = 13;
+  ReceiptCleanupTiming receipt_cleanup_timing = 14;
+}
+
+// Cumulative per-process timings. Wait totals can overlap across tasks.
+message StateWriteTiming {
+  uint64 acquisitions = 1;
+  uint64 wait_nanos = 2;
+  uint64 hold_nanos = 3;
+  uint64 max_wait_nanos = 4;
+  uint64 max_hold_nanos = 5;
+}
+
+message ReceiptCleanupTiming {
+  uint64 purge_calls = 1;
+  uint64 purge_nanos = 2;
+  uint64 max_purge_nanos = 3;
+  uint64 expired_receipts = 4;
+  uint64 ack_prune_calls = 5;
+  uint64 ack_prune_nanos = 6;
+  uint64 ack_prune_scanned_receipts = 7;
 }
 
 message SnapshotPageRequest {
@@ -364,6 +402,7 @@ message ReplicationEntry {
 }
 
 message ReplicateMutationResponse {
+  string process_instance_id = 2;
   uint64 applied_stream_sequence = 1;
 }
 
@@ -413,6 +452,7 @@ message OperationError {
   string owner_endpoint = 4;
   bool retryable = 5;
   bool unknown_write_outcome = 6;
+  uint64 retry_after_millis = 7;
 }
 
 message GetRequest {

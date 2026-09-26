@@ -335,7 +335,7 @@ impl CoordinatorService {
                             member.node_id
                         ))
                     })?;
-            let mut node = connect_node(&member.endpoint, deadline).await?;
+            let mut node = self.connect_node(&member.endpoint, deadline).await?;
             let info = rpc_before(deadline, node.get_process_info(proto::Empty {}))
                 .await?
                 .into_inner();
@@ -347,7 +347,7 @@ impl CoordinatorService {
             }
         }
         for range in &change.ranges {
-            let mut source = connect_node(&range.source_endpoint, deadline).await?;
+            let mut source = self.connect_node(&range.source_endpoint, deadline).await?;
             let digest = rpc_before(
                 deadline,
                 source.source_range_digest(RangeControlRequest {
@@ -431,7 +431,7 @@ impl CoordinatorService {
         tokio::time::sleep_until(last_grant.max(self.startup_at + NODE_LEASE_DURATION)).await;
         let deadline = Instant::now() + self.migration_timeout;
         for range in &original.ranges {
-            let mut source = connect_node(&range.source_endpoint, deadline).await?;
+            let mut source = self.connect_node(&range.source_endpoint, deadline).await?;
             rpc_before(
                 deadline,
                 source.abort_range_migration(RangeControlRequest {
@@ -580,8 +580,10 @@ impl CoordinatorService {
         range: &RangeMigration,
         deadline: Instant,
     ) -> Result<RangeMigration, Status> {
-        let mut source = connect_node(&range.source_endpoint, deadline).await?;
-        let mut destination = connect_node(&range.destination_endpoint, deadline).await?;
+        let mut source = self.connect_node(&range.source_endpoint, deadline).await?;
+        let mut destination = self
+            .connect_node(&range.destination_endpoint, deadline)
+            .await?;
         let spec = proto::RangeSpec {
             change_id: change.change_id.clone(),
             range_id: range.range_id.clone(),
@@ -705,7 +707,7 @@ impl CoordinatorService {
     ) -> Result<(), Status> {
         let destinations = destination_instances(change)?;
         for (node_id, (endpoint, expected_instance)) in destinations {
-            let mut client = connect_node(&endpoint, deadline).await?;
+            let mut client = self.connect_node(&endpoint, deadline).await?;
             let actual = rpc_before(deadline, client.get_process_info(proto::Empty {}))
                 .await?
                 .into_inner();
@@ -724,7 +726,7 @@ impl CoordinatorService {
         range: &RangeMigration,
         deadline: Instant,
     ) -> Result<u64, Status> {
-        let mut source = connect_node(&range.source_endpoint, deadline).await?;
+        let mut source = self.connect_node(&range.source_endpoint, deadline).await?;
         Ok(rpc_before(
             deadline,
             source.pause_range_writes(RangeControlRequest {
@@ -744,8 +746,10 @@ impl CoordinatorService {
         final_watermark: u64,
         deadline: Instant,
     ) -> Result<RangeMigration, Status> {
-        let mut source = connect_node(&range.source_endpoint, deadline).await?;
-        let mut destination = connect_node(&range.destination_endpoint, deadline).await?;
+        let mut source = self.connect_node(&range.source_endpoint, deadline).await?;
+        let mut destination = self
+            .connect_node(&range.destination_endpoint, deadline)
+            .await?;
         let watermark = replay_changelog(
             &mut source,
             &mut destination,
@@ -877,7 +881,9 @@ impl CoordinatorService {
             change.ranges.clone(),
             self.range_move_concurrency,
             |range| async move {
-                let mut destination = connect_node(&range.destination_endpoint, deadline).await?;
+                let mut destination = self
+                    .connect_node(&range.destination_endpoint, deadline)
+                    .await?;
                 rpc_before(
                     deadline,
                     destination.activate_destination_range(RangeControlRequest {
@@ -936,7 +942,7 @@ impl CoordinatorService {
             ranges_to_clean,
             self.range_move_concurrency,
             |mut range| async move {
-                let mut source = connect_node(&range.source_endpoint, deadline).await?;
+                let mut source = self.connect_node(&range.source_endpoint, deadline).await?;
                 rpc_before(
                     deadline,
                     source.cleanup_source_range(RangeControlRequest {
@@ -991,7 +997,7 @@ impl CoordinatorService {
                 change.stopping_node_ids.push(node_id.clone());
             }
             if !change.stop_prepared_node_ids.contains(&node_id) {
-                let mut client = connect_node(&endpoint, deadline).await?;
+                let mut client = self.connect_node(&endpoint, deadline).await?;
                 let actual = rpc_before(deadline, client.get_process_info(proto::Empty {}))
                     .await?
                     .into_inner();
@@ -1018,7 +1024,7 @@ impl CoordinatorService {
                     .retain(|stopping| stopping != &node_id);
                 change.stop_prepared_node_ids.push(node_id.clone());
             }
-            let mut client = match connect_node(&endpoint, deadline).await {
+            let mut client = match self.connect_node(&endpoint, deadline).await {
                 Ok(client) => client,
                 Err(error) if is_absence_status(&error) => {
                     self.store_stopped_node(&node_id).await?;
@@ -1087,7 +1093,7 @@ impl CoordinatorService {
         require_lease: bool,
     ) -> Result<(), Status> {
         for member in members {
-            let mut client = connect_node(&member.endpoint, deadline).await?;
+            let mut client = self.connect_node(&member.endpoint, deadline).await?;
             rpc_before(
                 deadline,
                 client.install_topology(InstallTopologyRequest {
@@ -1168,12 +1174,13 @@ impl CoordinatorService {
                     change_id: change_id.clone(),
                     range_id: range.range_id,
                 };
-                let mut source = connect_node(&range.source_endpoint, deadline).await?;
+                let mut source = self.connect_node(&range.source_endpoint, deadline).await?;
                 rpc_before(deadline, source.abort_range_migration(control.clone())).await?;
                 // Destination staging is never client-visible before publication,
                 // so inability to discard it is not an ownership safety failure.
-                if let Ok(mut destination) =
-                    connect_node(&range.destination_endpoint, deadline).await
+                if let Ok(mut destination) = self
+                    .connect_node(&range.destination_endpoint, deadline)
+                    .await
                 {
                     let _ = rpc_before(deadline, destination.abort_range_migration(control)).await;
                 }

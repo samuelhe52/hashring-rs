@@ -6,7 +6,7 @@ use std::{
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
     },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -43,11 +43,14 @@ use hashring_core::{
 
 pub const DEFAULT_MAX_MIGRATION_JOURNAL_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_REPLICATION_BYTES: usize = 64 * 1024 * 1024;
-const REPLICATION_STREAM_QUEUE_CAPACITY: usize = 8;
+const REPLICATION_STREAM_QUEUE_CAPACITY: usize = 32;
 const MAX_REPLICATION_FINGERPRINTS: u64 = 4_096;
 const REPLICATION_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-const IDEMPOTENCY_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
-const MAX_DEDUP_BYTES: usize = 16 * 1024 * 1024;
+const RECEIPT_RETENTION_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
+// A node retains deduplication receipts for the full retention period on owner and
+// follower paths. Account for live entries separately from staged migration
+// records so the default limit bounds retained data without double charging.
+const MAX_DEDUP_BYTES: usize = 128 * 1024 * 1024;
 const REQUIRED_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const PEER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -121,7 +124,7 @@ impl TryFrom<proto::RangeSpec> for RangeSpec {
 struct SourceMigration {
     range: RangeSpec,
     snapshot_keys: Option<Vec<Vec<u8>>>,
-    snapshot_dedup_ids: Vec<String>,
+    snapshot_dedup_ids: Vec<Arc<str>>,
     snapshot_ready: watch::Sender<bool>,
     journal: Vec<JournalRecord>,
     journal_bytes: usize,
@@ -207,6 +210,19 @@ struct ReplicationDispatcher {
     failed_streams: Arc<StdMutex<HashSet<ReplicationStreamKey>>>,
     retained_budget: Arc<Semaphore>,
     active_rpc_budget: Arc<Semaphore>,
+    pressure: Arc<NodePressureStats>,
+}
+
+#[derive(Default)]
+struct NodePressureStats {
+    owner_write_timing: diagnostics::StateWriteTiming,
+    follower_write_timing: diagnostics::StateWriteTiming,
+    ack_write_timing: diagnostics::StateWriteTiming,
+    owner_dedup_rejections: AtomicU64,
+    follower_dedup_rejections: AtomicU64,
+    replication_reservation_rejections: AtomicU64,
+    replication_rpc_retries: AtomicU64,
+    replication_stream_peak_pending: AtomicU64,
 }
 
 struct NodeState {
@@ -216,15 +232,21 @@ struct NodeState {
     owner_stream_sequences: HashMap<(u64, String), u64>,
     owner_stream_unacked: HashMap<(u64, String), VecDeque<(u64, u64)>>,
     ack_progress: HashMap<(u64, String), watch::Sender<u64>>,
+    ack_process_instances: HashMap<(u64, String), String>,
+    admitted_followers: HashMap<String, String>,
     follower_streams: HashMap<(u64, String), FollowerStreamState>,
     sources: HashMap<(String, String), SourceMigration>,
     destinations: HashMap<(String, String), DestinationMigration>,
     journal_bytes_total: usize,
     lease: Option<(u64, Instant)>,
     policy_write_fence: Option<(String, u64)>,
-    dedup: HashMap<String, DedupEntry>,
-    dedup_expirations: BinaryHeap<Reverse<(Instant, String)>>,
+    dedup: HashMap<Arc<str>, DedupEntry>,
+    dedup_expirations: BinaryHeap<Reverse<(Instant, Arc<str>)>>,
     dedup_bytes: usize,
+    dedup_peak_bytes: usize,
+    ack_progress_needs_prune: bool,
+    next_ack_prune_at: Instant,
+    cleanup_timing: proto::ReceiptCleanupTiming,
 }
 
 struct SnapshotPreparationGuard {
@@ -268,6 +290,7 @@ pub struct DataNodeService {
     coordinator_channel: Channel,
     state: Arc<RwLock<NodeState>>,
     replication_dispatch: ReplicationDispatcher,
+    pressure: Arc<NodePressureStats>,
     refresh_lock: Arc<Mutex<()>>,
     max_key_bytes: usize,
     max_value_bytes: usize,
@@ -279,6 +302,7 @@ pub struct DataNodeService {
 }
 
 mod dedup;
+mod diagnostics;
 mod migration;
 mod replication;
 mod rpc;

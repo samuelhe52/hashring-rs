@@ -777,3 +777,173 @@ async fn repair_failure_is_durably_backed_off_and_reported() {
     assert!(repair.next_attempt_unix_millis >= before + 2_000);
     assert_eq!(repair.last_error, "follower offline");
 }
+
+#[tokio::test]
+async fn lease_admissions_require_policy_coverage_and_current_process_identity() {
+    let members = (1..=3)
+        .map(|i| Member {
+            node_id: format!("n{i}"),
+            endpoint: format!("http://127.0.0.1:500{i}"),
+        })
+        .collect();
+    let config = hashring_core::topology::TopologyConfig {
+        write_ack_policy: WriteAckPolicy::FirstSuccessor,
+        ..Default::default()
+    };
+    let topology = TopologySnapshot::new_with_config(1, 7, 4, members, config).unwrap();
+    let repository = Arc::new(MemoryRepository::default());
+    let mut state = load_or_initialize(repository.as_ref(), Some(topology.clone())).unwrap();
+    for member in &topology.members {
+        state.process_instances.insert(
+            member.node_id.clone(),
+            format!("{}-process", member.node_id),
+        );
+    }
+    for task in &state.replica_repairs {
+        state.replica_admissions.push(ReplicaAdmission {
+            epoch: task.epoch,
+            start_exclusive: task.start_exclusive,
+            end_inclusive: task.end_inclusive,
+            owner_node_id: task.owner_node_id.clone(),
+            node_id: task.node_id.clone(),
+            process_instance_id: format!("{}-process", task.node_id),
+            verified_watermark: 0,
+            stream_cursor: 0,
+            digest: "verified".into(),
+        });
+    }
+    let service = CoordinatorService::new(state, repository, Duration::from_secs(1));
+    let request = proto::RenewNodeLeaseRequest {
+        node_id: "n1".into(),
+        process_instance_id: "n1-process".into(),
+        topology_epoch: 1,
+    };
+    let response = service
+        .renew_node_lease(Request::new(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.admitted_followers.len(), 2);
+    // Missing optional replicas must not delay a policy that requires only
+    // the first successor. Every required interval still needs admission.
+    {
+        let mut state = service.state.write().await;
+        state.replica_admissions.retain(|admission| {
+            topology.derived_ranges().unwrap().iter().any(|range| {
+                range.start_exclusive == admission.start_exclusive
+                    && range.end_inclusive == admission.end_inclusive
+                    && range.follower_node_ids.first() == Some(&admission.node_id)
+            })
+        });
+    }
+    let response = service
+        .renew_node_lease(Request::new(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.admitted_followers.len(), 2);
+    let missing = {
+        let mut state = service.state.write().await;
+        let index = state
+            .replica_admissions
+            .iter()
+            .position(|a| {
+                a.owner_node_id == "n1"
+                    && a.node_id == "n2"
+                    && topology.derived_ranges().unwrap().iter().any(|range| {
+                        range.start_exclusive == a.start_exclusive
+                            && range.end_inclusive == a.end_inclusive
+                            && range.follower_node_ids.first() == Some(&a.node_id)
+                    })
+            })
+            .unwrap();
+        state.replica_admissions.remove(index)
+    };
+    let response = service
+        .renew_node_lease(Request::new(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        response
+            .admitted_followers
+            .iter()
+            .map(|f| f.node_id.as_str())
+            .collect::<Vec<_>>(),
+        ["n3"]
+    );
+    {
+        let mut state = service.state.write().await;
+        state.replica_admissions.push(missing);
+        state
+            .process_instances
+            .insert("n2".into(), "n2-restarted".into());
+    }
+    let response = service
+        .renew_node_lease(Request::new(request))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        response
+            .admitted_followers
+            .iter()
+            .map(|f| f.node_id.as_str())
+            .collect::<Vec<_>>(),
+        ["n3"]
+    );
+}
+
+#[tokio::test]
+async fn stream_admission_batch_does_not_publish_a_partial_group() {
+    let members = (1..=3)
+        .map(|i| Member {
+            node_id: format!("n{i}"),
+            endpoint: format!("http://127.0.0.1:500{i}"),
+        })
+        .collect();
+    let topology = TopologySnapshot::new(1, 7, 4, members).unwrap();
+    let repository = Arc::new(MemoryRepository::default());
+    let mut state = load_or_initialize(repository.as_ref(), Some(topology)).unwrap();
+    for member in &state.committed.members {
+        state.process_instances.insert(
+            member.node_id.clone(),
+            format!("{}-process", member.node_id),
+        );
+    }
+    let tasks = state.replica_repairs[..2].to_vec();
+    let mut seeds: Vec<_> = tasks
+        .iter()
+        .map(|task| PreparedReplicaSeed {
+            task: task.clone(),
+            control: replica_repair_control(task),
+            admission: ReplicaAdmission {
+                epoch: task.epoch,
+                start_exclusive: task.start_exclusive,
+                end_inclusive: task.end_inclusive,
+                owner_node_id: task.owner_node_id.clone(),
+                node_id: task.node_id.clone(),
+                process_instance_id: format!("{}-process", task.node_id),
+                verified_watermark: 0,
+                stream_cursor: 0,
+                digest: "verified".into(),
+            },
+        })
+        .collect();
+    repository.store_state(&state).unwrap();
+    let service =
+        CoordinatorService::new(state.clone(), repository.clone(), Duration::from_secs(1));
+    seeds[1].admission.process_instance_id = "restarted".into();
+    assert!(service.store_repair_admissions(&seeds).await.is_err());
+    assert_eq!(*service.state.read().await, state);
+    assert_eq!(repository.load_state().unwrap().unwrap(), state);
+    seeds[1].admission.process_instance_id = format!("{}-process", seeds[1].task.node_id);
+    service.store_repair_admissions(&seeds).await.unwrap();
+    let durable = repository.load_state().unwrap().unwrap();
+    assert_eq!(durable.replica_admissions.len(), 2);
+    assert!(
+        durable.replica_repairs[..2]
+            .iter()
+            .all(|task| task.phase == ReplicaRepairPhase::Complete)
+    );
+}

@@ -509,7 +509,10 @@ async fn run_cluster(
     };
     let mut expected_rounds = vec![Some(0_u64); config.key_count as usize];
     let put_started = Instant::now();
-    write_dataset(&workload_client, workload, 0).await?;
+    if let Err(error) = write_dataset(&workload_client, workload, 0).await {
+        let _ = record_node_pressure(initial_members, events, observations).await;
+        return Err(error);
+    }
     measurements.insert(
         "initial_put".into(),
         measurement(config.key_count, put_started.elapsed()),
@@ -518,6 +521,7 @@ async fn run_cluster(
         "initial_put_complete",
         json!({ "keys": config.key_count, "seconds": put_started.elapsed().as_secs_f64() }),
     )?;
+    record_node_pressure(initial_members, events, observations).await?;
 
     let get_started = Instant::now();
     verify_dataset(&workload_client, workload, &expected_rounds).await?;
@@ -779,6 +783,63 @@ async fn run_cluster(
         json!({ "epoch": topology.epoch, "members": topology.members.len() }),
     )?;
     Ok(topology.epoch)
+}
+
+fn state_write_timing_json(timing: Option<hashring_core::proto::StateWriteTiming>) -> Value {
+    timing.map_or(Value::Null, |t| {
+        json!({
+            "acquisitions": t.acquisitions, "wait_nanos": t.wait_nanos, "hold_nanos": t.hold_nanos,
+            "max_wait_nanos": t.max_wait_nanos, "max_hold_nanos": t.max_hold_nanos,
+        })
+    })
+}
+
+async fn record_node_pressure(
+    members: &[Member],
+    events: &EventLog,
+    observations: &mut BTreeMap<String, Value>,
+) -> Result<()> {
+    let mut nodes = BTreeMap::new();
+    for member in members {
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut client =
+                configure_data_node_client(DataNodeClient::connect(member.endpoint.clone()).await?);
+            Ok::<_, anyhow::Error>(
+                client
+                    .get_process_info(hashring_core::proto::Empty {})
+                    .await?
+                    .into_inner(),
+            )
+        })
+        .await;
+        let value = match result {
+            Ok(Ok(info)) => json!({
+                "owner_write_timing": state_write_timing_json(info.owner_write_timing),
+                "follower_write_timing": state_write_timing_json(info.follower_write_timing),
+                "ack_write_timing": state_write_timing_json(info.ack_write_timing),
+                "receipt_cleanup_timing": info.receipt_cleanup_timing.map(|t| json!({
+                    "purge_calls": t.purge_calls, "purge_nanos": t.purge_nanos,
+                    "max_purge_nanos": t.max_purge_nanos, "expired_receipts": t.expired_receipts,
+                    "ack_prune_calls": t.ack_prune_calls, "ack_prune_nanos": t.ack_prune_nanos,
+                    "ack_prune_scanned_receipts": t.ack_prune_scanned_receipts,
+                })),
+                "dedup_bytes": info.dedup_bytes,
+                "dedup_peak_bytes": info.dedup_peak_bytes,
+                "dedup_capacity_bytes": info.dedup_capacity_bytes,
+                "owner_dedup_rejections": info.owner_dedup_rejections,
+                "follower_dedup_rejections": info.follower_dedup_rejections,
+                "replication_reservation_rejections": info.replication_reservation_rejections,
+                "replication_rpc_retries": info.replication_rpc_retries,
+                "replication_stream_peak_pending": info.replication_stream_peak_pending,
+            }),
+            Ok(Err(error)) => json!({ "error": error.to_string() }),
+            Err(_) => json!({ "error": "node pressure request timed out" }),
+        };
+        nodes.insert(member.node_id.clone(), value);
+    }
+    events.record("node_pressure_sampled", json!({ "nodes": nodes }))?;
+    observations.insert("node_pressure_after_initial_put".into(), json!(nodes));
+    Ok(())
 }
 
 fn latency_summary(samples: &mut [u64]) -> Value {

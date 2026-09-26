@@ -170,7 +170,7 @@ async fn committed_destination_fences_writes_until_idempotent_activation() {
                 }),
                 deleted: false,
                 mutation_id: String::new(),
-                remaining_window_millis: 0,
+                remaining_retention_millis: 0,
             }],
             journal_records: Vec::new(),
         }))
@@ -421,10 +421,21 @@ async fn dedup_budget_rejects_before_apply_and_expired_records_free_capacity() {
         .await
         .unwrap()
         .into_inner();
+    let error = rejected.error.unwrap();
+    assert_eq!(error.code, ErrorCode::ResourceExhausted as i32);
+    assert!(error.retry_after_millis > 0);
+    assert!(error.retry_after_millis <= 60_000);
+    let pressure = service
+        .get_process_info(Request::new(proto::Empty {}))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(pressure.owner_dedup_rejections, 1);
     assert_eq!(
-        rejected.error.unwrap().code,
-        ErrorCode::ResourceExhausted as i32
+        pressure.dedup_capacity_bytes,
+        service.max_dedup_bytes as u64
     );
+    assert!(pressure.dedup_peak_bytes > 0);
     assert_eq!(service.state.read().await.next_sequence, 1);
     assert!(
         !service
@@ -588,7 +599,10 @@ async fn migration_carries_snapshot_and_journal_mutation_ids() {
 async fn expired_staged_ids_free_migration_budget_before_commit() {
     let mut destination = service();
     destination.node_id = "node-2".into();
-    destination.max_dedup_bytes = dedup_retained_bytes("first", b"key-1".len(), "node-1".len());
+    destination.max_dedup_bytes =
+        staged_dedup_retained_bytes("first", b"key-1".len(), "node-1".len()).max(
+            dedup_retained_bytes("other", b"key-2".len(), "node-1".len()),
+        );
     destination
         .prepare_destination_range(Request::new(PrepareRangeRequest {
             range: Some(range(0)),
@@ -605,7 +619,7 @@ async fn expired_staged_ids_free_migration_budget_before_commit() {
             owner_node_id: "node-1".into(),
         }),
         deleted: false,
-        remaining_window_millis: 60_000,
+        remaining_retention_millis: 60_000,
     };
     let request = |record| ApplyDedupBatchRequest {
         change_id: "change-1".into(),
@@ -902,7 +916,7 @@ async fn deletion_replay_and_commit_remove_stale_destination_data() {
             }),
             deleted: true,
             mutation_id: String::new(),
-            remaining_window_millis: 0,
+            remaining_retention_millis: 0,
         }),
     };
     let batch = ApplyMigrationBatchRequest {
@@ -955,7 +969,7 @@ async fn migration_replay_preserves_delete_and_put_order() {
             version: Some(version(owner_sequence)),
             deleted: true,
             mutation_id: String::new(),
-            remaining_window_millis: 0,
+            remaining_retention_millis: 0,
         }),
     };
     let put = |watermark, owner_sequence, value: &[u8]| JournalRecord {
@@ -966,7 +980,7 @@ async fn migration_replay_preserves_delete_and_put_order() {
             version: Some(version(owner_sequence)),
             deleted: false,
             mutation_id: String::new(),
-            remaining_window_millis: 0,
+            remaining_retention_millis: 0,
         }),
     };
 

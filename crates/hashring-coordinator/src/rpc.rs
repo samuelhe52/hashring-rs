@@ -100,8 +100,17 @@ impl Coordinator for CoordinatorService {
             .map(|member| (member.node_id.clone(), member.endpoint.clone()))
             .collect();
         let channels = {
-            let mut cache = self.status_channels.lock().await;
-            let active: BTreeSet<_> = members.values().cloned().collect();
+            let mut cache = self.node_channels.lock().await;
+            let mut active: BTreeSet<_> = members.values().cloned().collect();
+            if let Some(change) = &state.active_change {
+                active.extend(
+                    change
+                        .target_topology
+                        .members
+                        .iter()
+                        .map(|member| member.endpoint.clone()),
+                );
+            }
             cache.retain(|endpoint, _| active.contains(endpoint));
             for endpoint in &active {
                 if !cache.contains_key(endpoint) {
@@ -587,6 +596,64 @@ impl Coordinator for CoordinatorService {
             ));
         }
         let epoch = state.committed.epoch;
+        // Every interval requiring a follower under this policy must be admitted
+        // before its identity can authorize local ACK writes. A restarted follower
+        // has a different identity and cannot satisfy the owner's cached
+        // admission with its mutation response.
+        let mut admitted_followers = Vec::new();
+        if state.committed.write_ack_policy != WriteAckPolicy::OwnerOnly {
+            let admissions: BTreeSet<_> = state
+                .replica_admissions
+                .iter()
+                .filter(|admission| {
+                    admission.epoch == epoch
+                        && admission.owner_node_id == request.node_id
+                        && !state.fenced_nodes.contains(&admission.node_id)
+                        && state.process_instances.get(&admission.node_id)
+                            == Some(&admission.process_instance_id)
+                })
+                .map(|admission| {
+                    (
+                        admission.start_exclusive,
+                        admission.end_inclusive,
+                        admission.node_id.as_str(),
+                    )
+                })
+                .collect();
+            let mut candidates = BTreeSet::new();
+            let mut missing = BTreeSet::new();
+            for range in state
+                .committed
+                .derived_ranges()
+                .map_err(|error| Status::internal(error.to_string()))?
+                .into_iter()
+                .filter(|range| range.owner_node_id == request.node_id)
+            {
+                let required = match state.committed.write_ack_policy {
+                    WriteAckPolicy::FirstSuccessor => 1,
+                    WriteAckPolicy::AllReplicas => range.follower_node_ids.len(),
+                    WriteAckPolicy::OwnerOnly => 0,
+                };
+                for follower in range.follower_node_ids.into_iter().take(required) {
+                    if !admissions.contains(&(
+                        range.start_exclusive,
+                        range.end_inclusive,
+                        follower.as_str(),
+                    )) {
+                        missing.insert(follower.clone());
+                    }
+                    candidates.insert(follower);
+                }
+            }
+            for node_id in candidates.difference(&missing) {
+                if let Some(process_instance_id) = state.process_instances.get(node_id) {
+                    admitted_followers.push(proto::AdmittedFollower {
+                        node_id: node_id.clone(),
+                        process_instance_id: process_instance_id.clone(),
+                    });
+                }
+            }
+        }
         let mut grants = self.lease_grants.lock().await;
         let granted_at = Instant::now();
         let renewed_unix_millis = unix_millis_now();
@@ -604,6 +671,7 @@ impl Coordinator for CoordinatorService {
         Ok(Response::new(proto::RenewNodeLeaseResponse {
             topology_epoch: epoch,
             lease_duration_millis: NODE_LEASE_DURATION.as_millis() as u64,
+            admitted_followers,
         }))
     }
 

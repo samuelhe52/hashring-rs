@@ -19,7 +19,7 @@ impl CoordinatorService {
             peer_failures: Arc::new(Mutex::new(BTreeMap::new())),
             pending_change_outages: Arc::new(Mutex::new(BTreeMap::new())),
             pending_change_probe_cursor: Arc::new(Mutex::new(0)),
-            status_channels: Arc::new(Mutex::new(BTreeMap::new())),
+            node_channels: Arc::new(Mutex::new(BTreeMap::new())),
             startup_at: Instant::now(),
             repair_interrupt: Arc::new(repair_interrupt),
         }
@@ -155,7 +155,7 @@ impl CoordinatorService {
         }
         let probes = try_map_bounded(candidates, 8, |(member, instance)| async move {
             let deadline = Instant::now() + Duration::from_millis(500);
-            let healthy = match connect_node(&member.endpoint, deadline).await {
+            let healthy = match self.connect_node(&member.endpoint, deadline).await {
                 Ok(mut node) => rpc_before(deadline, node.get_process_info(proto::Empty {}))
                     .await
                     .is_ok_and(|response| {
@@ -356,7 +356,7 @@ impl CoordinatorService {
         let epoch = state.committed.epoch;
         let deadline = Instant::now() + self.migration_timeout;
         try_map_bounded(members, self.range_move_concurrency, |member| async move {
-            let mut node = connect_node(&member.endpoint, deadline).await?;
+            let mut node = self.connect_node(&member.endpoint, deadline).await?;
             rpc_before(
                 deadline,
                 node.abort_replica_repairs(proto::AbortReplicaRepairsRequest {
@@ -601,13 +601,13 @@ impl CoordinatorService {
             direct_merge: false,
         };
         let deadline = Instant::now() + self.migration_timeout;
-        let mut source = connect_node(&range.source_endpoint, deadline).await?;
-        let mut destination = connect_node(&range.destination_endpoint, deadline).await?;
+        let mut source = self.connect_node(&range.source_endpoint, deadline).await?;
+        let mut destination = self
+            .connect_node(&range.destination_endpoint, deadline)
+            .await?;
         // A retry first releases any write fence left by an interrupted attempt.
         rpc_before(deadline, source.abort_range_migration(control.clone())).await?;
         rpc_before(deadline, destination.abort_range_migration(control.clone())).await?;
-        self.set_repair_phase(task, ReplicaRepairPhase::Copying)
-            .await?;
         let copied = self.copy_range(&change, &range, deadline).await?;
         if copied.source_process_instance_id != owner_instance
             || copied.destination_process_instance_id != follower_instance
@@ -631,12 +631,12 @@ impl CoordinatorService {
         final_watermark: u64,
         deadline: Instant,
     ) -> Result<PreparedReplicaSeed, Status> {
-        self.set_repair_phase(&copied.task, ReplicaRepairPhase::Verifying)
-            .await?;
         let verified = self
             .finalize_range(&copied.change, &copied.range, final_watermark, deadline)
             .await?;
-        let mut source = connect_node(&copied.range.source_endpoint, deadline).await?;
+        let mut source = self
+            .connect_node(&copied.range.source_endpoint, deadline)
+            .await?;
         let digest = rpc_before(deadline, source.source_range_digest(copied.control.clone()))
             .await?
             .into_inner()
@@ -719,6 +719,8 @@ impl CoordinatorService {
         let result = async {
             // Snapshot all ranges while writes continue. Only the short final
             // replay/checkpoint window fences writes for this stream.
+            self.set_repair_phases(tasks, ReplicaRepairPhase::Copying)
+                .await?;
             let copied = try_map_bounded(
                 tasks.to_vec(),
                 self.range_move_concurrency.min(4),
@@ -734,6 +736,8 @@ impl CoordinatorService {
                     Ok::<_, Status>((copied, watermark))
                 })
                 .await?;
+            self.set_repair_phases(tasks, ReplicaRepairPhase::Verifying)
+                .await?;
             prepared = try_map_bounded(
                 paused,
                 self.range_move_concurrency.min(4),
@@ -743,8 +747,8 @@ impl CoordinatorService {
             )
             .await?;
             let deadline = Instant::now() + self.migration_timeout;
-            let mut source = connect_node(&owner_endpoint, deadline).await?;
-            let mut destination = connect_node(&follower_endpoint, deadline).await?;
+            let mut source = self.connect_node(&owner_endpoint, deadline).await?;
+            let mut destination = self.connect_node(&follower_endpoint, deadline).await?;
             let request = proto::ReplicationProgressRequest {
                 topology_epoch: first.epoch,
                 owner_node_id: first.owner_node_id.clone(),
@@ -786,17 +790,14 @@ impl CoordinatorService {
                 )
                 .await?;
             }
-            for seed in &prepared {
-                self.store_repair_admission(&seed.task, seed.admission.clone())
-                    .await?;
-            }
+            self.store_repair_admissions(&prepared).await?;
             Ok(())
         }
         .await;
         if result.is_err() {
             let cleanup_deadline = Instant::now() + self.migration_timeout;
             let controls: Vec<_> = tasks.iter().map(replica_repair_control).collect();
-            if let Ok(mut source) = connect_node(&owner_endpoint, cleanup_deadline).await {
+            if let Ok(mut source) = self.connect_node(&owner_endpoint, cleanup_deadline).await {
                 for control in &controls {
                     let _ = rpc_before(
                         cleanup_deadline,
@@ -805,7 +806,10 @@ impl CoordinatorService {
                     .await;
                 }
             }
-            if let Ok(mut destination) = connect_node(&follower_endpoint, cleanup_deadline).await {
+            if let Ok(mut destination) = self
+                .connect_node(&follower_endpoint, cleanup_deadline)
+                .await
+            {
                 for control in &controls {
                     let _ = rpc_before(
                         cleanup_deadline,
@@ -814,35 +818,35 @@ impl CoordinatorService {
                     .await;
                 }
             }
-            for task in tasks {
-                self.set_repair_phase(task, ReplicaRepairPhase::Pending)
-                    .await?;
-            }
+            self.set_repair_phases(tasks, ReplicaRepairPhase::Pending)
+                .await?;
         }
         tracing::debug!(owner = %first.owner_node_id, follower = %first.node_id, ranges = tasks.len(), elapsed_ms = started.elapsed().as_millis(), success = result.is_ok(), "replica seed group finished");
         result
     }
 
-    pub(super) async fn set_repair_phase(
+    pub(super) async fn set_repair_phases(
         &self,
-        task: &ReplicaRepair,
+        tasks: &[ReplicaRepair],
         phase: ReplicaRepairPhase,
     ) -> Result<(), Status> {
         let mut state = self.state.write().await;
         let mut next = state.clone();
-        let repair = next
-            .replica_repairs
-            .iter_mut()
-            .find(|repair| {
-                repair == &task
-                    || (repair.epoch == task.epoch
-                        && repair.start_exclusive == task.start_exclusive
-                        && repair.end_inclusive == task.end_inclusive
-                        && repair.owner_node_id == task.owner_node_id
-                        && repair.node_id == task.node_id)
-            })
-            .ok_or_else(|| Status::failed_precondition("replica repair was invalidated"))?;
-        repair.phase = phase;
+        for task in tasks {
+            let repair = next
+                .replica_repairs
+                .iter_mut()
+                .find(|repair| {
+                    repair == &task
+                        || (repair.epoch == task.epoch
+                            && repair.start_exclusive == task.start_exclusive
+                            && repair.end_inclusive == task.end_inclusive
+                            && repair.owner_node_id == task.owner_node_id
+                            && repair.node_id == task.node_id)
+                })
+                .ok_or_else(|| Status::failed_precondition("replica repair was invalidated"))?;
+            repair.phase = phase;
+        }
         self.repository
             .store_state(&next)
             .map_err(|error| Status::internal(error.to_string()))?;
@@ -850,43 +854,46 @@ impl CoordinatorService {
         Ok(())
     }
 
-    pub(super) async fn store_repair_admission(
+    pub(super) async fn store_repair_admissions(
         &self,
-        task: &ReplicaRepair,
-        admission: ReplicaAdmission,
+        seeds: &[PreparedReplicaSeed],
     ) -> Result<(), Status> {
         let mut state = self.state.write().await;
         let mut next = state.clone();
-        if next.committed.epoch != task.epoch
-            || next.process_instances.get(&task.node_id) != Some(&admission.process_instance_id)
-        {
-            return Err(Status::failed_precondition(
-                "replica changed before durable admission",
-            ));
+        for seed in seeds {
+            let task = &seed.task;
+            let admission = &seed.admission;
+            if next.committed.epoch != task.epoch
+                || next.process_instances.get(&task.node_id) != Some(&admission.process_instance_id)
+            {
+                return Err(Status::failed_precondition(
+                    "replica changed before durable admission",
+                ));
+            }
+            let repair = next
+                .replica_repairs
+                .iter_mut()
+                .find(|repair| {
+                    repair.epoch == task.epoch
+                        && repair.start_exclusive == task.start_exclusive
+                        && repair.end_inclusive == task.end_inclusive
+                        && repair.owner_node_id == task.owner_node_id
+                        && repair.node_id == task.node_id
+                })
+                .ok_or_else(|| Status::failed_precondition("replica repair was invalidated"))?;
+            repair.phase = ReplicaRepairPhase::Complete;
+            repair.retry_count = 0;
+            repair.next_attempt_unix_millis = 0;
+            repair.last_error.clear();
+            next.replica_admissions.retain(|existing| {
+                !(existing.epoch == task.epoch
+                    && existing.start_exclusive == task.start_exclusive
+                    && existing.end_inclusive == task.end_inclusive
+                    && existing.owner_node_id == task.owner_node_id
+                    && existing.node_id == task.node_id)
+            });
+            next.replica_admissions.push(admission.clone());
         }
-        let repair = next
-            .replica_repairs
-            .iter_mut()
-            .find(|repair| {
-                repair.epoch == task.epoch
-                    && repair.start_exclusive == task.start_exclusive
-                    && repair.end_inclusive == task.end_inclusive
-                    && repair.owner_node_id == task.owner_node_id
-                    && repair.node_id == task.node_id
-            })
-            .ok_or_else(|| Status::failed_precondition("replica repair was invalidated"))?;
-        repair.phase = ReplicaRepairPhase::Complete;
-        repair.retry_count = 0;
-        repair.next_attempt_unix_millis = 0;
-        repair.last_error.clear();
-        next.replica_admissions.retain(|existing| {
-            !(existing.epoch == task.epoch
-                && existing.start_exclusive == task.start_exclusive
-                && existing.end_inclusive == task.end_inclusive
-                && existing.owner_node_id == task.owner_node_id
-                && existing.node_id == task.node_id)
-        });
-        next.replica_admissions.push(admission);
         self.repository
             .store_state(&next)
             .map_err(|error| Status::internal(error.to_string()))?;
