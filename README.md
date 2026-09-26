@@ -120,7 +120,7 @@ The summary records initial-put throughput plus sampled end-to-end client `PUT`
 and direct owner-RPC `PUT` round-trip latency distributions (microseconds,
 p50/p95/p99/max). The latter includes the network hop and owner processing,
 not CPU-only service time. After initial writes, `node_pressure_after_initial_put`
-records each node's current and peak mutation-retry-window bytes, its capacity,
+records each node's current and peak deduplication receipt store bytes, its capacity,
 owner and follower budget rejections, replication reservation rejections,
 replication RPC retries, and peak pending entries in one replication stream.
 Set `HASHRING_PROFILE_WRITES=1` when launching the experiment to also collect
@@ -131,9 +131,10 @@ times can overlap across tasks and nodes. Timing fields are `null` in experiment
 summaries unless profiling is enabled.
 The same sample is retained as a `node_pressure_sampled` event, including when
 initial writes fail. These counters are per process and reset on node restart;
-the stream peak excludes the replication RPC currently in flight. A full owner
-retry window returns a retry delay hint, which the client observes within its
-existing logical-operation deadline. Correctness runs record time to
+the stream peak excludes the replication RPC currently in flight. When the
+owner's deduplication receipt store is full, the node returns a retry delay
+hint, which the client observes within its existing logical-operation deadline.
+Correctness runs record time to
 full RF measured from each transition's execution start. Availability runs
 record failover publication and first recovered read times, sampled
 read-unavailability probes, acknowledged key preservation/loss (including a
@@ -221,7 +222,7 @@ seconds and renew every second. Automatic failure detection runs every second;
 repairs/recovery run every five seconds. Repair work is capped at 32
 owner/follower groups per pass and four concurrent groups, with per-group
 exponential retry backoff capped at 60 seconds. Each node caps its pending
-replication buffer at 64 MiB and its dedup receipts at 128 MiB; migration
+replication buffer at 64 MiB and its deduplication receipt store at 128 MiB; migration
 snapshot pages are capped at 8 MiB. A failed required repair remains visible,
 not silently considered healthy.
 
@@ -242,9 +243,11 @@ and verify the required applied ACKs against the admitted follower process ident
 Explicit copy/health guards still query live replica status. See
 [replica ACK performance](docs/optimizations/replica-ack-performance.md) for measurements
 and the admission/fencing boundaries.
-The client reuses one request ID across retries of a logical write within the
-in-memory 60-second deduplication window. A new CLI invocation generates a new
-ID, and receipts do not survive process loss.
+Each deduplication receipt identifies a mutation and retains its key, operation
+fingerprint, assigned version, delete flag, and expiry. The client reuses one
+request ID across retries of a logical write during the in-memory 60-second
+receipt retention period. A new CLI invocation generates a new ID, and
+receipts do not survive process loss.
 
 ## Request and error semantics
 

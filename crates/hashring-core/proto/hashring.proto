@@ -245,7 +245,7 @@ message MigrationRecord {
   RecordVersion version = 3;
   bool deleted = 4;
   string mutation_id = 5;
-  uint64 remaining_window_millis = 6;
+  uint64 remaining_retention_millis = 6;
 }
 
 message DeduplicationRecord {
@@ -254,7 +254,7 @@ message DeduplicationRecord {
   bytes fingerprint = 3;
   RecordVersion version = 4;
   bool deleted = 5;
-  uint64 remaining_window_millis = 6;
+  uint64 remaining_retention_millis = 6;
 }
 
 message DedupSnapshotPageResponse {

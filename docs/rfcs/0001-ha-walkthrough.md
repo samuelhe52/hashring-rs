@@ -115,8 +115,8 @@ sequenceDiagram
     C->>O: PUT: epoch + mutation ID
     O->>O: Check authority + gates<br/>Check mutation ID
     O->>O: Assign order<br/>Apply in memory
-    O->>B: Mutation + retry record
-    O->>F: Async mutation + retry record
+    O->>B: Mutation + deduplication receipt
+    O->>F: Async mutation + deduplication receipt
     B->>B: Check authority + order<br/>Apply in memory
     B-->>O: Applied ACK
     O-->>C: Success with record version
@@ -205,12 +205,12 @@ sequenceDiagram
     O--xC: Reply lost
     C->>O: Retry m with the same p
     O->>O: Consult retained deduplication state
-    O-->>C: Return original result without applying twice
+    O-->>C: Answer retry without applying twice
 ```
 
 The client preserves the same mutation ID across refreshes and retries. Deduplication records replicate with mutations so a promoted successor can answer from the history it retained. This does not recover writes lost under `OwnerOnly`.
 
-The default idempotency window is 60 seconds. The guarantee is at-most-once within that window, not indefinite exactly-once execution. If the memory budget cannot preserve the window, the owner rejects new writes before applying them. Reusing an ID with different content is a conflict.
+The receipt retention period is 60 seconds. The guarantee is at-most-once while the receipt is retained, not indefinite exactly-once execution. If the receipt store budget cannot preserve that period, the owner rejects new writes before applying them. Reusing an ID with different content is a conflict.
 
 Errors preserve two independent facts: **why the attempt ended** and **whether the mutation may have applied**. A deadline can expire with `KnownNotApplied` or `MayHaveApplied`; later retry failures cannot erase an earlier uncertain outcome. One end-to-end deadline bounds connection, topology refresh, backoff, and RPC attempts.
 

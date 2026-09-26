@@ -46,8 +46,8 @@ const MAX_PENDING_REPLICATION_BYTES: usize = 64 * 1024 * 1024;
 const REPLICATION_STREAM_QUEUE_CAPACITY: usize = 32;
 const MAX_REPLICATION_FINGERPRINTS: u64 = 4_096;
 const REPLICATION_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-const IDEMPOTENCY_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
-// A node retains mutation IDs for the full retry window on both owner and
+const RECEIPT_RETENTION_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
+// A node retains deduplication receipts for the full retention period on owner and
 // follower paths. Account for live entries separately from staged migration
 // records so the default limit bounds retained data without double charging.
 const MAX_DEDUP_BYTES: usize = 128 * 1024 * 1024;

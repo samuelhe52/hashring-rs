@@ -81,7 +81,7 @@ pub(super) fn stage_dedup(
     record: DeduplicationRecord,
     max_dedup_bytes: usize,
 ) -> Result<(), Status> {
-    if record.remaining_window_millis == 0 {
+    if record.remaining_retention_millis == 0 {
         return Ok(());
     }
     if record.mutation_id.is_empty()
@@ -92,7 +92,7 @@ pub(super) fn stage_dedup(
         return Err(Status::invalid_argument("invalid deduplication record"));
     }
     let expires_at = Instant::now()
-        + std::time::Duration::from_millis(record.remaining_window_millis.min(60_000));
+        + std::time::Duration::from_millis(record.remaining_retention_millis.min(60_000));
     if let Some(existing) = destination.dedup.get_mut(&record.mutation_id) {
         let same = existing.record.key == record.key
             && existing.record.fingerprint == record.fingerprint
@@ -114,7 +114,7 @@ pub(super) fn stage_dedup(
     );
     if destination.dedup_bytes.saturating_add(cost) > max_dedup_bytes {
         return Err(Status::resource_exhausted(
-            "staged mutation retry window is full",
+            "staged deduplication receipt store is full",
         ));
     }
     destination.dedup_bytes += cost;
@@ -138,7 +138,7 @@ pub(super) fn purge_staged_dedup(destination: &mut DestinationMigration, now: In
         .sum();
 }
 
-pub(super) fn remaining_window_millis(expires_at: Instant, now: Instant) -> u64 {
+pub(super) fn remaining_retention_millis(expires_at: Instant, now: Instant) -> u64 {
     let remaining = expires_at.saturating_duration_since(now);
     if remaining.is_zero() {
         return 0;
@@ -198,7 +198,7 @@ pub(super) fn insert_dedup(
     deleted: bool,
     now: Instant,
 ) {
-    let expires_at = now + IDEMPOTENCY_WINDOW;
+    let expires_at = now + RECEIPT_RETENTION_PERIOD;
     insert_dedup_until(
         state,
         mutation_id,
@@ -244,7 +244,7 @@ pub(super) fn dedup_retry_after_millis(state: &NodeState, now: Instant) -> u64 {
     state
         .dedup_expirations
         .peek()
-        .map(|Reverse((expires_at, _))| remaining_window_millis(*expires_at, now).max(1))
+        .map(|Reverse((expires_at, _))| remaining_retention_millis(*expires_at, now).max(1))
         .unwrap_or(1)
 }
 

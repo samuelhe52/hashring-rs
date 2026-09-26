@@ -24,7 +24,7 @@ The comparison uses fixed source snapshots based on `fd500a3`, with identical pr
 
 Artifacts, exact runner scripts, manifests, logs, source archives, and summaries are under `results/write-path-profile/` (Git-ignored). All performance runs use one million keys, 10 nodes, RF=3, 128-byte values, concurrency 64, seed 1, 128 virtual nodes, and the unchanged 30-second logical deadline. Each verifies all one million keys after loading. Runs execute sequentially, with fresh clusters and no concurrent compilation or test runs.
 
-See [the prior policy comparison](replica-ack-performance.md) for the original throughput variation and [retry-window memory](retry-window-memory.md) for the receipt-layout changes that preceded this work.
+See [the prior policy comparison](replica-ack-performance.md) for the original throughput variation and [receipt store memory](dedup-receipt-store-memory.md) for the receipt-layout changes that preceded this work.
 
 ### Repeated performance runs
 

@@ -15,7 +15,7 @@ impl DataNodeService {
                 dedup_bytes = state.dedup_bytes,
                 capacity_bytes = self.max_dedup_bytes,
                 retry_after_millis,
-                "owner mutation retry window is full"
+                "owner deduplication receipt store is full"
             );
         }
         OperationError {
@@ -23,7 +23,7 @@ impl DataNodeService {
             retry_after_millis,
             ..operation_error(
                 ErrorCode::ResourceExhausted,
-                "mutation retry window is full; retry after capacity returns",
+                "owner deduplication receipt store is full; retry after capacity returns",
                 true,
             )
         }
@@ -42,7 +42,7 @@ impl DataNodeService {
                 dedup_bytes = state.dedup_bytes,
                 capacity_bytes = self.max_dedup_bytes,
                 retry_after_millis = dedup_retry_after_millis(state, Instant::now()),
-                "follower mutation retry window is full"
+                "follower deduplication receipt store is full"
             );
         }
     }

@@ -337,7 +337,7 @@ impl DataNode for DataNodeService {
                     version: Some(record.version.clone()),
                     deleted: false,
                     mutation_id: mutation_id.clone(),
-                    remaining_window_millis: 0,
+                    remaining_retention_millis: 0,
                 }),
             });
         }
@@ -354,7 +354,7 @@ impl DataNode for DataNodeService {
         let dedup = state
             .dedup
             .get_mut(mutation_id.as_str())
-            .expect("new retry record exists");
+            .expect("new deduplication receipt exists");
         dedup.required_acks = required_acks.clone();
         dedup.retained_bytes += ack_cost;
         state.dedup_bytes += ack_cost;
@@ -651,7 +651,7 @@ impl DataNode for DataNodeService {
                     version: Some(version.clone()),
                     deleted: true,
                     mutation_id: mutation_id.clone(),
-                    remaining_window_millis: 0,
+                    remaining_retention_millis: 0,
                 }),
             });
         }
@@ -668,7 +668,7 @@ impl DataNode for DataNodeService {
         let dedup = state
             .dedup
             .get_mut(mutation_id.as_str())
-            .expect("new retry record exists");
+            .expect("new deduplication receipt exists");
         dedup.required_acks = required_acks.clone();
         dedup.retained_bytes += ack_cost;
         state.dedup_bytes += ack_cost;
@@ -960,7 +960,7 @@ impl DataNode for DataNodeService {
         {
             self.record_follower_dedup_rejection(&state);
             return Err(Status::resource_exhausted(
-                "follower mutation retry window is full",
+                "follower deduplication receipt store is full",
             ));
         }
         let mutation_id = entry.mutation_id.clone();
@@ -1215,7 +1215,7 @@ impl DataNode for DataNodeService {
                 version: Some(record.version.clone()),
                 deleted: record.deleted,
                 mutation_id: String::new(),
-                remaining_window_millis: 0,
+                remaining_retention_millis: 0,
             };
             let size = migration_record_size(&record);
             if !records.is_empty() && bytes + size > max_bytes {
@@ -1272,7 +1272,7 @@ impl DataNode for DataNodeService {
                 fingerprint: entry.fingerprint.to_vec(),
                 version: Some(entry.version.clone()),
                 deleted: entry.deleted,
-                remaining_window_millis: remaining_window_millis(entry.expires_at, now),
+                remaining_retention_millis: remaining_retention_millis(entry.expires_at, now),
             };
             let size = dedup_record_size(&record);
             if !records.is_empty() && bytes + size > page_limit(request.max_bytes) {
@@ -1319,7 +1319,7 @@ impl DataNode for DataNodeService {
             bytes += size;
             let mut copied = entry.clone();
             if let Some(record) = copied.record.as_mut() {
-                record.remaining_window_millis = state
+                record.remaining_retention_millis = state
                     .dedup
                     .get(record.mutation_id.as_str())
                     .filter(|dedup| {
@@ -1328,7 +1328,7 @@ impl DataNode for DataNodeService {
                             && Some(&dedup.version) == record.version.as_ref()
                     })
                     .map_or(0, |dedup| {
-                        remaining_window_millis(dedup.expires_at, Instant::now())
+                        remaining_retention_millis(dedup.expires_at, Instant::now())
                     });
             }
             records.push(copied);
@@ -1391,7 +1391,7 @@ impl DataNode for DataNodeService {
                         .to_vec(),
                     version: record.version.clone(),
                     deleted: record.deleted,
-                    remaining_window_millis: record.remaining_window_millis,
+                    remaining_retention_millis: record.remaining_retention_millis,
                 };
                 stage_dedup(destination, dedup, self.max_dedup_bytes)?;
             }
@@ -1518,7 +1518,7 @@ impl DataNode for DataNodeService {
                     || existing.deleted != record.deleted
                 {
                     return Err(Status::failed_precondition(
-                        "destination mutation ID conflicts with existing retry record",
+                        "destination mutation ID conflicts with existing deduplication receipt",
                     ));
                 }
             } else {
@@ -1535,7 +1535,7 @@ impl DataNode for DataNodeService {
         }
         if state.dedup_bytes.saturating_add(added_bytes) > self.max_dedup_bytes {
             return Err(Status::resource_exhausted(
-                "destination mutation retry window is full",
+                "destination deduplication receipt store is full",
             ));
         }
         let topology = state.topology.clone();

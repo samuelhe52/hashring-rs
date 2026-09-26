@@ -170,7 +170,7 @@ async fn committed_destination_fences_writes_until_idempotent_activation() {
                 }),
                 deleted: false,
                 mutation_id: String::new(),
-                remaining_window_millis: 0,
+                remaining_retention_millis: 0,
             }],
             journal_records: Vec::new(),
         }))
@@ -619,7 +619,7 @@ async fn expired_staged_ids_free_migration_budget_before_commit() {
             owner_node_id: "node-1".into(),
         }),
         deleted: false,
-        remaining_window_millis: 60_000,
+        remaining_retention_millis: 60_000,
     };
     let request = |record| ApplyDedupBatchRequest {
         change_id: "change-1".into(),
@@ -916,7 +916,7 @@ async fn deletion_replay_and_commit_remove_stale_destination_data() {
             }),
             deleted: true,
             mutation_id: String::new(),
-            remaining_window_millis: 0,
+            remaining_retention_millis: 0,
         }),
     };
     let batch = ApplyMigrationBatchRequest {
@@ -969,7 +969,7 @@ async fn migration_replay_preserves_delete_and_put_order() {
             version: Some(version(owner_sequence)),
             deleted: true,
             mutation_id: String::new(),
-            remaining_window_millis: 0,
+            remaining_retention_millis: 0,
         }),
     };
     let put = |watermark, owner_sequence, value: &[u8]| JournalRecord {
@@ -980,7 +980,7 @@ async fn migration_replay_preserves_delete_and_put_order() {
             version: Some(version(owner_sequence)),
             deleted: false,
             mutation_id: String::new(),
-            remaining_window_millis: 0,
+            remaining_retention_millis: 0,
         }),
     };
 
