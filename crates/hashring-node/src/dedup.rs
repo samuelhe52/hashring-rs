@@ -149,6 +149,10 @@ pub(super) fn remaining_window_millis(expires_at: Instant, now: Instant) -> u64 
 }
 
 pub(super) fn purge_expired_dedup(state: &mut NodeState, now: Instant) {
+    let started = diagnostics::enabled().then(Instant::now);
+    if started.is_some() {
+        state.cleanup_timing.purge_calls += 1;
+    }
     let mut removed = false;
     while state
         .dedup_expirations
@@ -166,6 +170,9 @@ pub(super) fn purge_expired_dedup(state: &mut NodeState, now: Instant) {
             && let Some(entry) = state.dedup.remove(mutation_id.as_ref())
         {
             state.dedup_bytes -= entry.retained_bytes;
+            if started.is_some() {
+                state.cleanup_timing.expired_receipts += 1;
+            }
             removed = true;
         }
     }
@@ -174,6 +181,11 @@ pub(super) fn purge_expired_dedup(state: &mut NodeState, now: Instant) {
         prune_ack_progress(state);
         state.ack_progress_needs_prune = false;
         state.next_ack_prune_at = now + std::time::Duration::from_secs(1);
+    }
+    if let Some(started) = started {
+        let elapsed = diagnostics::nanos(started.elapsed());
+        state.cleanup_timing.purge_nanos += elapsed;
+        state.cleanup_timing.max_purge_nanos = state.cleanup_timing.max_purge_nanos.max(elapsed);
     }
 }
 

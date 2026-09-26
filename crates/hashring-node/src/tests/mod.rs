@@ -51,6 +51,7 @@ fn service_for(node_id: &str, topology: TopologySnapshot) -> DataNodeService {
         dedup_peak_bytes: 0,
         ack_progress_needs_prune: false,
         next_ack_prune_at: Instant::now(),
+        cleanup_timing: proto::ReceiptCleanupTiming::default(),
     }));
     let pressure = Arc::new(NodePressureStats::default());
     let replication_dispatch = start_replication_dispatch(state.clone(), pressure.clone());

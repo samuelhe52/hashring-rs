@@ -122,7 +122,7 @@ impl DataNode for DataNodeService {
                 }));
             }
         };
-        let mut state = self.state.write().await;
+        let mut state = diagnostics::write(&self.state, &self.pressure.owner_write_timing).await;
         if let Some(error) = self.owner_error(&state, &request.key)? {
             return Ok(Response::new(PutResponse {
                 current_epoch: error.current_epoch,
@@ -444,7 +444,7 @@ impl DataNode for DataNodeService {
                 }));
             }
         };
-        let mut state = self.state.write().await;
+        let mut state = diagnostics::write(&self.state, &self.pressure.owner_write_timing).await;
         if let Some(error) = self.owner_error(&state, &request.key)? {
             return Ok(Response::new(DeleteResponse {
                 current_epoch: error.current_epoch,
@@ -877,7 +877,7 @@ impl DataNode for DataNodeService {
             ));
         }
 
-        let mut state = self.state.write().await;
+        let mut state = diagnostics::write(&self.state, &self.pressure.follower_write_timing).await;
         if entry.topology_epoch != state.topology.epoch {
             return Err(Status::failed_precondition(format!(
                 "replication epoch {} does not match installed epoch {}",
@@ -1151,6 +1151,13 @@ impl DataNode for DataNodeService {
             dedup_bytes: state.dedup_bytes as u64,
             dedup_peak_bytes: state.dedup_peak_bytes as u64,
             dedup_capacity_bytes: self.max_dedup_bytes as u64,
+            owner_write_timing: diagnostics::enabled()
+                .then(|| self.pressure.owner_write_timing.snapshot()),
+            follower_write_timing: diagnostics::enabled()
+                .then(|| self.pressure.follower_write_timing.snapshot()),
+            ack_write_timing: diagnostics::enabled()
+                .then(|| self.pressure.ack_write_timing.snapshot()),
+            receipt_cleanup_timing: diagnostics::enabled().then_some(state.cleanup_timing),
             owner_dedup_rejections: self
                 .pressure
                 .owner_dedup_rejections

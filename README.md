@@ -123,6 +123,12 @@ not CPU-only service time. After initial writes, `node_pressure_after_initial_pu
 records each node's current and peak mutation-retry-window bytes, its capacity,
 owner and follower budget rejections, replication reservation rejections,
 replication RPC retries, and peak pending entries in one replication stream.
+Set `HASHRING_PROFILE_WRITES=1` when launching the experiment to also collect
+per-node receipt-cleanup timings and state write-lock wait/hold timings for
+owner mutations, follower application, and replication ACK processing. These
+cumulative wall-time counters appear in the same pressure sample; summed wait
+times can overlap across tasks and nodes. Timing fields are `null` in experiment
+summaries unless profiling is enabled.
 The same sample is retained as a `node_pressure_sampled` event, including when
 initial writes fail. These counters are per process and reset on node restart;
 the stream peak excludes the replication RPC currently in flight. A full owner

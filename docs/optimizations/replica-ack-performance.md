@@ -77,3 +77,7 @@ Twenty consecutive correctness runs used nine initial nodes, scaled out to ten a
 | Scale-in with mutations | 0.568 s | 0.595 s | 0.616 s |
 
 All observed scale-outs met the 10-second normal target and 30-second hard cap. The two transport failures were on an intermediate build before coordinator channel reuse; the first build with shared channels passed, and these twenty committed-build runs passed. This sequence supports channel reuse as a likely contributor, but does not identify the exact transport failure or prove it cannot recur. Under an independent, identical-run assumption, zero failures in 20 trials still permits a 13.9% one-sided 95% upper bound on failure probability; sequential runs on one host may be correlated. This is evidence for the 20k migration profile, not a one-million-key migration test. Full details: `results/first-successor-reliability-89d23fa/README.md` and `audit.json`.
+
+## Follow-up: receipt cleanup and client routing
+
+[Receipt cleanup and request routing](write-path-cleanup-and-routing.md) records the subsequent source audit, opt-in lock/cleanup instrumentation, repeated million-key comparisons, and removal of redundant receipt scans and per-request topology copies.

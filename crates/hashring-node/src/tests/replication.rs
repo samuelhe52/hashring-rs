@@ -455,6 +455,7 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
         dedup_peak_bytes: 0,
         ack_progress_needs_prune: false,
         next_ack_prune_at: Instant::now(),
+        cleanup_timing: proto::ReceiptCleanupTiming::default(),
     };
     let version = RecordVersion {
         topology_epoch: 1,
@@ -1285,4 +1286,61 @@ async fn local_readiness_requires_admission_and_bounds_unacknowledged_lag() {
     assert!(service.ready_followers(key).await.is_err());
     service.state.write().await.owner_stream_unacked.clear();
     assert_eq!(service.ready_followers(key).await.unwrap().1, [follower]);
+}
+
+#[tokio::test]
+async fn ack_pruning_preserves_live_old_requirements_and_skips_current_epoch_scans() {
+    let service = service();
+    let mut state = service.state.write().await;
+    let current_epoch = state.topology.epoch;
+    let old = (0, "old-follower".to_owned());
+    let orphan = (0, "orphan-instance".to_owned());
+    let current = (current_epoch, "current-follower".to_owned());
+    for stream in [&old, &current] {
+        state
+            .ack_progress
+            .insert(stream.clone(), watch::channel(1).0);
+        state
+            .ack_process_instances
+            .insert(stream.clone(), "process".into());
+    }
+    // An identity can require retirement even without a corresponding sender.
+    state
+        .ack_process_instances
+        .insert(orphan.clone(), "process".into());
+    let version = RecordVersion {
+        topology_epoch: 0,
+        owner_sequence: 1,
+        owner_node_id: "node-1".into(),
+    };
+    insert_dedup_until(
+        &mut state,
+        "live".into(),
+        Arc::from(&b"key"[..]),
+        [0; 32],
+        version,
+        false,
+        Instant::now() + std::time::Duration::from_secs(60),
+    );
+    state.dedup.get_mut("live").unwrap().required_acks = vec![(0, old.1.clone(), 1)];
+    prune_ack_progress(&mut state);
+    assert!(state.ack_progress.contains_key(&old));
+    assert!(state.ack_process_instances.contains_key(&old));
+    assert!(!state.ack_process_instances.contains_key(&orphan));
+    assert!(state.ack_progress.contains_key(&current));
+
+    state.dedup.get_mut("live").unwrap().required_acks.clear();
+    prune_ack_progress(&mut state);
+    assert!(!state.ack_progress.contains_key(&old));
+    assert!(!state.ack_process_instances.contains_key(&old));
+    let scanned = state.cleanup_timing.ack_prune_scanned_receipts;
+    prune_ack_progress(&mut state);
+    assert_eq!(state.cleanup_timing.ack_prune_scanned_receipts, scanned);
+    assert!(state.ack_progress.contains_key(&current));
+    assert!(state.ack_process_instances.contains_key(&current));
+    state
+        .ack_process_instances
+        .insert(orphan.clone(), "late-instance".into());
+    prune_ack_progress(&mut state);
+    assert!(!state.ack_process_instances.contains_key(&orphan));
 }

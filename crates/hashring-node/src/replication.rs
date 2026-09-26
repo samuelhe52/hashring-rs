@@ -217,6 +217,29 @@ pub(super) fn replication_fingerprint(entry: &ReplicationEntry) -> String {
 }
 
 pub(super) fn prune_ack_progress(state: &mut NodeState) {
+    let started = diagnostics::enabled().then(Instant::now);
+    if started.is_some() {
+        state.cleanup_timing.ack_prune_calls += 1;
+    }
+    let current_epoch = state.topology.epoch;
+    // Current-epoch streams must always remain available for replication and
+    // ACK waiters. Receipt references matter only when retiring older streams.
+    // Checking the small stream tables avoids scanning every live receipt on
+    // each expiry tick during steady-state writes.
+    if state
+        .ack_progress
+        .keys()
+        .chain(state.ack_process_instances.keys())
+        .all(|(epoch, _)| *epoch == current_epoch)
+    {
+        if let Some(started) = started {
+            state.cleanup_timing.ack_prune_nanos += diagnostics::nanos(started.elapsed());
+        }
+        return;
+    }
+    if started.is_some() {
+        state.cleanup_timing.ack_prune_scanned_receipts += state.dedup.len() as u64;
+    }
     let live: HashSet<_> = state
         .dedup
         .values()
@@ -227,13 +250,15 @@ pub(super) fn prune_ack_progress(state: &mut NodeState) {
                 .map(|(epoch, node_id, _)| (*epoch, node_id.clone()))
         })
         .collect();
-    let current_epoch = state.topology.epoch;
     state
         .ack_progress
         .retain(|key, _| key.0 == current_epoch || live.contains(key));
     state
         .ack_process_instances
         .retain(|key, _| key.0 == current_epoch || live.contains(key));
+    if let Some(started) = started {
+        state.cleanup_timing.ack_prune_nanos += diagnostics::nanos(started.elapsed());
+    }
 }
 
 pub(super) fn start_replication_dispatch(
@@ -423,7 +448,7 @@ pub(super) async fn deliver_replication_stream(
                     if !response.process_instance_id.is_empty()
                         && response.applied_stream_sequence >= prepared.stream_sequence =>
                 {
-                    let mut state = state.write().await;
+                    let mut state = diagnostics::write(&state, &pressure.ack_write_timing).await;
                     let stream = (
                         prepared.mutation.topology_epoch,
                         prepared.follower_node_id.clone(),

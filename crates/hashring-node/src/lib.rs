@@ -215,6 +215,9 @@ struct ReplicationDispatcher {
 
 #[derive(Default)]
 struct NodePressureStats {
+    owner_write_timing: diagnostics::StateWriteTiming,
+    follower_write_timing: diagnostics::StateWriteTiming,
+    ack_write_timing: diagnostics::StateWriteTiming,
     owner_dedup_rejections: AtomicU64,
     follower_dedup_rejections: AtomicU64,
     replication_reservation_rejections: AtomicU64,
@@ -243,6 +246,7 @@ struct NodeState {
     dedup_peak_bytes: usize,
     ack_progress_needs_prune: bool,
     next_ack_prune_at: Instant,
+    cleanup_timing: proto::ReceiptCleanupTiming,
 }
 
 struct SnapshotPreparationGuard {
@@ -298,6 +302,7 @@ pub struct DataNodeService {
 }
 
 mod dedup;
+mod diagnostics;
 mod migration;
 mod replication;
 mod rpc;

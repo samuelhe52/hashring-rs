@@ -785,6 +785,15 @@ async fn run_cluster(
     Ok(topology.epoch)
 }
 
+fn state_write_timing_json(timing: Option<hashring_core::proto::StateWriteTiming>) -> Value {
+    timing.map_or(Value::Null, |t| {
+        json!({
+            "acquisitions": t.acquisitions, "wait_nanos": t.wait_nanos, "hold_nanos": t.hold_nanos,
+            "max_wait_nanos": t.max_wait_nanos, "max_hold_nanos": t.max_hold_nanos,
+        })
+    })
+}
+
 async fn record_node_pressure(
     members: &[Member],
     events: &EventLog,
@@ -805,6 +814,15 @@ async fn record_node_pressure(
         .await;
         let value = match result {
             Ok(Ok(info)) => json!({
+                "owner_write_timing": state_write_timing_json(info.owner_write_timing),
+                "follower_write_timing": state_write_timing_json(info.follower_write_timing),
+                "ack_write_timing": state_write_timing_json(info.ack_write_timing),
+                "receipt_cleanup_timing": info.receipt_cleanup_timing.map(|t| json!({
+                    "purge_calls": t.purge_calls, "purge_nanos": t.purge_nanos,
+                    "max_purge_nanos": t.max_purge_nanos, "expired_receipts": t.expired_receipts,
+                    "ack_prune_calls": t.ack_prune_calls, "ack_prune_nanos": t.ack_prune_nanos,
+                    "ack_prune_scanned_receipts": t.ack_prune_scanned_receipts,
+                })),
                 "dedup_bytes": info.dedup_bytes,
                 "dedup_peak_bytes": info.dedup_peak_bytes,
                 "dedup_capacity_bytes": info.dedup_capacity_bytes,

@@ -297,6 +297,30 @@ message NodeInfoResponse {
   uint64 replication_reservation_rejections = 8;
   uint64 replication_rpc_retries = 9;
   uint64 replication_stream_peak_pending = 10;
+  // Present only when HASHRING_PROFILE_WRITES=1 on this node.
+  StateWriteTiming owner_write_timing = 11;
+  StateWriteTiming follower_write_timing = 12;
+  StateWriteTiming ack_write_timing = 13;
+  ReceiptCleanupTiming receipt_cleanup_timing = 14;
+}
+
+// Cumulative per-process timings. Wait totals can overlap across tasks.
+message StateWriteTiming {
+  uint64 acquisitions = 1;
+  uint64 wait_nanos = 2;
+  uint64 hold_nanos = 3;
+  uint64 max_wait_nanos = 4;
+  uint64 max_hold_nanos = 5;
+}
+
+message ReceiptCleanupTiming {
+  uint64 purge_calls = 1;
+  uint64 purge_nanos = 2;
+  uint64 max_purge_nanos = 3;
+  uint64 expired_receipts = 4;
+  uint64 ack_prune_calls = 5;
+  uint64 ack_prune_nanos = 6;
+  uint64 ack_prune_scanned_receipts = 7;
 }
 
 message SnapshotPageRequest {
