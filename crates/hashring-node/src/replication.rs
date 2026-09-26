@@ -231,6 +231,9 @@ pub(super) fn prune_ack_progress(state: &mut NodeState) {
     state
         .ack_progress
         .retain(|key, _| key.0 == current_epoch || live.contains(key));
+    state
+        .ack_process_instances
+        .retain(|key, _| key.0 == current_epoch || live.contains(key));
 }
 
 pub(super) fn start_replication_dispatch(
@@ -417,15 +420,25 @@ pub(super) async fn deliver_replication_stream(
             drop(active_budget);
             match result {
                 Ok(Ok(response))
-                    if response.applied_stream_sequence >= prepared.stream_sequence =>
+                    if !response.process_instance_id.is_empty()
+                        && response.applied_stream_sequence >= prepared.stream_sequence =>
                 {
                     let mut state = state.write().await;
+                    let stream = (
+                        prepared.mutation.topology_epoch,
+                        prepared.follower_node_id.clone(),
+                    );
+                    let previous_instance = state
+                        .ack_process_instances
+                        .insert(stream, response.process_instance_id.clone());
+                    let instance_changed =
+                        previous_instance.as_ref() != Some(&response.process_instance_id);
                     if let Some(progress) = state.ack_progress.get(&(
                         prepared.mutation.topology_epoch,
                         prepared.follower_node_id.clone(),
                     )) {
                         progress.send_if_modified(|sequence| {
-                            if *sequence < response.applied_stream_sequence {
+                            if instance_changed || *sequence < response.applied_stream_sequence {
                                 *sequence = response.applied_stream_sequence;
                                 true
                             } else {

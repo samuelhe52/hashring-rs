@@ -146,7 +146,7 @@ impl CoordinatorService {
         let mut first_error = None;
         for member in &change.target_topology.members {
             let result = async {
-                let mut client = connect_node(&member.endpoint, deadline).await?;
+                let mut client = self.connect_node(&member.endpoint, deadline).await?;
                 if pause {
                     rpc_before(deadline, client.pause_policy_writes(request.clone())).await?;
                 } else {

@@ -313,6 +313,123 @@ async fn expired_mutation_ids_eventually_release_old_ack_progress() {
     assert!(!state.ack_progress.contains_key(&(0, "old-follower".into())));
 }
 
+#[tokio::test]
+async fn acknowledged_mutation_releases_ack_metadata_but_keeps_retry_result() {
+    let service = service();
+    let version = RecordVersion {
+        topology_epoch: 1,
+        owner_sequence: 1,
+        owner_node_id: "node-1".into(),
+    };
+    let required = vec![(1, "node-2".into(), 1)];
+    let ack_bytes = required_ack_retained_bytes(&["node-2".into()]);
+    let base_bytes;
+    {
+        let mut state = service.state.write().await;
+        insert_dedup(
+            &mut state,
+            "mutation-1".into(),
+            Arc::from(&b"key"[..]),
+            [0; 32],
+            version.clone(),
+            false,
+            Instant::now(),
+        );
+        let heap_id = &state.dedup_expirations.peek().unwrap().0.1;
+        let map_id = state.dedup.keys().next().unwrap();
+        assert!(Arc::ptr_eq(heap_id, map_id));
+        base_bytes = state.dedup_bytes;
+        let entry = state.dedup.get_mut("mutation-1").unwrap();
+        entry.required_acks = required.clone();
+        entry.retained_bytes += ack_bytes;
+        state.dedup_bytes += ack_bytes;
+        let (sender, _) = watch::channel(1);
+        state.ack_progress.insert((1, "node-2".into()), sender);
+        state
+            .admitted_followers
+            .insert("node-2".into(), "follower-process".into());
+        state
+            .ack_process_instances
+            .insert((1, "node-2".into()), "follower-process".into());
+    }
+
+    service
+        .wait_required_acks(&required, 1, "mutation-1", &version)
+        .await
+        .unwrap();
+    let state = service.state.read().await;
+    let entry = &state.dedup["mutation-1"];
+    assert!(entry.required_acks.is_empty());
+    assert_eq!(state.dedup_bytes, base_bytes);
+    assert_eq!(entry.version, version);
+    drop(state);
+    service
+        .wait_required_acks(&[], 1, "mutation-1", &version)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn unacknowledged_mutation_retains_ack_requirements_for_retry() {
+    let service = service();
+    let version = RecordVersion {
+        topology_epoch: 1,
+        owner_sequence: 1,
+        owner_node_id: "node-1".into(),
+    };
+    let required = vec![(1, "node-2".into(), 1)];
+    let (sender, _) = watch::channel(0);
+    {
+        let mut state = service.state.write().await;
+        insert_dedup(
+            &mut state,
+            "mutation-1".into(),
+            Arc::from(&b"key"[..]),
+            [0; 32],
+            version.clone(),
+            false,
+            Instant::now(),
+        );
+        let ack_bytes = required_ack_retained_bytes(&["node-2".into()]);
+        let entry = state.dedup.get_mut("mutation-1").unwrap();
+        entry.required_acks = required.clone();
+        entry.retained_bytes += ack_bytes;
+        state.dedup_bytes += ack_bytes;
+        state
+            .ack_progress
+            .insert((1, "node-2".into()), sender.clone());
+    }
+    assert!(
+        service
+            .wait_required_acks(&required, 1, "mutation-1", &version)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        service.state.read().await.dedup["mutation-1"].required_acks,
+        required
+    );
+    sender.send_replace(1);
+    {
+        let mut state = service.state.write().await;
+        state
+            .admitted_followers
+            .insert("node-2".into(), "follower-process".into());
+        state
+            .ack_process_instances
+            .insert((1, "node-2".into()), "follower-process".into());
+    }
+    service
+        .wait_required_acks(&required, 1, "mutation-1", &version)
+        .await
+        .unwrap();
+    assert!(
+        service.state.read().await.dedup["mutation-1"]
+            .required_acks
+            .is_empty()
+    );
+}
+
 #[test]
 fn owner_assigns_independent_contiguous_sequences_per_follower() {
     let topology = replication_topology(3);
@@ -324,6 +441,8 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
         owner_stream_sequences: HashMap::new(),
         owner_stream_unacked: HashMap::new(),
         ack_progress: HashMap::new(),
+        ack_process_instances: HashMap::new(),
+        admitted_followers: HashMap::new(),
         follower_streams: HashMap::new(),
         sources: HashMap::new(),
         destinations: HashMap::new(),
@@ -1026,16 +1145,144 @@ async fn first_successor_requires_the_exact_healthy_follower_and_its_ack() {
     {
         let mut state = service.state.write().await;
         state
+            .admitted_followers
+            .insert(first.clone(), "follower-process".into());
+        state
+            .ack_process_instances
+            .insert((1, first.clone()), "follower-process".into());
+        state
             .ack_progress
             .insert((1, first.clone()), first_sender.clone());
         state
             .ack_progress
             .insert((1, second), second_sender.clone());
     }
-    let waiter = tokio::spawn(async move { service.wait_required_acks(&[(1, first, 1)], 1).await });
+    let waiter = tokio::spawn(async move {
+        service
+            .wait_required_acks(
+                &[(1, first, 1)],
+                1,
+                "mutation-1",
+                &RecordVersion {
+                    topology_epoch: 1,
+                    owner_sequence: 1,
+                    owner_node_id: "node-1".into(),
+                },
+            )
+            .await
+    });
     second_sender.send_replace(1);
     tokio::task::yield_now().await;
     assert!(!waiter.is_finished());
     first_sender.send_replace(1);
     assert!(waiter.await.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn required_ack_rejects_a_restarted_follower_until_its_new_process_is_admitted() {
+    let service = service();
+    let required = vec![(1, "node-2".into(), 1)];
+    let version = RecordVersion {
+        topology_epoch: 1,
+        owner_sequence: 1,
+        owner_node_id: "node-1".into(),
+    };
+    {
+        let mut state = service.state.write().await;
+        state
+            .ack_progress
+            .insert((1, "node-2".into()), watch::channel(1).0);
+        state
+            .admitted_followers
+            .insert("node-2".into(), "old-process".into());
+        state
+            .ack_process_instances
+            .insert((1, "node-2".into()), "new-process".into());
+    }
+    assert!(
+        service
+            .wait_required_acks(&required, 1, "id", &version)
+            .await
+            .is_err()
+    );
+    service
+        .state
+        .write()
+        .await
+        .admitted_followers
+        .insert("node-2".into(), "new-process".into());
+    service
+        .wait_required_acks(&required, 1, "id", &version)
+        .await
+        .unwrap();
+    // A late waiter cannot use a sequence acknowledged by the previous process.
+    service
+        .state
+        .write()
+        .await
+        .ack_progress
+        .get(&(1, "node-2".into()))
+        .unwrap()
+        .send_replace(0);
+    assert!(
+        service
+            .wait_required_acks(&required, 1, "id", &version)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn local_readiness_requires_admission_and_bounds_unacknowledged_lag() {
+    let topology = TopologySnapshot::new(
+        1,
+        7,
+        4,
+        (1..=3)
+            .map(|i| Member {
+                node_id: format!("node-{i}"),
+                endpoint: format!("http://127.0.0.1:500{i}"),
+            })
+            .collect(),
+    )
+    .unwrap();
+    let service = service_for("node-1", topology);
+    let key = b"local-readiness";
+    let follower;
+    {
+        let mut state = service.state.write().await;
+        state.topology.write_ack_policy = WriteAckPolicy::FirstSuccessor;
+        follower = state
+            .topology
+            .replica_node_ids_for_token(state.topology.key_token(key))
+            .unwrap()[1]
+            .to_owned();
+    }
+    assert!(service.ready_followers(key).await.is_err());
+    {
+        let mut state = service.state.write().await;
+        state
+            .admitted_followers
+            .insert(follower.clone(), "process".into());
+    }
+    assert_eq!(
+        service.ready_followers(key).await.unwrap().1,
+        std::slice::from_ref(&follower)
+    );
+    {
+        let mut state = service.state.write().await;
+        let old = now_unix_millis().saturating_sub(
+            state
+                .topology
+                .write_availability_guard
+                .max_replica_lag_millis
+                + 1,
+        );
+        state
+            .owner_stream_unacked
+            .insert((1, follower.clone()), [(1, old)].into());
+    }
+    assert!(service.ready_followers(key).await.is_err());
+    service.state.write().await.owner_stream_unacked.clear();
+    assert_eq!(service.ready_followers(key).await.unwrap().1, [follower]);
 }

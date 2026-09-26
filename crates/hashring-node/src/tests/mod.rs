@@ -34,6 +34,8 @@ fn service_for(node_id: &str, topology: TopologySnapshot) -> DataNodeService {
         owner_stream_sequences: HashMap::new(),
         owner_stream_unacked: HashMap::new(),
         ack_progress: HashMap::new(),
+        ack_process_instances: HashMap::new(),
+        admitted_followers: HashMap::new(),
         follower_streams: HashMap::new(),
         sources: HashMap::new(),
         destinations: HashMap::new(),

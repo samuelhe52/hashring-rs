@@ -12,21 +12,57 @@ pub(super) fn mutation_fingerprint(key: &[u8], value: &[u8], deleted: bool) -> [
 }
 
 pub(super) fn dedup_retained_bytes(mutation_id: &str, key_len: usize, owner_len: usize) -> usize {
+    mutation_id.len()
+        + key_len
+        + owner_len
+        + std::mem::size_of::<(Arc<str>, DedupEntry)>()
+        + std::mem::size_of::<(Instant, Arc<str>)>()
+        + 32 // Arc control blocks for the ID and key
+        + 64 // hash-table buckets and allocator metadata
+}
+
+pub(super) fn staged_dedup_retained_bytes(
+    mutation_id: &str,
+    key_len: usize,
+    owner_len: usize,
+) -> usize {
     mutation_id.len().saturating_mul(2)
         + key_len
         + owner_len
-        + std::mem::size_of::<DedupEntry>()
-        + std::mem::size_of::<(Instant, String)>()
-        + std::mem::size_of::<DeduplicationRecord>()
-        + std::mem::size_of::<StagedDedup>()
-        + 128 // hash-table buckets and allocator metadata
+        + 32 // fingerprint bytes
+        + std::mem::size_of::<(String, StagedDedup)>()
+        + 64 // hash-table buckets and allocator metadata
 }
 
 pub(super) fn required_ack_retained_bytes(followers: &[String]) -> usize {
     followers
         .iter()
-        .map(|node_id| 2 * std::mem::size_of::<RequiredAck>() + node_id.len() + 64)
+        .map(|node_id| required_ack_entry_bytes(node_id.len()))
         .sum()
+}
+
+fn required_ack_entry_bytes(node_id_len: usize) -> usize {
+    2 * std::mem::size_of::<RequiredAck>() + node_id_len + 64
+}
+
+pub(super) fn complete_required_acks(
+    state: &mut NodeState,
+    mutation_id: &str,
+    version: &RecordVersion,
+) {
+    let Some(entry) = state.dedup.get_mut(mutation_id) else {
+        return;
+    };
+    if &entry.version != version || entry.required_acks.is_empty() {
+        return;
+    }
+    let required = std::mem::take(&mut entry.required_acks);
+    let released = required
+        .iter()
+        .map(|(_, node_id, _)| required_ack_entry_bytes(node_id.len()))
+        .sum::<usize>();
+    entry.retained_bytes -= released;
+    state.dedup_bytes -= released;
 }
 
 pub(super) fn dedup_record_size(record: &DeduplicationRecord) -> usize {
@@ -71,7 +107,7 @@ pub(super) fn stage_dedup(
         return Ok(());
     }
     let version = record.version.as_ref().expect("version was checked above");
-    let cost = dedup_retained_bytes(
+    let cost = staged_dedup_retained_bytes(
         &record.mutation_id,
         record.key.len(),
         version.owner_node_id.len(),
@@ -125,9 +161,9 @@ pub(super) fn purge_expired_dedup(state: &mut NodeState, now: Instant) {
             .expect("expiration was checked above");
         if state
             .dedup
-            .get(&mutation_id)
+            .get(mutation_id.as_ref())
             .is_some_and(|entry| entry.expires_at <= now)
-            && let Some(entry) = state.dedup.remove(&mutation_id)
+            && let Some(entry) = state.dedup.remove(mutation_id.as_ref())
         {
             state.dedup_bytes -= entry.retained_bytes;
             removed = true;
@@ -172,6 +208,7 @@ pub(super) fn insert_dedup_until(
     expires_at: Instant,
 ) {
     let retained_bytes = dedup_retained_bytes(&mutation_id, key.len(), version.owner_node_id.len());
+    let mutation_id: Arc<str> = mutation_id.into();
     state
         .dedup_expirations
         .push(Reverse((expires_at, mutation_id.clone())));

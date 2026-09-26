@@ -81,7 +81,7 @@ impl DataNode for DataNodeService {
             }
             if let Some(existing) = state
                 .dedup
-                .get(&request.request_id)
+                .get(request.request_id.as_str())
                 .filter(|entry| entry.expires_at > Instant::now())
             {
                 if existing.fingerprint != mutation_fingerprint(&request.key, &request.value, false)
@@ -101,7 +101,10 @@ impl DataNode for DataNodeService {
                 let required = existing.required_acks.clone();
                 let epoch = state.topology.epoch;
                 drop(state);
-                let error = self.wait_required_acks(&required, epoch).await.err();
+                let error = self
+                    .wait_required_acks(&required, epoch, &request.request_id, &version)
+                    .await
+                    .err();
                 return Ok(Response::new(PutResponse {
                     version: error.is_none().then_some(version),
                     current_epoch: epoch,
@@ -141,13 +144,16 @@ impl DataNode for DataNodeService {
         let dedup_now = Instant::now();
         purge_expired_dedup(&mut state, dedup_now);
         let fingerprint = mutation_fingerprint(&request.key, &request.value, false);
-        if let Some(existing) = state.dedup.get(&request.request_id) {
+        if let Some(existing) = state.dedup.get(request.request_id.as_str()) {
             if existing.fingerprint == fingerprint && !existing.deleted {
                 let version = existing.version.clone();
                 let required = existing.required_acks.clone();
                 let epoch = state.topology.epoch;
                 drop(state);
-                let error = self.wait_required_acks(&required, epoch).await.err();
+                let error = self
+                    .wait_required_acks(&required, epoch, &request.request_id, &version)
+                    .await
+                    .err();
                 return Ok(Response::new(PutResponse {
                     version: error.is_none().then_some(version),
                     current_epoch: epoch,
@@ -347,7 +353,7 @@ impl DataNode for DataNodeService {
         );
         let dedup = state
             .dedup
-            .get_mut(&mutation_id)
+            .get_mut(mutation_id.as_str())
             .expect("new retry record exists");
         dedup.required_acks = required_acks.clone();
         dedup.retained_bytes += ack_cost;
@@ -358,7 +364,7 @@ impl DataNode for DataNodeService {
             .dispatch(replications, reservations);
         drop(state);
         let error = self
-            .wait_required_acks(&required_acks, current_epoch)
+            .wait_required_acks(&required_acks, current_epoch, &mutation_id, &version)
             .await
             .err();
         Ok(Response::new(PutResponse {
@@ -400,7 +406,7 @@ impl DataNode for DataNodeService {
             }
             if let Some(existing) = state
                 .dedup
-                .get(&request.request_id)
+                .get(request.request_id.as_str())
                 .filter(|entry| entry.expires_at > Instant::now())
             {
                 if existing.fingerprint != mutation_fingerprint(&request.key, &[], true)
@@ -415,10 +421,14 @@ impl DataNode for DataNodeService {
                         )),
                     }));
                 }
+                let version = existing.version.clone();
                 let required = existing.required_acks.clone();
                 let epoch = state.topology.epoch;
                 drop(state);
-                let error = self.wait_required_acks(&required, epoch).await.err();
+                let error = self
+                    .wait_required_acks(&required, epoch, &request.request_id, &version)
+                    .await
+                    .err();
                 return Ok(Response::new(DeleteResponse {
                     current_epoch: epoch,
                     error,
@@ -454,12 +464,16 @@ impl DataNode for DataNodeService {
         let dedup_now = Instant::now();
         purge_expired_dedup(&mut state, dedup_now);
         let fingerprint = mutation_fingerprint(&request.key, &[], true);
-        if let Some(existing) = state.dedup.get(&request.request_id) {
+        if let Some(existing) = state.dedup.get(request.request_id.as_str()) {
             if existing.fingerprint == fingerprint && existing.deleted {
+                let version = existing.version.clone();
                 let required = existing.required_acks.clone();
                 let epoch = state.topology.epoch;
                 drop(state);
-                let error = self.wait_required_acks(&required, epoch).await.err();
+                let error = self
+                    .wait_required_acks(&required, epoch, &request.request_id, &version)
+                    .await
+                    .err();
                 return Ok(Response::new(DeleteResponse {
                     current_epoch: epoch,
                     error,
@@ -653,7 +667,7 @@ impl DataNode for DataNodeService {
         );
         let dedup = state
             .dedup
-            .get_mut(&mutation_id)
+            .get_mut(mutation_id.as_str())
             .expect("new retry record exists");
         dedup.required_acks = required_acks.clone();
         dedup.retained_bytes += ack_cost;
@@ -664,7 +678,7 @@ impl DataNode for DataNodeService {
             .dispatch(replications, reservations);
         drop(state);
         let error = self
-            .wait_required_acks(&required_acks, current_epoch)
+            .wait_required_acks(&required_acks, current_epoch, &mutation_id, &version)
             .await
             .err();
         Ok(Response::new(DeleteResponse {
@@ -899,6 +913,7 @@ impl DataNode for DataNodeService {
                 .is_some_and(|existing| existing == &fingerprint)
             {
                 return Ok(Response::new(ReplicateMutationResponse {
+                    process_instance_id: self.process_instance_id.clone(),
                     applied_stream_sequence: stream.applied_sequence,
                 }));
             }
@@ -908,6 +923,7 @@ impl DataNode for DataNodeService {
                 && !stream.fingerprints.contains_key(&entry.stream_sequence)
             {
                 return Ok(Response::new(ReplicateMutationResponse {
+                    process_instance_id: self.process_instance_id.clone(),
                     applied_stream_sequence: stream.applied_sequence,
                 }));
             }
@@ -931,7 +947,7 @@ impl DataNode for DataNodeService {
         let dedup_now = Instant::now();
         purge_expired_dedup(&mut state, dedup_now);
         let mutation_fingerprint = mutation_fingerprint(&entry.key, &entry.value, entry.deleted);
-        if state.dedup.contains_key(&entry.mutation_id) {
+        if state.dedup.contains_key(entry.mutation_id.as_str()) {
             return Err(Status::already_exists(
                 "replication stream reused a live mutation ID",
             ));
@@ -984,6 +1000,7 @@ impl DataNode for DataNodeService {
             Instant::now(),
         );
         Ok(Response::new(ReplicateMutationResponse {
+            process_instance_id: self.process_instance_id.clone(),
             applied_stream_sequence,
         }))
     }
@@ -1235,11 +1252,15 @@ impl DataNode for DataNodeService {
         let now = Instant::now();
         for id in &ids[start..] {
             next_cursor += 1;
-            let Some(entry) = state.dedup.get(id).filter(|entry| entry.expires_at > now) else {
+            let Some(entry) = state
+                .dedup
+                .get(id.as_ref())
+                .filter(|entry| entry.expires_at > now)
+            else {
                 continue;
             };
             let record = DeduplicationRecord {
-                mutation_id: id.clone(),
+                mutation_id: id.to_string(),
                 key: entry.key.to_vec(),
                 fingerprint: entry.fingerprint.to_vec(),
                 version: Some(entry.version.clone()),
@@ -1293,7 +1314,7 @@ impl DataNode for DataNodeService {
             if let Some(record) = copied.record.as_mut() {
                 record.remaining_window_millis = state
                     .dedup
-                    .get(&record.mutation_id)
+                    .get(record.mutation_id.as_str())
                     .filter(|dedup| {
                         dedup.fingerprint
                             == mutation_fingerprint(&record.key, &record.value, record.deleted)
@@ -1484,7 +1505,7 @@ impl DataNode for DataNodeService {
         let mut added_bytes = 0usize;
         for staged in dedup.values() {
             let record = &staged.record;
-            if let Some(existing) = state.dedup.get(&record.mutation_id) {
+            if let Some(existing) = state.dedup.get(record.mutation_id.as_str()) {
                 if existing.fingerprint.as_slice() != record.fingerprint
                     || Some(&existing.version) != record.version.as_ref()
                     || existing.deleted != record.deleted
@@ -1518,7 +1539,7 @@ impl DataNode for DataNodeService {
             apply_internal_record(&mut state.records, key, record);
         }
         for (id, staged) in dedup {
-            if state.dedup.contains_key(&id) {
+            if state.dedup.contains_key(id.as_str()) {
                 continue;
             }
             let record = staged.record;
@@ -1648,6 +1669,7 @@ impl DataNode for DataNodeService {
         let epoch = topology.epoch;
         if epoch != state.topology.epoch {
             state.lease = None;
+            state.admitted_followers.clear();
             clear_replica_repair_staging(&mut state);
         }
         state.topology = topology;

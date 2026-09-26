@@ -198,9 +198,15 @@ message RenewNodeLeaseRequest {
   uint64 topology_epoch = 3;
 }
 
+message AdmittedFollower {
+  string node_id = 1;
+  string process_instance_id = 2;
+}
+
 message RenewNodeLeaseResponse {
   uint64 topology_epoch = 1;
   uint64 lease_duration_millis = 2;
+  repeated AdmittedFollower admitted_followers = 3;
 }
 
 message ReportPeerHealthRequest {
@@ -372,6 +378,7 @@ message ReplicationEntry {
 }
 
 message ReplicateMutationResponse {
+  string process_instance_id = 2;
   uint64 applied_stream_sequence = 1;
 }
 

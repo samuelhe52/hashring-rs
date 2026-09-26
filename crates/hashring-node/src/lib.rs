@@ -48,9 +48,9 @@ const MAX_REPLICATION_FINGERPRINTS: u64 = 4_096;
 const REPLICATION_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const IDEMPOTENCY_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 // A node retains mutation IDs for the full retry window on both owner and
-// follower paths. The million-key, RF=3 profile peaked at the 128 MiB limit
-// on one node, so leave room for placement skew and in-flight replication.
-const MAX_DEDUP_BYTES: usize = 256 * 1024 * 1024;
+// follower paths. Account for live entries separately from staged migration
+// records so the default limit bounds retained data without double charging.
+const MAX_DEDUP_BYTES: usize = 128 * 1024 * 1024;
 const REQUIRED_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const PEER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -124,7 +124,7 @@ impl TryFrom<proto::RangeSpec> for RangeSpec {
 struct SourceMigration {
     range: RangeSpec,
     snapshot_keys: Option<Vec<Vec<u8>>>,
-    snapshot_dedup_ids: Vec<String>,
+    snapshot_dedup_ids: Vec<Arc<str>>,
     snapshot_ready: watch::Sender<bool>,
     journal: Vec<JournalRecord>,
     journal_bytes: usize,
@@ -229,14 +229,16 @@ struct NodeState {
     owner_stream_sequences: HashMap<(u64, String), u64>,
     owner_stream_unacked: HashMap<(u64, String), VecDeque<(u64, u64)>>,
     ack_progress: HashMap<(u64, String), watch::Sender<u64>>,
+    ack_process_instances: HashMap<(u64, String), String>,
+    admitted_followers: HashMap<String, String>,
     follower_streams: HashMap<(u64, String), FollowerStreamState>,
     sources: HashMap<(String, String), SourceMigration>,
     destinations: HashMap<(String, String), DestinationMigration>,
     journal_bytes_total: usize,
     lease: Option<(u64, Instant)>,
     policy_write_fence: Option<(String, u64)>,
-    dedup: HashMap<String, DedupEntry>,
-    dedup_expirations: BinaryHeap<Reverse<(Instant, String)>>,
+    dedup: HashMap<Arc<str>, DedupEntry>,
+    dedup_expirations: BinaryHeap<Reverse<(Instant, Arc<str>)>>,
     dedup_bytes: usize,
     dedup_peak_bytes: usize,
     ack_progress_needs_prune: bool,

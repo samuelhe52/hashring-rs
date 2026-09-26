@@ -599,7 +599,10 @@ async fn migration_carries_snapshot_and_journal_mutation_ids() {
 async fn expired_staged_ids_free_migration_budget_before_commit() {
     let mut destination = service();
     destination.node_id = "node-2".into();
-    destination.max_dedup_bytes = dedup_retained_bytes("first", b"key-1".len(), "node-1".len());
+    destination.max_dedup_bytes =
+        staged_dedup_retained_bytes("first", b"key-1".len(), "node-1".len()).max(
+            dedup_retained_bytes("other", b"key-2".len(), "node-1".len()),
+        );
     destination
         .prepare_destination_range(Request::new(PrepareRangeRequest {
             range: Some(range(0)),

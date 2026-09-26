@@ -215,7 +215,7 @@ seconds and renew every second. Automatic failure detection runs every second;
 repairs/recovery run every five seconds. Repair work is capped at 32
 owner/follower groups per pass and four concurrent groups, with per-group
 exponential retry backoff capped at 60 seconds. Each node caps its pending
-replication buffer at 64 MiB and its dedup receipts at 16 MiB; migration
+replication buffer at 64 MiB and its dedup receipts at 128 MiB; migration
 snapshot pages are capped at 8 MiB. A failed required repair remains visible,
 not silently considered healthy.
 
@@ -231,6 +231,11 @@ cargo run -- replica-status
 before reporting write success. `AllReplicas` waits for every desired follower,
 so writes block if the full desired placement is not healthy. A policy change
 briefly fences writes and publishes a new epoch only after its readiness check.
+With the default availability guard, owners use lease-carried stream admissions
+and verify the required applied ACKs against the admitted follower process identities.
+Explicit copy/health guards still query live replica status. See
+[replica ACK performance](docs/optimizations/replica-ack-performance.md) for measurements
+and the admission/fencing boundaries.
 The client reuses one request ID across retries of a logical write within the
 in-memory 60-second deduplication window. A new CLI invocation generates a new
 ID, and receipts do not survive process loss.

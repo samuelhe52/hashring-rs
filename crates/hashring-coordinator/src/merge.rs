@@ -253,7 +253,7 @@ impl CoordinatorService {
         let mut first_error = None;
         for member in members {
             let result = async {
-                let mut client = connect_node(&member.endpoint, deadline).await?;
+                let mut client = self.connect_node(&member.endpoint, deadline).await?;
                 if pause {
                     rpc_before(deadline, client.pause_policy_writes(request.clone())).await?;
                 } else {
@@ -287,8 +287,8 @@ impl CoordinatorService {
                 .map(|member| member.endpoint.as_str())
                 .ok_or_else(|| Status::failed_precondition("replication stream member disappeared"))
         };
-        let mut source = connect_node(endpoint(owner)?, deadline).await?;
-        let mut destination = connect_node(endpoint(follower)?, deadline).await?;
+        let mut source = self.connect_node(endpoint(owner)?, deadline).await?;
+        let mut destination = self.connect_node(endpoint(follower)?, deadline).await?;
         let request = proto::ReplicationProgressRequest {
             topology_epoch: state.committed.epoch,
             owner_node_id: owner.clone(),
@@ -496,7 +496,7 @@ impl CoordinatorService {
                 continue;
             };
             self.store_stopping_node(&member.node_id).await?;
-            let mut node = match connect_node(&member.endpoint, deadline).await {
+            let mut node = match self.connect_node(&member.endpoint, deadline).await {
                 Ok(node) => node,
                 Err(error) if is_absence_status(&error) => {
                     self.store_stopped_node(&member.node_id).await?;
