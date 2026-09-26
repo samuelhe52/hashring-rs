@@ -69,6 +69,34 @@ The same fresh executable, with `HASHRING_PROFILE_WRITES=1`, passed the FirstSuc
 
 Validation also passed 11 client and 35 node unit tests, including old-epoch ACK-reference retention and orphan identity cleanup; the process tests `online_scale_out_and_scale_in_preserve_concurrent_writes` and `moved_request_retries_a_transient_coordinator_outage_until_deadline`; workspace/all-target Clippy with warnings denied; formatting; and whitespace checks.
 
+## Clean-build throughput across all acknowledgement policies
+
+After commit `8b58d79ad7f083c76f5555906cf8463d84aca69b`, the repository Cargo build cache was cleared (`cargo clean` removed 9.2 GiB), then the release binary was rebuilt with `CARGO_TARGET_DIR=target/clean-policy-bench cargo build --release`. The target was fresh. The build used Rust 1.98.1 for `aarch64-apple-darwin`; the executable BLAKE3 is `287bb196640e95ebc3f1af7058a6e84736590ef3c132df3b712442047baa7dd9` and the source-tree BLAKE3 is `77961acb30a180b4f7cfd2959b7910b66f3e3a89293d4d294ce75a0169ec2914`. The runner required clean-source verification for every process. It ran three sequential one-million-key trials per policy, rotating policy order by trial; each used 10 nodes, RF=3, 128-byte values, concurrency 64, seed 1, 128 virtual nodes, and the 30-second logical operation deadline. Profiling was disabled. Each run verified all one million keys after the writes.
+
+| Policy | Successful trials | PUT throughput, median (range) | GET verification seconds, median | Queue rejections across trials |
+| --- | ---: | ---: | ---: | ---: |
+| OwnerOnly | 3/3 | 16,366/s (16,203–22,845) | 17.015 | 1,418 |
+| FirstSuccessor | 3/3 | 19,599/s (18,549–20,280) | 17.598 | 122 |
+| AllReplicas | 3/3 | 17,869/s (17,414–19,744) | 17.560 | 40 |
+
+All nine runs passed write completion and full read verification. They used the same executable BLAKE3 (`287bb196640e95ebc3f1af7058a6e84736590ef3c132df3b712442047baa7dd9`) and source digest (`77961acb30a180b4f7cfd2959b7910b66f3e3a89293d4d294ce75a0169ec2914`). Per-trial measurements are recorded here so the comparison remains available without the ignored raw artifacts:
+
+| Policy | Trial | PUT seconds | PUT writes/s | GET verification seconds | Queue rejections |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| OwnerOnly | 1 | 61.101 | 16,366 | 19.136 | 316 |
+| FirstSuccessor | 1 | 53.912 | 18,549 | 17.598 | 105 |
+| AllReplicas | 1 | 55.963 | 17,869 | 18.859 | 0 |
+| FirstSuccessor | 2 | 49.309 | 20,280 | 18.066 | 5 |
+| AllReplicas | 2 | 57.424 | 17,414 | 17.560 | 40 |
+| OwnerOnly | 2 | 61.717 | 16,203 | 17.015 | 486 |
+| AllReplicas | 3 | 50.647 | 19,744 | 17.009 | 0 |
+| OwnerOnly | 3 | 43.773 | 22,845 | 15.798 | 616 |
+| FirstSuccessor | 3 | 51.023 | 19,599 | 17.566 | 12 |
+
+Every post-write sample reported zero receipt-capacity rejections and zero replication RPC retries. Queue reservation rejections are retryable; counts were concentrated in OwnerOnly and did not produce failed writes. The OwnerOnly range is notably wide, and these three trials do not establish a stable policy ranking or explain the load variation. The earlier isolated final-build OwnerOnly sample was 19,977/s, within the range of this cohort.
+
+The full per-run manifests, summaries, event streams, logs, and the runner are preserved under the Git-ignored `results/write-policy-throughput-8b58d79/`. A preliminary OwnerOnly invocation was stopped immediately after cluster startup to correct the output directory; its incomplete artifacts are separately retained there and are excluded from the nine-run results. Build and cohort details are in that directory's README and `plan.json`.
+
 ## Remaining work
 
 The source audit and measurements support avoidable shared-lock cleanup work and client allocation/copying as actual bottlenecks. They do not prove a single cause for every earlier reversal of OwnerOnly and FirstSuccessor throughput. OwnerOnly still queues the same follower replication at RF3, while earlier responses allow it to apply more pressure. Optimized OwnerOnly and FirstSuccessor ranges still overlap. Queue rejection counts rose after faster routing, so bounded stream pipelining or better retry pacing remain candidates for a separate measured change. No queue size, timeout, ACK policy, receipt lifetime, or failover lease was changed here.
