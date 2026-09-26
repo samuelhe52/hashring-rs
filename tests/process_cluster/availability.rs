@@ -432,7 +432,7 @@ async fn first_successor_failover_promotes_admitted_copy_without_bulk_copy() {
         .iter()
         .position(|arg| arg == "--virtual-nodes")
         .unwrap();
-    args[vnodes + 1] = "4".into();
+    args[vnodes + 1] = "32".into();
     let _coordinator = spawn_process(&args);
     wait_for_listener(ports[0]);
     let client = HashringClient::connect(&endpoint, Duration::from_secs(15))
@@ -526,6 +526,24 @@ async fn first_successor_failover_promotes_admitted_copy_without_bulk_copy() {
     })
     .await
     .expect("failed owner was not removed");
+    let promoted_owners: std::collections::BTreeSet<_> = topology
+        .derived_ranges()
+        .unwrap()
+        .into_iter()
+        .filter(|range| range.owner_node_id == "node-1")
+        .map(|range| {
+            let new_owner = promoted.owner_for_token(range.end_inclusive).unwrap();
+            assert_eq!(
+                new_owner.node_id, range.follower_node_ids[0],
+                "an old owner range did not promote its first successor"
+            );
+            new_owner.node_id.clone()
+        })
+        .collect();
+    assert!(
+        promoted_owners.len() >= 2,
+        "failed owner's vnode ranges did not distribute across survivors: {promoted_owners:?}"
+    );
     let reader = HashringClient::connect(&endpoint, Duration::from_secs(5))
         .await
         .unwrap();
@@ -591,6 +609,158 @@ async fn first_successor_failover_promotes_admitted_copy_without_bulk_copy() {
         repaired.is_ok(),
         "returned node was not re-seeded and admitted"
     );
+}
+
+#[tokio::test]
+async fn lost_first_successor_blocks_raw_writes_until_replacement_is_ready() {
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("lost-first-successor.redb");
+    let ports = unused_ports(4);
+    let endpoint = format!("http://127.0.0.1:{}", ports[0]);
+    let members: Vec<_> = (1..=3)
+        .map(|index| (format!("node-{index}"), ports[index]))
+        .collect();
+    let _coordinator = spawn_process(&coordinator_arguments(ports[0], &state, &members));
+    wait_for_listener(ports[0]);
+    let client = HashringClient::connect(&endpoint, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let mut nodes: Vec<_> = members
+        .iter()
+        .map(|(node_id, port)| {
+            spawn_process(&[
+                "node".into(),
+                "--id".into(),
+                node_id.clone(),
+                "--listen".into(),
+                format!("127.0.0.1:{port}"),
+                "--coordinator".into(),
+                endpoint.clone(),
+            ])
+        })
+        .collect();
+    wait_for_full_rf(&endpoint, 1, 3).await;
+    let policy = client
+        .begin_write_policy_change(WriteAckPolicy::FirstSuccessor)
+        .await
+        .unwrap();
+    let applied = client
+        .execute_topology_change(
+            &policy.change_id,
+            policy.base_epoch,
+            policy.target_topology.epoch,
+        )
+        .await
+        .unwrap();
+    assert_eq!(applied.phase, MigrationPhase::Complete);
+    let topology = applied.target_topology;
+    let key = (0_u64..100_000)
+        .map(|candidate| candidate.to_be_bytes().to_vec())
+        .find(|key| {
+            topology
+                .replica_node_ids_for_token(topology.key_token(key))
+                .unwrap()
+                .starts_with(&["node-1", "node-2"])
+        })
+        .expect("test needs a range owned by node-1 with node-2 as first successor");
+    client.put(key.clone(), b"before".to_vec()).await.unwrap();
+
+    nodes[1].stop();
+    let mut owner = DataNodeClient::connect(format!("http://127.0.0.1:{}", ports[1]))
+        .await
+        .unwrap();
+    let blocked = tokio::time::timeout(
+        Duration::from_secs(5),
+        owner.put(hashring_core::proto::PutRequest {
+            key: key.clone(),
+            value: b"during-loss".to_vec(),
+            topology_epoch: topology.epoch,
+            request_id: "lost-first-successor-blocked".into(),
+        }),
+    )
+    .await
+    .expect("raw write stalled instead of returning a retryable result")
+    .unwrap()
+    .into_inner();
+    assert_eq!(blocked.current_epoch, topology.epoch);
+    assert!(
+        blocked.version.is_none(),
+        "write acknowledged without its first successor"
+    );
+    let error = blocked
+        .error
+        .expect("write succeeded after first-successor loss");
+    assert!(error.retryable, "write block was not retryable: {error:?}");
+    assert!(
+        matches!(
+            ErrorCode::try_from(error.code).unwrap(),
+            ErrorCode::OutcomeUnknown
+                | ErrorCode::TemporarilyUnavailable
+                | ErrorCode::ReplicaNotReady
+        ),
+        "unexpected raw write block: {error:?}"
+    );
+
+    let promoted = tokio::time::timeout(Duration::from_secs(25), async {
+        loop {
+            let mut coordinator = CoordinatorClient::connect(endpoint.clone()).await.unwrap();
+            let current: TopologySnapshot = coordinator
+                .get_topology(Empty {})
+                .await
+                .unwrap()
+                .into_inner()
+                .try_into()
+                .unwrap();
+            if current.epoch > topology.epoch
+                && current
+                    .members
+                    .iter()
+                    .all(|member| member.node_id != "node-2")
+            {
+                break current;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("lost first successor was not removed");
+    assert_eq!(promoted.owner(&key).unwrap().node_id, "node-1");
+    assert_eq!(
+        promoted
+            .replica_node_ids_for_token(promoted.key_token(&key))
+            .unwrap()[1],
+        "node-3"
+    );
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for attempt in 0..100_u32 {
+            let response = owner
+                .put(hashring_core::proto::PutRequest {
+                    key: key.clone(),
+                    value: b"after-recovery".to_vec(),
+                    topology_epoch: promoted.epoch,
+                    request_id: format!("lost-first-successor-recovered-{attempt}"),
+                })
+                .await
+                .unwrap()
+                .into_inner();
+            if response.error.is_none() {
+                assert!(response.version.is_some());
+                return;
+            }
+            let error = response.error.unwrap();
+            assert!(error.retryable, "write did not recover: {error:?}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("replacement first successor never admitted a write");
+    })
+    .await
+    .expect("replacement first successor did not become writable");
+    let reader = HashringClient::connect(&endpoint, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(reader.get(key).await.unwrap().value, b"after-recovery");
 }
 
 #[tokio::test]
