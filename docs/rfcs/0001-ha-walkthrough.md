@@ -1,16 +1,16 @@
 # How the HA cache fits together
 
-This is a presentation companion to [RFC 0001](0001-ha-for-consistent-hash-cache.md). It explains the intended design; it is not an implementation-status report or evidence that the acceptance tests pass. The RFC remains the detailed contract. Its baseline and implementation phases describe the original plan.
+This walkthrough accompanies [RFC 0001](0001-ha-for-consistent-hash-cache.md). It explains the intended design. It does not report implementation status, and it is not evidence that the acceptance tests pass. For exact rules, the RFC is the reference. The RFC's baseline and implementation phases describe the original plan.
 
-**The central idea:** the ring determines where data belongs, the coordinator controls when ownership changes, and verified replicas determine whether the system can safely serve after a change.
+**The short version:** the ring decides where data belongs. The coordinator decides when ownership changes. Verified replicas decide whether the system can serve safely after a change.
 
-Use the eight sections below as a roughly 15-minute walkthrough. Each section has one takeaway to present. Diagrams use Mermaid so they can be reviewed with the prose and rendered in a Mermaid-capable Markdown viewer.
+The eight sections take about 15 minutes to present, and each one has a single takeaway. The diagrams are Mermaid, so any Mermaid-capable Markdown viewer renders them.
 
 ## 1. Three roles, two traffic paths · 2 minutes
 
-**Takeaway: clients contact owners directly; the coordinator manages authority and recovery.**
+**Takeaway: clients talk to owners directly. The coordinator handles authority and recovery.**
 
-The diagram follows one range. A physical cache node can own some ranges and follow other owners at the same time.
+The diagram shows a single range. In practice every cache node owns some ranges and follows other owners for other ranges.
 
 ```mermaid
 %%{init: {"flowchart": {"rankSpacing": 65}}}%%
@@ -31,23 +31,23 @@ flowchart TB
     O -->|Replication| F2
 ```
 
-Solid arrows between clients and cache nodes carry data operations. Dotted arrows represent control interactions; nodes also renew leases with the coordinator. Redb stores control metadata, **not durable cached values**.
+Solid arrows are data traffic. Dotted arrows are control traffic, which also includes nodes renewing their leases. Redb stores control metadata only. Cached values are never written to disk.
 
-| Role | Responsibility | Why it exists |
+| Role | What it does | Why it is separate |
 | --- | --- | --- |
-| Client | Derive the owner, route directly, refresh topology, retry within a deadline | Keep the coordinator out of normal data traffic |
-| Owner and followers | Apply in-memory records, replicate ordered mutations, seed and verify copies | Separate serving a request from restoring redundancy |
-| Singleton coordinator | Serialize topology changes, fence authority, persist admission and recovery work | Give all nodes one committed ownership decision |
+| Client | Computes the owner, sends requests to it, refreshes topology, retries until a deadline | Keeps the coordinator off the data path |
+| Owner and followers | Apply records in memory, replicate mutations in order, seed and verify copies | Serving requests and restoring redundancy are different jobs |
+| Coordinator (single instance) | Serializes topology changes, fences old owners, persists admission and recovery work | Every node needs the same answer about who owns what |
 
-The scope is cache-node HA. Coordinator replication and automatic coordinator failover are out of scope. If the coordinator is unavailable, leases eventually expire and nodes stop serving.
+This design covers cache-node HA only. The coordinator is not replicated and does not fail over. If it goes down, leases expire and nodes stop serving.
 
 Source: [Goal](0001-ha-for-consistent-hash-cache.md#goal), [Thin coordinator](0001-ha-for-consistent-hash-cache.md#1-thin-coordinator).
 
-## 2. Placement also determines failover · 2 minutes
+## 2. Placement also decides failover · 2 minutes
 
-**Takeaway: the first distinct physical successor is both a follower and the natural replacement owner.**
+**Takeaway: the first distinct physical successor is a follower now and the replacement owner later.**
 
-A key hashes to a token. Moving clockwise, the first token owns the key; the next distinct physical nodes are its followers. Virtual-node tokens distribute ownership across physical nodes. Repeated tokens from the same physical node do not count as extra replicas.
+A key hashes to a token. Walking clockwise, the first token's node owns the key, and the next distinct physical nodes are its followers. Virtual-node tokens spread ownership across the physical nodes. A second token from a node that is already in the set does not add a replica.
 
 Here is a small clockwise slice of a ring, with replication factor (RF) 3:
 
@@ -60,50 +60,50 @@ flowchart LR
     C --> D["D<br/>80"]
 ```
 
-For a key at token 15, the owner is A and the desired replicas are **A, B, C**. Token 25 belongs to A again, so follower selection skips it.
+A key at token 15 is owned by A, and its desired replicas are **A, B, C**. Token 25 also belongs to A, so follower selection skips it.
 
-If A is removed, both its tokens disappear. B becomes the owner of the merged interval `(10, 40]`; the desired replicas become **B, C, D**. B may activate only if its admitted coverage proves that it holds the entire merged interval, including all constituent intervals.
+Now remove A. Both of its tokens disappear, and B owns the merged interval `(10, 40]`. The desired replicas become **B, C, D**. B can take over only if its admitted coverage includes the whole merged interval, not just the part it followed before.
 
-This explains two choices:
+Two design choices follow from this:
 
-- Promotion follows the ring rather than selecting the least-loaded or apparently freshest replica. Routing and recovery use the same placement rule.
-- Ranges have topology-relative bounds, not permanent shard identities. Joining nodes split intervals; departing nodes merge them. Readiness must be proved for the resulting bounds.
+- Promotion follows the ring. It does not pick the least-loaded replica or the one that looks most up to date, so routing and recovery use the same rule.
+- Ranges are defined by their bounds in the current topology. They have no permanent shard ID. A joining node splits intervals, and a departing node merges them. Readiness has to be proved for whatever bounds result.
 
-The slice illustrates one promotion. Across a real vnode ring, different ranges of a failed physical node can move to different successors.
+This slice shows one promotion. In a real ring with many vnodes, the ranges of a failed node move to several different successors.
 
 Source: [Ring, ranges, and placement](0001-ha-for-consistent-hash-cache.md#1-ring-ranges-and-placement).
 
-## 3. Belonging, readiness, and authority are separate · 2 minutes
+## 3. Placement, readiness, and authority are separate · 2 minutes
 
-**Takeaway: being listed in the ring does not prove that a node has the data or permission to serve.**
+**Takeaway: a node listed in the ring may not have the data yet, and may not be allowed to serve.**
 
-| Question | Mechanism | What it proves |
+| Question | Answered by | What it establishes |
 | --- | --- | --- |
-| Where should this range live? | Committed topology: epoch, tokens, RF, policy, guards, digest | Deterministic owner and ordered desired followers |
-| Does this copy contain the required history? | Durable admission for exact epoch, bounds, node, and verified watermark | Complete initial coverage and contiguous mutation history |
-| Is this follower usable now? | Admission, connection, and configured lag bound | Follower health for the relevant gates |
-| May this owner serve now? | Installed topology and valid node/epoch lease, plus fencing | Authority to serve under that epoch |
-| May this write succeed now? | Availability guards and ACK policy | Enough eligible copies and required acknowledgements |
+| Where should this range live? | Committed topology: epoch, tokens, RF, policy, guards, digest | The owner and the ordered list of desired followers |
+| Does this copy have the full history? | Durable admission record for an exact epoch, range, node, and verified watermark | The copy has all initial data and a contiguous mutation history |
+| Can this follower be counted on right now? | Admission, a live connection, and lag within the configured bound | The follower is healthy for the write gates |
+| May this owner serve right now? | Installed topology, a valid lease for the node and epoch, and fencing | The owner has authority for this epoch |
+| May this write succeed right now? | Availability guards and the ACK policy | Enough eligible copies exist and the required ACKs arrived |
 
-For example, D can be a desired follower while still receiving a snapshot. It is not yet admitted and cannot count as a ready replica. An admitted copy can later become disconnected or too far behind to be healthy.
+For example, D can be a desired follower while its snapshot is still arriving. Until D is admitted, it does not count as a replica. An admitted copy can also drop out later if it disconnects or falls too far behind.
 
-Admission updates do not change the global topology epoch or get sent to clients. This lets replica repair progress without changing routing. Ownership and policy changes do require a committed epoch.
+Admission changes do not bump the topology epoch, and clients never see them. Repair can therefore make progress without disturbing routing. Changes to ownership or policy do require a new committed epoch.
 
 Source: [Committed topology](0001-ha-for-consistent-hash-cache.md#2-committed-topology-contract), [Readiness](0001-ha-for-consistent-hash-cache.md#3-desired-placement-versus-operational-readiness).
 
-## 4. A write policy chooses what success means · 2 minutes
+## 4. The write policy defines success · 2 minutes
 
-**Takeaway: waiting for the specific promotion target is what connects write acknowledgement to failover safety.**
+**Takeaway: waiting for the node that would be promoted is what makes an ACK survive failover.**
 
-Every successful ACK means applied to memory. It does not mean persisted to disk. Assuming authority and configured availability guards pass:
+An ACK always means the mutation was applied in memory, never that it reached disk. Assuming the owner has authority and the guards pass:
 
-| Policy | Required application before success | Cost and failure behavior |
+| Policy | Must apply before success | Cost and failure behavior |
 | --- | --- | --- |
-| `OwnerOnly` — default | Owner | Does not wait for follower ACKs; recent acknowledged writes can be lost on owner failure |
-| `FirstSuccessor` | Owner and the exact first successor | Adds replication wait; acknowledged writes survive one member failure from a healthy starting state |
-| `AllReplicas` | Complete desired RF | Waits for every required copy; under-replication blocks writes |
+| `OwnerOnly` (default) | Owner | No follower wait. If the owner fails, recent acknowledged writes can be lost |
+| `FirstSuccessor` | Owner and the first successor | One replication round trip. From a healthy state, acknowledged writes survive any single failure |
+| `AllReplicas` | Every node in the desired replica set | Waits for every copy. Writes stop while the range is under-replicated |
 
-The following sequence shows a successful `FirstSuccessor` write at RF=3, with both followers admitted. The later follower's delivery is independent of the client response.
+Here is a successful `FirstSuccessor` write at RF=3 with both followers admitted. The client gets its response without waiting for the later follower.
 
 ```mermaid
 %%{init: {"sequence": {"actorMargin": 20, "width": 120, "diagramMarginX": 10, "mirrorActors": false, "messageMargin": 25}}}%%
@@ -123,15 +123,15 @@ sequenceDiagram
     Note over O,F: Later follower ACK is not required
 ```
 
-Why not “any two copies”? If A and C acknowledge while B is behind, the ring still promotes B when A disappears. An arbitrary second ACK would not protect the deterministic promotion path.
+Why not accept any two copies? Suppose A and C acknowledge while B lags. If A then fails, the ring still promotes B, and B is missing the write. A second ACK only helps if it comes from B.
 
-Guards are a separate admission decision. Defaults require one admitted copy and zero healthy followers, so a leased `OwnerOnly` owner can write alone. Stricter guards trade availability for reduced loss risk. `AllReplicas` never reinterprets “all” as only the copies that happen to be available.
+Guards are a separate check that runs before the write. By default they require one admitted copy and zero healthy followers, so a leased `OwnerOnly` owner can accept writes on its own. Stricter guards give up some availability to reduce the chance of loss. `AllReplicas` always means the full desired set, never just the copies that happen to be up.
 
 Source: [Consistency contract](0001-ha-for-consistent-hash-cache.md#5-consistency-contract), [Owner write path](0001-ha-for-consistent-hash-cache.md#2-owner-write-path).
 
-## 5. Failover has two recovery milestones · 2 minutes
+## 5. Reads and writes recover at different times · 2 minutes
 
-**Takeaway: making a replacement safe to read from and making it safe to acknowledge new writes are different steps.**
+**Takeaway: a new owner can serve reads before it is allowed to acknowledge writes.**
 
 ```mermaid
 %%{init: {"flowchart": {"rankSpacing": 25, "nodeSpacing": 25}}}%%
@@ -148,19 +148,19 @@ flowchart TD
     G -->|Yes| I[Writes resume]
 ```
 
-With `FirstSuccessor`, B may have all acknowledged data when A fails. But once B owns the range, C is B's first successor. If C is behind, B must wait for C to catch up and be admitted before successful writes resume. Otherwise the next acknowledged write would lack the protection the policy promises.
+Under `FirstSuccessor`, B may hold every acknowledged write when A fails. Once B owns the range, though, C becomes B's first successor. If C is behind, B has to wait for C to catch up and be admitted before writes can succeed again. Otherwise the next acknowledged write would have no protected copy.
 
-With `OwnerOnly`, writes may resume when the configured guards pass, accepting possible acknowledged-tail loss. With `AllReplicas`, the complete desired RF must be ready; too few remaining members can keep writes blocked until capacity returns.
+Under `OwnerOnly`, writes resume as soon as the guards pass, and some recently acknowledged writes may already be gone. Under `AllReplicas`, every desired copy must be ready. If too few members remain, writes stay blocked until capacity comes back.
 
-Fencing prevents two owners from serving conflicting authority. Leases cover `(node_id, topology_epoch)`, and process identity prevents a restarted empty process from inheriting an old instance's authority. GET also requires a valid lease.
+Fencing stops two owners from serving the same range. A lease covers `(node_id, topology_epoch)`, and the process-instance ID means a restarted process with empty memory cannot pick up the old instance's authority. GET needs a valid lease too.
 
-One broken link is not enough to identify a failed endpoint. Missing/expired leases can confirm failure; otherwise the design requires corroboration from at least two independent nodes. An ambiguous pairwise failure remains degraded rather than causing arbitrary eviction. The default five-second lease is a fencing parameter, **not a five-second failover SLA**.
+A single broken link does not say which end has failed. A missing or expired lease is enough to confirm a failure. Otherwise at least two independent nodes must report the member unreachable. If only one pair of nodes disagrees, the affected ranges stay degraded and nobody is evicted. The default lease is five seconds, but that is a fencing parameter. It is **not a five-second failover target**.
 
 Source: [Leases](0001-ha-for-consistent-hash-cache.md#2-owner-leases-and-fencing), [Failure confirmation](0001-ha-for-consistent-hash-cache.md#3-failure-suspicion-and-confirmation), [Failover](0001-ha-for-consistent-hash-cache.md#4-failover).
 
-## 6. Data movement prepares copies before using them · 1 minute
+## 6. Copies are verified before they are used · 1 minute
 
-**Takeaway: snapshot, catch-up, and verification provide the evidence needed for a transition.**
+**Takeaway: every transition waits for a copy that has been snapshotted, caught up, and verified.**
 
 ```mermaid
 flowchart LR
@@ -169,32 +169,32 @@ flowchart LR
     V --> R[Admit or stage]
 ```
 
-| Operation | What changes | Gate before using the result |
+| Operation | What changes | What must hold before the result is used |
 | --- | --- | --- |
-| Scale-out | New tokens split ranges and change owner/follower obligations | Briefly pause affected writes, drain final changes, verify, satisfy target policy barriers, then commit and activate |
-| Graceful scale-in | Removed tokens merge ranges | Prove successor coverage and required downstream readiness; synchronize missing data before cutover |
-| Failure removal | Authority moves without cooperation from the failed node | Fence old authority and require surviving admitted coverage; incomplete copies cannot be promoted |
-| Replica repair | Missing copies fill in the desired set | Verify snapshot and incremental history before admission; unchanged topology needs no routing epoch bump |
-| Stronger ACK policy | More specific copies become required for success | Catch up required copies before committing the stronger policy |
+| Scale-out | New tokens split ranges and add owner and follower duties | Pause affected writes briefly, drain the last changes, verify, meet the target policy, then commit and activate |
+| Graceful scale-in | Removed tokens merge ranges | Successors cover the merged ranges and downstream followers are ready. Missing data is synced before cutover |
+| Failure removal | Ownership moves without help from the failed node | Old authority is fenced and a surviving admitted copy covers each range. Incomplete copies are not promoted |
+| Replica repair | Missing copies are filled in | Snapshot and incremental history are verified before admission. The topology epoch does not change |
+| Stronger ACK policy | More copies become required for success | Those copies catch up before the stronger policy is committed |
 
-Graceful scale-in can usually reuse replicas instead of copying the owner's whole dataset. Repair still has work after promotion because the desired follower set changes. Repair is bounded and resumable; a topology change can invalidate its epoch or bounds and require replanning.
+A graceful scale-in can usually reuse existing replicas instead of copying the owner's whole dataset. Repair still has work to do after a promotion, because the desired follower set shifts. Repair is bounded and resumable. If the topology changes under it, the task's epoch or bounds may no longer match, and it is re-planned.
 
-A returning fenced node rejoins explicitly and is reset and seeded as a new participant. Old records are not proof of readiness.
+A node that was fenced and comes back must rejoin explicitly. It is reset and seeded like a brand-new node. The records it still holds prove nothing.
 
 Source: [Membership and data movement](0001-ha-for-consistent-hash-cache.md#membership-and-data-movement).
 
-## 7. Ordering and retries close different correctness gaps · 2 minutes
+## 7. Ordering and retries solve different problems · 2 minutes
 
-**Takeaway: a lost reply must not turn into a duplicate mutation, and a missing replication entry must not disappear unnoticed.**
+**Takeaway: a lost reply must not cause a duplicate write, and a missing replication entry must not go unnoticed.**
 
-Two counters answer different questions:
+There are two counters, and they do different jobs:
 
-- The record version `(topology_epoch, owner_node_id, owner_sequence)` identifies mutation order on the physical owner.
-- A contiguous `stream_sequence` belongs to each `(epoch, owner, follower)` stream. A follower may receive only a subset of the owner's mutations, so the separate counter detects gaps in that follower's delivery.
+- The record version `(topology_epoch, owner_node_id, owner_sequence)` orders mutations on the physical owner.
+- Each `(epoch, owner, follower)` stream has its own contiguous `stream_sequence`. A follower receives only the mutations for ranges it replicates, so it needs its own counter to spot gaps.
 
-A gap triggers retained-history catch-up or snapshot repair. Followers do not skip it. A new topology epoch establishes new stream identities and readiness barriers.
+When a follower sees a gap, it catches up from retained history or from a snapshot. It never skips the gap. A new topology epoch starts new streams and new readiness checks.
 
-For client retries, consider an owner that applies a write but loses its reply:
+Retries cover a different failure. Say the owner applies a write, but the reply never reaches the client:
 
 ```mermaid
 sequenceDiagram
@@ -208,26 +208,26 @@ sequenceDiagram
     O-->>C: Answer retry without applying twice
 ```
 
-The client preserves the same mutation ID across refreshes and retries. Deduplication records replicate with mutations so a promoted successor can answer from the history it retained. This does not recover writes lost under `OwnerOnly`.
+The client keeps the same mutation ID across refreshes and retries. Deduplication receipts replicate along with mutations, so a promoted successor can answer a retry from what it received. This does not bring back writes that `OwnerOnly` lost.
 
-The receipt retention period is 60 seconds. The guarantee is at-most-once while the receipt is retained, not indefinite exactly-once execution. If the receipt store budget cannot preserve that period, the owner rejects new writes before applying them. Reusing an ID with different content is a conflict.
+Receipts are kept for 60 seconds. Within that window a mutation runs at most once. There is no exactly-once guarantee beyond it. If the receipt store runs out of budget, the owner rejects new writes before applying them rather than evict receipts early. Reusing an ID with different content is a conflict.
 
-Errors preserve two independent facts: **why the attempt ended** and **whether the mutation may have applied**. A deadline can expire with `KnownNotApplied` or `MayHaveApplied`; later retry failures cannot erase an earlier uncertain outcome. One end-to-end deadline bounds connection, topology refresh, backoff, and RPC attempts.
+Each error carries two separate facts: **why the attempt stopped** and **whether the mutation might have been applied**. A deadline can expire with either `KnownNotApplied` or `MayHaveApplied`. Once an outcome is uncertain, later retry failures cannot turn it back into a known one. A single end-to-end deadline covers connecting, topology refresh, backoff, and every RPC attempt.
 
 Source: [Replication streams](0001-ha-for-consistent-hash-cache.md#1-mutation-ordering-and-replication-streams), [Idempotency](0001-ha-for-consistent-hash-cache.md#3-mutation-idempotency), [Retry semantics](0001-ha-for-consistent-hash-cache.md#4-error-and-retry-semantics).
 
-## 8. End with the guarantees and their limits · 1 minute
+## 8. Guarantees and limits · 1 minute
 
-**Takeaway: this design makes the availability versus acknowledged-loss tradeoff explicit.**
+**Takeaway: the design makes you choose between write availability and the risk of losing acknowledged writes, and states which one you chose.**
 
-| Teammate's question | Answer |
+| Question you will probably get | Answer |
 | --- | --- |
-| Does RF=3 mean every successful write exists on three nodes? | Only `AllReplicas` requires that. RF describes desired placement; the ACK policy defines success. |
+| Does RF=3 mean every successful write is on three nodes? | Only under `AllReplicas`. RF says where copies should live. The ACK policy says what success means. |
 | Can a follower answer a normal GET? | No. Reads go to the current leased owner. |
-| Is `OwnerOnly` linearizable across failover? | No. Its per-key linearizability promise is within one owner epoch; failover may expose older state. |
-| Can we recover from an incomplete copy? | It cannot be promoted without complete admitted coverage. The range remains unavailable. |
-| Does durable coordinator metadata make cache data durable? | No. Cached data and its ACKs are in-memory. |
-| Does cache-node HA cover coordinator failure? | No. Nodes fail closed when leases expire; coordinator HA is outside scope. |
-| How do we explain a blocked range? | Inspect epoch/owner, lease, desired versus admitted copies, stream lag/gaps, active policy, guards, and repair phase. |
+| Is `OwnerOnly` linearizable across failover? | No. Per-key linearizability holds within one owner epoch. After failover, clients may see older state. |
+| Can we recover from an incomplete copy? | No. It cannot be promoted without complete admitted coverage, so the range stays unavailable. |
+| Does durable coordinator metadata make cached data durable? | No. Cached data and its ACKs live in memory. |
+| Does cache-node HA cover coordinator failure? | No. Nodes stop serving when their leases expire. Coordinator HA is out of scope. |
+| How do we explain why a range is blocked? | Check the epoch and owner, the lease, desired versus admitted copies, stream lag and gaps, the active policy, the guards, and the repair phase. |
 
-For deeper discussion, return to the RFC's [test plan](0001-ha-for-consistent-hash-cache.md#test-plan) and [verification criteria](0001-ha-for-consistent-hash-cache.md#verification). They define the evidence needed to establish the intended guarantees; this walkthrough does not substitute for that evidence.
+For more depth, see the RFC's [test plan](0001-ha-for-consistent-hash-cache.md#test-plan) and [verification criteria](0001-ha-for-consistent-hash-cache.md#verification). They define the evidence the guarantees depend on. This walkthrough is not that evidence.
