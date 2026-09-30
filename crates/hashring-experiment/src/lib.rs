@@ -18,17 +18,20 @@ use hashring_client::{ClientError, HashringClient};
 use hashring_core::{
     limits::DEFAULT_MAX_VALUE_BYTES,
     migration::{MigrationPhase, TopologyChange},
-    proto::ErrorCode,
-    topology::Member,
+    proto::{ErrorCode, PutRequest, data_node_client::DataNodeClient},
+    topology::{Member, WriteAckPolicy},
+    transport::configure_data_node_client,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tonic::transport::Channel;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExperimentMode {
     Correctness,
     Performance,
+    Availability,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -43,8 +46,14 @@ pub struct ExperimentConfig {
     pub virtual_nodes: u32,
     pub operation_timeout_ms: u64,
     pub migration_timeout_ms: u64,
+    pub range_move_concurrency: usize,
     pub pre_publish_delay_ms: u64,
     pub require_clean_source: bool,
+    pub verbose: bool,
+    pub desired_replication_factor: u32,
+    pub minimum_admitted_copies: u32,
+    pub minimum_healthy_followers: u32,
+    pub write_ack_policy: WriteAckPolicy,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -54,6 +63,7 @@ pub struct ExperimentSummary {
     pub elapsed_seconds: f64,
     pub final_epoch: Option<u64>,
     pub measurements: BTreeMap<String, Measurement>,
+    pub observations: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -160,14 +170,16 @@ struct ManagedProcess {
 struct ProcessGroup {
     executable: PathBuf,
     log_dir: PathBuf,
+    verbose: bool,
     processes: Vec<ManagedProcess>,
 }
 
 impl ProcessGroup {
-    fn new(executable: PathBuf, log_dir: PathBuf) -> Self {
+    fn new(executable: PathBuf, log_dir: PathBuf, verbose: bool) -> Self {
         Self {
             executable,
             log_dir,
+            verbose,
             processes: Vec::new(),
         }
     }
@@ -181,7 +193,14 @@ impl ProcessGroup {
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
-            .env("RUST_LOG", "hashring_rs=info")
+            .env(
+                "RUST_LOG",
+                if self.verbose {
+                    "hashring_rs=info,hashring_coordinator=debug,hashring_node=info"
+                } else {
+                    "hashring_rs=info"
+                },
+            )
             .spawn()
             .with_context(|| format!("spawning {name}"))?;
         self.processes.push(ManagedProcess { name, child });
@@ -219,6 +238,21 @@ impl ProcessGroup {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
+
+    fn kill(&mut self, name: &str) -> Result<(String, Instant)> {
+        let index = self
+            .processes
+            .iter()
+            .position(|process| process.name == name)
+            .with_context(|| format!("unknown managed process {name}"))?;
+        let mut process = self.processes.remove(index);
+        process
+            .child
+            .kill()
+            .with_context(|| format!("killing {name}"))?;
+        let signalled_at = Instant::now();
+        Ok((process.child.wait()?.to_string(), signalled_at))
+    }
 }
 
 impl Drop for ProcessGroup {
@@ -255,7 +289,7 @@ pub async fn run_experiment(
         runtime_tree_hash.as_deref(),
     );
     let manifest = ExperimentManifest {
-        schema_version: 3,
+        schema_version: 4,
         started_unix_ms: unix_ms(),
         executable_path: executable.display().to_string(),
         executable_blake3: file_digest(&executable)?,
@@ -292,6 +326,7 @@ pub async fn run_experiment(
                 "formal run requires a clean build and matching clean runtime source tree"
             )),
             BTreeMap::new(),
+            BTreeMap::new(),
         );
         write_json(&config.output_dir.join("summary.json"), &summary)?;
         events.record(
@@ -303,8 +338,17 @@ pub async fn run_experiment(
 
     let started = Instant::now();
     let mut measurements = BTreeMap::new();
-    let result = run_cluster(&config, executable, log_dir, &events, &mut measurements).await;
-    let summary = summarize(started.elapsed(), result, measurements);
+    let mut observations = BTreeMap::new();
+    let result = run_cluster(
+        &config,
+        executable,
+        log_dir,
+        &events,
+        &mut measurements,
+        &mut observations,
+    )
+    .await;
+    let summary = summarize(started.elapsed(), result, measurements, observations);
     write_json(&config.output_dir.join("summary.json"), &summary)?;
     events.record(
         "experiment_finished",
@@ -320,6 +364,7 @@ fn summarize(
     elapsed: Duration,
     result: Result<u64>,
     measurements: BTreeMap<String, Measurement>,
+    observations: BTreeMap<String, Value>,
 ) -> ExperimentSummary {
     match result {
         Ok(final_epoch) => ExperimentSummary {
@@ -328,6 +373,7 @@ fn summarize(
             elapsed_seconds: elapsed.as_secs_f64(),
             final_epoch: Some(final_epoch),
             measurements,
+            observations,
         },
         Err(error) => ExperimentSummary {
             success: false,
@@ -335,6 +381,7 @@ fn summarize(
             elapsed_seconds: elapsed.as_secs_f64(),
             final_epoch: None,
             measurements,
+            observations,
         },
     }
 }
@@ -345,6 +392,7 @@ async fn run_cluster(
     log_dir: PathBuf,
     events: &EventLog,
     measurements: &mut BTreeMap<String, Measurement>,
+    observations: &mut BTreeMap<String, Value>,
 ) -> Result<u64> {
     let ports = reserve_ports(config.node_count + 1)?;
     let coordinator_port = ports[0];
@@ -360,9 +408,10 @@ async fn run_cluster(
     let initial_count = match config.mode {
         ExperimentMode::Correctness => config.node_count - 1,
         ExperimentMode::Performance => config.node_count,
+        ExperimentMode::Availability => 3,
     };
     let initial_members = &members[..initial_count];
-    let mut processes = ProcessGroup::new(executable, log_dir);
+    let mut processes = ProcessGroup::new(executable, log_dir, config.verbose);
     let state_path = config.output_dir.join("coordinator.redb");
     let mut coordinator_args = vec![
         "coordinator".into(),
@@ -374,8 +423,16 @@ async fn run_cluster(
         config.hash_seed.to_string(),
         "--virtual-nodes".into(),
         config.virtual_nodes.to_string(),
+        "--minimum-admitted-copies".into(),
+        config.minimum_admitted_copies.to_string(),
+        "--minimum-healthy-followers".into(),
+        config.minimum_healthy_followers.to_string(),
+        "--desired-replication-factor".into(),
+        config.desired_replication_factor.to_string(),
         "--migration-timeout-ms".into(),
         config.migration_timeout_ms.to_string(),
+        "--range-move-concurrency".into(),
+        config.range_move_concurrency.to_string(),
     ];
     coordinator_args.extend([
         "--pre-publish-delay-ms".into(),
@@ -416,6 +473,34 @@ async fn run_cluster(
         "cluster_ready",
         json!({ "initial_nodes": initial_count, "peak_nodes": config.node_count }),
     )?;
+    let rf_started = Instant::now();
+    wait_for_full_rf(
+        &admin_client,
+        config.desired_replication_factor,
+        Duration::from_millis(config.migration_timeout_ms),
+        &mut processes,
+    )
+    .await?;
+    observations.insert(
+        "initial_full_rf_seconds".into(),
+        json!(rf_started.elapsed().as_secs_f64()),
+    );
+    if config.write_ack_policy != WriteAckPolicy::OwnerOnly {
+        let change = admin_client
+            .begin_write_policy_change(config.write_ack_policy)
+            .await?;
+        admin_client
+            .execute_topology_change(
+                change.change_id,
+                change.base_epoch,
+                change.target_topology.epoch,
+            )
+            .await?;
+        events.record(
+            "ack_policy_activated",
+            json!({ "policy": config.write_ack_policy }),
+        )?;
+    }
 
     let workload = Workload {
         key_count: config.key_count,
@@ -424,7 +509,10 @@ async fn run_cluster(
     };
     let mut expected_rounds = vec![Some(0_u64); config.key_count as usize];
     let put_started = Instant::now();
-    write_dataset(&workload_client, workload, 0).await?;
+    if let Err(error) = write_dataset(&workload_client, workload, 0).await {
+        let _ = record_node_pressure(initial_members, events, observations).await;
+        return Err(error);
+    }
     measurements.insert(
         "initial_put".into(),
         measurement(config.key_count, put_started.elapsed()),
@@ -433,6 +521,7 @@ async fn run_cluster(
         "initial_put_complete",
         json!({ "keys": config.key_count, "seconds": put_started.elapsed().as_secs_f64() }),
     )?;
+    record_node_pressure(initial_members, events, observations).await?;
 
     let get_started = Instant::now();
     verify_dataset(&workload_client, workload, &expected_rounds).await?;
@@ -444,6 +533,107 @@ async fn run_cluster(
         "initial_get_verify_complete",
         json!({ "keys": config.key_count, "seconds": get_started.elapsed().as_secs_f64() }),
     )?;
+    let sample_count = config.key_count.min(128);
+    let mut latencies_us = Vec::with_capacity(sample_count as usize);
+    for key in 0..sample_count {
+        let started = Instant::now();
+        workload_client
+            .put(
+                key.to_be_bytes().to_vec(),
+                deterministic_value(key, 0, config.value_bytes),
+            )
+            .await?;
+        latencies_us.push(started.elapsed().as_micros() as u64);
+    }
+    observations.insert(
+        "client_put_latency_us".into(),
+        latency_summary(&mut latencies_us),
+    );
+    events.record(
+        "client_put_latency_sampled",
+        json!({
+            "samples": sample_count, "policy": config.write_ack_policy,
+            "latency_us": observations["client_put_latency_us"]
+        }),
+    )?;
+    let sample_topology = admin_client.refresh_topology().await?;
+    let operation_timeout = Duration::from_millis(config.operation_timeout_ms);
+    let mut owner_clients: BTreeMap<String, DataNodeClient<Channel>> = BTreeMap::new();
+    for member in &sample_topology.members {
+        let connected = tokio::time::timeout(
+            operation_timeout,
+            DataNodeClient::connect(member.endpoint.clone()),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "connecting direct owner RPC to {} timed out",
+                member.node_id
+            )
+        })??;
+        owner_clients.insert(
+            member.node_id.clone(),
+            configure_data_node_client(connected),
+        );
+    }
+    let mut owner_rpc_latencies_us = Vec::with_capacity(sample_count as usize);
+    for key in 0..sample_count {
+        let encoded = key.to_be_bytes().to_vec();
+        let owner = sample_topology.owner(&encoded)?;
+        let client = owner_clients
+            .get_mut(&owner.node_id)
+            .expect("topology owner has a client");
+        let started = Instant::now();
+        let response = tokio::time::timeout(
+            operation_timeout,
+            client.put(PutRequest {
+                key: encoded,
+                value: deterministic_value(key, 0, config.value_bytes),
+                topology_epoch: sample_topology.epoch,
+                request_id: format!("experiment-owner-rpc-{}-{key}", std::process::id()),
+            }),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "direct owner PUT for key {key} on {} timed out",
+                owner.node_id
+            )
+        })??
+        .into_inner();
+        ensure!(
+            response.error.is_none() && response.version.is_some(),
+            "direct owner PUT failed for key {key}: {:?}",
+            response.error
+        );
+        owner_rpc_latencies_us.push(started.elapsed().as_micros() as u64);
+    }
+    observations.insert(
+        "owner_rpc_put_latency_us".into(),
+        latency_summary(&mut owner_rpc_latencies_us),
+    );
+    events.record(
+        "owner_rpc_put_latency_sampled",
+        json!({
+            "samples": sample_count, "policy": config.write_ack_policy,
+            "latency_us": observations["owner_rpc_put_latency_us"]
+        }),
+    )?;
+
+    if matches!(config.mode, ExperimentMode::Availability) {
+        return run_availability(
+            config,
+            &members,
+            &ports,
+            &coordinator_endpoint,
+            &admin_client,
+            &mut processes,
+            events,
+            measurements,
+            observations,
+        )
+        .await;
+    }
 
     if matches!(config.mode, ExperimentMode::Correctness) {
         let added = &members[config.node_count - 1];
@@ -458,6 +648,7 @@ async fn run_cluster(
         wait_for_listener(ports[config.node_count], &mut processes).await?;
         let scale_out_mutations =
             (scale_out_cohorts.rewrite.len() + scale_out_cohorts.delete.len()) as u64;
+        let rf_started = Instant::now();
         let duration = migrate_while_mutating(
             &workload_client,
             &admin_client,
@@ -483,6 +674,17 @@ async fn run_cluster(
             "scale_out_with_mutations".into(),
             measurement(scale_out_mutations, duration),
         );
+        wait_for_full_rf(
+            &admin_client,
+            config.desired_replication_factor,
+            Duration::from_millis(config.migration_timeout_ms),
+            &mut processes,
+        )
+        .await?;
+        observations.insert(
+            "scale_out_transition_to_full_rf_seconds".into(),
+            json!(rf_started.elapsed().as_secs_f64()),
+        );
         let verify_started = Instant::now();
         verify_dataset(&workload_client, workload, &expected_rounds).await?;
         let verify_duration = verify_started.elapsed();
@@ -501,7 +703,6 @@ async fn run_cluster(
                 "seconds": verify_duration.as_secs_f64(),
             }),
         )?;
-
         let scale_in = admin_client
             .begin_topology_change(initial_members.to_vec())
             .await?;
@@ -511,6 +712,7 @@ async fn run_cluster(
         );
         let scale_in_mutations =
             (scale_out_cohorts.delete.len() + scale_out_cohorts.rewrite.len()) as u64;
+        let rf_started = Instant::now();
         let duration = migrate_while_mutating(
             &workload_client,
             &admin_client,
@@ -536,6 +738,24 @@ async fn run_cluster(
             "scale_in_with_mutations".into(),
             measurement(scale_in_mutations, duration),
         );
+        let status = processes
+            .wait_for_successful_exit(&added.node_id, Duration::from_secs(10))
+            .await?;
+        events.record(
+            "removed_node_exited",
+            json!({ "node_id": added.node_id, "status": status }),
+        )?;
+        wait_for_full_rf(
+            &admin_client,
+            config.desired_replication_factor,
+            Duration::from_millis(config.migration_timeout_ms),
+            &mut processes,
+        )
+        .await?;
+        observations.insert(
+            "scale_in_transition_to_full_rf_seconds".into(),
+            json!(rf_started.elapsed().as_secs_f64()),
+        );
         let verify_started = Instant::now();
         verify_dataset(&workload_client, workload, &expected_rounds).await?;
         let verify_duration = verify_started.elapsed();
@@ -554,13 +774,6 @@ async fn run_cluster(
                 "seconds": verify_duration.as_secs_f64(),
             }),
         )?;
-        let status = processes
-            .wait_for_successful_exit(&added.node_id, Duration::from_secs(10))
-            .await?;
-        events.record(
-            "removed_node_exited",
-            json!({ "node_id": added.node_id, "status": status }),
-        )?;
     }
 
     processes.ensure_running()?;
@@ -572,6 +785,338 @@ async fn run_cluster(
     Ok(topology.epoch)
 }
 
+fn state_write_timing_json(timing: Option<hashring_core::proto::StateWriteTiming>) -> Value {
+    timing.map_or(Value::Null, |t| {
+        json!({
+            "acquisitions": t.acquisitions, "wait_nanos": t.wait_nanos, "hold_nanos": t.hold_nanos,
+            "max_wait_nanos": t.max_wait_nanos, "max_hold_nanos": t.max_hold_nanos,
+        })
+    })
+}
+
+async fn record_node_pressure(
+    members: &[Member],
+    events: &EventLog,
+    observations: &mut BTreeMap<String, Value>,
+) -> Result<()> {
+    let mut nodes = BTreeMap::new();
+    for member in members {
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut client =
+                configure_data_node_client(DataNodeClient::connect(member.endpoint.clone()).await?);
+            Ok::<_, anyhow::Error>(
+                client
+                    .get_process_info(hashring_core::proto::Empty {})
+                    .await?
+                    .into_inner(),
+            )
+        })
+        .await;
+        let value = match result {
+            Ok(Ok(info)) => json!({
+                "owner_write_timing": state_write_timing_json(info.owner_write_timing),
+                "follower_write_timing": state_write_timing_json(info.follower_write_timing),
+                "ack_write_timing": state_write_timing_json(info.ack_write_timing),
+                "receipt_cleanup_timing": info.receipt_cleanup_timing.map(|t| json!({
+                    "purge_calls": t.purge_calls, "purge_nanos": t.purge_nanos,
+                    "max_purge_nanos": t.max_purge_nanos, "expired_receipts": t.expired_receipts,
+                    "ack_prune_calls": t.ack_prune_calls, "ack_prune_nanos": t.ack_prune_nanos,
+                    "ack_prune_scanned_receipts": t.ack_prune_scanned_receipts,
+                })),
+                "dedup_bytes": info.dedup_bytes,
+                "dedup_peak_bytes": info.dedup_peak_bytes,
+                "dedup_capacity_bytes": info.dedup_capacity_bytes,
+                "owner_dedup_rejections": info.owner_dedup_rejections,
+                "follower_dedup_rejections": info.follower_dedup_rejections,
+                "replication_reservation_rejections": info.replication_reservation_rejections,
+                "replication_rpc_retries": info.replication_rpc_retries,
+                "replication_stream_peak_pending": info.replication_stream_peak_pending,
+            }),
+            Ok(Err(error)) => json!({ "error": error.to_string() }),
+            Err(_) => json!({ "error": "node pressure request timed out" }),
+        };
+        nodes.insert(member.node_id.clone(), value);
+    }
+    events.record("node_pressure_sampled", json!({ "nodes": nodes }))?;
+    observations.insert("node_pressure_after_initial_put".into(), json!(nodes));
+    Ok(())
+}
+
+fn latency_summary(samples: &mut [u64]) -> Value {
+    samples.sort_unstable();
+    let percentile = |numerator: usize| -> u64 { samples[(samples.len() - 1) * numerator / 100] };
+    json!({
+        "samples": samples.len(),
+        "p50": percentile(50),
+        "p95": percentile(95),
+        "p99": percentile(99),
+        "max": samples[samples.len() - 1],
+    })
+}
+
+async fn wait_for_full_rf(
+    client: &HashringClient,
+    desired_rf: u32,
+    timeout: Duration,
+    processes: &mut ProcessGroup,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        processes.ensure_running()?;
+        if let Ok(Ok(status)) =
+            tokio::time::timeout(Duration::from_secs(3), client.replica_status()).await
+            && !status.ranges.is_empty()
+            && status.ranges.iter().all(|range| {
+                range.live_rf == desired_rf
+                    && !range.repairing
+                    && range.followers.iter().all(|follower| follower.healthy)
+            })
+        {
+            return Ok(());
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "full RF did not converge within {timeout:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_availability(
+    config: &ExperimentConfig,
+    members: &[Member],
+    ports: &[u16],
+    coordinator_endpoint: &str,
+    admin_client: &HashringClient,
+    processes: &mut ProcessGroup,
+    events: &EventLog,
+    measurements: &mut BTreeMap<String, Measurement>,
+    observations: &mut BTreeMap<String, Value>,
+) -> Result<u64> {
+    let topology = admin_client.refresh_topology().await?;
+    let owner_keys: Vec<_> = (0..config.key_count)
+        .filter(|key| {
+            topology
+                .owner(&key.to_be_bytes())
+                .is_ok_and(|owner| owner.node_id == members[0].node_id)
+        })
+        .take(128)
+        .collect();
+    ensure!(
+        !owner_keys.is_empty(),
+        "availability dataset has no keys owned by the failed node"
+    );
+    events.record(
+        "failover_sample_selected",
+        json!({ "owner": members[0].node_id, "keys": owner_keys }),
+    )?;
+
+    // An identifiable, just-acknowledged tail makes OwnerOnly loss observable
+    // when it occurs; zero loss in one run is not a durability guarantee.
+    let tail_key = *owner_keys.last().expect("nonempty sample was checked");
+    let tail_bytes = config
+        .value_bytes
+        .clamp(1024 * 1024, DEFAULT_MAX_VALUE_BYTES);
+    let tail_value = deterministic_value(tail_key, 1, tail_bytes);
+    let tail_put_started = Instant::now();
+    let writer =
+        HashringClient::connect(coordinator_endpoint.to_owned(), Duration::from_secs(10)).await?;
+    writer
+        .put(tail_key.to_be_bytes().to_vec(), tail_value.clone())
+        .await?;
+    let tail_put_seconds = tail_put_started.elapsed().as_secs_f64();
+    let tail_ack_at = Instant::now();
+    let failed_at = Instant::now();
+    let (exit, kill_signalled_at) = processes.kill(&members[0].node_id)?;
+    let tail_ack_to_kill_ms = kill_signalled_at.duration_since(tail_ack_at).as_millis();
+    events.record(
+        "owner_killed",
+        json!({ "node_id": members[0].node_id, "exit": exit,
+            "tail_key": tail_key, "tail_bytes": tail_bytes,
+            "tail_put_seconds": tail_put_seconds,
+            "tail_ack_to_kill_ms": tail_ack_to_kill_ms }),
+    )?;
+    let probe =
+        HashringClient::connect(coordinator_endpoint.to_owned(), Duration::from_millis(250))
+            .await?;
+    let probe_key = owner_keys[0].to_be_bytes().to_vec();
+    let failover_deadline = Instant::now() + Duration::from_secs(30);
+    let mut first_unavailable: Option<Instant> = None;
+    let mut longest_unavailable_ms = 0u128;
+    let mut unavailable_probes = 0u64;
+    let mut published_seconds = None;
+    loop {
+        processes.ensure_running()?;
+        let available = matches!(
+            probe.get(probe_key.clone()).await,
+            Ok(_)
+                | Err(ClientError::Operation(hashring_client::OperationFailure {
+                    code: ErrorCode::NotFound,
+                    ..
+                }))
+        );
+        if available {
+            if let Some(started) = first_unavailable.take() {
+                longest_unavailable_ms = longest_unavailable_ms.max(started.elapsed().as_millis());
+            }
+        } else {
+            unavailable_probes += 1;
+            first_unavailable.get_or_insert_with(Instant::now);
+        }
+        let current = admin_client.refresh_topology().await?;
+        if published_seconds.is_none()
+            && current.epoch > topology.epoch
+            && !current
+                .members
+                .iter()
+                .any(|member| member.node_id == members[0].node_id)
+        {
+            let seconds = failed_at.elapsed().as_secs_f64();
+            published_seconds = Some(seconds);
+            events.record(
+                "failover_published",
+                json!({ "seconds": seconds, "epoch": current.epoch }),
+            )?;
+        }
+        if published_seconds.is_some() && available {
+            break;
+        }
+        ensure!(
+            Instant::now() < failover_deadline,
+            "automatic failover did not publish and resolve the read probe within 30 seconds"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if let Some(started) = first_unavailable {
+        longest_unavailable_ms = longest_unavailable_ms.max(started.elapsed().as_millis());
+    }
+    let failover_seconds = published_seconds.expect("loop exits only after publication");
+    let read_recovery_seconds = failed_at.elapsed().as_secs_f64();
+    observations.insert("failover_seconds".into(), json!(failover_seconds));
+    observations.insert("read_recovery_seconds".into(), json!(read_recovery_seconds));
+    observations.insert(
+        "observed_unavailable_max_streak_ms".into(),
+        json!(longest_unavailable_ms),
+    );
+    observations.insert("unavailable_probe_count".into(), json!(unavailable_probes));
+    events.record(
+        "failover_read_recovered",
+        json!({
+            "seconds": failover_seconds,
+            "read_recovery_seconds": read_recovery_seconds,
+            "observed_unavailable_max_streak_ms": longest_unavailable_ms,
+            "unavailable_probe_count": unavailable_probes,
+        }),
+    )?;
+
+    let reader =
+        HashringClient::connect(coordinator_endpoint.to_owned(), Duration::from_secs(5)).await?;
+    let mut lost = 0u64;
+    let mut tail_survived = true;
+    for key in &owner_keys {
+        match reader.get(key.to_be_bytes().to_vec()).await {
+            Ok(output) if *key == tail_key => {
+                if output.value != tail_value {
+                    ensure!(
+                        output.value == deterministic_value(*key, 0, config.value_bytes),
+                        "tail key {key} has a value other than the acknowledged or prior value"
+                    );
+                    lost += 1;
+                    tail_survived = false;
+                }
+            }
+            Ok(output) => ensure!(
+                output.value == deterministic_value(*key, 0, config.value_bytes),
+                "surviving key {key} has an unexpected value"
+            ),
+            Err(ClientError::Operation(failure)) if failure.code == ErrorCode::NotFound => {
+                lost += 1;
+                if *key == tail_key {
+                    tail_survived = false;
+                }
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading acknowledged key {key} after failover"));
+            }
+        }
+    }
+    ensure!(
+        config.write_ack_policy != WriteAckPolicy::FirstSuccessor || lost == 0,
+        "FirstSuccessor lost {lost} acknowledged sampled keys"
+    );
+    observations.insert(
+        "acknowledged_key_survival".into(),
+        json!({
+            "sampled": owner_keys.len(), "preserved": owner_keys.len() as u64 - lost,
+            "lost": lost, "policy": config.write_ack_policy,
+            "tail_key": tail_key, "tail_survived": tail_survived,
+        }),
+    );
+    events.record(
+        "acknowledged_key_survival_checked",
+        observations["acknowledged_key_survival"].clone(),
+    )?;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let change = admin_client.topology_change().await?;
+        if change.is_none_or(|change| change.phase.is_terminal()) {
+            break;
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "failover change did not complete"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let replacement = &members[3];
+    let target = vec![members[1].clone(), members[2].clone(), replacement.clone()];
+    let change = admin_client.begin_topology_change(target).await?;
+    let restore_started = Instant::now();
+    spawn_node(
+        processes,
+        replacement.node_id.clone(),
+        ports[4],
+        coordinator_endpoint,
+    )?;
+    wait_for_listener(ports[4], processes).await?;
+    let completed = admin_client
+        .execute_topology_change(
+            change.change_id,
+            change.base_epoch,
+            change.target_topology.epoch,
+        )
+        .await?;
+    wait_for_full_rf(
+        admin_client,
+        config.desired_replication_factor,
+        Duration::from_millis(config.migration_timeout_ms),
+        processes,
+    )
+    .await?;
+    let restored_seconds = restore_started.elapsed().as_secs_f64();
+    observations.insert(
+        "replacement_to_full_rf_seconds".into(),
+        json!(restored_seconds),
+    );
+    observations.insert(
+        "failure_to_full_rf_seconds".into(),
+        json!(failed_at.elapsed().as_secs_f64()),
+    );
+    measurements.insert(
+        "restore_full_rf".into(),
+        measurement(1, restore_started.elapsed()),
+    );
+    events.record(
+        "full_rf_restored",
+        json!({ "epoch": completed.target_topology.epoch,
+        "replacement_to_full_rf_seconds": restored_seconds }),
+    )?;
+    Ok(completed.target_topology.epoch)
+}
+
 async fn migrate_while_mutating(
     workload_client: &HashringClient,
     admin_client: &HashringClient,
@@ -580,6 +1125,7 @@ async fn migrate_while_mutating(
     events: &EventLog,
 ) -> Result<Duration> {
     let label = workload.label;
+    let direct_merge = change.direct_merge;
     events.record(
         "migration_started",
         json!({ "label": label, "change_id": change.change_id }),
@@ -592,7 +1138,11 @@ async fn migrate_while_mutating(
             .execute_topology_change(change_id, change.base_epoch, change.target_topology.epoch)
             .await
     });
-    let active_phase = wait_for_migration_activity(admin_client).await?;
+    let active_phase = if direct_merge {
+        None
+    } else {
+        Some(wait_for_migration_activity(admin_client).await?)
+    };
     let completed_mutations = Arc::new(AtomicU64::new(0));
     let writer_client = workload_client.clone();
     let writer_progress = completed_mutations.clone();
@@ -607,32 +1157,67 @@ async fn migrate_while_mutating(
         )
         .await
     });
-    let (overlap_phase, overlap_mutations) =
-        match wait_for_mutation_overlap(admin_client, &completed_mutations, &writer).await {
-            Ok(overlap) => overlap,
-            Err(error) => {
-                writer.abort();
-                execution.abort();
-                return Err(error);
-            }
-        };
+    if !direct_merge {
+        let (overlap_phase, overlap_mutations) =
+            match wait_for_mutation_overlap(admin_client, &completed_mutations, &writer).await {
+                Ok(overlap) => overlap,
+                Err(error) => {
+                    writer.abort();
+                    execution.abort();
+                    return Err(error);
+                }
+            };
+        events.record(
+            "migration_mutation_overlap_observed",
+            json!({
+                "label": label,
+                "initial_phase": format!("{:?}", active_phase.expect("copy migration has an active phase")),
+                "observed_phase": format!("{overlap_phase:?}"),
+                "completed_mutations_while_active": overlap_mutations,
+                "untouched_moving_sentinels": workload.sentinel_count,
+            }),
+        )?;
+    }
+    let writer_result = writer.await.context("joining concurrent mutator")?;
+    if let Err(error) = &writer_result {
+        events.record(
+            "migration_writer_failed",
+            json!({
+                "label": label,
+                "error": format!("{error:#}"),
+                "completed_mutations": completed_mutations.load(AtomicOrdering::Acquire),
+                "change_phase": admin_client.topology_change().await.ok().flatten().map(|change| format!("{:?}", change.phase)),
+            }),
+        )?;
+    }
+    let execution_result = execution.await.context("joining migration execution")?;
     events.record(
-        "migration_mutation_overlap_observed",
+        "migration_execution_finished",
         json!({
             "label": label,
-            "initial_phase": format!("{active_phase:?}"),
-            "observed_phase": format!("{overlap_phase:?}"),
-            "completed_mutations_while_active": overlap_mutations,
-            "untouched_moving_sentinels": workload.sentinel_count,
+            "result": match &execution_result {
+                Ok(change) => format!("{:?}", change.phase),
+                Err(error) => format!("error: {error}"),
+            },
         }),
     )?;
-    let mutations = writer.await.context("joining concurrent mutator")??;
-    let completed = execution.await.context("joining migration execution")??;
+    let mutations = writer_result?;
+    let completed = execution_result?;
     ensure!(
         completed.phase == MigrationPhase::Complete,
         "migration ended in {:?}",
         completed.phase
     );
+    if direct_merge {
+        events.record(
+            "direct_merge_cutover_observed",
+            json!({
+                "label": label,
+                "completed_mutations": completed_mutations.load(AtomicOrdering::Acquire),
+                "untouched_moving_sentinels": workload.sentinel_count,
+            }),
+        )?;
+    }
     let duration = started.elapsed();
     events.record(
         "migration_complete",
@@ -870,27 +1455,27 @@ fn moving_key_cohorts(change: &TopologyChange, key_count: u64) -> Result<MovingK
 }
 
 fn moving_keys(change: &TopologyChange, key_count: u64) -> Vec<u64> {
+    let base = change
+        .base_topology
+        .as_ref()
+        .expect("planned change includes its base topology");
     let mut moving = Vec::new();
     for key in 0..key_count {
         let encoded = key.to_be_bytes();
-        let token = change.target_topology.key_token(&encoded);
-        if change
-            .ranges
-            .iter()
-            .any(|range| range_contains(range.start_exclusive, range.end_inclusive, token))
+        if base
+            .owner(&encoded)
+            .expect("base topology is valid")
+            .node_id
+            != change
+                .target_topology
+                .owner(&encoded)
+                .expect("target topology is valid")
+                .node_id
         {
             moving.push(key);
         }
     }
     moving
-}
-
-fn range_contains(start_exclusive: u64, end_inclusive: u64, token: u64) -> bool {
-    match start_exclusive.cmp(&end_inclusive) {
-        std::cmp::Ordering::Less => token > start_exclusive && token <= end_inclusive,
-        std::cmp::Ordering::Greater => token > start_exclusive || token <= end_inclusive,
-        std::cmp::Ordering::Equal => true,
-    }
 }
 
 fn deterministic_value(key: u64, round: u64, value_bytes: usize) -> Vec<u8> {
@@ -982,12 +1567,48 @@ fn reserve_ports(count: usize) -> Result<Vec<u16>> {
 
 fn validate_config(config: &ExperimentConfig) -> Result<()> {
     ensure!(config.node_count >= 2, "node_count must be at least 2");
+    if matches!(config.mode, ExperimentMode::Availability) {
+        ensure!(
+            config.node_count == 4,
+            "availability mode requires exactly 4 nodes (3 initial and 1 replacement)"
+        );
+        ensure!(
+            config.desired_replication_factor == 3,
+            "availability mode requires desired_replication_factor=3"
+        );
+        ensure!(
+            config.write_ack_policy != WriteAckPolicy::AllReplicas,
+            "availability mode cannot keep AllReplicas writable after one node fails"
+        );
+    }
+    let initial_count = match config.mode {
+        ExperimentMode::Correctness => config.node_count - 1,
+        ExperimentMode::Performance => config.node_count,
+        ExperimentMode::Availability => 3,
+    };
+    ensure!(
+        initial_count >= config.desired_replication_factor as usize,
+        "initial membership must be at least the desired replication factor"
+    );
+    ensure!(
+        config.minimum_admitted_copies > 0
+            && config.minimum_admitted_copies <= config.desired_replication_factor,
+        "minimum admitted copies must be between 1 and desired RF"
+    );
+    ensure!(
+        config.minimum_healthy_followers < config.desired_replication_factor,
+        "minimum healthy followers must be below desired RF"
+    );
     ensure!(config.key_count > 0, "key_count must be positive");
     ensure!(
         usize::try_from(config.key_count).is_ok(),
         "key_count exceeds the platform address space"
     );
     ensure!(config.concurrency > 0, "concurrency must be positive");
+    ensure!(
+        config.range_move_concurrency > 0,
+        "range_move_concurrency must be positive"
+    );
     ensure!(config.value_bytes > 0, "value_bytes must be positive");
     ensure!(
         config.value_bytes <= DEFAULT_MAX_VALUE_BYTES,
@@ -1129,6 +1750,7 @@ mod tests {
             Duration::from_secs(3),
             Err(anyhow::anyhow!("injected failure")),
             measurements,
+            BTreeMap::new(),
         );
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("summary.json");

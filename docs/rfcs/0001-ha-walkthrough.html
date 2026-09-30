@@ -1,0 +1,691 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<meta name="description" content="A walkthrough of the intended high-availability design for the consistent-hash cache.">
+<title>How the HA cache fits together · RFC 0001 walkthrough</title>
+<style>
+:root{
+  color-scheme:light dark;
+  --paper:#fbfaf7;--ink:#1b2430;--muted:#5d6874;--rule:#e3dfd7;--soft:#f3f1ec;--box:#fff;
+  --accent:#b4532a;--accent-soft:#f8ebe3;--link:#1f5f80;--link-soft:#e5eff5;
+  --ok:#2c7549;--ok-soft:#e4f1e9;--bad:#a33a3a;--bad-soft:#f7e5e5;--nd:#6a4c93;
+  --serif:"Iowan Old Style","Charter","Palatino Linotype",Georgia,serif;
+  --sans:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme:dark){:root{
+  --paper:#14181d;--ink:#e7e4dd;--muted:#9ba4ae;--rule:#2d343c;--soft:#1b2026;--box:#1e242b;
+  --accent:#e59066;--accent-soft:#3a271f;--link:#83b9d8;--link-soft:#1b2c37;
+  --ok:#7fc79c;--ok-soft:#18301f;--bad:#e79090;--bad-soft:#3a2121;--nd:#b7a1dd;
+}}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--paper);color:var(--ink);font:16.5px/1.65 var(--sans);-webkit-font-smoothing:antialiased}
+a{color:var(--link);text-decoration-thickness:1px;text-underline-offset:3px}
+a:hover{text-decoration-thickness:2px}
+code{font-family:var(--mono);font-size:.86em;background:var(--soft);border:1px solid var(--rule);padding:.08em .34em;border-radius:4px;white-space:nowrap}
+strong{font-weight:650}
+p{margin:0 0 1em}
+ul{padding-left:1.3rem;margin:0 0 1.2em}
+li{margin:0 0 .45em}
+
+/* Layout */
+.layout{max-width:1160px;margin:0 auto;padding:0 32px;display:grid;grid-template-columns:210px minmax(0,760px);gap:64px;justify-content:center}
+.toc{position:sticky;top:0;align-self:start;padding:56px 0 32px;max-height:100vh;overflow:auto}
+.toc-title{font-size:.72rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);font-weight:700;margin:0 0 12px}
+.toc ol{list-style:none;margin:0;padding:0;border-left:1px solid var(--rule)}
+.toc li{margin:0}
+.toc a{display:grid;grid-template-columns:24px 1fr;gap:2px;padding:6px 0 6px 14px;margin-left:-1px;border-left:2px solid transparent;color:var(--muted);text-decoration:none;font-size:.87rem;line-height:1.35}
+.toc a span{font-variant-numeric:tabular-nums;opacity:.7}
+.toc a:hover{color:var(--ink)}
+.toc a.active{color:var(--ink);border-left-color:var(--accent);font-weight:600}
+.toc a.active span{color:var(--accent);opacity:1}
+.contents{display:none;margin:0 0 8px;padding:16px 18px;background:var(--box);border:1px solid var(--rule);border-radius:12px}
+.contents ol{margin:0;padding-left:1.4rem;columns:2;column-gap:28px;font-size:.92rem}
+.contents li{margin:0 0 4px;break-inside:avoid}
+main{padding:56px 0 80px;min-width:0}
+
+/* Header */
+.eyebrow{font-size:.78rem;letter-spacing:.1em;text-transform:uppercase;color:var(--accent);font-weight:700;margin:0 0 14px}
+h1{font-family:var(--serif);font-size:clamp(2.3rem,5vw,3.4rem);font-weight:500;line-height:1.06;letter-spacing:-.025em;margin:0 0 20px}
+.lede{font-size:1.04rem;color:var(--muted);max-width:660px}
+.meta{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0 30px;padding:0;list-style:none}
+.meta li{margin:0;font-size:.8rem;padding:3px 10px;border:1px solid var(--rule);border-radius:999px;color:var(--muted);background:var(--box)}
+.thesis{margin:0 0 24px;padding:22px 26px;background:var(--box);border:1px solid var(--rule);border-radius:12px}
+.thesis-label{font-size:.72rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);font-weight:700;margin:0 0 12px}
+.thesis ol{list-style:none;margin:0;padding:0;display:grid;grid-template-columns:repeat(3,1fr);gap:22px}
+.thesis li{margin:0;font-family:var(--serif);font-size:1.12rem;line-height:1.35}
+.thesis li b{display:block;font-family:var(--sans);font-size:.76rem;letter-spacing:.07em;text-transform:uppercase;color:var(--accent);margin-bottom:4px}
+
+/* Sections */
+section{padding-top:28px;margin-top:56px;border-top:1px solid var(--rule);scroll-margin-top:8px}
+.sec-head{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin:0 0 14px}
+.sec-num{font-family:var(--serif);font-size:1.05rem;color:var(--accent);font-variant-numeric:tabular-nums;font-weight:600}
+h2{font-family:var(--serif);font-size:clamp(1.5rem,3vw,1.9rem);font-weight:500;line-height:1.2;letter-spacing:-.015em;margin:0;flex:1 1 auto}
+.time{font-size:.76rem;color:var(--muted);border:1px solid var(--rule);border-radius:999px;padding:1px 9px;white-space:nowrap}
+.takeaway{margin:0 0 22px;padding:12px 16px 12px 18px;border-left:3px solid var(--accent);background:var(--accent-soft);border-radius:0 8px 8px 0;font-weight:560;line-height:1.5}
+.takeaway::before{content:"Takeaway";display:block;font-size:.7rem;letter-spacing:.1em;text-transform:uppercase;color:var(--accent);font-weight:700;margin-bottom:2px}
+.source{margin-top:18px;font-size:.84rem;color:var(--muted)}
+.source::before{content:"In the RFC:";font-weight:700;margin-right:6px}
+
+/* Figures */
+figure{margin:26px 0 28px;padding:18px 18px 14px;background:var(--box);border:1px solid var(--rule);border-radius:12px;break-inside:avoid}
+figure svg{display:block;width:100%;height:auto}
+figcaption{font-size:.82rem;color:var(--muted);margin-top:10px;padding-top:10px;border-top:1px solid var(--rule)}
+.scroll{overflow-x:auto}
+.scroll svg{min-width:560px}
+
+/* SVG vocabulary */
+svg text{font-family:var(--sans);fill:var(--ink)}
+.t{font-size:14px;font-weight:650}
+.s{font-size:12px;fill:var(--muted)}
+.s.ink{fill:var(--ink)}
+.lbl{font-size:12px;fill:var(--muted);paint-order:stroke;stroke:var(--box);stroke-width:5px;stroke-linejoin:round}
+.lbl.accent{fill:var(--accent);font-weight:600}
+.lbl.bad{fill:var(--bad);font-weight:600}
+.lbl.ok{fill:var(--ok);font-weight:600}
+.lbl.link{fill:var(--link);font-weight:600}
+.t.bad{fill:var(--bad)}.t.ok{fill:var(--ok)}
+.box{fill:var(--box);stroke:var(--ink);stroke-opacity:.5;stroke-width:1.2}
+.box.accent{fill:var(--accent-soft);stroke:var(--accent);stroke-opacity:1}
+.box.ok{fill:var(--ok-soft);stroke:var(--ok);stroke-opacity:1}
+.box.bad{fill:var(--bad-soft);stroke:var(--bad);stroke-opacity:1}
+.box.soft{fill:var(--soft);stroke:var(--rule);stroke-opacity:1}
+.box.link{fill:var(--link-soft);stroke:var(--link);stroke-opacity:1}
+.data{fill:none;stroke:var(--ink);stroke-width:1.6}
+.ctl{fill:none;stroke:var(--link);stroke-width:1.5;stroke-dasharray:6 5}
+.async{fill:none;stroke:var(--muted);stroke-width:1.4;stroke-dasharray:3 4}
+.reply{fill:none;stroke:var(--ink);stroke-width:1.4;stroke-dasharray:6 4}
+.reply.accent{stroke:var(--accent);stroke-width:2}
+.reply.ok{stroke:var(--ok);stroke-width:2}
+.reply.bad{stroke:var(--bad)}
+.plain{fill:none;stroke:var(--muted);stroke-width:1.2}
+.sep{stroke:var(--rule);stroke-width:1}
+.life{stroke:var(--muted);stroke-opacity:.45;stroke-width:1.5;stroke-dasharray:2 5}
+.axis{stroke:var(--muted);stroke-width:1.5}
+.n-a{fill:var(--accent)}.n-b{fill:var(--link)}.n-c{fill:var(--ok)}.n-d{fill:var(--nd)}.n-p{fill:var(--muted);opacity:.5}
+.tok{font-size:13px;font-weight:700;fill:var(--paper)}
+.ghost{fill:none;stroke:var(--muted);stroke-width:1.3;stroke-dasharray:3 3}
+.ghost-t{font-size:13px;font-weight:700;fill:var(--muted);opacity:.7}
+.num{font-size:12px;fill:var(--muted);font-variant-numeric:tabular-nums}
+.panel{font-size:11px;font-weight:700;letter-spacing:.09em;fill:var(--muted)}
+.band-a{fill:var(--accent-soft);stroke:var(--accent)}
+.band-b{fill:var(--link-soft);stroke:var(--link)}
+.m-ink{fill:var(--ink)}.m-link{fill:var(--link)}.m-muted{fill:var(--muted)}.m-accent{fill:var(--accent)}.m-ok{fill:var(--ok)}.m-bad{fill:var(--bad)}
+.x-mark{stroke:var(--bad);stroke-width:2.2}
+
+/* Tables */
+.table-wrap{margin:22px 0 24px;overflow-x:auto;border:1px solid var(--rule);border-radius:10px;background:var(--box)}
+table{border-collapse:collapse;width:100%;font-size:.9rem;line-height:1.5}
+th,td{padding:11px 14px;text-align:left;vertical-align:top;border-bottom:1px solid var(--rule)}
+th{font-size:.72rem;letter-spacing:.07em;text-transform:uppercase;color:var(--muted);background:var(--soft);font-weight:700}
+tbody tr:last-child td{border-bottom:0}
+td:first-child{font-weight:600}
+
+/* Policy cards */
+.policies{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin:22px 0 10px;padding:0;list-style:none}
+.policy{margin:0;padding:16px 16px 14px;background:var(--box);border:1px solid var(--rule);border-radius:12px;display:flex;flex-direction:column;gap:12px}
+.policy h3{margin:0;font-size:1rem;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.policy h3 code{font-size:.95rem;background:none;border:0;padding:0;font-weight:700}
+.tag{font-size:.64rem;letter-spacing:.08em;text-transform:uppercase;font-weight:700;color:var(--accent);border:1px solid currentColor;border-radius:999px;padding:0 7px;line-height:1.6}
+.copies{display:flex;gap:6px;align-items:center}
+.copy{width:30px;height:30px;border-radius:50%;display:grid;place-items:center;font-size:.8rem;font-weight:700;border:1.5px dashed var(--muted);color:var(--muted)}
+.copy.wait{border:0;background:var(--ink);color:var(--paper)}
+.copy.wait.owner{background:var(--accent)}
+.policy dl{margin:0;font-size:.87rem;line-height:1.45}
+.policy dt{font-size:.66rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:700;margin-top:8px}
+.policy dt:first-child{margin-top:0}
+.policy dd{margin:2px 0 0}
+.policy-note{font-size:.82rem;color:var(--muted);margin:0 0 20px}
+
+/* Two-up notes */
+.pair{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:18px 0 22px}
+.pair>div{padding:14px 16px;background:var(--box);border:1px solid var(--rule);border-radius:10px;font-size:.93rem}
+.pair h3{margin:0 0 6px;font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.pair p:last-child{margin:0}
+
+/* FAQ */
+.faq{margin:18px 0 22px;display:grid;gap:10px}
+.faq div{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.25fr);gap:18px;padding:14px 16px;background:var(--box);border:1px solid var(--rule);border-radius:10px}
+.faq dt{font-weight:600;line-height:1.45}
+.faq dd{margin:0;line-height:1.5}
+.faq dd b{font-weight:700;color:var(--bad)}
+
+footer{margin-top:64px;padding-top:16px;border-top:1px solid var(--rule);font-size:.82rem;color:var(--muted)}
+
+@media (max-width:1060px){
+  .layout{display:block;max-width:800px}
+  .toc{display:none}
+  .contents{display:block}
+  main{padding-top:40px}
+}
+@media (max-width:720px){
+  body{font-size:16px}
+  .layout{padding:0 18px}
+  .thesis ol,.policies,.pair{grid-template-columns:1fr}
+  .thesis ol{gap:14px}
+  .faq div{grid-template-columns:1fr;gap:6px}
+  .contents ol{columns:1}
+  figure{padding:12px 10px 10px;margin-left:-6px;margin-right:-6px}
+}
+@media print{
+  :root{--paper:#fff;--box:#fff}
+  body{font-size:10.5pt}
+  .layout{display:block;max-width:none;padding:0}
+  .toc,.contents{display:none}
+  main{padding:0}
+  .sec-head{break-after:avoid}
+  figure,.policy,.faq div,.pair>div{break-inside:avoid}
+  .scroll svg{min-width:0}
+  a{color:inherit;text-decoration:none}
+}
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <defs>
+    <marker id="ah-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="m-ink"/></marker>
+    <marker id="ah-link" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="m-link"/></marker>
+    <marker id="ah-muted" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="m-muted"/></marker>
+    <marker id="ah-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="m-accent"/></marker>
+    <marker id="ah-ok" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="m-ok"/></marker>
+  </defs>
+</svg>
+
+<div class="layout">
+
+<nav class="toc" aria-label="Sections">
+  <p class="toc-title">Walkthrough</p>
+  <ol>
+    <li><a href="#roles"><span>01</span>Three roles, two traffic paths</a></li>
+    <li><a href="#placement"><span>02</span>Placement also decides failover</a></li>
+    <li><a href="#readiness"><span>03</span>Placement, readiness, and authority</a></li>
+    <li><a href="#policy"><span>04</span>The write policy defines success</a></li>
+    <li><a href="#failover"><span>05</span>Reads and writes recover separately</a></li>
+    <li><a href="#movement"><span>06</span>Copies are verified before use</a></li>
+    <li><a href="#retries"><span>07</span>Ordering and retries</a></li>
+    <li><a href="#limits"><span>08</span>Guarantees and limits</a></li>
+  </ol>
+</nav>
+
+<main id="main-content">
+
+<header>
+  <p class="eyebrow">RFC 0001 · Walkthrough</p>
+  <h1>How the HA cache fits together</h1>
+  <p class="lede">This walkthrough accompanies <a href="0001-ha-for-consistent-hash-cache.md">RFC 0001</a>. It explains the intended design. It does not report implementation status, and it is not evidence that the acceptance tests pass. For exact rules, the RFC is the reference. The RFC's baseline and implementation phases describe the original plan.</p>
+  <ul class="meta">
+    <li>8 sections</li>
+    <li>About 15 minutes to present</li>
+    <li>One takeaway per section</li>
+  </ul>
+  <div class="thesis">
+    <p class="thesis-label">The short version</p>
+    <ol>
+      <li><b>The ring</b>decides where data belongs.</li>
+      <li><b>The coordinator</b>decides when ownership changes.</li>
+      <li><b>Verified replicas</b>decide whether the system can serve safely after a change.</li>
+    </ol>
+  </div>
+  <nav class="contents" aria-label="Sections">
+    <ol>
+      <li><a href="#roles">Three roles, two traffic paths</a></li>
+      <li><a href="#placement">Placement also decides failover</a></li>
+      <li><a href="#readiness">Placement, readiness, and authority</a></li>
+      <li><a href="#policy">The write policy defines success</a></li>
+      <li><a href="#failover">Reads and writes recover separately</a></li>
+      <li><a href="#movement">Copies are verified before use</a></li>
+      <li><a href="#retries">Ordering and retries</a></li>
+      <li><a href="#limits">Guarantees and limits</a></li>
+    </ol>
+  </nav>
+</header>
+
+<!-- 1 -->
+<section id="roles" aria-labelledby="h-roles">
+<div class="sec-head"><span class="sec-num">01</span><h2 id="h-roles">Three roles, two traffic paths</h2><span class="time">2 min</span></div>
+<p class="takeaway">Clients talk to owners directly. The coordinator handles authority and recovery.</p>
+<p>The diagram shows a single range. In practice every cache node owns some ranges and follows other owners for other ranges.</p>
+
+<figure>
+<div class="scroll">
+<svg viewBox="0 0 820 470" role="img" aria-labelledby="f1-title">
+  <title id="f1-title">The client sends GET, PUT, and DELETE to the owner and refreshes topology from the coordinator. The coordinator sends topology and leases to the owner, sends control and seeding traffic to both followers, and stores control metadata. The owner replicates to the first successor and the later follower.</title>
+  <rect class="box" x="30" y="20" width="220" height="62" rx="10"/>
+  <text class="t" x="140" y="47" text-anchor="middle">Client</text>
+  <text class="s" x="140" y="66" text-anchor="middle">Cached topology</text>
+
+  <rect class="box link" x="450" y="20" width="220" height="62" rx="10"/>
+  <text class="t" x="560" y="47" text-anchor="middle">Coordinator</text>
+  <text class="s" x="560" y="66" text-anchor="middle">Authority and recovery</text>
+
+  <path class="box soft" d="M700,30 v42 a50,9 0 0 0 100,0 v-42"/>
+  <ellipse class="box soft" cx="750" cy="30" rx="50" ry="9"/>
+  <text class="s" x="750" y="56" text-anchor="middle">Control</text>
+  <text class="s" x="750" y="71" text-anchor="middle">metadata</text>
+  <line class="plain" x1="670" y1="51" x2="700" y2="51"/>
+
+  <rect class="box accent" x="30" y="180" width="220" height="62" rx="10"/>
+  <text class="t" x="140" y="207" text-anchor="middle">Owner</text>
+  <text class="s" x="140" y="226" text-anchor="middle">Reads and mutation order</text>
+
+  <rect class="box" x="30" y="340" width="220" height="62" rx="10"/>
+  <text class="t" x="140" y="367" text-anchor="middle">First successor</text>
+  <text class="s" x="140" y="386" text-anchor="middle">Replica and next owner</text>
+
+  <rect class="box" x="300" y="340" width="220" height="62" rx="10"/>
+  <text class="t" x="410" y="367" text-anchor="middle">Later follower</text>
+  <text class="s" x="410" y="386" text-anchor="middle">Additional replica</text>
+
+  <line class="data" x1="140" y1="82" x2="140" y2="179" marker-end="url(#ah-ink)"/>
+  <text class="lbl" x="152" y="136">GET · PUT · DELETE</text>
+  <line class="data" x1="140" y1="242" x2="140" y2="339" marker-end="url(#ah-ink)"/>
+  <text class="lbl" x="152" y="296">Replication</text>
+  <path class="data" d="M250,226 H410 V339" marker-end="url(#ah-ink)"/>
+  <text class="lbl" x="330" y="244" text-anchor="middle">Replication</text>
+
+  <line class="ctl" x1="250" y1="51" x2="449" y2="51" marker-end="url(#ah-link)"/>
+  <text class="lbl" x="350" y="42" text-anchor="middle">Topology refresh</text>
+  <path class="ctl" d="M500,82 V204 H251" marker-end="url(#ah-link)"/>
+  <text class="lbl" x="375" y="196" text-anchor="middle">Topology · lease</text>
+  <path class="ctl" d="M620,82 V440 H140 V403" marker-end="url(#ah-link)"/>
+  <path class="ctl" d="M410,440 V403" marker-end="url(#ah-link)"/>
+  <text class="lbl" x="515" y="458" text-anchor="middle">Control · seeding</text>
+
+  <line class="data" x1="665" y1="310" x2="705" y2="310"/>
+  <text class="s" x="714" y="314">Data</text>
+  <line class="ctl" x1="665" y1="336" x2="705" y2="336"/>
+  <text class="s" x="714" y="340">Control</text>
+</svg>
+</div>
+<figcaption>Solid arrows are data traffic. Dashed arrows are control traffic, which also includes nodes renewing their leases. Redb stores control metadata only. Cached values are never written to disk.</figcaption>
+</figure>
+
+<div class="table-wrap" role="region" aria-label="Roles" tabindex="0"><table>
+<thead><tr><th>Role</th><th>What it does</th><th>Why it is separate</th></tr></thead>
+<tbody>
+<tr><td>Client</td><td>Computes the owner, sends requests to it, refreshes topology, retries until a deadline</td><td>Keeps the coordinator off the data path</td></tr>
+<tr><td>Owner and followers</td><td>Apply records in memory, replicate mutations in order, seed and verify copies</td><td>Serving requests and restoring redundancy are different jobs</td></tr>
+<tr><td>Coordinator (single instance)</td><td>Serializes topology changes, fences old owners, persists admission and recovery work</td><td>Every node needs the same answer about who owns what</td></tr>
+</tbody></table></div>
+
+<p>This design covers cache-node HA only. The coordinator is not replicated and does not fail over. If it goes down, leases expire and nodes stop serving.</p>
+<p class="source"><a href="0001-ha-for-consistent-hash-cache.md#goal">Goal</a> · <a href="0001-ha-for-consistent-hash-cache.md#1-thin-coordinator">Thin coordinator</a></p>
+</section>
+
+<!-- 2 -->
+<section id="placement" aria-labelledby="h-placement">
+<div class="sec-head"><span class="sec-num">02</span><h2 id="h-placement">Placement also decides failover</h2><span class="time">2 min</span></div>
+<p class="takeaway">The first distinct physical successor is a follower now and the replacement owner later.</p>
+<p>A key hashes to a token. Walking clockwise, the first token's node owns the key, and the next distinct physical nodes are its followers. Virtual-node tokens spread ownership across the physical nodes. A second token from a node that is already in the set does not add a replica.</p>
+<p>Here is a small clockwise slice of a ring, with replication factor (RF) 3:</p>
+
+<figure>
+<div class="scroll">
+<svg viewBox="0 0 820 395" role="img" aria-labelledby="f2-title">
+  <title id="f2-title">Before: tokens 10 (previous), A 20, A 25, B 40, C 60, D 80. A key at 15 falls in (10, 20], owned by A, with replicas A, B, C. A's second token at 25 is skipped. After A is removed, B owns the merged range (10, 40], with replicas B, C, D.</title>
+
+  <text class="panel" x="40" y="28">BEFORE · RF=3</text>
+  <text class="s" x="785" y="28" text-anchor="end">clockwise →</text>
+  <line class="axis" x1="40" y1="100" x2="785" y2="100"/>
+  <rect class="band-a" x="80" y="93" width="140" height="14" rx="7"/>
+  <text class="lbl accent" x="150" y="80" text-anchor="middle">(10, 20] owned by A</text>
+  <path d="M150,93 l7,7 l-7,7 l-7,-7 z" class="m-ink"/>
+  <text class="lbl" x="150" y="134" text-anchor="middle">key 15</text>
+
+  <circle class="n-p" cx="80" cy="100" r="9"/>
+  <text class="num" x="80" y="134" text-anchor="middle">10</text>
+  <circle class="n-a" cx="220" cy="100" r="14"/><text class="tok" x="220" y="105" text-anchor="middle">A</text>
+  <text class="num" x="220" y="134" text-anchor="middle">20</text>
+  <g opacity=".38"><circle class="n-a" cx="300" cy="100" r="14"/><text class="tok" x="300" y="105" text-anchor="middle">A</text></g>
+  <text class="num" x="300" y="134" text-anchor="middle">25</text>
+  <text class="s" x="300" y="76" text-anchor="middle">skipped: A again</text>
+  <circle class="n-b" cx="460" cy="100" r="14"/><text class="tok" x="460" y="105" text-anchor="middle">B</text>
+  <text class="num" x="460" y="134" text-anchor="middle">40</text>
+  <circle class="n-c" cx="610" cy="100" r="14"/><text class="tok" x="610" y="105" text-anchor="middle">C</text>
+  <text class="num" x="610" y="134" text-anchor="middle">60</text>
+  <circle class="n-d" cx="750" cy="100" r="14"/><text class="tok" x="750" y="105" text-anchor="middle">D</text>
+  <text class="num" x="750" y="134" text-anchor="middle">80</text>
+
+  <text class="s" x="40" y="177">Replicas for key 15</text>
+  <circle class="n-a" cx="172" cy="173" r="12"/><text class="tok" x="172" y="178" text-anchor="middle">A</text>
+  <circle class="n-b" cx="204" cy="173" r="12"/><text class="tok" x="204" y="178" text-anchor="middle">B</text>
+  <circle class="n-c" cx="236" cy="173" r="12"/><text class="tok" x="236" y="178" text-anchor="middle">C</text>
+  <text class="s" x="260" y="177">owner, first successor, later follower</text>
+
+  <line class="sep" x1="40" y1="208" x2="785" y2="208"/>
+
+  <text class="panel" x="40" y="242">AFTER A IS REMOVED</text>
+  <line class="axis" x1="40" y1="312" x2="785" y2="312"/>
+  <rect class="band-b" x="80" y="305" width="380" height="14" rx="7"/>
+  <text class="lbl link" x="380" y="290" text-anchor="middle">(10, 40] merged, owned by B</text>
+  <path d="M150,305 l7,7 l-7,7 l-7,-7 z" class="m-ink"/>
+  <text class="lbl" x="150" y="346" text-anchor="middle">key 15</text>
+
+  <circle class="n-p" cx="80" cy="312" r="9"/>
+  <text class="num" x="80" y="346" text-anchor="middle">10</text>
+  <circle class="ghost" cx="220" cy="312" r="14"/><text class="ghost-t" x="220" y="317" text-anchor="middle">A</text>
+  <circle class="ghost" cx="300" cy="312" r="14"/><text class="ghost-t" x="300" y="317" text-anchor="middle">A</text>
+  <circle class="n-b" cx="460" cy="312" r="14"/><text class="tok" x="460" y="317" text-anchor="middle">B</text>
+  <text class="num" x="460" y="346" text-anchor="middle">40</text>
+  <circle class="n-c" cx="610" cy="312" r="14"/><text class="tok" x="610" y="317" text-anchor="middle">C</text>
+  <text class="num" x="610" y="346" text-anchor="middle">60</text>
+  <circle class="n-d" cx="750" cy="312" r="14"/><text class="tok" x="750" y="317" text-anchor="middle">D</text>
+  <text class="num" x="750" y="346" text-anchor="middle">80</text>
+
+  <text class="s" x="40" y="385">Replicas for key 15</text>
+  <circle class="n-b" cx="172" cy="381" r="12"/><text class="tok" x="172" y="386" text-anchor="middle">B</text>
+  <circle class="n-c" cx="204" cy="381" r="12"/><text class="tok" x="204" y="386" text-anchor="middle">C</text>
+  <circle class="n-d" cx="236" cy="381" r="12"/><text class="tok" x="236" y="386" text-anchor="middle">D</text>
+  <text class="s" x="260" y="385">B may take over only if it covers all of (10, 40]</text>
+</svg>
+</div>
+</figure>
+
+<p>A key at token 15 is owned by A, and its desired replicas are <strong>A, B, C</strong>. Token 25 also belongs to A, so follower selection skips it.</p>
+<p>Now remove A. Both of its tokens disappear, and B owns the merged interval <code>(10, 40]</code>. The desired replicas become <strong>B, C, D</strong>. B can take over only if its admitted coverage includes the whole merged interval, not just the part it followed before.</p>
+<p>Two design choices follow from this:</p>
+<ul>
+<li>Promotion follows the ring. It does not pick the least-loaded replica or the one that looks most up to date, so routing and recovery use the same rule.</li>
+<li>Ranges are defined by their bounds in the current topology. They have no permanent shard ID. A joining node splits intervals, and a departing node merges them. Readiness has to be proved for whatever bounds result.</li>
+</ul>
+<p>This slice shows one promotion. In a real ring with many vnodes, the ranges of a failed node move to several different successors.</p>
+<p class="source"><a href="0001-ha-for-consistent-hash-cache.md#1-ring-ranges-and-placement">Ring, ranges, and placement</a></p>
+</section>
+
+<!-- 3 -->
+<section id="readiness" aria-labelledby="h-readiness">
+<div class="sec-head"><span class="sec-num">03</span><h2 id="h-readiness">Placement, readiness, and authority are separate</h2><span class="time">2 min</span></div>
+<p class="takeaway">A node listed in the ring may not have the data yet, and may not be allowed to serve.</p>
+
+<div class="table-wrap" role="region" aria-label="Placement, readiness, and authority" tabindex="0"><table>
+<thead><tr><th>Question</th><th>Answered by</th><th>What it establishes</th></tr></thead>
+<tbody>
+<tr><td>Where should this range live?</td><td>Committed topology: epoch, tokens, RF, policy, guards, digest</td><td>The owner and the ordered list of desired followers</td></tr>
+<tr><td>Does this copy have the full history?</td><td>Durable admission record for an exact epoch, range, node, and verified watermark</td><td>The copy has all initial data and a contiguous mutation history</td></tr>
+<tr><td>Can this follower be counted on right now?</td><td>Admission, a live connection, and lag within the configured bound</td><td>The follower is healthy for the write gates</td></tr>
+<tr><td>May this owner serve right now?</td><td>Installed topology, a valid lease for the node and epoch, and fencing</td><td>The owner has authority for this epoch</td></tr>
+<tr><td>May this write succeed right now?</td><td>Availability guards and the ACK policy</td><td>Enough eligible copies exist and the required ACKs arrived</td></tr>
+</tbody></table></div>
+
+<p>For example, D can be a desired follower while its snapshot is still arriving. Until D is admitted, it does not count as a replica. An admitted copy can also drop out later if it disconnects or falls too far behind.</p>
+<p>Admission changes do not bump the topology epoch, and clients never see them. Repair can therefore make progress without disturbing routing. Changes to ownership or policy do require a new committed epoch.</p>
+<p class="source"><a href="0001-ha-for-consistent-hash-cache.md#2-committed-topology-contract">Committed topology</a> · <a href="0001-ha-for-consistent-hash-cache.md#3-desired-placement-versus-operational-readiness">Readiness</a></p>
+</section>
+
+<!-- 4 -->
+<section id="policy" aria-labelledby="h-policy">
+<div class="sec-head"><span class="sec-num">04</span><h2 id="h-policy">The write policy defines success</h2><span class="time">2 min</span></div>
+<p class="takeaway">Waiting for the node that would be promoted is what makes an ACK survive failover.</p>
+<p>An ACK always means the mutation was applied in memory, never that it reached disk. Assuming the owner has authority and the guards pass:</p>
+
+<ul class="policies">
+  <li class="policy">
+    <h3><code>OwnerOnly</code><span class="tag">default</span></h3>
+    <div class="copies" role="img" aria-label="Waits for A only"><span class="copy wait owner">A</span><span class="copy">B</span><span class="copy">C</span></div>
+    <dl><dt>Must apply before success</dt><dd>Owner</dd><dt>Cost and failure behavior</dt><dd>No follower wait. If the owner fails, recent acknowledged writes can be lost.</dd></dl>
+  </li>
+  <li class="policy">
+    <h3><code>FirstSuccessor</code></h3>
+    <div class="copies" role="img" aria-label="Waits for A and B"><span class="copy wait owner">A</span><span class="copy wait">B</span><span class="copy">C</span></div>
+    <dl><dt>Must apply before success</dt><dd>Owner and the first successor</dd><dt>Cost and failure behavior</dt><dd>One replication round trip. From a healthy state, acknowledged writes survive any single failure.</dd></dl>
+  </li>
+  <li class="policy">
+    <h3><code>AllReplicas</code></h3>
+    <div class="copies" role="img" aria-label="Waits for A, B, and C"><span class="copy wait owner">A</span><span class="copy wait">B</span><span class="copy wait">C</span></div>
+    <dl><dt>Must apply before success</dt><dd>Every node in the desired replica set</dd><dt>Cost and failure behavior</dt><dd>Waits for every copy. Writes stop while the range is under-replicated.</dd></dl>
+  </li>
+</ul>
+<p class="policy-note">Filled circles are the copies that must apply a write before the client sees success, for RF=3 with owner A, first successor B, and later follower C.</p>
+
+<p>Here is a successful <code>FirstSuccessor</code> write at RF=3 with both followers admitted. The client gets its response without waiting for the later follower.</p>
+
+<figure>
+<div class="scroll">
+<svg viewBox="0 0 820 500" role="img" aria-labelledby="f4-title">
+  <title id="f4-title">FirstSuccessor write sequence. The client sends PUT with epoch and mutation ID to owner A. A checks authority, gates, and the mutation ID, assigns order, and applies in memory. A sends the mutation and deduplication receipt to first successor B and, asynchronously, to later follower C. B checks authority and order, applies in memory, and sends an applied ACK. A returns success with the record version. C's ACK is not required.</title>
+  <rect class="box" x="20" y="14" width="140" height="52" rx="9"/><text class="t" x="90" y="45" text-anchor="middle">Client</text>
+  <rect class="box accent" x="230" y="14" width="160" height="52" rx="9"/><text class="t" x="310" y="36" text-anchor="middle">Owner</text><text class="s" x="310" y="54" text-anchor="middle">A</text>
+  <rect class="box" x="450" y="14" width="160" height="52" rx="9"/><text class="t" x="530" y="36" text-anchor="middle">First successor</text><text class="s" x="530" y="54" text-anchor="middle">B</text>
+  <rect class="box" x="650" y="14" width="160" height="52" rx="9"/><text class="t" x="730" y="36" text-anchor="middle">Later follower</text><text class="s" x="730" y="54" text-anchor="middle">C</text>
+  <line class="life" x1="90" y1="66" x2="90" y2="492"/>
+  <line class="life" x1="310" y1="66" x2="310" y2="492"/>
+  <line class="life" x1="530" y1="66" x2="530" y2="492"/>
+  <line class="life" x1="730" y1="66" x2="730" y2="492"/>
+
+  <line class="data" x1="90" y1="105" x2="309" y2="105" marker-end="url(#ah-ink)"/>
+  <text class="lbl" x="200" y="97" text-anchor="middle">PUT · epoch + mutation ID</text>
+
+  <rect class="box soft" x="228" y="122" width="164" height="46" rx="7"/>
+  <text class="s ink" x="310" y="141" text-anchor="middle">Check authority and gates</text>
+  <text class="s ink" x="310" y="159" text-anchor="middle">Check mutation ID</text>
+  <rect class="box soft" x="228" y="178" width="164" height="46" rx="7"/>
+  <text class="s ink" x="310" y="197" text-anchor="middle">Assign order</text>
+  <text class="s ink" x="310" y="215" text-anchor="middle">Apply in memory</text>
+
+  <line class="data" x1="310" y1="256" x2="529" y2="256" marker-end="url(#ah-ink)"/>
+  <text class="lbl" x="420" y="248" text-anchor="middle">Mutation + deduplication receipt</text>
+  <line class="async" x1="310" y1="288" x2="729" y2="288" marker-end="url(#ah-muted)"/>
+  <text class="lbl" x="630" y="280" text-anchor="middle">Async mutation + receipt</text>
+
+  <rect class="box soft" x="448" y="306" width="164" height="46" rx="7"/>
+  <text class="s ink" x="530" y="325" text-anchor="middle">Check authority and order</text>
+  <text class="s ink" x="530" y="343" text-anchor="middle">Apply in memory</text>
+
+  <line class="reply" x1="530" y1="386" x2="311" y2="386" marker-end="url(#ah-ink)"/>
+  <text class="lbl" x="420" y="378" text-anchor="middle">Applied ACK</text>
+  <line class="reply accent" x1="310" y1="426" x2="91" y2="426" marker-end="url(#ah-accent)"/>
+  <text class="lbl accent" x="200" y="418" text-anchor="middle">Success + record version</text>
+
+  <rect class="box soft" x="624" y="440" width="190" height="34" rx="7"/>
+  <text class="s" x="719" y="462" text-anchor="middle">C's ACK is not required</text>
+</svg>
+</div>
+</figure>
+
+<p>Why not accept any two copies? Suppose A and C acknowledge while B lags. If A then fails, the ring still promotes B, and B is missing the write. A second ACK only helps if it comes from B.</p>
+<p>Guards are a separate check that runs before the write. By default they require one admitted copy and zero healthy followers, so a leased <code>OwnerOnly</code> owner can accept writes on its own. Stricter guards give up some availability to reduce the chance of loss. <code>AllReplicas</code> always means the full desired set, never just the copies that happen to be up.</p>
+<p class="source"><a href="0001-ha-for-consistent-hash-cache.md#5-consistency-contract">Consistency contract</a> · <a href="0001-ha-for-consistent-hash-cache.md#2-owner-write-path">Owner write path</a></p>
+</section>
+
+<!-- 5 -->
+<section id="failover" aria-labelledby="h-failover">
+<div class="sec-head"><span class="sec-num">05</span><h2 id="h-failover">Reads and writes recover at different times</h2><span class="time">2 min</span></div>
+<p class="takeaway">A new owner can serve reads before it is allowed to acknowledge writes.</p>
+
+<figure>
+<div class="scroll">
+<svg viewBox="0 0 820 680" role="img" aria-labelledby="f5-title">
+  <title id="f5-title">Failover flow. Confirm the failure and fence the old authority, then commit the removal and derive new ranges. Without full admitted coverage, the range is unavailable. Otherwise install the topology and activate the lease. Reads resume, and repair of missing followers starts in the background, feeding readiness updates to the write gate. If the write gate is met, writes resume. Otherwise writes stay blocked.</title>
+  <rect class="box" x="260" y="16" width="300" height="48" rx="10"/>
+  <text class="t" x="410" y="45" text-anchor="middle">Confirm failure, fence old authority</text>
+  <line class="data" x1="410" y1="64" x2="410" y2="99" marker-end="url(#ah-ink)"/>
+  <rect class="box" x="260" y="100" width="300" height="48" rx="10"/>
+  <text class="t" x="410" y="129" text-anchor="middle">Commit removal, derive new ranges</text>
+  <line class="data" x1="410" y1="148" x2="410" y2="178" marker-end="url(#ah-ink)"/>
+
+  <polygon class="box" points="410,179 540,215 410,251 280,215"/>
+  <text class="t" x="410" y="220" text-anchor="middle">Full admitted coverage?</text>
+  <line class="data" x1="540" y1="215" x2="599" y2="215" marker-end="url(#ah-ink)"/>
+  <text class="lbl" x="569" y="206" text-anchor="middle">No</text>
+  <rect class="box bad" x="600" y="191" width="190" height="48" rx="10"/>
+  <text class="t bad" x="695" y="220" text-anchor="middle">Range unavailable</text>
+  <line class="data" x1="410" y1="251" x2="410" y2="289" marker-end="url(#ah-ink)"/>
+  <text class="lbl" x="422" y="275">Yes</text>
+
+  <rect class="box" x="260" y="290" width="300" height="48" rx="10"/>
+  <text class="t" x="410" y="319" text-anchor="middle">Install topology, activate lease</text>
+  <path class="data" d="M410,338 V362 H220 V389" marker-end="url(#ah-ink)"/>
+  <path class="data" d="M410,362 H600 V389" marker-end="url(#ah-ink)"/>
+
+  <rect class="box ok" x="110" y="390" width="220" height="54" rx="10"/>
+  <text class="t ok" x="220" y="414" text-anchor="middle">Reads resume</text>
+  <text class="s" x="220" y="433" text-anchor="middle">milestone 1</text>
+  <rect class="box" x="490" y="390" width="220" height="54" rx="10"/>
+  <text class="t" x="600" y="414" text-anchor="middle">Repair missing followers</text>
+  <text class="s" x="600" y="433" text-anchor="middle">in the background</text>
+
+  <path class="data" d="M220,444 V520 H289" marker-end="url(#ah-ink)"/>
+  <path class="ctl" d="M600,444 V520 H531" marker-end="url(#ah-link)"/>
+  <text class="lbl" x="612" y="488">readiness updates</text>
+
+  <polygon class="box" points="410,484 530,520 410,556 290,520"/>
+  <text class="t" x="410" y="525" text-anchor="middle">Write gate met?</text>
+  <path class="data" d="M410,556 V584 H220 V613" marker-end="url(#ah-ink)"/>
+  <path class="data" d="M410,584 H600 V613" marker-end="url(#ah-ink)"/>
+  <text class="lbl" x="310" y="578" text-anchor="middle">No</text>
+  <text class="lbl" x="510" y="578" text-anchor="middle">Yes</text>
+
+  <rect class="box bad" x="110" y="614" width="220" height="54" rx="10"/>
+  <text class="t bad" x="220" y="646" text-anchor="middle">Writes blocked</text>
+  <rect class="box ok" x="490" y="614" width="220" height="54" rx="10"/>
+  <text class="t ok" x="600" y="638" text-anchor="middle">Writes resume</text>
+  <text class="s" x="600" y="657" text-anchor="middle">milestone 2</text>
+</svg>
+</div>
+</figure>
+
+<p>Under <code>FirstSuccessor</code>, B may hold every acknowledged write when A fails. Once B owns the range, though, C becomes B's first successor. If C is behind, B has to wait for C to catch up and be admitted before writes can succeed again. Otherwise the next acknowledged write would have no protected copy.</p>
+<p>Under <code>OwnerOnly</code>, writes resume as soon as the guards pass, and some recently acknowledged writes may already be gone. Under <code>AllReplicas</code>, every desired copy must be ready. If too few members remain, writes stay blocked until capacity comes back.</p>
+
+<div class="pair">
+  <div><h3>Fencing</h3><p>Fencing stops two owners from serving the same range. A lease covers <code>(node_id, topology_epoch)</code>, and the process-instance ID means a restarted process with empty memory cannot pick up the old instance's authority. GET needs a valid lease too.</p></div>
+  <div><h3>Confirming a failure</h3><p>A single broken link does not say which end has failed. A missing or expired lease is enough to confirm a failure. Otherwise at least two independent nodes must report the member unreachable. If only one pair of nodes disagrees, the affected ranges stay degraded and nobody is evicted.</p></div>
+</div>
+<p>The default lease is five seconds, but that is a fencing parameter. It is <strong>not a five-second failover target</strong>.</p>
+<p class="source"><a href="0001-ha-for-consistent-hash-cache.md#2-owner-leases-and-fencing">Leases</a> · <a href="0001-ha-for-consistent-hash-cache.md#3-failure-suspicion-and-confirmation">Failure confirmation</a> · <a href="0001-ha-for-consistent-hash-cache.md#4-failover">Failover</a></p>
+</section>
+
+<!-- 6 -->
+<section id="movement" aria-labelledby="h-movement">
+<div class="sec-head"><span class="sec-num">06</span><h2 id="h-movement">Copies are verified before they are used</h2><span class="time">1 min</span></div>
+<p class="takeaway">Every transition waits for a copy that has been snapshotted, caught up, and verified.</p>
+
+<figure>
+<div class="scroll">
+<svg viewBox="0 0 820 110" role="img" aria-labelledby="f6-title">
+  <title id="f6-title">Snapshot, then catch up, then verify, then admit or stage.</title>
+  <path class="box soft" d="M8,18 H182 L204,55 L182,92 H8 Z"/>
+  <text class="t" x="100" y="52" text-anchor="middle">Snapshot</text>
+  <text class="s" x="100" y="71" text-anchor="middle">copy current data</text>
+  <path class="box soft" d="M210,18 H384 L406,55 L384,92 H210 L232,55 Z"/>
+  <text class="t" x="312" y="52" text-anchor="middle">Catch up</text>
+  <text class="s" x="312" y="71" text-anchor="middle">stream new mutations</text>
+  <path class="box soft" d="M412,18 H586 L608,55 L586,92 H412 L434,55 Z"/>
+  <text class="t" x="514" y="52" text-anchor="middle">Verify</text>
+  <text class="s" x="514" y="71" text-anchor="middle">count, digest, watermark</text>
+  <path class="box ok" d="M614,18 H812 V92 H614 L636,55 Z"/>
+  <text class="t ok" x="722" y="52" text-anchor="middle">Admit or stage</text>
+  <text class="s" x="722" y="71" text-anchor="middle">usable in a transition</text>
+</svg>
+</div>
+</figure>
+
+<div class="table-wrap" role="region" aria-label="Data movement operations" tabindex="0"><table>
+<thead><tr><th>Operation</th><th>What changes</th><th>What must hold before the result is used</th></tr></thead>
+<tbody>
+<tr><td>Scale-out</td><td>New tokens split ranges and add owner and follower duties</td><td>Pause affected writes briefly, drain the last changes, verify, meet the target policy, then commit and activate</td></tr>
+<tr><td>Graceful scale-in</td><td>Removed tokens merge ranges</td><td>Successors cover the merged ranges and downstream followers are ready. Missing data is synced before cutover</td></tr>
+<tr><td>Failure removal</td><td>Ownership moves without help from the failed node</td><td>Old authority is fenced and a surviving admitted copy covers each range. Incomplete copies are not promoted</td></tr>
+<tr><td>Replica repair</td><td>Missing copies are filled in</td><td>Snapshot and incremental history are verified before admission. The topology epoch does not change</td></tr>
+<tr><td>Stronger ACK policy</td><td>More copies become required for success</td><td>Those copies catch up before the stronger policy is committed</td></tr>
+</tbody></table></div>
+
+<p>A graceful scale-in can usually reuse existing replicas instead of copying the owner's whole dataset. Repair still has work to do after a promotion, because the desired follower set shifts. Repair is bounded and resumable. If the topology changes under it, the task's epoch or bounds may no longer match, and it is re-planned.</p>
+<p>A node that was fenced and comes back must rejoin explicitly. It is reset and seeded like a brand-new node. The records it still holds prove nothing.</p>
+<p class="source"><a href="0001-ha-for-consistent-hash-cache.md#membership-and-data-movement">Membership and data movement</a></p>
+</section>
+
+<!-- 7 -->
+<section id="retries" aria-labelledby="h-retries">
+<div class="sec-head"><span class="sec-num">07</span><h2 id="h-retries">Ordering and retries solve different problems</h2><span class="time">2 min</span></div>
+<p class="takeaway">A lost reply must not cause a duplicate write, and a missing replication entry must not go unnoticed.</p>
+
+<p>There are two counters, and they do different jobs:</p>
+<div class="pair">
+  <div><h3>Record version</h3><p><code>(topology_epoch, owner_node_id, owner_sequence)</code> orders mutations on the physical owner.</p></div>
+  <div><h3>Stream sequence</h3><p>Each <code>(epoch, owner, follower)</code> stream has its own contiguous <code>stream_sequence</code>. A follower receives only the mutations for ranges it replicates, so it needs its own counter to spot gaps.</p></div>
+</div>
+<p>When a follower sees a gap, it catches up from retained history or from a snapshot. It never skips the gap. A new topology epoch starts new streams and new readiness checks.</p>
+<p>Retries cover a different failure. Say the owner applies a write, but the reply never reaches the client:</p>
+
+<figure>
+<div class="scroll">
+<svg viewBox="0 0 820 390" role="img" aria-labelledby="f7-title">
+  <title id="f7-title">The client sends mutation ID m with payload p to the current owner. The owner applies it and keeps the fingerprint and result. The reply is lost. The client retries m with the same p. The owner finds the receipt for m, does not apply the mutation again, and returns the stored result.</title>
+  <rect class="box" x="100" y="14" width="160" height="48" rx="9"/><text class="t" x="180" y="43" text-anchor="middle">Client</text>
+  <rect class="box accent" x="520" y="14" width="200" height="48" rx="9"/><text class="t" x="620" y="43" text-anchor="middle">Current owner</text>
+  <line class="life" x1="180" y1="62" x2="180" y2="382"/>
+  <line class="life" x1="620" y1="62" x2="620" y2="382"/>
+
+  <line class="data" x1="180" y1="100" x2="619" y2="100" marker-end="url(#ah-ink)"/>
+  <text class="lbl" x="400" y="92" text-anchor="middle">Mutation ID m, payload p</text>
+  <rect class="box soft" x="522" y="116" width="196" height="46" rx="7"/>
+  <text class="s ink" x="620" y="135" text-anchor="middle">Apply</text>
+  <text class="s ink" x="620" y="153" text-anchor="middle">Keep fingerprint and result</text>
+
+  <line class="reply bad" x1="620" y1="196" x2="412" y2="196"/>
+  <path class="x-mark" d="M396,186 l16,20 M412,186 l-16,20"/>
+  <text class="lbl bad" x="516" y="188" text-anchor="middle">Reply lost</text>
+
+  <line class="data" x1="180" y1="240" x2="619" y2="240" marker-end="url(#ah-ink)"/>
+  <text class="lbl" x="400" y="232" text-anchor="middle">Retry m with the same p</text>
+  <rect class="box soft" x="522" y="256" width="196" height="46" rx="7"/>
+  <text class="s ink" x="620" y="275" text-anchor="middle">Find receipt for m</text>
+  <text class="s ink" x="620" y="293" text-anchor="middle">Do not apply again</text>
+
+  <line class="reply ok" x1="620" y1="340" x2="181" y2="340" marker-end="url(#ah-ok)"/>
+  <text class="lbl ok" x="400" y="332" text-anchor="middle">Stored result, applied once</text>
+</svg>
+</div>
+</figure>
+
+<p>The client keeps the same mutation ID across refreshes and retries. Deduplication receipts replicate along with mutations, so a promoted successor can answer a retry from what it received. This does not bring back writes that <code>OwnerOnly</code> lost.</p>
+<p>Receipts are kept for 60 seconds. Within that window a mutation runs at most once. There is no exactly-once guarantee beyond it. If the receipt store runs out of budget, the owner rejects new writes before applying them rather than evict receipts early. Reusing an ID with different content is a conflict.</p>
+<p>Each error carries two separate facts: <strong>why the attempt stopped</strong> and <strong>whether the mutation might have been applied</strong>. A deadline can expire with either <code>KnownNotApplied</code> or <code>MayHaveApplied</code>. Once an outcome is uncertain, later retry failures cannot turn it back into a known one. A single end-to-end deadline covers connecting, topology refresh, backoff, and every RPC attempt.</p>
+<p class="source"><a href="0001-ha-for-consistent-hash-cache.md#1-mutation-ordering-and-replication-streams">Replication streams</a> · <a href="0001-ha-for-consistent-hash-cache.md#3-mutation-idempotency">Idempotency</a> · <a href="0001-ha-for-consistent-hash-cache.md#4-error-and-retry-semantics">Retry semantics</a></p>
+</section>
+
+<!-- 8 -->
+<section id="limits" aria-labelledby="h-limits">
+<div class="sec-head"><span class="sec-num">08</span><h2 id="h-limits">Guarantees and limits</h2><span class="time">1 min</span></div>
+<p class="takeaway">The design makes you choose between write availability and the risk of losing acknowledged writes, and states which one you chose.</p>
+<p>Questions you will probably get:</p>
+
+<dl class="faq">
+  <div><dt>Does RF=3 mean every successful write is on three nodes?</dt><dd>Only under <code>AllReplicas</code>. RF says where copies should live. The ACK policy says what success means.</dd></div>
+  <div><dt>Can a follower answer a normal GET?</dt><dd><b>No.</b> Reads go to the current leased owner.</dd></div>
+  <div><dt>Is <code>OwnerOnly</code> linearizable across failover?</dt><dd><b>No.</b> Per-key linearizability holds within one owner epoch. After failover, clients may see older state.</dd></div>
+  <div><dt>Can we recover from an incomplete copy?</dt><dd><b>No.</b> It cannot be promoted without complete admitted coverage, so the range stays unavailable.</dd></div>
+  <div><dt>Does durable coordinator metadata make cached data durable?</dt><dd><b>No.</b> Cached data and its ACKs live in memory.</dd></div>
+  <div><dt>Does cache-node HA cover coordinator failure?</dt><dd><b>No.</b> Nodes stop serving when their leases expire. Coordinator HA is out of scope.</dd></div>
+  <div><dt>How do we explain why a range is blocked?</dt><dd>Check the epoch and owner, the lease, desired versus admitted copies, stream lag and gaps, the active policy, the guards, and the repair phase.</dd></div>
+</dl>
+
+<p>For more depth, see the RFC's <a href="0001-ha-for-consistent-hash-cache.md#test-plan">test plan</a> and <a href="0001-ha-for-consistent-hash-cache.md#verification">verification criteria</a>. They define the evidence the guarantees depend on. This walkthrough is not that evidence.</p>
+</section>
+
+<footer>Generated from <a href="0001-ha-walkthrough.md">0001-ha-walkthrough.md</a>. The diagrams are redrawn from its Mermaid sources. This page describes the intended design, not implementation status.</footer>
+</main>
+</div>
+
+<script>
+(() => {
+  const links = [...document.querySelectorAll('.toc a')];
+  const byId = new Map(links.map(a => [a.getAttribute('href').slice(1), a]));
+  const obs = new IntersectionObserver(entries => {
+    for (const e of entries) {
+      if (!e.isIntersecting) continue;
+      links.forEach(a => a.classList.remove('active'));
+      byId.get(e.target.id)?.classList.add('active');
+    }
+  }, {rootMargin: '-20% 0px -70% 0px'});
+  document.querySelectorAll('main section').forEach(s => obs.observe(s));
+})();
+</script>
+</body>
+</html>

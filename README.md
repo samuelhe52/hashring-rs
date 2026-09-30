@@ -1,6 +1,6 @@
 # hashring-rs
 
-`hashring-rs` is a process-distributed, single-owner in-memory cache. One binary
+`hashring-rs` is a process-distributed, single-owner, replicated in-memory cache. One binary
 provides the durable coordinator, data-node, and client/admin roles.
 Nodes communicate exclusively through the versioned gRPC contract, so the same
 client works with local processes, containers, VMs, or remote hosts.
@@ -13,10 +13,12 @@ Bootstrap membership is supplied only when creating a coordinator store:
 cargo run -- coordinator \
   --state ./coordinator.redb \
   --member node-1=http://127.0.0.1:50051 \
-  --member node-2=http://127.0.0.1:50052
+  --member node-2=http://127.0.0.1:50052 \
+  --member node-3=http://127.0.0.1:50053
 
 cargo run -- node --id node-1 --listen 127.0.0.1:50051
 cargo run -- node --id node-2 --listen 127.0.0.1:50052
+cargo run -- node --id node-3 --listen 127.0.0.1:50053
 ```
 
 Restart the coordinator with only `--state`; the hash seed, epoch, membership,
@@ -28,23 +30,31 @@ cargo run -- put --key example --value payload
 cargo run -- get --key example
 cargo run -- delete --key example
 cargo run -- topology
+cargo run -- replica-status
 ```
 
 `--key-hex`, `--value-hex`, and `get --hex` support arbitrary bytes. `DELETE`
 is idempotent: success means the key is absent afterward, even if it was already
 absent.
 
+Each virtual-node range has one owner and up to `desired_replication_factor-1`
+clockwise, distinct physical followers. The default is RF=3, `OwnerOnly`
+acknowledgements, with a write guard requiring only the owner. Replication and
+follower repair continue asynchronously. A stricter guard can require admitted
+copies and healthy followers before writes; follower admission requires a
+verified snapshot/stream catch-up. The guard is a readiness gate, not a
+durability or zero-loss promise.
+
 ## Workspace architecture
 
-The root package contains the operational binary and a compatibility facade for
-the original public module paths. Implementation responsibilities are separated
-into five workspace crates:
+The root package contains the operational binary. Implementation
+responsibilities are separated into five workspace crates:
 
 - `hashring-core` owns the protobuf contract, topology and migration domain
   types, shared protocol limits, and coordinator transport configuration;
 - `hashring-client` owns routing, deadlines, retries, and public client errors;
 - `hashring-coordinator` owns durable cluster state and migration orchestration;
-- `hashring-node` owns in-memory records, migration staging, and the data-node
+- `hashring-node` owns in-memory records, replication streams, migration staging, and the data-node
   service;
 - `hashring-experiment` owns reproducible real-process workload orchestration
   and evidence capture.
@@ -71,14 +81,28 @@ target/release/hashring-rs experiment \
   --mode correctness --require-clean-source \
   --output results/correctness-10-node
 
+# Diagnostic run: print client retry reasons and retain coordinator
+# migration/repair progress in the process logs. A longer deadline is
+# diagnostic only; it does not establish the default 30-second deadline is met.
+target/release/hashring-rs experiment \
+  --mode correctness --verbose --operation-timeout-ms 120000 \
+  --output results/correctness-10-node-diagnostic
+
 # Nominal acceptance profile: 10 data nodes and 1,000,000 logical keys.
 target/release/hashring-rs experiment \
   --mode performance --require-clean-source \
   --output results/performance-10-node-1m
+
+# Failure/repair evidence: 3 live nodes plus 1 replacement. Run separately
+# with --policy owner-only to sample its possible acknowledged-loss window.
+target/release/hashring-rs experiment \
+  --mode availability --policy first-successor \
+  --output results/availability-first-successor
 ```
 
 Correctness mode defaults to 20,000 keys; performance mode defaults to
-1,000,000. Both default to 10 peak nodes, 128-byte values, concurrency 64,
+1,000,000; availability mode defaults to 1,000 keys and 4 total nodes. The
+other modes default to 10 peak nodes. All default to 128-byte values, concurrency 64,
 seed 1, and 128 virtual nodes. Use explicit flags to vary them; the manifest
 always records the actual configuration, build-time revision/toolchain/profile,
 runtime source status and diff, and a BLAKE3 digest of the executable. The
@@ -86,6 +110,41 @@ runtime source status and diff, and a BLAKE3 digest of the executable. The
 the runner never overwrites a non-empty result directory. Formal runs use
 `--require-clean-source`; dirty ad hoc runs remain available but are explicitly
 marked `source_reproducible=false` in the manifest.
+`--verbose` is recorded in the manifest. It prints client retry details to the
+experiment command's stderr and adds coordinator phase and replica-seeding
+progress to the retained process logs. Capture the command's stderr separately
+when keeping a complete diagnostic record.
+If a concurrent writer fails, the runner records its error and waits for the
+migration outcome before writing the summary.
+The summary records initial-put throughput plus sampled end-to-end client `PUT`
+and direct owner-RPC `PUT` round-trip latency distributions (microseconds,
+p50/p95/p99/max). The latter includes the network hop and owner processing,
+not CPU-only service time. After initial writes, `node_pressure_after_initial_put`
+records each node's current and peak deduplication receipt store bytes, its capacity,
+owner and follower budget rejections, replication reservation rejections,
+replication RPC retries, and peak pending entries in one replication stream.
+Set `HASHRING_PROFILE_WRITES=1` when launching the experiment to also collect
+per-node receipt-cleanup timings and state write-lock wait/hold timings for
+owner mutations, follower application, and replication ACK processing. These
+cumulative wall-time counters appear in the same pressure sample; summed wait
+times can overlap across tasks and nodes. Timing fields are `null` in experiment
+summaries unless profiling is enabled.
+The same sample is retained as a `node_pressure_sampled` event, including when
+initial writes fail. These counters are per process and reset on node restart;
+the stream peak excludes the replication RPC currently in flight. When the
+owner's deduplication receipt store is full, the node returns a retry delay
+hint, which the client observes within its existing logical-operation deadline.
+Correctness runs record time to
+full RF measured from each transition's execution start. Availability runs
+record failover publication and first recovered read times, sampled
+read-unavailability probes, acknowledged key preservation/loss (including a
+just-acknowledged 1 MiB-or-larger tail write), and replacement-to-full-RF time.
+These are observed local process measurements, not service-level guarantees.
+Compare RF=1 and RF=3 with `--minimum-admitted-copies 1
+--minimum-healthy-followers 0` and `OwnerOnly` in both runs to estimate
+replication overhead; compare policies at the same
+RF to estimate ACK-wait overhead. A single OwnerOnly run with zero observed
+loss does not close its loss window.
 
 ## Change membership
 
@@ -108,11 +167,14 @@ cargo run -- node --id node-3 --listen 127.0.0.1:50053
 cargo run -- execute-change \
   --change-id CHANGE_ID --base-epoch 1 --target-epoch 2
 cargo run -- change-status
+cargo run -- replica-status
 ```
 
 The source remains authoritative while a point-in-time snapshot is copied and
-concurrent puts and deletes are replayed from a bounded changelog. Cutover briefly
-returns retryable `RangeBusy` responses for affected writes while reads continue,
+independent ranges are moved concurrently with a default limit of 16. Use
+`coordinator --range-move-concurrency N` (or the same `experiment` option) to tune
+that bound. Concurrent puts and deletes are replayed from a bounded changelog.
+Cutover briefly returns retryable `RangeBusy` responses for affected writes while reads continue,
 verifies the live-record count, contiguous watermark, and a BLAKE3 digest, then
 publishes the new epoch. During the read handoff, the frozen source and committed
 destination contain the same data; destination writes remain fenced until every
@@ -127,6 +189,65 @@ recoverable without treating a transient outage as a successful stop. Interrupte
 coordinator work resumes automatically. Pre-publication cleanup has its own deadline
 and remains in a recoverable `Aborting` state until authoritative sources acknowledge
 it; a post-publication failure never rolls the epoch back.
+
+For planned membership cutovers, new-epoch leases are withheld until required
+target followers are verified and admitted. Automatic failover may publish a
+degraded but guard-compliant placement, then repair followers in the background.
+A restart of the
+ordinary coordinator resumes its persisted transition and repair plan. If a
+required target node remains unavailable, the published transition can remain
+pending. For a single-node join, loss of the new process before activation can be
+recovered by publishing a further epoch with the original members, but only
+when every original owner is still the same live process and the frozen source
+ranges retain their verified watermarks. The superseding change records the
+previous change ID and re-admits required followers before granting leases.
+Loss of an original owner or a more complex second failure remains blocked
+without a coverage proof; inspect `change-status` and `replica-status`, which
+reports the recovery block reason. Before publication, an unavailable new
+joiner that remains unavailable for 30 seconds causes the unpublished attempt
+to abort after source cleanup. Restore
+the same live process where possible. Coordinator consensus/failover is not
+provided.
+
+`replica-status` reports the committed epoch, digest, desired RF, ACK policy,
+per-node process identity, lease expiry and last renewal, current suspicion and
+fencing, whether a node is joining, and the active change phase. It also
+reports each range's nominal `current_rf`, leased `live_rf`, owner lease,
+follower admission/lag/health,
+last known owner ACK sequence, `writable` and its block reason,
+under-replication, repair phase, retry count, next attempt time, and last error.
+`current_rf` alone does not prove liveness. During a cutover fence, status
+conservatively marks affected ranges as potentially blocked. Leases last five
+seconds and renew every second. Automatic failure detection runs every second;
+repairs/recovery run every five seconds. Repair work is capped at 32
+owner/follower groups per pass and four concurrent groups, with per-group
+exponential retry backoff capped at 60 seconds. Each node caps its pending
+replication buffer at 64 MiB and its deduplication receipt store at 128 MiB; migration
+snapshot pages are capped at 8 MiB. A failed required repair remains visible,
+not silently considered healthy.
+
+To strengthen acknowledgements after all followers are admitted:
+
+```sh
+cargo run -- begin-policy-change --policy first-successor
+cargo run -- execute-change --change-id CHANGE_ID --base-epoch E --target-epoch E_PLUS_1
+cargo run -- replica-status
+```
+
+`FirstSuccessor` waits for the first clockwise follower's applied-stream ACK
+before reporting write success. `AllReplicas` waits for every desired follower,
+so writes block if the full desired placement is not healthy. A policy change
+briefly fences writes and publishes a new epoch only after its readiness check.
+With the default availability guard, owners use lease-carried stream admissions
+and verify the required applied ACKs against the admitted follower process identities.
+Explicit copy/health guards still query live replica status. See
+[replica ACK performance](docs/optimizations/replica-ack-performance.md) for measurements
+and the admission/fencing boundaries.
+Each deduplication receipt identifies a mutation and retains its key, operation
+fingerprint, assigned version, delete flag, and expiry. The client reuses one
+request ID across retries of a logical write during the in-memory 60-second
+receipt retention period. A new CLI invocation generates a new ID, and
+receipts do not survive process loss.
 
 ## Request and error semantics
 
@@ -145,20 +266,28 @@ it; a post-publication failure never rolls the epoch back.
   immediately.
 - If a `PUT`, `DELETE`, or mutating admin RPC was dispatched but its response was
   lost, a final failure reports `unknown_write_outcome=true`. A later successful
-  DELETE confirms that the key is absent. Request IDs are correlation IDs, not
-  persistent deduplication receipts; retrying a `PUT` may allocate a newer version
-  for the same value.
+  DELETE confirms that the key is absent. Mutation IDs have bounded, in-memory
+  deduplication receipts for retries; they are not durable across node loss.
 - Key and value limits are 64 KiB and 8 MiB. A node's aggregate migration-journal
   budget defaults to 16 MiB. A cluster supports at most 1,024 members, 4,096
   virtual nodes per member, and 1,048,576 total assignments. A single membership
   change may move at most 16,384 ranges; these bounds keep topology and change
   snapshots within the 64 MiB control-plane message limit.
 
-All data-node binaries must be upgraded before clients issue DELETE: an older
-destination does not understand deletion journal records. Replication, automatic
-failure recovery, heartbeat eviction, transactions, durable data-node storage,
-and coordinator consensus remain intentionally out of scope. Unexpected owner
-loss makes that owner's data unavailable.
+The default `OwnerOnly` policy acknowledges once the owner applies a write;
+followers receive it asynchronously. If that owner dies abruptly, **any
+acknowledged writes not yet applied by the promoted follower can be lost**,
+including an acknowledged update reverting to an older value even when the
+key remains present.
+There is no fixed time-based maximum loss window: the configured 5-second lag
+threshold applies only to a guard that requires healthy followers; it is not an
+RPO bound. `FirstSuccessor` closes that
+single-owner-loss window for acknowledged writes that reached its required
+follower, but not for simultaneous/correlated node losses. Data nodes are
+in-memory; neither policy provides crash durability. During degraded placement,
+the guard or ACK policy may make writes unavailable rather than weaken the
+requested guarantee. Transactions, durable data-node storage, and coordinator
+consensus remain out of scope.
 
 ## Tests
 
