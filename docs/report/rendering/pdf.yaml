@@ -1,0 +1,16 @@
+documentclass: ctexart
+papersize: a4
+lang: zh-CN
+geometry:
+  - margin=2cm
+fontsize: 11pt
+linestretch: 1.2
+numbersections: false
+toc: false
+colorlinks: true
+linkcolor: blue
+urlcolor: blue
+mainfont: "Source Han Serif SC"
+CJKmainfont: "Source Han Serif SC"
+CJKmonofont: "Source Han Serif SC"
+monofont: "JetBrains Mono"

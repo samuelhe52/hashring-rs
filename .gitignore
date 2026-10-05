@@ -26,3 +26,6 @@
 # Local planning and scratch files
 /PLAN.md
 /tmp/
+
+# Generated report PDFs and rendering intermediates
+/docs/report/build/

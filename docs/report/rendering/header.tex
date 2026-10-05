@@ -1,0 +1,26 @@
+% Shared report typography, adapted from personal-pandoc-ctex-template.
+\usepackage{indentfirst}
+\setlength{\parindent}{2em}
+\setlength{\parskip}{3pt}
+\usepackage{etoolbox}
+\usepackage{needspace}
+\usepackage{graphicx}
+\usepackage{longtable,booktabs,array,calc}
+\usepackage{caption}
+\newcounter{none}
+\makeatletter
+\patchcmd\longtable{\par}{\if@noskipsec\mbox{}\fi\par}{}{}
+\makeatother
+\AtBeginEnvironment{longtable}{\small\setstretch{1.15}}
+\preto\subsection{\Needspace{5\baselineskip}}
+\preto\subsubsection{\Needspace{7\baselineskip}}
+\AtBeginEnvironment{Highlighting}{\footnotesize}
+
+% Omit the empty author/date blocks in Pandoc's default title layout.
+\makeatletter
+\renewcommand{\@maketitle}{%
+  \newpage\null\vskip 2em
+  \begin{center}{\LARGE\bfseries\@title\par}\end{center}
+  \vskip 0.5em
+}
+\makeatother

@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1010 330" width="1010" height="330" role="img" aria-label="移除节点 A 前后的区间与副本变化">
+<defs><marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#1b2430" opacity=".6"/></marker></defs>
+<text x="18.0" y="34.0" font-size="15" font-weight="700" fill="#1b2430" text-anchor="start" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >移除 A 之前</text>
+<path d="M38.0 303.4A197.0 197.0 0 0 1 40.4 269.2" stroke="#c9c3b8" stroke-width="3" fill="none" stroke-linecap="round" stroke-dasharray="0.1 9"/>
+<path d="M429.6 269.2A197.0 197.0 0 0 1 432.0 303.4" stroke="#c9c3b8" stroke-width="3" fill="none" stroke-linecap="round" stroke-dasharray="0.1 9"/>
+<path d="M29.2 263.7A209 209 0 0 1 50.1 202.6L71.3 213.8A185 185 0 0 0 52.8 267.9Z" fill="#a07a12" fill-opacity="0.45" stroke="#fff" stroke-width="1.5"/>
+<path d="M50.1 202.6A209 209 0 0 1 88.7 150.8L105.5 167.9A185 185 0 0 0 71.3 213.8Z" fill="#c0532b" fill-opacity="1" stroke="#1b2430" stroke-width="2.2"/>
+<path d="M88.7 150.8A209 209 0 0 1 113.5 130.0L127.4 149.5A185 185 0 0 0 105.5 167.9Z" fill="#c0532b" fill-opacity="1" stroke="#fff" stroke-width="1.5"/>
+<path d="M113.5 130.0A209 209 0 0 1 202.7 93.5L206.4 117.2A185 185 0 0 0 127.4 149.5Z" fill="#1f6f8b" fill-opacity="1" stroke="#fff" stroke-width="1.5"/>
+<path d="M202.7 93.5A209 209 0 0 1 328.8 113.2L318.0 134.7A185 185 0 0 0 206.4 117.2Z" fill="#3d7d4f" fill-opacity="1" stroke="#fff" stroke-width="1.5"/>
+<path d="M328.8 113.2A209 209 0 0 1 419.9 202.6L398.7 213.8A185 185 0 0 0 318.0 134.7Z" fill="#6a4c93" fill-opacity="1" stroke="#fff" stroke-width="1.5"/>
+<path d="M419.9 202.6A209 209 0 0 1 440.8 263.7L417.2 267.9A185 185 0 0 0 398.7 213.8Z" fill="#e3dfd7" fill-opacity="1" stroke="#fff" stroke-width="1.5"/>
+<path d="M73.2 135.1A231 231 0 0 1 363.1 107.7" fill="none" stroke="#1b2430" stroke-width="1.4" stroke-dasharray="3 4" opacity=".55" marker-end="url(#arr)"/>
+<circle cx="73.2" cy="135.1" r="11" fill="#c0532b" stroke="#fff" stroke-width="2"/>
+<text x="73.2" y="139.6" font-size="12" font-weight="700" fill="#fff" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >1</text>
+<text x="100.7" y="117.1" font-size="15" font-weight="700" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >×</text>
+<circle cx="199.3" cy="71.8" r="11" fill="#1f6f8b" stroke="#fff" stroke-width="2"/>
+<text x="199.3" y="76.3" font-size="12" font-weight="700" fill="#fff" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >2</text>
+<circle cx="338.7" cy="93.6" r="11" fill="#3d7d4f" stroke="#fff" stroke-width="2"/>
+<text x="338.7" y="98.1" font-size="12" font-weight="700" fill="#fff" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >3</text>
+<circle cx="60.7" cy="208.2" r="6" fill="#a07a12" stroke="#fff" stroke-width="2"/>
+<text x="87.2" y="226.2" font-size="12" font-weight="600" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >P10</text>
+<circle cx="97.1" cy="159.4" r="6" fill="#c0532b" stroke="#fff" stroke-width="2"/>
+<text x="118.1" y="184.8" font-size="12" font-weight="600" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >A20</text>
+<circle cx="120.4" cy="139.7" r="6" fill="#c0532b" stroke="#fff" stroke-width="2"/>
+<text x="137.9" y="168.1" font-size="12" font-weight="600" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >A25</text>
+<circle cx="204.6" cy="105.4" r="6" fill="#1f6f8b" stroke="#fff" stroke-width="2"/>
+<text x="209.2" y="139.0" font-size="12" font-weight="600" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >B40</text>
+<circle cx="323.4" cy="124.0" r="6" fill="#3d7d4f" stroke="#fff" stroke-width="2"/>
+<text x="309.9" y="154.8" font-size="12" font-weight="600" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >C60</text>
+<circle cx="409.3" cy="208.2" r="6" fill="#6a4c93" stroke="#fff" stroke-width="2"/>
+<text x="382.8" y="226.2" font-size="12" font-weight="600" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >D80</text>
+<text x="235.0" y="238.0" font-size="17" font-weight="700" fill="#1b2430" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >区间 (10, 20]</text>
+<text x="235.0" y="267.0" font-size="13" font-weight="500" fill="#1b2430" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >副本列表：A → B → C</text>
+<text x="235.0" y="292.0" font-size="12" font-weight="500" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >A25 属于 A，跳过</text>
+<text x="558.0" y="34.0" font-size="15" font-weight="700" fill="#1b2430" text-anchor="start" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >移除 A 之后</text>
+<path d="M578.0 303.4A197.0 197.0 0 0 1 580.4 269.2" stroke="#c9c3b8" stroke-width="3" fill="none" stroke-linecap="round" stroke-dasharray="0.1 9"/>
+<path d="M969.6 269.2A197.0 197.0 0 0 1 972.0 303.4" stroke="#c9c3b8" stroke-width="3" fill="none" stroke-linecap="round" stroke-dasharray="0.1 9"/>
+<path d="M569.2 263.7A209 209 0 0 1 590.1 202.6L611.3 213.8A185 185 0 0 0 592.8 267.9Z" fill="#a07a12" fill-opacity="0.45" stroke="#fff" stroke-width="1.5"/>
+<path d="M590.1 202.6A209 209 0 0 1 742.7 93.5L746.4 117.2A185 185 0 0 0 611.3 213.8Z" fill="#1f6f8b" fill-opacity="1" stroke="#1b2430" stroke-width="2.2"/>
+<path d="M742.7 93.5A209 209 0 0 1 868.8 113.2L858.0 134.7A185 185 0 0 0 746.4 117.2Z" fill="#3d7d4f" fill-opacity="1" stroke="#fff" stroke-width="1.5"/>
+<path d="M868.8 113.2A209 209 0 0 1 959.9 202.6L938.7 213.8A185 185 0 0 0 858.0 134.7Z" fill="#6a4c93" fill-opacity="1" stroke="#fff" stroke-width="1.5"/>
+<path d="M959.9 202.6A209 209 0 0 1 980.8 263.7L957.2 267.9A185 185 0 0 0 938.7 213.8Z" fill="#e3dfd7" fill-opacity="1" stroke="#fff" stroke-width="1.5"/>
+<path d="M739.3 71.8A231 231 0 0 1 991.0 218.1" fill="none" stroke="#1b2430" stroke-width="1.4" stroke-dasharray="3 4" opacity=".55" marker-end="url(#arr)"/>
+<circle cx="739.3" cy="71.8" r="11" fill="#1f6f8b" stroke="#fff" stroke-width="2"/>
+<text x="739.3" y="76.3" font-size="12" font-weight="700" fill="#fff" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >1</text>
+<circle cx="878.7" cy="93.6" r="11" fill="#3d7d4f" stroke="#fff" stroke-width="2"/>
+<text x="878.7" y="98.1" font-size="12" font-weight="700" fill="#fff" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >2</text>
+<circle cx="979.4" cy="192.3" r="11" fill="#6a4c93" stroke="#fff" stroke-width="2"/>
+<text x="979.4" y="196.8" font-size="12" font-weight="700" fill="#fff" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >3</text>
+<rect x="722.3" y="38.8" width="34" height="17" rx="4" fill="#1b2430"/>
+<text x="739.3" y="51.3" font-size="11" font-weight="700" fill="#fff" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >接管</text>
+<circle cx="600.7" cy="208.2" r="6" fill="#a07a12" stroke="#fff" stroke-width="2"/>
+<text x="627.2" y="226.2" font-size="12" font-weight="600" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >P10</text>
+<circle cx="637.1" cy="159.4" r="6" fill="#fff" stroke="#5d6874" stroke-width="1.5" opacity=".5"/>
+<text x="658.1" y="184.8" font-size="12" font-weight="600" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" opacity=".45" text-decoration="line-through">A20</text>
+<circle cx="660.4" cy="139.7" r="6" fill="#fff" stroke="#5d6874" stroke-width="1.5" opacity=".5"/>
+<text x="677.9" y="168.1" font-size="12" font-weight="600" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" opacity=".45" text-decoration="line-through">A25</text>
+<circle cx="744.6" cy="105.4" r="6" fill="#1f6f8b" stroke="#fff" stroke-width="2"/>
+<text x="749.2" y="139.0" font-size="12" font-weight="600" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >B40</text>
+<circle cx="863.4" cy="124.0" r="6" fill="#3d7d4f" stroke="#fff" stroke-width="2"/>
+<text x="849.9" y="154.8" font-size="12" font-weight="600" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >C60</text>
+<circle cx="949.3" cy="208.2" r="6" fill="#6a4c93" stroke="#fff" stroke-width="2"/>
+<text x="922.8" y="226.2" font-size="12" font-weight="600" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >D80</text>
+<text x="775.0" y="238.0" font-size="17" font-weight="700" fill="#1b2430" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >合并区间 (10, 40]</text>
+<text x="775.0" y="267.0" font-size="13" font-weight="500" fill="#1b2430" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >副本列表：B → C → D</text>
+<text x="775.0" y="292.0" font-size="12" font-weight="500" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >原第一个 follower B 成为 owner</text>
+<path d="M481.0 150 L523.0 150" stroke="#5d6874" stroke-width="2" fill="none"/>
+<path d="M523.0 144 L532.0 150 L523.0 156 Z" fill="#5d6874"/>
+</svg>
