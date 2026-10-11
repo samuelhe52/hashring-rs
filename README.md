@@ -289,6 +289,12 @@ the guard or ACK policy may make writes unavailable rather than weaken the
 requested guarantee. Transactions, durable data-node storage, and coordinator
 consensus remain out of scope.
 
+## Reports
+
+The [preliminary report](docs/report/preliminary-report.md) describes the design,
+validation results, and remaining work. See the [report build instructions](docs/report/README.md)
+for the shared Markdown/Pandoc/XeLaTeX pipeline used to render report PDFs.
+
 ## Tests
 
 ```sh

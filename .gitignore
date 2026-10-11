@@ -29,3 +29,5 @@
 
 // Performance testing
 perf*
+# Generated report PDFs and rendering intermediates
+/docs/report/build/

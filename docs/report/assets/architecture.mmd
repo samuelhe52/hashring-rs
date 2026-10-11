@@ -1,0 +1,15 @@
+flowchart TB
+    subgraph 控制面
+        K["协调器"]
+    end
+    subgraph 数据面
+        direction LR
+        C["客户端"]
+        O["owner 节点"]
+        F["follower 节点"]
+    end
+    C -->|"读写（直连 owner）"| O
+    O -->|"按序复制流"| F
+    C -.->|"拉取拓扑"| K
+    O -.->|"续约、可达性报告"| K
+    F -.->|"续约、可达性报告"| K

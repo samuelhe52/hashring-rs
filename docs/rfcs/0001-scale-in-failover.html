@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>缩容与故障接管 · 副本放置即接管计划</title>
+<style>
+:root{
+  color-scheme:light dark;
+  --paper:#fbfaf7;--ink:#1b2430;--muted:#5d6874;--rule:#e3dfd7;--soft:#f3f1ec;--box:#fff;
+  --accent:#b4532a;--accent-soft:#f8ebe3;--link:#1f5f80;
+  --ok:#2c7549;--ok-soft:#e4f1e9;--warn:#9a6700;--warn-soft:#fbf0d9;--bad:#a33a3a;--bad-soft:#f7e5e5;
+  --nA:#c0532b;--nB:#1f6f8b;--nC:#3d7d4f;--nD:#6a4c93;--nE:#a07a12;
+  --serif:"Songti SC","Noto Serif SC","Source Han Serif SC","Iowan Old Style",Georgia,serif;
+  --sans:system-ui,-apple-system,"PingFang SC","Noto Sans SC","Microsoft YaHei",sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme:dark){:root{
+  --paper:#14181d;--ink:#e7e4dd;--muted:#9ba4ae;--rule:#2d343c;--soft:#1b2026;--box:#1e242b;
+  --accent:#e59066;--accent-soft:#3a271f;--link:#83b9d8;
+  --ok:#7fc79c;--ok-soft:#18301f;--warn:#e2b45a;--warn-soft:#3a2f17;--bad:#e79090;--bad-soft:#3a2121;
+  --nA:#e5895f;--nB:#5eaecb;--nC:#7cc08f;--nD:#b39ae0;--nE:#d9b44f;
+}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);font:16px/1.75 var(--sans);-webkit-font-smoothing:antialiased}
+a{color:var(--link)}
+code{font-family:var(--mono);font-size:.86em;background:var(--soft);border:1px solid var(--rule);padding:.05em .35em;border-radius:4px}
+main{max-width:1080px;margin:0 auto;padding:56px 28px 96px}
+.eyebrow{font-size:.78rem;letter-spacing:.12em;color:var(--accent);font-weight:700;margin:0 0 10px}
+h1{font-family:var(--serif);font-weight:600;font-size:clamp(2rem,4.4vw,2.9rem);line-height:1.2;margin:0 0 16px;letter-spacing:-.01em}
+h2{font-family:var(--serif);font-weight:600;font-size:1.6rem;margin:64px 0 8px;line-height:1.3}
+h2 .num{color:var(--accent);margin-right:.4em;font-family:var(--sans);font-size:.8em;font-weight:700}
+.lede{color:var(--muted);font-size:1.05rem;max-width:760px;margin:0 0 24px}
+.sub{color:var(--muted);max-width:780px;margin:0 0 22px}
+.thesis{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:26px 0 0}
+.thesis div{background:var(--box);border:1px solid var(--rule);border-radius:12px;padding:16px 18px}
+.thesis b{display:block;font-family:var(--serif);font-size:1.08rem;margin-bottom:4px}
+.thesis span{color:var(--muted);font-size:.92rem}
+.card{background:var(--box);border:1px solid var(--rule);border-radius:14px;padding:22px}
+
+/* Ring widget */
+.stage{display:grid;grid-template-columns:minmax(0,460px) minmax(0,1fr);gap:26px;align-items:start}
+.ringbox{position:relative}
+svg{display:block;width:100%;height:auto}
+.arc{cursor:pointer;transition:fill .5s,opacity .5s}
+.arc:hover{opacity:.8}
+.arc.sel{stroke:var(--ink);stroke-width:2}
+.arc.down{fill:var(--soft)!important;stroke:var(--bad);stroke-width:1.5;stroke-dasharray:4 3}
+.arc.drain{animation:pulse 1.1s ease-in-out infinite}
+.arc.flash{animation:flash 1.2s ease-out 1}
+@keyframes pulse{50%{opacity:.45}}
+@keyframes flash{0%{opacity:.2}100%{opacity:1}}
+.tok{transition:opacity .5s}
+.tok.gone{opacity:.25}
+.toklabel{font:600 12px var(--sans);fill:var(--muted)}
+.walk{fill:none;stroke:var(--ink);stroke-width:1.5;stroke-dasharray:3 4;opacity:.55}
+.badge text{font:700 11px var(--sans);fill:#fff}
+.skip{font:700 12px var(--sans);fill:var(--muted)}
+.center-t{font:600 13px var(--sans);fill:var(--muted)}
+.center-b{font:600 17px var(--serif);fill:var(--ink)}
+.center-s{font:500 12px var(--sans);fill:var(--muted)}
+@media (prefers-reduced-motion:reduce){.arc,.tok{transition:none}.arc.drain,.arc.flash{animation:none}}
+
+.ctl{display:flex;flex-direction:column;gap:14px}
+.row{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.lbl{font-size:.8rem;color:var(--muted);font-weight:700;letter-spacing:.06em;min-width:4.5em}
+.seg{display:inline-flex;border:1px solid var(--rule);border-radius:999px;padding:3px;background:var(--soft)}
+.seg button,.chipbtn,.btn{font:inherit;font-size:.9rem;border:0;cursor:pointer;color:var(--ink)}
+.seg button{background:transparent;padding:4px 14px;border-radius:999px}
+.seg button[aria-pressed="true"]{background:var(--box);box-shadow:0 1px 3px rgba(0,0,0,.12);font-weight:650}
+.chipbtn{width:34px;height:34px;border-radius:50%;font-weight:700;color:#fff;opacity:.45;transition:opacity .2s,transform .2s}
+.chipbtn[aria-pressed="true"]{opacity:1;transform:scale(1.1);box-shadow:0 0 0 2px var(--paper),0 0 0 4px currentColor}
+.btn{padding:7px 16px;border-radius:8px;background:var(--soft);border:1px solid var(--rule)}
+.btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+.btn:disabled{opacity:.4;cursor:default}
+.steps{display:flex;gap:6px;margin:2px 0}
+.steps i{flex:1;height:5px;border-radius:3px;background:var(--rule)}
+.steps i.on{background:var(--accent)}
+.stepcard{border-left:3px solid var(--accent);background:var(--accent-soft);border-radius:0 10px 10px 0;padding:12px 16px;min-height:132px}
+.stepcard h3{margin:0 0 4px;font-size:1.02rem}
+.stepcard p{margin:0;font-size:.93rem}
+.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.metric{border:1px solid var(--rule);border-radius:10px;padding:10px 12px;background:var(--box)}
+.metric b{display:block;font-size:1.35rem;font-family:var(--serif)}
+.metric span{font-size:.8rem;color:var(--muted);line-height:1.4;display:block}
+
+.n{display:inline-flex;align-items:center;justify-content:center;min-width:26px;height:24px;padding:0 6px;border-radius:6px;font:700 .82rem var(--sans);color:#fff;margin:1px 2px;position:relative}
+.n.has{box-shadow:inset 0 -3px 0 var(--ok)}
+.n.miss{background:var(--warn-soft)!important;color:var(--warn);outline:1.5px dashed var(--warn)}
+.n.reverify{opacity:.75;outline:2px solid var(--warn);outline-offset:1px}
+.n.reverify::before{content:"↻";position:absolute;top:-9px;right:-7px;font-size:.62rem;background:var(--warn);color:var(--paper);border-radius:50%;width:13px;height:13px;line-height:13px;text-align:center}
+.n.x{background:var(--bad-soft)!important;color:var(--bad);text-decoration:line-through}
+.n.own::after{content:"接管";position:absolute;top:-9px;right:-8px;font-size:.6rem;background:var(--ink);color:var(--paper);border-radius:4px;padding:0 3px;line-height:1.4}
+table{width:100%;border-collapse:collapse;font-size:.9rem}
+th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--rule);vertical-align:middle}
+th{font-size:.76rem;color:var(--muted);letter-spacing:.05em}
+td.mono{font-family:var(--mono);font-size:.82rem;white-space:nowrap}
+.legend{display:flex;flex-wrap:wrap;gap:14px;font-size:.82rem;color:var(--muted);margin:10px 0 0}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.dim{opacity:.55}
+.note{font-size:.85rem;color:var(--muted);margin:10px 0 0}
+
+/* Policy widget */
+.grid5{display:grid;grid-template-columns:minmax(0,2.3fr) repeat(3,minmax(0,1fr));border:1px solid var(--rule);border-radius:12px;overflow:hidden;font-size:.9rem}
+.grid5>div{padding:8px 12px;border-bottom:1px solid var(--rule);transition:opacity .35s,background .35s}
+.grid5 .h{font-weight:700;background:var(--soft);font-size:.82rem}
+.grid5 .hide{opacity:.12}
+.grid5 .cell{text-align:center;font-family:var(--mono)}
+.v1{color:var(--muted)}
+.v2{color:var(--ok);font-weight:700}
+.dead{color:var(--bad);font-weight:700}
+.verdict{margin-top:14px;padding:12px 16px;border-radius:10px;font-weight:600;transition:opacity .35s}
+.verdict.good{background:var(--ok-soft);color:var(--ok)}
+.verdict.bad{background:var(--bad-soft);color:var(--bad)}
+
+/* Bars */
+.bar{display:grid;grid-template-columns:8em 1fr 5.5em;gap:12px;align-items:center;margin:10px 0}
+.bar .track{height:22px;background:var(--soft);border-radius:6px;overflow:hidden}
+.bar .fill{height:100%;border-radius:6px;transition:width 1s ease-out}
+.bar b{font-family:var(--serif)}
+
+footer{margin-top:64px;padding-top:20px;border-top:1px solid var(--rule);color:var(--muted);font-size:.88rem}
+@media (max-width:860px){.stage{grid-template-columns:1fr}.thesis,.metrics{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<main>
+<p class="eyebrow">HASHRING-RS · 总体方案设计补充材料</p>
+<h1>缩容与故障接管：<br>副本放置即接管计划</h1>
+<p class="lede">一个区间的第一个 follower，恰好是 owner 离开后环会自然选出的新 owner。所以节点离开时，它的区间直接并入下一个 owner 的管辖范围，而这个 owner 早已作为 follower 持有这部分数据。</p>
+<div class="thesis">
+  <div><b>不需要选举</b><span>接管者由环的结构决定，所有参与方用同一份拓扑算出同一个答案。</span></div>
+  <div><b>关键路径上不搬数据</b><span>新 owner 用它作为 follower 时早已持有的记录直接服务。</span></div>
+  <div><b>先恢复服务，再恢复冗余</b><span>缺少的副本在后台以快照加增量补齐。</span></div>
+</div>
+
+<h2><span class="num">01</span>在环上看接管过程</h2>
+<p class="sub">环上共 5 个节点，每个节点 3 个 token。点击环上任意一段区间，可以看到副本列表是怎样“从区间末端顺时针走、跳过重复的物理节点”推导出来的。然后选择一个节点，逐步查看计划内缩容或故障接管。</p>
+
+<div class="card">
+<div class="stage">
+  <div class="ringbox"><svg id="ring" viewBox="0 0 460 460" role="img" aria-label="一致性哈希环"></svg>
+    <div class="legend">
+      <span><i class="n has" style="background:var(--nB)">B</i>已持有数据并已准入</span>
+      <span><i class="n miss">D</i>需补数据</span>
+      <span><i class="n reverify" style="background:var(--nC)">C</i>故障路径：后台重新复制并准入</span>
+    </div>
+  </div>
+  <div class="ctl">
+    <div class="row"><span class="lbl">场景</span>
+      <div class="seg" id="mode">
+        <button data-v="graceful" aria-pressed="true">计划内缩容</button>
+        <button data-v="failure" aria-pressed="false">节点故障</button>
+      </div></div>
+    <div class="row"><span class="lbl">离开节点</span><div class="row" id="nodes"></div></div>
+    <div class="row"><span class="lbl">复制因子</span>
+      <div class="seg" id="rf">
+        <button data-v="2" aria-pressed="false">RF = 2</button>
+        <button data-v="3" aria-pressed="true">RF = 3</button>
+      </div></div>
+    <div class="steps" id="dots"></div>
+    <div class="stepcard" aria-live="polite"><h3 id="stitle"></h3><p id="sbody"></p></div>
+    <div class="row">
+      <button class="btn" id="prev">上一步</button>
+      <button class="btn primary" id="next">下一步</button>
+      <button class="btn" id="reset">重置</button>
+    </div>
+    <div class="metrics">
+      <div class="metric"><b id="m1"></b><span>离开节点作为 owner 负责的键空间</span></div>
+      <div class="metric"><b>0%</b><span>接管时关键路径上需要复制的键空间</span></div>
+      <div class="metric"><b id="m3"></b><span id="m3l">后台补齐的副本量</span></div>
+    </div>
+  </div>
+</div>
+<h3 style="margin:26px 0 6px;font-size:1rem">受影响的区间：副本列表如何变化</h3>
+<p class="note" style="margin:0 0 8px" id="tnote"></p>
+<table><thead><tr><th>原区间</th><th>原副本列表</th><th>移除后并入的区间</th><th>新副本列表</th></tr></thead><tbody id="rows"></tbody></table>
+</div>
+
+<h2><span class="num">02</span>为什么要等“第一个 follower”确认</h2>
+<p class="sub">接管者是确定的，所以写入策略只要让它在确认前先收到写入，已确认的写入就能在 owner 故障后保留下来。选择一个策略并播放：owner A 确认一次写入 <code>k = v2</code> 后立即宕机，异步复制还没送达的副本仍是旧值 <code>v1</code>。</p>
+<div class="card">
+  <div class="row" style="margin-bottom:14px"><span class="lbl">写入策略</span>
+    <div class="seg" id="policy">
+      <button data-v="owner" aria-pressed="true">OwnerOnly</button>
+      <button data-v="any2" aria-pressed="false">任意两个副本（反例）</button>
+      <button data-v="first" aria-pressed="false">FirstSuccessor</button>
+      <button data-v="all" aria-pressed="false">AllReplicas</button>
+    </div>
+    <button class="btn primary" id="play">播放</button>
+  </div>
+  <div class="grid5" id="lanes"></div>
+  <div class="verdict" id="verdict"></div>
+</div>
+
+<h2><span class="num">03</span>实测：缩容比扩容快一个数量级</h2>
+<p class="sub">仓库记录的 20 次连续测试：9 ↔ 10 个节点，RF=3，<code>FirstSuccessor</code>，20,000 个键，迁移期间持续写入。扩容需要为新节点复制数据；缩容时数据已在继承者手中，只需短暂停写、追平复制流并发布新拓扑。</p>
+<div class="card" id="bars">
+  <div class="bar"><span>扩容（中位数）</span><div class="track"><div class="fill" style="width:0;background:var(--nB)" data-w="100"></div></div><b>7.958 s</b></div>
+  <div class="bar"><span>缩容（中位数）</span><div class="track"><div class="fill" style="width:0;background:var(--accent)" data-w="7.48"></div></div><b>0.595 s</b></div>
+  <p class="note">缩容最小 0.568 s、最大 0.616 s；扩容最小 7.781 s、最大 8.463 s。这是单机本地的小规模测量，只说明两条路径的量级差别，不代表百万键规模的迁移性能。来源：<a href="../optimizations/replica-ack-performance.md"><code>replica-ack-performance.md</code></a>。</p>
+</div>
+
+<footer>
+  文字说明见 <a href="0001-scale-in-failover.md">0001-scale-in-failover.md</a>，设计契约见 <a href="0001-ha-for-consistent-hash-cache.md">RFC 0001</a>。相关代码：副本推导 <a href="../../crates/hashring-core/src/topology.rs"><code>topology.rs</code></a>；自然继承的缩容 <a href="../../crates/hashring-coordinator/src/merge.rs"><code>merge.rs</code></a>；覆盖证明 <a href="../../crates/hashring-coordinator/src/removal.rs"><code>removal.rs</code></a>；故障接管 <a href="../../crates/hashring-coordinator/src/failure.rs"><code>failure.rs</code></a>、<a href="../../crates/hashring-coordinator/src/change.rs"><code>change.rs</code></a>。演示中的环是示意数据，真实系统每个节点默认有 128 个 token。
+</footer>
+</main>
+
+<script>
+(() => {
+const NODES = ['A','B','C','D','E'];
+const color = n => `var(--n${n})`;
+const TOKENS = [[8,'A'],[30,'C'],[52,'B'],[71,'E'],[95,'D'],[118,'A'],[140,'B'],[163,'C'],
+  [190,'E'],[214,'A'],[236,'D'],[258,'B'],[283,'C'],[307,'E'],[332,'D']];
+
+const S = {mode:'graceful', x:'A', rf:3, step:0, sel:null, lastPublished:false};
+
+const STEPS = {
+  graceful: [
+    ['初始状态', '每段区间的副本列表都由环推导：从区间末端出发顺时针走，依次收集不同的物理节点。注意 {X} 的每段区间，第一个 follower 都是谁。'],
+    ['暂停受影响的写入，等待复制流追平', '{X} 仍在线，读请求照常进行。Coordinator 暂停相关写入，等待 {X} 发往各继承者的复制流全部被应用。已追平的 follower 的准入记录将直接带入新拓扑。'],
+    ['发布新 epoch：区间并入继承者', '{X} 的 token 从环上删除，相邻区间合并。每段合并区间的新 owner 正是原来的第一个 follower，它早已持有数据，安装新拓扑后立刻用原有记录服务，没有复制任何数据。'],
+    ['后台补齐副本', '副本列表去掉 {X} 后，其余节点依次前移一位，末尾补上顺时针的下一个节点。只有这个新补上的节点缺少部分数据，它在后台以快照加增量获得数据，验证后准入。'],
+    ['完成：停止离开的节点', '不再需要的旧副本被清理，最后才停止 {X}。整个过程中，读取从未中断，写入只在追平尾部的短暂窗口内暂停。'],
+  ],
+  failure: [
+    ['初始状态', '每段区间的副本列表都由环推导。注意 {X} 的每段区间，第一个 follower 都是谁：它就是 {X} 故障后的接管者。'],
+    ['{X} 突然失联', '{X} 负责的区间暂时无法读写，客户端在截止时间内重试。与缩容不同，{X} 最后尚未复制出去的写入已经无法追平。'],
+    ['确认故障，等待旧租约过期', '租约过期即可确认故障，否则需要至少两个独立节点报告不可达。Coordinator 停止续约并等到 {X} 的租约一定已过期：即使 {X} 其实还活着，它也会自行停止服务，不会出现两个 owner。'],
+    ['证明覆盖，发布新 epoch：读恢复', '检查每段合并区间的新 owner 对每个组成部分都持有准入记录，然后发布新拓扑。继承者用已有数据立刻恢复读取。旧准入绑定旧 epoch，所以 follower 都显示为“待重新准入”。'],
+    ['后台修复，写入按策略恢复', 'follower 以快照加增量重新复制并准入。OwnerOnly 在满足最低副本要求后即恢复写入；FirstSuccessor 要等新的第一个 follower 准入；AllReplicas 要等全部副本就绪。'],
+    ['完成', '所有区间恢复到期望的副本数。若第一个 follower 缺少准入记录，该区间会保持不可用，而不是用不完整的数据提供服务。'],
+  ],
+};
+const PUBLISH = {graceful:2, failure:3};
+const REPAIRED = {graceful:3, failure:4};
+
+// ---------- ring math ----------
+function buildRanges(tokens, rf){
+  const t = [...tokens].sort((a,b)=>a[0]-b[0]); const n = t.length;
+  return t.map((tok,i)=>{
+    const start = t[(i-1+n)%n][0], end = tok[0];
+    const seen = [], walk = [];
+    for(let o=0;o<n && seen.length<Math.min(rf,new Set(t.map(z=>z[1])).size);o++){
+      const z = t[(i+o)%n]; const fresh = !seen.includes(z[1]);
+      if(fresh) seen.push(z[1]); walk.push({pos:z[0], node:z[1], counted:fresh});
+    }
+    return {start, end, len:((end-start+360)%360)||360, list:seen, walk};
+  });
+}
+const contains = (r,p) => { const d=(p-r.start+360)%360; return d>0 && d<=r.len; };
+const rangeAt = (rs,p) => rs.find(r=>contains(r,p));
+
+// ---------- svg helpers ----------
+const C=230, R=150, W=22;
+const pt = (r,deg) => { const a=deg*Math.PI/180; return [C+r*Math.sin(a), C-r*Math.cos(a)]; };
+function band(a0,len,r1,r2){
+  const a1=a0+len, lg=len>180?1:0;
+  const [x1,y1]=pt(r2,a0),[x2,y2]=pt(r2,a1),[x3,y3]=pt(r1,a1),[x4,y4]=pt(r1,a0);
+  return `M${x1} ${y1}A${r2} ${r2} 0 ${lg} 1 ${x2} ${y2}L${x3} ${y3}A${r1} ${r1} 0 ${lg} 0 ${x4} ${y4}Z`;
+}
+function arcPath(a0,len,r){
+  const lg=len>180?1:0,[x1,y1]=pt(r,a0),[x2,y2]=pt(r,a0+len);
+  return `M${x1} ${y1}A${r} ${r} 0 ${lg} 1 ${x2} ${y2}`;
+}
+const esc = s => s.replace(/\{X\}/g, S.x);
+
+// ---------- render ----------
+const $ = id => document.getElementById(id);
+function render(){
+  const steps = STEPS[S.mode], pub = S.step >= PUBLISH[S.mode], repaired = S.step >= REPAIRED[S.mode];
+  const before = buildRanges(TOKENS, S.rf);
+  const after = buildRanges(TOKENS.filter(t=>t[1]!==S.x), S.rf);
+  const cur = pub ? after : before;
+  const justPublished = pub && !S.lastPublished; S.lastPublished = pub;
+  if(S.sel===null || !rangeAt(cur,S.sel)) S.sel = before.find(r=>r.list[0]===S.x).end;
+  const selR = rangeAt(cur, S.sel);
+  const down = S.mode==='failure' && S.step>=1 && !pub;
+  const drain = S.mode==='graceful' && S.step===1;
+
+  let g = `<circle cx="${C}" cy="${C}" r="${R+W/2}" fill="none" stroke="var(--soft)" stroke-width="${W+8}"/>`;
+  cur.forEach(r=>{
+    const affectedOld = !pub && r.list[0]===S.x;
+    const merged = pub && before.some(b=>b.list[0]===S.x && contains(r,b.end));
+    const cls = ['arc', r===selR?'sel':'', affectedOld&&down?'down':'', affectedOld&&drain?'drain':'', merged&&justPublished?'flash':''].join(' ');
+    g += `<path class="${cls}" data-end="${r.end}" d="${band(r.start,r.len,R,R+W)}" fill="${color(r.list[0])}"><title>(${r.start}, ${r.end}] · owner ${r.list[0]}</title></path>`;
+  });
+  // walk overlay
+  if(selR && !(down && selR.list[0]===S.x)){
+    const last = selR.walk[selR.walk.length-1];
+    const span = ((last.pos - selR.end + 360)%360);
+    if(span>0) g += `<path class="walk" d="${arcPath(selR.end, span, R+W+18)}"/>`;
+    let k=0;
+    selR.walk.forEach(w=>{
+      const [x,y]=pt(R+W+18,w.pos);
+      if(w.counted){ k++; g += `<g class="badge"><circle cx="${x}" cy="${y}" r="10" fill="${color(w.node)}" stroke="var(--box)" stroke-width="2"/><text x="${x}" y="${y+4}" text-anchor="middle">${k}</text></g>`; }
+      else g += `<text class="skip" x="${x}" y="${y+4}" text-anchor="middle">×</text>`;
+    });
+  }
+  // tokens
+  TOKENS.forEach(([p,n])=>{
+    const gone = pub && n===S.x, [x,y]=pt(R+W/2,p), [lx,ly]=pt(R-16,p);
+    const failed = down && n===S.x;
+    g += `<g class="tok ${gone?'gone':''}"><circle cx="${x}" cy="${y}" r="6" fill="${gone?'var(--box)':color(n)}" stroke="${failed?'var(--bad)':'var(--box)'}" stroke-width="${failed?3:2}"/>`+
+         `<text class="toklabel" x="${lx}" y="${ly+4}" text-anchor="middle">${n}${p}</text></g>`;
+  });
+  // centre
+  if(selR){
+    const unavailable = down && selR.list[0]===S.x;
+    g += `<text class="center-t" x="${C}" y="${C-30}" text-anchor="middle">选中区间</text>`+
+         `<text class="center-b" x="${C}" y="${C-6}" text-anchor="middle">(${selR.start}, ${selR.end}]</text>`+
+         `<text class="center-s" x="${C}" y="${C+18}" text-anchor="middle">${unavailable?'owner 失联，暂不可用':'副本：'+selR.list.join(' → ')}</text>`+
+         `<text class="center-s" x="${C}" y="${C+38}" text-anchor="middle">${unavailable?'':'① owner，②③ follower，× 跳过'}</text>`;
+  }
+  $('ring').innerHTML = g;
+  $('ring').querySelectorAll('.arc').forEach(el=>el.addEventListener('click',()=>{S.sel=+el.dataset.end;render();}));
+
+  // stepper
+  $('dots').innerHTML = steps.map((_,i)=>`<i class="${i<=S.step?'on':''}"></i>`).join('');
+  $('stitle').textContent = `${S.step+1} / ${steps.length} · ${esc(steps[S.step][0])}`;
+  $('sbody').textContent = esc(steps[S.step][1]);
+  $('prev').disabled = S.step===0; $('next').disabled = S.step===steps.length-1;
+
+  // table
+  const affected = before.filter(r=>r.list.includes(S.x));
+  let rows='', tail=0;
+  affected.forEach(r=>{
+    const nr = rangeAt(after, r.end);
+    const oldChips = r.list.map(n=>`<span class="n ${n===S.x?'x':''}" style="background:${color(n)}">${n}</span>`).join('');
+    const newChips = nr.list.map((n,i)=>{
+      const had = r.list.includes(n);
+      if(!had) tail += r.len;
+      let st = had ? 'has' : 'miss';
+      if(S.mode==='failure' && pub && i>0 && !repaired) st = had ? 'reverify' : 'miss';
+      if(repaired) st = 'has';
+      const own = i===0 && r.list[0]===S.x ? 'own' : '';
+      return `<span class="n ${st} ${own}" style="background:${color(n)}">${n}</span>`;
+    }).join('');
+    rows += `<tr><td class="mono">(${r.start}, ${r.end}]</td><td>${oldChips}</td><td class="mono ${pub?'':'dim'}">(${nr.start}, ${nr.end}]</td><td class="${pub?'':'dim'}">${newChips}</td></tr>`;
+  });
+  $('rows').innerHTML = rows;
+  $('tnote').textContent = pub ? '新拓扑已发布。标有“接管”的是新 owner：它在原列表中就是第一个 follower。' : '新拓扑尚未发布，灰色部分为按新环预先推导的结果。';
+
+  const owned = before.filter(r=>r.list[0]===S.x).reduce((s,r)=>s+r.len,0);
+  $('m1').textContent = Math.round(owned/360*100)+'%';
+  if(S.mode==='graceful'){
+    $('m3').textContent = Math.round(tail/360*100)+'%';
+    $('m3l').textContent = '后台补齐的数据量：恰好等于离开节点原来持有的全部副本，是恢复 RF 所需的最小量（完整数据集 = 100%）';
+  } else {
+    $('m3').textContent = ((S.rf-1)*100)+'%';
+    $('m3l').textContent = '后台重新复制的数据量：当前实现在故障后重新准入全部 follower（完整数据集 = 100%）';
+  }
+}
+
+// ---------- controls ----------
+$('nodes').innerHTML = NODES.map(n=>`<button class="chipbtn" data-v="${n}" style="background:${color(n)};color:${color(n)}" aria-pressed="${n===S.x}" aria-label="节点 ${n}"><span style="color:#fff">${n}</span></button>`).join('');
+function seg(id, key, conv=v=>v){
+  $(id).addEventListener('click', e=>{
+    const b = e.target.closest('button'); if(!b) return;
+    S[key]=conv(b.dataset.v); S.step=0; S.sel=null; S.lastPublished=false;
+    $(id).querySelectorAll('button').forEach(x=>x.setAttribute('aria-pressed', x===b));
+    render();
+  });
+}
+seg('mode','mode'); seg('nodes','x'); seg('rf','rf',Number);
+$('next').onclick=()=>{S.step++;render();};
+$('prev').onclick=()=>{S.step--; if(S.step<PUBLISH[S.mode]) S.lastPublished=false; render();};
+$('reset').onclick=()=>{S.step=0;S.sel=null;S.lastPublished=false;render();};
+render();
+
+// ---------- policy widget ----------
+const POL = {
+  owner:{acked:['A'], text:'OwnerOnly：A 应用后立即确认，B 还没收到。A 宕机后环提升 B，B 上仍是 v1，已确认的写入丢失。'},
+  any2:{acked:['A','C'], text:'任意两个副本：A 和 C 确认了，但环提升的是第一个 follower B，而 B 恰好落后。多等一个副本并没有保护到真正的接管者，写入仍然丢失。'},
+  first:{acked:['A','B'], text:'FirstSuccessor：确认前 B 已经应用了这次写入。A 宕机后 B 接管，v2 保留。C 仍是异步复制，不影响结果。'},
+  all:{acked:['A','B','C'], text:'AllReplicas：全部副本应用后才确认，v2 必然保留；代价是任何副本不可用时写入都会停止。'},
+};
+let pol='owner', timer=null;
+function lanes(k){
+  const p = POL[pol], has = n => p.acked.includes(n);
+  const ev = [
+    ['客户端向 owner A 写入 k = v2', {A:'v2',B:'v1',C:'v1'}, ['A']],
+    [`确认前，${p.acked.join('、')} 已应用`, Object.fromEntries(['A','B','C'].map(n=>[n,has(n)?'v2':'v1'])), p.acked],
+    ['A 向客户端返回“成功”', null, []],
+    ['A 宕机：异步复制尚未送达', Object.fromEntries(['A','B','C'].map(n=>[n,n==='A'?'✕':(has(n)?'v2':'v1')])), []],
+    ['环提升第一个 follower B，读 k', null, ['B']],
+  ];
+  let h = `<div class="h">事件</div><div class="h cell">A（owner）</div><div class="h cell">B（第一个 follower）</div><div class="h cell">C（第二个 follower）</div>`;
+  let state = {A:'v1',B:'v1',C:'v1'};
+  ev.forEach((e,i)=>{
+    if(e[1]) state = e[1];
+    const hide = i>=k ? 'hide':'';
+    h += `<div class="${hide}">${i+1}. ${e[0]}</div>` + ['A','B','C'].map(n=>{
+      const v = state[n], cls = v==='✕'?'dead':v==='v2'?'v2':'v1';
+      const mark = i===4 && n==='B' ? ' ← 读到' : '';
+      return `<div class="cell ${hide}"><span class="${cls}">${v}</span>${mark}</div>`;
+    }).join('');
+  });
+  $('lanes').innerHTML = h;
+  const v = $('verdict');
+  v.className = 'verdict ' + (has('B') ? 'good' : 'bad');
+  v.textContent = (has('B') ? '✓ 写入保留。' : '✕ 已确认的写入丢失。') + p.text;
+  v.style.opacity = k>=5 ? 1 : 0;
+}
+$('policy').addEventListener('click', e=>{
+  const b=e.target.closest('button'); if(!b) return; pol=b.dataset.v;
+  $('policy').querySelectorAll('button').forEach(x=>x.setAttribute('aria-pressed',x===b));
+  clearInterval(timer); lanes(5);
+});
+$('play').onclick=()=>{
+  clearInterval(timer); let k=0; lanes(0);
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if(reduce){ lanes(5); return; }
+  timer=setInterval(()=>{ k++; lanes(k); if(k>=5) clearInterval(timer); }, 700);
+};
+lanes(5);
+
+// ---------- bars ----------
+new IntersectionObserver((es,o)=>es.forEach(e=>{ if(e.isIntersecting){
+  e.target.querySelectorAll('.fill').forEach(f=>f.style.width=f.dataset.w+'%'); o.disconnect(); }}),{threshold:.4}).observe($('bars'));
+})();
+</script>
+</body>
+</html>
