@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::{BufWriter, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -1637,7 +1637,14 @@ fn prepare_output_directory(path: &Path) -> Result<()> {
 
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let file = File::create(path)?;
-    serde_json::to_writer_pretty(file, value)?;
+    // The manifest inlines a multi-megabyte `git diff`. Serializing pretty JSON
+    // emits a few bytes at a time, so an unbuffered handle turns a single write
+    // into tens of thousands of `write` syscalls plus the ext4 metadata churn
+    // that follows them.
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, value)?;
+    // Surface a deferred write error instead of losing it in `Drop`.
+    writer.flush()?;
     Ok(())
 }
 
