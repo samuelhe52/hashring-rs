@@ -1,5 +1,162 @@
 use super::*;
 
+fn apply_replication_entry(
+    node: &DataNodeService,
+    state: &mut NodeState,
+    entry: ReplicationEntry,
+) -> Result<u64, Status> {
+    if entry.stream_sequence == 0 {
+        return Err(Status::invalid_argument(
+            "replication stream sequence must be greater than zero",
+        ));
+    }
+    if entry.mutation_id.is_empty() || entry.mutation_id.len() > MAX_MUTATION_ID_BYTES {
+        return Err(Status::invalid_argument(format!(
+            "mutation id must contain 1 to {MAX_MUTATION_ID_BYTES} bytes"
+        )));
+    }
+    if entry.key.is_empty() || entry.key.len() > node.max_key_bytes {
+        return Err(Status::invalid_argument("replication key size is invalid"));
+    }
+    if entry.value.len() > node.max_value_bytes {
+        return Err(Status::resource_exhausted(
+            "replication value exceeds the node limit",
+        ));
+    }
+    if entry.deleted && !entry.value.is_empty() {
+        return Err(Status::invalid_argument(
+            "deleted replication entry must omit its value",
+        ));
+    }
+    let version = entry
+        .version
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("replication entry omitted version"))?;
+    if version.topology_epoch != entry.topology_epoch
+        || version.owner_node_id != entry.owner_node_id
+    {
+        return Err(Status::failed_precondition(
+            "replication entry version does not match its stream authority",
+        ));
+    }
+
+    if entry.topology_epoch != state.topology.epoch {
+        return Err(Status::failed_precondition(format!(
+            "replication epoch {} does not match installed epoch {}",
+            entry.topology_epoch, state.topology.epoch
+        )));
+    }
+    let owner = state
+        .topology
+        .owner(&entry.key)
+        .map_err(|error| Status::internal(error.to_string()))?;
+    if owner.node_id != entry.owner_node_id {
+        return Err(Status::failed_precondition(
+            "replication entry was not issued by the current owner",
+        ));
+    }
+    let replicas = state
+        .topology
+        .replica_node_ids_for_token(state.topology.key_token(&entry.key))
+        .map_err(|error| Status::internal(error.to_string()))?;
+    if !replicas[1..].contains(&node.node_id.as_str()) {
+        return Err(Status::failed_precondition(
+            "this node is not a desired follower for the mutation",
+        ));
+    }
+
+    let fingerprint = replication_fingerprint(&entry);
+    let stream_key = (entry.topology_epoch, entry.owner_node_id.clone());
+    let stream = state.follower_streams.entry(stream_key).or_default();
+    if entry.stream_sequence <= stream.applied_sequence {
+        if stream
+            .fingerprints
+            .get(&entry.stream_sequence)
+            .is_some_and(|existing| existing == &fingerprint)
+        {
+            return Ok(stream.applied_sequence);
+        }
+        if entry.stream_sequence <= stream.checkpoint_sequence
+            && !stream.fingerprints.contains_key(&entry.stream_sequence)
+        {
+            return Ok(stream.applied_sequence);
+        }
+        return Err(Status::already_exists(
+            "replication stream sequence conflicts with an applied entry",
+        ));
+    }
+    let expected = stream.applied_sequence.saturating_add(1);
+    if entry.stream_sequence != expected {
+        return Err(Status::aborted(format!(
+            "replication gap: expected sequence {expected}, received {}",
+            entry.stream_sequence
+        )));
+    }
+    if version.owner_sequence <= stream.last_owner_sequence {
+        return Err(Status::failed_precondition(
+            "replication record version did not advance the owner sequence",
+        ));
+    }
+
+    let dedup_now = Instant::now();
+    purge_expired_dedup(state, dedup_now);
+    let mutation_fingerprint = mutation_fingerprint(&entry.key, &entry.value, entry.deleted);
+    if state.dedup.contains_key(entry.mutation_id.as_str()) {
+        return Err(Status::already_exists(
+            "replication stream reused a live mutation ID",
+        ));
+    }
+    if state.dedup_bytes.saturating_add(dedup_retained_bytes(
+        &entry.mutation_id,
+        entry.key.len(),
+        version.owner_node_id.len(),
+    )) > node.max_dedup_bytes
+    {
+        node.record_follower_dedup_rejection(&*state);
+        return Err(Status::resource_exhausted(
+            "follower deduplication receipt store is full",
+        ));
+    }
+    let mutation_id = entry.mutation_id.clone();
+    let dedup_key: Arc<[u8]> = Arc::from(entry.key.as_slice());
+
+    apply_internal_record(
+        &mut state.records,
+        entry.key,
+        Record {
+            value: entry.value.into(),
+            version: version.clone(),
+            deleted: entry.deleted,
+        },
+    );
+    let stream = state
+        .follower_streams
+        .get_mut(&(entry.topology_epoch, entry.owner_node_id))
+        .expect("replication stream was initialized above");
+    stream.applied_sequence = entry.stream_sequence;
+    stream.last_owner_sequence = version.owner_sequence;
+    stream
+        .fingerprints
+        .insert(entry.stream_sequence, fingerprint);
+    if entry.stream_sequence > MAX_REPLICATION_FINGERPRINTS {
+        stream
+            .fingerprints
+            .remove(&(entry.stream_sequence - MAX_REPLICATION_FINGERPRINTS));
+    }
+    let applied_stream_sequence = stream.applied_sequence;
+    insert_dedup(
+        state,
+        mutation_id,
+        dedup_key,
+        mutation_fingerprint,
+        version.clone(),
+        entry.deleted,
+        Instant::now(),
+    );
+    Ok(applied_stream_sequence)
+}
+
+
 #[tonic::async_trait]
 impl DataNode for DataNodeService {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
@@ -842,164 +999,30 @@ impl DataNode for DataNodeService {
         request: Request<ReplicationEntry>,
     ) -> Result<Response<ReplicateMutationResponse>, Status> {
         let entry = request.into_inner();
-        if entry.stream_sequence == 0 {
-            return Err(Status::invalid_argument(
-                "replication stream sequence must be greater than zero",
-            ));
-        }
-        if entry.mutation_id.is_empty() || entry.mutation_id.len() > MAX_MUTATION_ID_BYTES {
-            return Err(Status::invalid_argument(format!(
-                "mutation id must contain 1 to {MAX_MUTATION_ID_BYTES} bytes"
-            )));
-        }
-        if entry.key.is_empty() || entry.key.len() > self.max_key_bytes {
-            return Err(Status::invalid_argument("replication key size is invalid"));
-        }
-        if entry.value.len() > self.max_value_bytes {
-            return Err(Status::resource_exhausted(
-                "replication value exceeds the node limit",
-            ));
-        }
-        if entry.deleted && !entry.value.is_empty() {
-            return Err(Status::invalid_argument(
-                "deleted replication entry must omit its value",
-            ));
-        }
-        let version = entry
-            .version
-            .as_ref()
-            .ok_or_else(|| Status::invalid_argument("replication entry omitted version"))?;
-        if version.topology_epoch != entry.topology_epoch
-            || version.owner_node_id != entry.owner_node_id
-        {
-            return Err(Status::failed_precondition(
-                "replication entry version does not match its stream authority",
-            ));
-        }
-
         let mut state = diagnostics::write(&self.state, &self.pressure.follower_write_timing).await;
-        if entry.topology_epoch != state.topology.epoch {
-            return Err(Status::failed_precondition(format!(
-                "replication epoch {} does not match installed epoch {}",
-                entry.topology_epoch, state.topology.epoch
-            )));
-        }
-        let owner = state
-            .topology
-            .owner(&entry.key)
-            .map_err(|error| Status::internal(error.to_string()))?;
-        if owner.node_id != entry.owner_node_id {
-            return Err(Status::failed_precondition(
-                "replication entry was not issued by the current owner",
-            ));
-        }
-        let replicas = state
-            .topology
-            .replica_node_ids_for_token(state.topology.key_token(&entry.key))
-            .map_err(|error| Status::internal(error.to_string()))?;
-        if !replicas[1..].contains(&self.node_id.as_str()) {
-            return Err(Status::failed_precondition(
-                "this node is not a desired follower for the mutation",
-            ));
-        }
-
-        let fingerprint = replication_fingerprint(&entry);
-        let stream_key = (entry.topology_epoch, entry.owner_node_id.clone());
-        let stream = state.follower_streams.entry(stream_key).or_default();
-        if entry.stream_sequence <= stream.applied_sequence {
-            if stream
-                .fingerprints
-                .get(&entry.stream_sequence)
-                .is_some_and(|existing| existing == &fingerprint)
-            {
-                return Ok(Response::new(ReplicateMutationResponse {
-                    process_instance_id: self.process_instance_id.clone(),
-                    applied_stream_sequence: stream.applied_sequence,
-                }));
-            }
-            // The verified full-stream snapshot supersedes queued entries from
-            // before its checkpoint. They cannot mutate data after the snapshot.
-            if entry.stream_sequence <= stream.checkpoint_sequence
-                && !stream.fingerprints.contains_key(&entry.stream_sequence)
-            {
-                return Ok(Response::new(ReplicateMutationResponse {
-                    process_instance_id: self.process_instance_id.clone(),
-                    applied_stream_sequence: stream.applied_sequence,
-                }));
-            }
-            return Err(Status::already_exists(
-                "replication stream sequence conflicts with an applied entry",
-            ));
-        }
-        let expected = stream.applied_sequence.saturating_add(1);
-        if entry.stream_sequence != expected {
-            return Err(Status::aborted(format!(
-                "replication gap: expected sequence {expected}, received {}",
-                entry.stream_sequence
-            )));
-        }
-        if version.owner_sequence <= stream.last_owner_sequence {
-            return Err(Status::failed_precondition(
-                "replication record version did not advance the owner sequence",
-            ));
-        }
-
-        let dedup_now = Instant::now();
-        purge_expired_dedup(&mut state, dedup_now);
-        let mutation_fingerprint = mutation_fingerprint(&entry.key, &entry.value, entry.deleted);
-        if state.dedup.contains_key(entry.mutation_id.as_str()) {
-            return Err(Status::already_exists(
-                "replication stream reused a live mutation ID",
-            ));
-        }
-        if state.dedup_bytes.saturating_add(dedup_retained_bytes(
-            &entry.mutation_id,
-            entry.key.len(),
-            version.owner_node_id.len(),
-        )) > self.max_dedup_bytes
-        {
-            self.record_follower_dedup_rejection(&state);
-            return Err(Status::resource_exhausted(
-                "follower deduplication receipt store is full",
-            ));
-        }
-        let mutation_id = entry.mutation_id.clone();
-        let dedup_key: Arc<[u8]> = Arc::from(entry.key.as_slice());
-
-        apply_internal_record(
-            &mut state.records,
-            entry.key,
-            Record {
-                value: entry.value.into(),
-                version: version.clone(),
-                deleted: entry.deleted,
-            },
-        );
-        let stream = state
-            .follower_streams
-            .get_mut(&(entry.topology_epoch, entry.owner_node_id))
-            .expect("replication stream was initialized above");
-        stream.applied_sequence = entry.stream_sequence;
-        stream.last_owner_sequence = version.owner_sequence;
-        stream
-            .fingerprints
-            .insert(entry.stream_sequence, fingerprint);
-        if entry.stream_sequence > MAX_REPLICATION_FINGERPRINTS {
-            stream
-                .fingerprints
-                .remove(&(entry.stream_sequence - MAX_REPLICATION_FINGERPRINTS));
-        }
-        let applied_stream_sequence = stream.applied_sequence;
-        insert_dedup(
-            &mut state,
-            mutation_id,
-            dedup_key,
-            mutation_fingerprint,
-            version.clone(),
-            entry.deleted,
-            Instant::now(),
-        );
+        let applied_stream_sequence = apply_replication_entry(self, &mut state, entry)?;
         Ok(Response::new(ReplicateMutationResponse {
+            process_instance_id: self.process_instance_id.clone(),
+            applied_stream_sequence,
+        }))
+    }
+
+    async fn replicate_mutations(
+        &self,
+        request: Request<ReplicationBatch>,
+    ) -> Result<Response<ReplicateMutationsResponse>, Status> {
+        let batch = request.into_inner();
+        if batch.entries.is_empty() {
+            return Err(Status::invalid_argument(
+                "replication batch must not be empty",
+            ));
+        }
+        let mut state = diagnostics::write(&self.state, &self.pressure.follower_write_timing).await;
+        let mut applied_stream_sequence = 0;
+        for entry in batch.entries {
+            applied_stream_sequence = apply_replication_entry(self, &mut state, entry)?;
+        }
+        Ok(Response::new(ReplicateMutationsResponse {
             process_instance_id: self.process_instance_id.clone(),
             applied_stream_sequence,
         }))
