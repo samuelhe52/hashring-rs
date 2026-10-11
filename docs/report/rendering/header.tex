@@ -16,11 +16,17 @@
 \preto\subsubsection{\Needspace{7\baselineskip}}
 \AtBeginEnvironment{Highlighting}{\footnotesize}
 
-% Omit the empty author/date blocks in Pandoc's default title layout.
+% Show authors when supplied; omit the empty author/date blocks otherwise.
 \makeatletter
 \renewcommand{\@maketitle}{%
   \newpage\null\vskip 2em
-  \begin{center}{\LARGE\bfseries\@title\par}\end{center}
+  \begin{center}
+    {\LARGE\bfseries\@title\par}
+    \ifx\@author\@empty\else
+      \vskip 1.6em
+      {\large\@author\par}
+    \fi
+  \end{center}
   \vskip 0.5em
 }
 \makeatother
