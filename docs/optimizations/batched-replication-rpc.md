@@ -52,6 +52,37 @@ the existing tests and any single-entry callers.
   duration rather than one entry, but the total work per entry is unchanged and the
   number of acquisitions drops.
 
+## Measured effect
+
+Instrumenting the follower's `ReplicateMutations` handler to count received entries
+and RPCs, over a correctness run of 20,000 keys at concurrency 64, RF=3,
+`OwnerOnly`, 128-byte values, 9 nodes:
+
+| | value |
+| --- | --- |
+| replication entries delivered | 40,000 |
+| `ReplicateMutations` RPCs | 31,357 |
+| **mean batch size** | **1.28** |
+| peak pending per stream | 7–20 (queue capacity 32) |
+
+The bounds are not the limiter: with 128-byte values each entry costs ~450 bytes, so
+64 entries is ~29 KB against a 9 MiB budget. The limiter is that `try_recv` usually
+finds the queue empty.
+
+Mean batch size is governed by `1 + arrival_rate x loop_time`. This workload offers
+~2,300 entries/s per stream and ~274 us per delivery-loop iteration, so ~0.6 entries
+arrive during one iteration. Neither `REPLICATION_BATCH_MAX_ENTRIES` nor
+`REPLICATION_BATCH_MAX_BYTES` changes that ratio; only a deliberate linger (paid for
+in added latency) or more concurrent producers per stream would.
+
+Consequence: the amortizations claimed above are real in mechanism but small in
+magnitude here. Follower state-write acquisitions fell only from 40,000 to 31,357
+(-21.6%), and ACK writebacks fell by the same 21.6%. At this workload's arrival rate
+the change removes roughly one RPC in five, not one in sixty-four. Throughput here is
+latency-bound per stream, not batch-bound, so this workload cannot show the
+change's ceiling. Re-measure with higher per-stream concurrency before drawing
+conclusions about the bound.
+
 ## Source
 
 - `crates/hashring-core/proto/hashring.proto`: `ReplicationBatch`,
@@ -67,4 +98,6 @@ the existing tests and any single-entry callers.
   `crates/hashring-node/src/tests/replication.rs`.
 
 See also [replication-backpressure.md](replication-backpressure.md) for the queue and
-retained-byte limits this change builds on.
+retained-byte limits this change builds on, and
+[state-write-lock-profile.md](state-write-lock-profile.md) for the measured wait and
+hold times of the three write paths this change touches.
