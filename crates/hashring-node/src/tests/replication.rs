@@ -114,6 +114,54 @@ async fn follower_applies_only_contiguous_authorized_replication() {
 }
 
 #[tokio::test]
+async fn follower_applies_a_replication_batch_in_order() {
+    let topology = replication_topology(3);
+    let key = key_with_placement(&topology, |replicas| replicas[1..].contains(&"node-2"));
+    let service = service_for("node-2", topology.clone());
+    let entries = vec![
+        replication_entry(&topology, key.clone(), 1, 10, b"one", false),
+        replication_entry(&topology, key.clone(), 2, 11, b"two", false),
+        replication_entry(&topology, key.clone(), 3, 12, b"", true),
+    ];
+    let applied = service
+        .replicate_mutations(Request::new(ReplicationBatch { entries }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(applied.applied_stream_sequence, 3);
+    let owner_node_id = topology.owner(&key).unwrap().node_id.clone();
+    let state = service.state.read().await;
+    assert!(state.records[&key].deleted);
+    assert_eq!(
+        state
+            .follower_streams
+            .get(&(topology.epoch, owner_node_id))
+            .unwrap()
+            .applied_sequence,
+        3
+    );
+}
+
+#[tokio::test]
+async fn replication_batch_rejects_a_gap_between_entries() {
+    let topology = replication_topology(3);
+    let key = key_with_placement(&topology, |replicas| replicas[1..].contains(&"node-2"));
+    let service = service_for("node-2", topology.clone());
+    let entries = vec![
+        replication_entry(&topology, key.clone(), 1, 10, b"one", false),
+        replication_entry(&topology, key.clone(), 3, 11, b"three", false),
+    ];
+    assert_eq!(
+        service
+            .replicate_mutations(Request::new(ReplicationBatch { entries }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Aborted
+    );
+}
+
+#[tokio::test]
 async fn full_stream_checkpoint_repairs_a_gap_without_replaying_old_entries() {
     let topology = replication_topology(3);
     let follower = service_for("node-2", topology.clone());
@@ -875,7 +923,12 @@ async fn unavailable_follower_backpressures_before_unbounded_queue_growth() {
             break error;
         }
         successful += 1;
-        assert!(successful <= REPLICATION_STREAM_QUEUE_CAPACITY + 1);
+        // Backpressure is bounded by the per-stream channel plus at most one
+        // in-flight replication batch that the delivery task drained before
+        // blocking on the unavailable follower.
+        assert!(
+            successful <= REPLICATION_STREAM_QUEUE_CAPACITY + REPLICATION_BATCH_MAX_ENTRIES
+        );
     };
 
     assert_eq!(rejected.code, ErrorCode::ResourceExhausted as i32);
