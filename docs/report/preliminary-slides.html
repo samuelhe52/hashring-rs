@@ -1,0 +1,778 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>hashring-rs 初期答辩</title>
+<style>
+:root{
+  --paper:#fbfaf7;--ink:#1b2430;--muted:#5d6874;--rule:#e3dfd7;--soft:#f3f1ec;--box:#fff;
+  --accent:#b4532a;--accent-soft:#f8ebe3;
+  --ok:#2c7549;--ok-soft:#e4f1e9;--warn:#9a6700;--warn-soft:#fbf0d9;--bad:#a33a3a;--bad-soft:#f7e5e5;
+  --nA:#c0532b;--nB:#1f6f8b;--nC:#3d7d4f;--nD:#6a4c93;--nE:#a07a12;
+  --serif:"Songti SC","Noto Serif SC","Source Han Serif SC",Georgia,serif;
+  --sans:system-ui,-apple-system,"PingFang SC","Noto Sans SC","Microsoft YaHei",sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:#2a2f36;overflow:hidden}
+body{font:22px/1.6 var(--sans);color:var(--ink);-webkit-font-smoothing:antialiased}
+code{font-family:var(--mono);font-size:.84em;background:var(--soft);border:1px solid var(--rule);padding:.02em .32em;border-radius:5px}
+
+/* ---------- deck frame: fixed 1280×720 stage scaled to fit ---------- */
+#deck{position:absolute;left:50%;top:50%;width:1280px;height:720px;transform-origin:center center}
+.slide{position:absolute;inset:0;background:var(--paper);padding:52px 72px 52px;display:none;flex-direction:column;overflow:hidden}
+.slide.on{display:flex}
+.slide .pg{position:absolute;right:40px;bottom:22px;font:600 14px var(--sans);color:var(--muted);letter-spacing:.08em}
+.slide .tag{position:absolute;left:72px;bottom:22px;font:700 13px var(--sans);color:var(--muted);letter-spacing:.14em}
+.eyebrow{font:700 15px var(--sans);letter-spacing:.14em;color:var(--accent);margin:0 0 6px}
+h1{font-family:var(--serif);font-weight:600;font-size:44px;line-height:1.25;margin:0 0 10px;letter-spacing:-.01em}
+h2{font-family:var(--serif);font-weight:600;font-size:36px;line-height:1.3;margin:0 0 8px}
+.sub{color:var(--muted);font-size:20px;margin:0 0 18px;max-width:1100px}
+.muted{color:var(--muted)}
+.small{font-size:16px}
+.body{flex:1;display:flex;flex-direction:column;justify-content:center;min-height:0;padding-bottom:24px}
+#bar{position:fixed;left:0;bottom:0;height:4px;background:var(--accent);transition:width .3s;z-index:5}
+#hint{position:fixed;right:14px;top:10px;font:12px var(--sans);color:#9aa3ad;z-index:5;transition:opacity .6s}
+#notes{position:fixed;left:0;right:0;bottom:4px;max-height:34vh;overflow:auto;background:rgba(20,24,29,.94);color:#e7e4dd;font:17px/1.65 var(--sans);padding:14px 22px;z-index:6;display:none}
+#notes b{color:#e59066}
+.notes{display:none}
+
+/* ---------- shared ---------- */
+.card{background:var(--box);border:1px solid var(--rule);border-radius:14px;padding:20px 24px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:24px}
+.n{display:inline-flex;align-items:center;justify-content:center;min-width:28px;height:26px;padding:0 6px;border-radius:6px;font:700 15px var(--sans);color:#fff;margin:0 2px}
+.stat b{display:block;font-family:var(--serif);font-size:44px;line-height:1.1;font-weight:600}
+.stat span{display:block;color:var(--muted);font-size:16px;line-height:1.5;margin-top:8px}
+svg.ring{width:440px;height:440px;flex:none}
+.stage{display:grid;grid-template-columns:440px 1fr;gap:36px;flex:1;min-height:0;align-items:start}
+.ctl{display:flex;flex-direction:column;gap:14px;min-width:0}
+.row{display:flex;flex-wrap:wrap;align-items:center;gap:10px}
+.lbl{font-size:15px;color:var(--muted);font-weight:700;letter-spacing:.06em;min-width:4.6em}
+.seg{display:inline-flex;border:1px solid var(--rule);border-radius:999px;padding:3px;background:var(--soft)}
+.seg button,.chipbtn,.btn{font:inherit;border:0;cursor:pointer;color:var(--ink)}
+.seg button{background:transparent;padding:4px 16px;border-radius:999px;font-size:17px}
+.seg button[aria-pressed="true"]{background:var(--box);box-shadow:0 1px 3px rgba(0,0,0,.12);font-weight:650}
+.btn{padding:6px 18px;border-radius:8px;background:var(--soft);border:1px solid var(--rule);font-size:17px}
+.btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+.btn[aria-pressed="true"]{background:var(--ink);color:#fff;border-color:var(--ink)}
+.btn:disabled{opacity:.4;cursor:default}
+.steps{display:flex;gap:6px}
+.steps i{flex:1;height:5px;border-radius:3px;background:var(--rule)}
+.steps i.on{background:var(--accent)}
+.stepcard{background:var(--accent-soft);border-radius:12px;padding:14px 20px}
+.stepcard h3{margin:0 0 6px;font-size:21px}
+.stepcard p{margin:0;font-size:18px;line-height:1.65}
+.center-t{font:600 14px var(--sans);fill:var(--muted)}
+.center-b{font:600 24px var(--serif);fill:var(--ink)}
+.center-big{font:600 40px var(--serif);fill:var(--ink)}
+.center-s{font:500 14px var(--sans);fill:var(--muted)}
+.ringlabel{font:600 13px var(--sans);fill:var(--muted)}
+.nodelabel{font:700 16px var(--sans);fill:#fff}
+@keyframes pop{0%{transform:scale(0)}70%{transform:scale(1.25)}100%{transform:scale(1)}}
+@keyframes flash{0%{opacity:.15}100%{opacity:1}}
+.pop{transform-box:fill-box;transform-origin:center;animation:pop .5s ease-out}
+.flash{animation:flash 1s ease-out}
+
+/* ---------- title ---------- */
+.title{justify-content:center;background:var(--ink);color:#f3efe7}
+.title h1{font-size:76px;letter-spacing:-.02em;margin:0 0 6px;color:#fff}
+.title .lead{font-family:var(--serif);font-size:32px;color:#e7e1d6;margin:0 0 42px}
+.title .eyebrow{color:#e59066}
+.title .who{font-size:20px;color:#b8c0c8;line-height:1.9}
+.title .who b{color:#fff;font-weight:600}
+.title .pg,.end .pg{color:#7d8792}
+.ringmark{position:absolute;right:70px;top:50%;transform:translateY(-50%);width:400px;opacity:.9}
+
+/* ---------- consistent hashing: mechanism ---------- */
+#ch1 .stepcard{min-height:182px}
+.modbox{border:1px solid var(--rule);background:var(--box);border-radius:12px;padding:12px 16px;transition:opacity .4s}
+.modbox.off{opacity:.15}
+.modbox h4{margin:0 0 8px;font-size:16px;font-weight:700}
+.chipgrid{display:grid;grid-template-columns:repeat(13,1fr);gap:5px}
+.chipgrid i{height:20px;border-radius:4px;transition:background .5s,opacity .5s}
+.chipgrid i.mv{box-shadow:0 0 0 2.5px var(--ink)}
+.chipgrid i.stay{opacity:.3}
+.versus{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:10px}
+.versus div{border-radius:10px;padding:6px 12px;font-size:15px;color:var(--muted)}
+.versus b{font:600 26px var(--serif);display:block;color:var(--ink)}
+.versus .good{background:var(--ok-soft)}.versus .good b{color:var(--ok)}
+.versus .bad{background:var(--bad-soft)}.versus .bad b{color:var(--bad)}
+
+/* ---------- consistent hashing: virtual nodes ---------- */
+.shares{display:flex;flex-direction:column;gap:7px}
+.sh{display:grid;grid-template-columns:28px 1fr 4.2em;gap:10px;align-items:center;font-size:17px}
+.sh .track{height:22px;background:var(--soft);border-radius:5px;position:relative;overflow:visible}
+.sh .fill{height:100%;border-radius:5px;transition:width .6s ease-out}
+.sh .ideal{position:absolute;top:-4px;bottom:-4px;border-left:2px dashed var(--ink);opacity:.5;transition:left .6s}
+.sh b{font-family:var(--serif);text-align:right}
+.sh.gone{opacity:.35}
+.vnote{background:var(--soft);border-radius:12px;padding:12px 16px;font-size:16px;line-height:1.65;color:var(--muted)}
+.vnote b{color:var(--ink)}
+
+/* ---------- architecture ---------- */
+.arch{display:grid;grid-template-columns:1.7fr 1fr;gap:32px;align-items:center;flex:1}
+.arch svg{width:100%;height:auto}
+.arch svg text{font-family:var(--sans)!important}
+.pts{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:16px}
+.pts li{padding-left:18px;position:relative;font-size:19px}
+.pts li::before{content:"";position:absolute;left:0;top:.62em;width:8px;height:8px;border-radius:50%;background:var(--accent)}
+.pts li b{display:block;font-size:21px}
+.pts li span{color:var(--muted)}
+.stack{margin-top:18px;font-size:16px;color:var(--muted)}
+
+/* ---------- replica ring widget ---------- */
+.arc{cursor:pointer;transition:fill .5s,opacity .5s}
+.arc:hover{opacity:.8}
+.arc.sel{stroke:var(--ink);stroke-width:2.5}
+.arc.down{fill:var(--soft)!important;stroke:var(--bad);stroke-width:1.5;stroke-dasharray:4 3}
+.arc.drain{animation:pulse 1.1s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.45}}
+.tok{transition:opacity .5s}.tok.gone{opacity:.25}
+.toklabel{font:600 12px var(--sans);fill:var(--muted)}
+.walk{fill:none;stroke:var(--ink);stroke-width:1.5;stroke-dasharray:3 4;opacity:.55}
+.badge text{font:700 11px var(--sans);fill:#fff}
+.skip{font:700 13px var(--sans);fill:var(--muted)}
+.chipbtn{width:36px;height:36px;border-radius:50%;font-weight:700;font-size:16px;color:#fff;opacity:.4;transition:opacity .2s,transform .2s}
+.chipbtn[aria-pressed="true"]{opacity:1;transform:scale(1.1);box-shadow:0 0 0 2px var(--paper),0 0 0 4px var(--ink)}
+#rep .stepcard{min-height:150px}
+.chips{font-size:17px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.chips .arrow{color:var(--muted)}
+.n.x{background:var(--bad-soft)!important;color:var(--bad);text-decoration:line-through}
+.n.miss{background:var(--warn-soft)!important;color:var(--warn);outline:1.5px dashed var(--warn)}
+.n.own{box-shadow:0 0 0 2px var(--paper),0 0 0 4px var(--ink)}
+
+/* ---------- migration ---------- */
+.flow{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:44px}
+.flow .card{padding:16px 18px;position:relative}
+.flow .k{font:700 14px var(--sans);color:var(--accent);letter-spacing:.08em}
+.flow b{display:block;font-size:20px;margin:2px 0 4px}
+.flow span{font-size:16px;color:var(--muted);line-height:1.5;display:block}
+.flow .card:not(:last-child)::after{content:"→";position:absolute;right:-13px;top:50%;transform:translateY(-50%);color:var(--muted);font-size:18px;z-index:1}
+.cmp{display:grid;grid-template-columns:1.25fr 1fr;gap:28px;align-items:center}
+.bar{display:grid;grid-template-columns:6.4em 1fr 5.4em;gap:14px;align-items:center;margin:14px 0;font-size:19px}
+.bar .track{height:34px;background:var(--soft);border-radius:6px;overflow:hidden}
+.bar .fill{height:100%;border-radius:6px;transition:width 1s ease-out;width:0}
+.bar b{font-family:var(--serif);font-size:22px}
+.why{background:var(--ok-soft);border-radius:12px;padding:16px 20px;font-size:18px}
+.why b{color:var(--ok)}
+
+/* ---------- progress ---------- */
+.done{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:26px}
+.done span{background:var(--ok-soft);color:var(--ok);border-radius:999px;padding:4px 16px;font-size:17px;font-weight:600}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:18px}
+.stats .stat b{font-size:38px}
+.tl{padding:16px 26px 14px}
+.tlhead{display:flex;justify-content:space-between;align-items:baseline;gap:16px;flex-wrap:wrap}
+.tlhead b{font-size:19px}.tlhead span{font-size:14px;color:var(--muted)}
+.tl .track{position:relative;height:52px;margin:62px 0 6px;background:var(--soft);border-radius:8px}
+.tl .tseg{position:absolute;top:0;bottom:0;border-radius:8px;font-size:15px;font-weight:600;padding:3px 12px;line-height:1.35;overflow:hidden;white-space:nowrap}
+.tl .tseg small{display:block;font-size:12px;font-weight:500;opacity:.85}
+.tl .wait{background:var(--warn-soft);color:var(--warn);border:1px dashed var(--warn)}
+.tl .rf{background:var(--ok-soft);color:var(--ok);display:flex;align-items:center;justify-content:center}
+.tl .mk{position:absolute;top:-8px;bottom:-8px;width:0}
+.tl .mk i{position:absolute;top:0;bottom:0;left:-1px;border-left:2px solid var(--ink)}
+.tl .mk.ok i{border-color:var(--ok)}
+.tl .mk span{position:absolute;left:0;transform:translateX(-50%);font-size:13px;line-height:1.3;color:var(--muted);text-align:center;white-space:nowrap}
+.tl .mk:first-child span,.tl .mk[style*="left:0"] span{transform:none}
+.tl .mk span b{color:var(--ink);font-size:15px}
+.tl .mk.ok span b{color:var(--ok)}
+.tl .mk .up{bottom:calc(100% + 4px)}
+.tl .mk .down{top:calc(100% + 4px)}
+.tlfoot{margin:62px 0 0;font-size:16px;color:var(--muted)}
+.tlfoot b{color:var(--ok)}
+.stats .card{padding:18px 20px}
+
+/* ---------- limits / next ---------- */
+.lists .card h3{margin:0 0 14px;font-size:22px}
+.lists ul{margin:0;padding-left:1.2em}
+.lists li{margin:0 0 12px;font-size:19px}
+.lists .lim{background:var(--warn-soft)}
+.lists .lim h3{color:var(--warn)}
+.lists .nxt h3{color:var(--ok)}
+
+/* ---------- team ---------- */
+.team{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
+.team .card{padding:26px 26px 22px}
+.team b{display:block;font-family:var(--serif);font-size:32px;font-weight:600}
+.team em{font-style:normal;font-size:15px;font-weight:700;color:var(--accent);letter-spacing:.06em}
+.team ul{margin:16px 0 0;padding:0;list-style:none;display:flex;flex-wrap:wrap;gap:8px}
+.team li{background:var(--soft);border-radius:8px;padding:4px 12px;font-size:17px}
+
+/* ---------- end ---------- */
+.end{justify-content:center;align-items:center;background:var(--ink);color:#f3efe7;text-align:center}
+.end h1{font-size:80px;color:#fff;margin:0 0 14px}
+.end p{font-size:22px;color:#9aa3ad;margin:0;letter-spacing:.1em}
+
+@media print{
+  @page{size:1280px 720px;margin:0}
+  html,body{overflow:visible;background:#fff;height:auto}
+  #deck{position:static;transform:none!important;width:1280px;height:auto}
+  .slide{position:relative;display:flex!important;width:1280px;height:720px;page-break-after:always;break-after:page}
+  #bar,#hint,#notes{display:none!important}
+  .bar .fill,.sh .fill{transition:none}
+}
+@media (prefers-reduced-motion:reduce){.arc,.tok,.bar .fill,.sh .fill,.chipgrid i{transition:none}.arc.drain,.pop,.flash{animation:none}}
+</style>
+</head>
+<body>
+<div id="deck">
+
+<!-- 标题 -->
+<section class="slide title">
+  <svg class="ringmark" viewBox="0 0 400 400" aria-hidden="true">
+    <circle cx="200" cy="200" r="150" fill="none" stroke="#3a434e" stroke-width="26"/>
+    <g fill="none" stroke-width="26">
+      <path d="M200 50 A150 150 0 0 1 330 125" stroke="#e5895f"/>
+      <path d="M330 125 A150 150 0 0 1 330 275" stroke="#5eaecb"/>
+      <path d="M330 275 A150 150 0 0 1 200 350" stroke="#7cc08f"/>
+      <path d="M200 350 A150 150 0 0 1 70 275" stroke="#b39ae0"/>
+      <path d="M70 275 A150 150 0 0 1 70 125" stroke="#d9b44f"/>
+      <path d="M70 125 A150 150 0 0 1 200 50" stroke="#5eaecb" opacity=".6"/>
+    </g>
+  </svg>
+  <p class="eyebrow">初期答辩 · 第六组</p>
+  <h1>hashring-rs</h1>
+  <p class="lead">支持在线扩缩容与故障转移的分布式内存缓存</p>
+  <div class="who"><b>何子谦</b>（组长）　陈明远　陈阳<br>2026 年 10 月</div>
+  <span class="pg"></span>
+  <aside class="notes"><b>≈15 s</b>　大家好，我们是第六组。项目是 hashring-rs：一个分布式内存缓存，重点是节点增减和故障时，服务不中断、数据仍能找到。</aside>
+</section>
+
+<!-- 一致性哈希：机制 -->
+<section class="slide" id="ch1">
+  <p class="eyebrow">01 · 一致性哈希</p>
+  <h2>一致性哈希：增减节点时，只移动一小段数据</h2>
+  <div class="stage" style="margin-top:12px">
+    <svg class="ring" id="chRing" viewBox="0 0 460 460" role="img" aria-label="一致性哈希环"></svg>
+    <div class="ctl">
+      <div class="steps" id="chDots"></div>
+      <div class="stepcard" aria-live="polite"><h3 id="chTitle"></h3><p id="chBody"></p></div>
+      <div class="row"><button class="btn" id="chPrev">上一步</button><button class="btn primary" id="chNext">下一步</button></div>
+      <div class="modbox off" id="chMod">
+        <h4 id="chModT"></h4>
+        <div class="chipgrid" id="chChips"></div>
+        <div class="versus">
+          <div class="bad">取模：需要迁移<b id="chVsMod">—</b></div>
+          <div class="good">一致性哈希：需要迁移<b id="chVsRing">—</b></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <span class="tag">HASHRING-RS</span><span class="pg"></span>
+  <aside class="notes"><b>≈75 s</b>　（用 → 逐步播放）先讲一致性哈希是什么。① 哈希函数把任意键变成一个 64 位整数，我们把这个范围首尾相接画成一个环，每个键落在环上某个点。② 节点也用哈希放到同一个环上。③ 规则只有一条：键从自己的位置顺时针走，碰到的第一个节点就是它的 owner；所以每个节点负责它和上一个节点之间的一段。④ 为什么要这样做？加入节点 D：只有 C 到 D 之间这一段换了主人，其余不动。右边是最直观的做法“哈希取模”：节点数从 3 变 4，大约四分之三的键都要换节点，对缓存来说几乎等于全部失效。</aside>
+</section>
+
+<!-- 一致性哈希：虚拟节点 -->
+<section class="slide" id="ch2">
+  <p class="eyebrow">01 · 一致性哈希</p>
+  <h2>虚拟节点：一个物理节点，在环上占多个位置</h2>
+  <div class="stage" style="margin-top:12px">
+    <svg class="ring" id="vnRing" viewBox="0 0 460 460" role="img" aria-label="虚拟节点"></svg>
+    <div class="ctl">
+      <div class="row"><span class="lbl">每节点位置</span>
+        <div class="seg" id="vnT"><button data-v="1" aria-pressed="true">1 个</button><button data-v="32" aria-pressed="false">32 个</button></div>
+        <button class="btn" id="vnRm" aria-pressed="false">移除节点 B</button>
+      </div>
+      <div class="stepcard" aria-live="polite" style="min-height:118px"><h3 id="vnTitle"></h3><p id="vnBody"></p></div>
+      <div>
+        <p class="muted" style="font-size:15px;margin:0 0 6px">各节点负责的环比例（虚线 = 平均值）</p>
+        <div class="shares" id="vnBars"></div>
+      </div>
+      <div class="vnote">相邻两个位置之间的一段称为<b>区间</b>，它是迁移和复制的基本单位。<br><b>本系统：</b>xxh3-64 哈希，每个节点 128 个位置；10 个节点时环上共有 1,280 个区间。</div>
+    </div>
+  </div>
+  <span class="tag">HASHRING-RS</span><span class="pg"></span>
+  <aside class="notes"><b>≈50 s</b>　（用 → 逐步播放）只放一个位置有两个问题。第一，区间长短全靠哈希落点，这里最多的节点负责 36%，最少的只有 3%。第二，移除 B，它的整段负载压到一个邻居身上。解决办法是虚拟节点：每个物理节点在环上放很多个位置。放 32 个后各节点都接近 20%；再移除 B，它的几十段区间分别并入不同节点，由大家分摊。我们的系统每个节点 128 个位置。相邻位置之间的一段叫“区间”，后面迁移和复制都以区间为单位。</aside>
+</section>
+
+<!-- 架构 -->
+<section class="slide">
+  <p class="eyebrow">02 · 总体架构</p>
+  <h2>控制面管变化，数据面走直连</h2>
+  <div class="arch">
+    <svg viewBox="0 0 1020 455" role="img" aria-label="系统总体架构">
+      <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#527089"/></marker></defs>
+      <rect x="350" y="20" width="320" height="165" rx="12" fill="#f8fafc" stroke="#b8c6d2" stroke-width="1.5"/>
+      <rect x="20" y="225" width="980" height="205" rx="12" fill="#f8fafc" stroke="#b8c6d2" stroke-width="1.5"/>
+      <g font-size="23" fill="#1b2430" text-anchor="middle"><text x="510" y="55">控制面</text><text x="82" y="263">数据面</text></g>
+      <g fill="#edf3f8" stroke="#527089" stroke-width="1.5"><rect x="410" y="78" width="200" height="75" rx="7"/><rect x="50" y="305" width="180" height="75" rx="7"/><rect x="420" y="305" width="180" height="75" rx="7"/><rect x="790" y="305" width="180" height="75" rx="7"/></g>
+      <g font-size="24" fill="#1b2430" text-anchor="middle"><text x="510" y="126">协调器</text><text x="140" y="352">客户端</text><text x="510" y="352">owner 节点</text><text x="880" y="352">follower 节点</text></g>
+      <g fill="none" stroke="#527089" stroke-width="2" marker-end="url(#arrow)"><path d="M230 343 H412"/><path d="M600 343 H782"/><path d="M140 305 V115 H402" stroke-dasharray="6 5"/><path d="M510 305 V161" stroke-dasharray="6 5"/><path d="M880 305 V115 H618" stroke-dasharray="6 5"/></g>
+      <g font-size="21" fill="#314d62" text-anchor="middle"><rect x="247" y="278" width="145" height="35" fill="#f8fafc"/><text x="322" y="303">读写（直连 owner）</text><rect x="622" y="278" width="145" height="35" fill="#f8fafc"/><text x="695" y="303">按序复制流</text><rect x="79" y="186" width="122" height="33" fill="#fff"/><text x="140" y="210">拉取拓扑</text><rect x="414" y="185" width="192" height="33" fill="#fff"/><text x="510" y="209">续约、可达性报告</text><rect x="784" y="185" width="192" height="33" fill="#fff"/><text x="880" y="209">续约、可达性报告</text></g>
+    </svg>
+    <div>
+      <ul class="pts">
+        <li><b>协调器维护拓扑</b><span>负责维护成员状态、串行发布拓扑变化，并为每次拓扑分配版本。</span></li>
+        <li><b>客户端本地路由</b><span>客户端缓存整张拓扑，根据键本地计算 owner，然后直接连接对应节点。</span></li>
+        <li><b>owner 读写并顺序复制</b><span>owner 负责正常读写，并按顺序把变更复制给 follower。</span></li>
+      </ul>
+      <p class="stack">Rust 实现，各角色之间通过带版本的 gRPC 接口通信。</p>
+    </div>
+  </div>
+  <span class="tag">HASHRING-RS</span><span class="pg"></span>
+  <aside class="notes"><b>≈40 s</b>　系统有三种角色。数据面只有客户端和数据节点：客户端缓存刚才那张环，自己算出 owner 直接访问，owner 再按序复制给 follower。控制面是单实例协调器，负责拓扑变更、版本号 epoch 和租约，但不处理任何读写。协调器挂了，节点会在租约到期后自行停服，而不是在错误的拓扑下继续服务。</aside>
+</section>
+
+<!-- 副本放置即接管计划 -->
+<section class="slide" id="rep">
+  <p class="eyebrow">03 · 副本与接管</p>
+  <h2>副本放置，本身就是接管计划</h2>
+  <p class="sub" style="margin-bottom:12px">每个区间保存 3 份：从区间末端顺时针走，依次取 3 个<b style="color:var(--ink)">不同的物理节点</b>。第 1 个是 owner（处理读写），后两个是 follower（只接收复制）。</p>
+  <div class="stage">
+    <svg class="ring" id="ring" viewBox="0 0 460 460" role="img" aria-label="副本放置"></svg>
+    <div class="ctl">
+      <div class="row"><span class="lbl">场景</span>
+        <div class="seg" id="mode"><button data-v="graceful" aria-pressed="true">计划内缩容</button><button data-v="failure" aria-pressed="false">节点故障</button></div></div>
+      <div class="row"><span class="lbl">离开节点</span><div class="row" id="nodes"></div></div>
+      <div class="steps" id="dots"></div>
+      <div class="stepcard" aria-live="polite"><h3 id="stitle"></h3><p id="sbody"></p></div>
+      <div class="row"><button class="btn" id="prev">上一步</button><button class="btn primary" id="next">下一步</button><button class="btn" id="reset">重置</button></div>
+      <div class="chips" id="chips"></div>
+    </div>
+  </div>
+  <span class="tag">HASHRING-RS</span><span class="pg"></span>
+  <aside class="notes"><b>≈60 s（重点）</b>　（用 → 逐步播放）这是整个设计最重要的性质。每段区间存 3 份：从区间末端顺时针收集 3 个不同的物理节点，× 表示跳过重复的节点。现在让 A 离开：A 的位置被删除，相邻区间合并，环选出的新 owner 恰好是原来的第一个 follower，它早就有这份数据。所以接管不需要选举，关键路径上也不需要搬数据；只有列表末尾新补的那个副本在后台补数据。故障场景同理，只是要先等旧 owner 的租约过期，确认它不可能再服务，才发布新拓扑。</aside>
+</section>
+
+<!-- 扩容 vs 缩容 -->
+<section class="slide">
+  <p class="eyebrow">04 · 在线扩缩容</p>
+  <h2>扩容要搬数据，缩容只改归属</h2>
+  <div class="body">
+  <p class="sub">扩容：受影响的区间按“先日志、后快照”迁移到新节点，源节点全程继续服务。</p>
+  <div class="flow">
+    <div class="card"><span class="k">① 开启变更日志</span><b>先于快照</b><span>之后的写入与删除都记入日志，迁移期间不漏写。</span></div>
+    <div class="card"><span class="k">② 复制快照</span><b>源节点照常读写</b><span>新节点导入区间内的全部记录。</span></div>
+    <div class="card"><span class="k">③ 回放追赶</span><b>按序重放日志</b><span>追上快照之后的所有变化。</span></div>
+    <div class="card"><span class="k">④ 校验并切换</span><b>短暂停写，读不停</b><span>比较两端记录数与内容摘要，一致后发布新拓扑。</span></div>
+  </div>
+  <div class="cmp">
+    <div>
+      <div class="bar"><span>扩容</span><div class="track"><div class="fill" style="background:var(--nB)" data-w="100"></div></div><b>7.958 s</b></div>
+      <div class="bar"><span>缩容</span><div class="track"><div class="fill" style="background:var(--accent)" data-w="7.48"></div></div><b>0.595 s</b></div>
+      <p class="muted small" style="margin:6px 0 0">9 → 10 → 9 个节点，2 万键，迁移中的键被并发改写和删除；连续 20 次的中位数。</p>
+    </div>
+    <div class="why"><b>缩容快一个数量级：</b>离开节点的区间并入原第一个 follower，数据早已在它手里；只需短暂停写、追平复制、发布新拓扑。<br><b>20 / 20</b> 次全部通过逐键校验。</div>
+  </div>
+  </div>
+  <span class="tag">HASHRING-RS</span><span class="pg"></span>
+  <aside class="notes"><b>≈45 s</b>　扩容必须复制数据。关键在顺序：先开日志再导快照，否则快照期间的写入会漏掉。最后切换时只对迁移中的区间短暂停写，读不受影响，两端校验一致才发布。缩容就是上一页的性质，数据已在继承者手里，所以中位数 0.6 秒，扩容是 8 秒。20 次连续运行，迁移期间并发改写和删除，全部逐键校验通过。</aside>
+</section>
+
+<!-- 进展 -->
+<section class="slide">
+  <p class="eyebrow">05 · 进展</p>
+  <h2>主体功能已实现，并完成初步验证</h2>
+  <div class="body">
+  <div class="done"><span>一致性哈希路由</span><span>客户端直连</span><span>在线扩容 / 缩容</span><span>多副本复制</span><span>故障检测与接管</span><span>后台副本修复</span><span>多进程实验运行器</span></div>
+  <div class="stats">
+    <div class="card stat"><b>109</b><span>个测试全部通过：81 个单元测试 + 28 个真实多进程集成测试，含迁移中断与故障注入</span></div>
+    <div class="card stat"><b>20 / 20</b><span>次扩缩容（9 → 10 → 9 节点）在并发改写、删除下逐键校验全部正确</span></div>
+    <div class="card stat"><b>1.6 万/s</b><span>10 个节点、100 万键的写入吞吐（单机多进程）</span></div>
+  </div>
+  <div class="card tl">
+    <div class="tlhead"><b>故障转移实测：杀死 owner 之后发生了什么</b><span>3 个节点 · 5 次运行中位数 · 写入等第一个 follower 确认</span></div>
+    <div class="track">
+      <div class="tseg wait" style="left:0;width:50%">等待旧 owner 的 5 秒租约过期<small>此时它即使还活着也会自行停服，不会出现两个 owner</small></div>
+      <div class="tseg rf" style="left:80.6%;width:11.7%">补齐 3 副本</div>
+      <div class="mk" style="left:0"><i></i><span class="up">0 s<br><b>杀死 owner</b></span></div>
+      <div class="mk" style="left:51.6%"><i></i><span class="up">5.16 s<br><b>发布新拓扑</b></span></div>
+      <div class="mk ok" style="left:52.2%"><i></i><span class="down">5.22 s<br><b>读取恢复</b></span></div>
+      <div class="mk" style="left:92.2%"><i></i><span class="down">8.1–9.2 s<br><b>替换节点完成修复</b></span></div>
+    </div>
+    <p class="tlfoot">已确认的写入：<b>128 个抽样键 0 丢失</b>（含故障前最后一次确认的写入）。读恢复时间几乎全部来自租约等待。</p>
+  </div>
+  </div>
+  <span class="tag">HASHRING-RS</span><span class="pg"></span>
+  <aside class="notes"><b>≈45 s</b>　前面讲的机制都已实现：109 个测试全部通过，扩缩容 20 次逐键校验全部正确，百万键下写入每秒 1.6 万次以上。下面是故障转移的实测时间线：杀死 owner 后，协调器先等旧租约过期，大约 5 秒，这是为了保证不会有两个 owner；然后发布新拓扑，继承者立刻恢复读取；替换节点在 8 到 9 秒补齐副本。写入等第一个 follower 确认时，已确认的写入一个都没丢。</aside>
+</section>
+
+<!-- 局限与下一步 -->
+<section class="slide">
+  <p class="eyebrow">06 · 局限与下一步</p>
+  <h2>局限与下一步</h2>
+  <div class="body">
+  <div class="grid2 lists">
+    <div class="card lim">
+      <h3>局限</h3>
+      <ul>
+        <li>故障实验中杀死 owner 时没有持续读写负载</li>
+        <li>在线迁移只在 2 万键规模上做了重复验证</li>
+        <li>尚未测量负载下的 p95 / p99 延迟</li>
+        <li>协调器是单实例，本身没有高可用</li>
+        <li>所有实验在一台机器上运行，节点之间走本机回环网络</li>
+      </ul>
+    </div>
+    <div class="card nxt">
+      <h3>下一步</h3>
+      <ul>
+        <li>在持续读写中注入 owner / follower 故障</li>
+        <li>10 万至 100 万键规模的在线迁移</li>
+        <li>测量不同并发度、值大小下的吞吐与尾延迟</li>
+        <li>端到端验证重试去重与并发读写的正确性</li>
+        <li>故障后保留未受影响副本的准入，减少修复量</li>
+      </ul>
+    </div>
+  </div>
+  </div>
+  <span class="tag">HASHRING-RS</span><span class="pg"></span>
+  <aside class="notes"><b>≈30 s</b>　局限主要是：单机实验、故障时没加负载、迁移规模小、没测尾延迟、协调器单实例。下一步逐条补上，并优化故障后的副本修复。</aside>
+</section>
+
+<!-- 小组分工 -->
+<section class="slide">
+  <p class="eyebrow">第六组</p>
+  <h2>小组分工</h2>
+  <div class="body">
+  <div class="team">
+    <div class="card"><em>组长</em><b>何子谦</b>
+      <ul><li>项目统筹</li><li>整体架构与高可用（HA）机制设计</li><li>核心代码实现</li><li>文档及报告材料审校与完善</li></ul></div>
+    <div class="card"><em>组员</em><b>陈明远</b>
+      <ul><li>HA 机制设计</li><li>核心代码实现</li><li>性能测试与优化</li><li>文档撰写</li></ul></div>
+    <div class="card"><em>组员</em><b>陈阳</b>
+      <ul><li>性能测试与优化</li><li>可视化界面开发</li><li>文档撰写</li><li>PPT 制作</li></ul></div>
+  </div>
+  </div>
+  <span class="tag">HASHRING-RS</span><span class="pg"></span>
+  <aside class="notes"><b>≈10 s</b>　这是我们的分工。</aside>
+</section>
+
+<!-- 结束 -->
+<section class="slide end">
+  <h1>谢谢，欢迎建议</h1>
+  <p>HASHRING-RS · 第六组</p>
+  <span class="pg"></span>
+  <aside class="notes">谢谢大家。</aside>
+</section>
+
+</div>
+<div id="bar"></div>
+<div id="hint">← → 翻页 / 逐步播放 · N 讲稿 · F 全屏</div>
+<div id="notes"></div>
+
+<script>
+const color = n => `var(--n${n})`;
+const ringPt = (c, r, deg) => { const a = deg * Math.PI / 180; return [c + r * Math.sin(a), c - r * Math.cos(a)]; };
+function ringBand(c, a0, len, r1, r2){
+  const a1 = a0 + len, lg = len > 180 ? 1 : 0;
+  const [x1,y1] = ringPt(c,r2,a0), [x2,y2] = ringPt(c,r2,a1), [x3,y3] = ringPt(c,r1,a1), [x4,y4] = ringPt(c,r1,a0);
+  return `M${x1} ${y1}A${r2} ${r2} 0 ${lg} 1 ${x2} ${y2}L${x3} ${y3}A${r1} ${r1} 0 ${lg} 0 ${x4} ${y4}Z`;
+}
+function ringArc(c, a0, len, r){ const lg = len > 180 ? 1 : 0, [x1,y1] = ringPt(c,r,a0), [x2,y2] = ringPt(c,r,a0+len); return `M${x1} ${y1}A${r} ${r} 0 ${lg} 1 ${x2} ${y2}`; }
+function h32(s){ let h = 2166136261 >>> 0; for (const ch of s){ h ^= ch.charCodeAt(0); h = Math.imul(h, 16777619) >>> 0; }
+  h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b) >>> 0; h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35) >>> 0; h ^= h >>> 16; return h >>> 0; }
+// owner of position p among [pos, name] tokens: first token clockwise at or after p
+function ownerAt(p, toks){ const s = [...toks].sort((a,b) => a[0] - b[0]); return (s.find(t => t[0] >= p) || s[0]); }
+
+/* ---------- slide: consistent hashing mechanism ---------- */
+(() => {
+  const $ = id => document.getElementById(id), C = 230, R = 168;
+  const BASE = [[40,'A'],[160,'B'],[250,'C']], JOIN = [330,'D'];
+  // keys: one per 12° slot (skipping slots that hold a node), jitter and mod-N bucket from the same hash
+  const KEYS = [...Array(30).keys()].filter(i => ![3,13,20,27].includes(i)).map(i => {
+    const h = h32(`key-${i}-9`); return { h, p: i * 12 + 2 + (h >>> 20) % 9 };
+  });
+  const HI = KEYS.reduce((a,k) => Math.abs(k.p - 340) < Math.abs(a.p - 340) ? k : a);  // walks across 0 to reach A
+  const MODC = ['A','B','C','D'];
+  const STEPS = [
+    ['① 把哈希值排成一个环', '哈希函数把任意键映射成 0 到 2⁶⁴−1 之间的一个整数。把这个范围首尾相接，就得到一个环，每个键落在环上一个固定的位置。'],
+    ['② 节点也放到同一个环上', '对节点 ID 做同样的哈希，节点也落在环上。键和节点用的是同一个环。'],
+    ['③ 顺时针遇到的第一个节点就是 owner', '键从自己的位置出发顺时针走，遇到的第一个节点负责它。因此每个节点负责“上一个节点到自己”之间的一段。只要知道节点的位置，任何客户端都能算出同一个答案。'],
+    ['④ 加入节点 D：只有一段换主人', 'D 落在 C 和 A 之间，只接管原来属于 A 的一段（黑框的键），其余键的 owner 完全不变。而取模分片中，N 从 3 变成 4，大约 3/4 的键都要换节点。'],
+  ];
+  let k = 0;
+  const ringMoved = KEYS.filter(x => ownerAt(x.p, BASE)[1] !== ownerAt(x.p, [...BASE, JOIN])[1]);
+  const modMoved = KEYS.filter(x => x.h % 3 !== x.h % 4);
+  const pct = (a, b) => Math.round(a / b * 100) + '%';
+
+  function render(){
+    const nodes = k >= 3 ? [...BASE, JOIN] : BASE;
+    let g = `<defs><marker id="chArr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="var(--ink)"/></marker></defs>`;
+    g += `<circle cx="${C}" cy="${C}" r="${R}" fill="none" stroke="var(--rule)" stroke-width="12"/>`;
+    if (k >= 2){
+      const s = [...nodes].sort((a,b) => a[0] - b[0]);
+      s.forEach((t,i) => { const prev = s[(i - 1 + s.length) % s.length][0], len = (t[0] - prev + 360) % 360;
+        const fresh = k >= 3 && t[1] === 'D';
+        g += `<path class="${fresh ? 'flash' : ''}" d="${ringBand(C, prev, len, R - 36, R - 22)}" fill="${color(t[1])}" opacity=".55"/>`; });
+    }
+    if (k === 0){
+      const [tx,ty] = ringPt(C, R + 14, 0);
+      g += `<line x1="${tx}" y1="${ty - 8}" x2="${tx}" y2="${ty + 22}" stroke="var(--ink)" stroke-width="2"/>`;
+      g += `<text class="ringlabel" x="${tx + 8}" y="${ty - 4}">0</text><text class="ringlabel" x="${tx - 8}" y="${ty - 4}" text-anchor="end">2⁶⁴−1</text>`;
+      g += `<path d="${ringArc(C, 12, 50, R + 30)}" fill="none" stroke="var(--ink)" stroke-width="1.6" marker-end="url(#chArr)"/>`;
+      const [lx,ly] = ringPt(C, R + 48, 40); g += `<text class="ringlabel" x="${lx}" y="${ly}">顺时针</text>`;
+    }
+    KEYS.forEach(x => {
+      const [cx,cy] = ringPt(C, R, x.p);
+      const mv = k >= 3 && ringMoved.includes(x), own = k >= 3 ? ownerAt(x.p, nodes)[1] : ownerAt(x.p, BASE)[1];
+      const fill = k >= 2 ? color(own) : '#b3ada3';
+      const big = mv || (k === 2 && x === HI);
+      g += `<circle cx="${cx}" cy="${cy}" r="${big ? 7.5 : 5.5}" fill="${fill}" stroke="${mv ? 'var(--ink)' : 'var(--paper)'}" stroke-width="${mv ? 2.5 : 1.5}" ${k >= 3 && !mv ? 'opacity=".45"' : ''}/>`;
+    });
+    if (k === 2){
+      const a = BASE.find(t => t[1] === 'A')[0], span = (a - HI.p + 360) % 360;
+      g += `<path d="${ringArc(C, HI.p + 4, span - 13, R + 24)}" fill="none" stroke="var(--ink)" stroke-width="2" stroke-dasharray="4 4" marker-end="url(#chArr)"/>`;
+      const [lx,ly] = ringPt(C, R + 26, HI.p - 3);
+      g += `<text x="${lx}" y="${ly}" text-anchor="end" style="font:700 15px var(--mono);fill:var(--ink)">user:42</text>`;
+    }
+    if (k >= 1) nodes.forEach(t => {
+      const [cx,cy] = ringPt(C, R, t[0]), pop = k >= 3 && t[1] === 'D';
+      g += `<g class="${pop ? 'pop' : ''}"><circle cx="${cx}" cy="${cy}" r="18" fill="${color(t[1])}" stroke="var(--paper)" stroke-width="3"/><text class="nodelabel" x="${cx}" y="${cy + 6}" text-anchor="middle">${t[1]}</text></g>`;
+    });
+    const cnt = n => KEYS.filter(x => ownerAt(x.p, BASE)[1] === n).length;
+    const center = [
+      ['哈希空间', '0 … 2<tspan dy="-10" font-size="15">64</tspan><tspan dy="10"> − 1</tspan>', `${KEYS.length} 个键`],
+      ['节点', 'A · B · C', '与键在同一个环上'],
+      ['各节点负责的键数', `A ${cnt('A')} · B ${cnt('B')} · C ${cnt('C')}`, ''],
+      ['加入 D 后需要迁移', `${ringMoved.length} / ${KEYS.length}`, '全部来自 A'],
+    ][k];
+    g += `<text class="center-t" x="${C}" y="${C - 34}" text-anchor="middle">${center[0]}</text>`;
+    g += `<text class="${k === 3 ? 'center-big' : 'center-b'}" x="${C}" y="${C + (k === 3 ? 12 : 4)}" text-anchor="middle">${center[1]}</text>`;
+    g += `<text class="center-s" x="${C}" y="${C + 40}" text-anchor="middle">${center[2]}</text>`;
+    $('chRing').innerHTML = g;
+
+    $('chDots').innerHTML = STEPS.map((_,i) => `<i class="${i <= k ? 'on' : ''}"></i>`).join('');
+    $('chTitle').textContent = STEPS[k][0]; $('chBody').textContent = STEPS[k][1];
+    $('chPrev').disabled = k === 0; $('chNext').disabled = k === STEPS.length - 1;
+
+    const N = k >= 3 ? 4 : 3;
+    $('chMod').classList.toggle('off', k < 2);
+    $('chModT').textContent = k >= 3 ? `对比：取模分片 hash(key) mod N，N 从 3 变为 4（黑框 = 换了节点）` : `对比：取模分片，节点 = hash(key) mod 3`;
+    $('chChips').innerHTML = KEYS.map(x => {
+      const mv = k >= 3 && modMoved.includes(x);
+      return `<i class="${k >= 3 ? (mv ? 'mv' : 'stay') : ''}" style="background:${color(MODC[x.h % N])}"></i>`;
+    }).join('');
+    $('chVsMod').textContent = k >= 3 ? `${modMoved.length} / ${KEYS.length}（${pct(modMoved.length, KEYS.length)}）` : '—';
+    $('chVsRing').textContent = k >= 3 ? `${ringMoved.length} / ${KEYS.length}（${pct(ringMoved.length, KEYS.length)}）` : '—';
+  }
+  $('chNext').onclick = () => { k++; render(); };
+  $('chPrev').onclick = () => { k--; render(); };
+  $('ch1').step = {
+    next(){ if (k < STEPS.length - 1){ k++; render(); return true; } return false; },
+    prev(){ if (k > 0){ k--; render(); return true; } return false; },
+    reset(end){ k = end ? STEPS.length - 1 : 0; render(); },
+  };
+  render();
+})();
+
+/* ---------- slide: virtual nodes ---------- */
+(() => {
+  const $ = id => document.getElementById(id), C = 230, R = 160, W = 30;
+  const NODES = ['A','B','C','D','E'];
+  const toks = (t, drop) => NODES.filter(n => n !== drop).flatMap(n => [...Array(t).keys()].map(i => [h32(`${n}#${i}#10`) / 4294967296 * 360, n])).sort((a,b) => a[0] - b[0]);
+  const ranges = ts => ts.map((x,i) => { const prev = ts[(i - 1 + ts.length) % ts.length][0]; return { start: prev, len: (x[0] - prev + 360) % 360, end: x[0], node: x[1] }; });
+  const shares = rs => Object.fromEntries(NODES.map(n => [n, rs.filter(r => r.node === n).reduce((s,r) => s + r.len, 0) / 3.6]));
+  const STATES = [[1,false],[1,true],[32,false],[32,true]];
+  let st = 0;
+
+  function render(){
+    const [t, rm] = STATES[st];
+    const before = ranges(toks(t)), after = ranges(toks(t, 'B'));
+    const cur = rm ? after : before, sh = shares(cur);
+    let g = `<circle cx="${C}" cy="${C}" r="${R + W/2}" fill="none" stroke="var(--soft)" stroke-width="${W + 8}"/>`;
+    cur.forEach(r => { g += `<path d="${ringBand(C, r.start, r.len, R, R + W)}" fill="${color(r.node)}" stroke="var(--paper)" stroke-width="${t === 1 ? 1.5 : .6}"/>`; });
+    let heirs = new Set();
+    if (rm) before.filter(r => r.node === 'B').forEach(r => {
+      const heir = ownerAt(r.end, toks(t, 'B'))[1]; heirs.add(heir);
+      g += `<path class="flash" d="${ringBand(C, r.start, r.len, R + W + 5, R + W + 15)}" fill="${color(heir)}"/>`;
+      g += `<path d="${ringBand(C, r.start, r.len, R + W + 5, R + W + 15)}" fill="none" stroke="var(--ink)" stroke-width=".8"/>`;
+    });
+    toks(t, rm ? 'B' : null).forEach(([p,n]) => {
+      const [x,y] = ringPt(C, R + W/2, p);
+      g += t === 1 ? `<circle cx="${x}" cy="${y}" r="13" fill="${color(n)}" stroke="var(--paper)" stroke-width="3"/><text class="nodelabel" style="font-size:13px" x="${x}" y="${y + 5}" text-anchor="middle">${n}</text>`
+                   : '';
+    });
+    const live = NODES.filter(n => !(rm && n === 'B')), vals = live.map(n => sh[n]);
+    if (rm){
+      g += `<text class="center-t" x="${C}" y="${C - 22}" text-anchor="middle">B 的区间并入了</text><text class="center-big" x="${C}" y="${C + 22}" text-anchor="middle">${heirs.size} 个节点</text>`;
+      g += `<text class="center-s" x="${C}" y="${C + 50}" text-anchor="middle">外圈 = B 原来的区间及其新主人</text>`;
+    } else {
+      g += `<text class="center-t" x="${C}" y="${C - 22}" text-anchor="middle">负责比例 最多 / 最少</text><text class="center-big" x="${C}" y="${C + 22}" text-anchor="middle">${Math.round(Math.max(...vals))}% / ${Math.round(Math.min(...vals))}%</text>`;
+      g += `<text class="center-s" x="${C}" y="${C + 50}" text-anchor="middle">理想值 ${Math.round(100 / live.length)}%</text>`;
+    }
+    $('vnRing').innerHTML = g;
+
+    const ideal = 100 / live.length, scale = v => Math.min(v / 50 * 100, 100);
+    $('vnBars').innerHTML = NODES.map(n => {
+      const gone = rm && n === 'B';
+      return `<div class="sh ${gone ? 'gone' : ''}"><span class="n" style="background:${color(n)};margin:0">${n}</span><div class="track"><div class="fill" style="width:${gone ? 0 : scale(sh[n])}%;background:${color(n)}"></div><div class="ideal" style="left:${scale(ideal)}%"></div></div><b>${gone ? '已移除' : sh[n].toFixed(0) + '%'}</b></div>`;
+    }).join('');
+    const TEXT = [
+      ['每个节点只有 1 个位置', `区间长短完全取决于哈希落点：最多的节点负责 ${Math.round(Math.max(...vals))}%，最少的只有 ${Math.round(Math.min(...vals))}%。`],
+      ['移除 B：负载全压给一个邻居', `B 的整段区间全部并入顺时针方向的下一个节点。`],
+      ['每个节点放 32 个位置', `长短区间相互抵消，各节点都接近平均值 ${Math.round(ideal)}%。`],
+      ['移除 B：负载被分摊', `B 的 32 段区间分别并入 ${heirs.size} 个不同的节点，其余节点各分担一部分。`],
+    ][st];
+    $('vnTitle').textContent = TEXT[0]; $('vnBody').textContent = TEXT[1];
+    $('vnT').querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', +b.dataset.v === t));
+    $('vnRm').setAttribute('aria-pressed', rm); $('vnRm').textContent = rm ? '恢复节点 B' : '移除节点 B';
+  }
+  $('vnT').addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return; st = (+b.dataset.v === 32 ? 2 : 0) + (STATES[st][1] ? 1 : 0); render(); });
+  $('vnRm').onclick = () => { st ^= 1; render(); };
+  $('ch2').step = {
+    next(){ if (st < 3){ st++; render(); return true; } return false; },
+    prev(){ if (st > 0){ st--; render(); return true; } return false; },
+    reset(end){ st = end ? 2 : 0; render(); },
+  };
+  render();
+})();
+
+/* ---------- slide: replica placement (adapted from docs/rfcs/0001-scale-in-failover.html) ---------- */
+(() => {
+const NODES = ['A','B','C','D','E'];
+const TOKENS = [[8,'A'],[30,'C'],[52,'B'],[71,'E'],[95,'D'],[118,'A'],[140,'B'],[163,'C'],
+  [190,'E'],[214,'A'],[236,'D'],[258,'B'],[283,'C'],[307,'E'],[332,'D']];
+const RF = 3;
+const S = {mode:'graceful', x:'A', step:0, sel:null, lastPublished:false};
+const STEPS = {
+  graceful: [
+    ['初始状态', '点击环上任意区间：编号 ①②③ 是从区间末端顺时针收集到的 3 个副本，× 表示跳过已经收集过的物理节点。注意 {X} 负责的区间里，第一个 follower 是谁。'],
+    ['暂停受影响写入，追平复制', '{X} 仍在线，读照常进行。协调器短暂暂停相关写入，等 {X} 发往 follower 的复制全部应用。'],
+    ['发布新拓扑：区间并入继承者', '{X} 的位置被删除，相邻区间合并。新 owner 正是原来的第一个 follower，它早已持有数据，立即服务，没有复制任何数据。'],
+    ['后台补齐副本', '副本列表去掉 {X}，其余节点前移一位，末尾补上一个新节点。只有它缺数据，在后台补齐。'],
+  ],
+  failure: [
+    ['初始状态', '注意 {X} 负责的区间里，第一个 follower 是谁：它就是 {X} 故障后的接管者。'],
+    ['{X} 突然失联', '{X} 负责的区间暂时无法读写，客户端在截止时间内重试。'],
+    ['确认故障', '协调器确认 A 故障后，停止服务。'],
+    ['发布新拓扑：继承者恢复读取', '继承者用已有数据立即恢复读取，不需要复制数据。'],
+    ['后台修复副本', '缺少的副本在后台补齐，区间恢复到 3 份。'],
+  ],
+};
+const PUBLISH = {graceful:2, failure:3};
+function buildRanges(tokens){
+  const t = [...tokens].sort((a,b)=>a[0]-b[0]); const n = t.length;
+  const distinct = new Set(t.map(z=>z[1])).size;
+  return t.map((tok,i)=>{
+    const start = t[(i-1+n)%n][0], end = tok[0];
+    const seen = [], walk = [];
+    for(let o=0;o<n && seen.length<Math.min(RF,distinct);o++){
+      const z = t[(i+o)%n]; const fresh = !seen.includes(z[1]);
+      if(fresh) seen.push(z[1]); walk.push({pos:z[0], node:z[1], counted:fresh});
+    }
+    return {start, end, len:((end-start+360)%360)||360, list:seen, walk};
+  });
+}
+const contains = (r,p) => { const d=(p-r.start+360)%360; return d>0 && d<=r.len; };
+const rangeAt = (rs,p) => rs.find(r=>contains(r,p));
+const C=230, R=150, W=24;
+const pt = (r,deg) => ringPt(C, r, deg);
+const esc = s => s.replace(/\{X\}/g, S.x);
+const $ = id => document.getElementById(id);
+const chip = (n,cls='') => `<span class="n ${cls}" style="background:${color(n)}">${n}</span>`;
+
+function render(){
+  const steps = STEPS[S.mode], pub = S.step >= PUBLISH[S.mode];
+  const before = buildRanges(TOKENS), after = buildRanges(TOKENS.filter(t=>t[1]!==S.x));
+  const cur = pub ? after : before;
+  const justPublished = pub && !S.lastPublished; S.lastPublished = pub;
+  if(S.sel===null || !rangeAt(cur,S.sel)) S.sel = before.find(r=>r.list[0]===S.x).end;
+  const selR = rangeAt(cur, S.sel);
+  const down = S.mode==='failure' && S.step>=1 && !pub;
+  const drain = S.mode==='graceful' && S.step===1;
+
+  let g = `<circle cx="${C}" cy="${C}" r="${R+W/2}" fill="none" stroke="var(--soft)" stroke-width="${W+8}"/>`;
+  cur.forEach(r=>{
+    const affectedOld = !pub && r.list[0]===S.x;
+    const merged = pub && before.some(b=>b.list[0]===S.x && contains(r,b.end));
+    const cls = ['arc', r===selR?'sel':'', affectedOld&&down?'down':'', affectedOld&&drain?'drain':'', merged&&justPublished?'flash':''].join(' ');
+    g += `<path class="${cls}" data-end="${r.end}" d="${ringBand(C,r.start,r.len,R,R+W)}" fill="${color(r.list[0])}"><title>(${r.start}, ${r.end}] · owner ${r.list[0]}</title></path>`;
+  });
+  if(selR && !(down && selR.list[0]===S.x)){
+    const last = selR.walk[selR.walk.length-1];
+    const span = ((last.pos - selR.end + 360)%360);
+    if(span>0) g += `<path class="walk" d="${ringArc(C, selR.end, span, R+W+18)}"/>`;
+    let k=0;
+    selR.walk.forEach(w=>{
+      const [x,y]=pt(R+W+18,w.pos);
+      if(w.counted){ k++; g += `<g class="badge"><circle cx="${x}" cy="${y}" r="10" fill="${color(w.node)}" stroke="var(--box)" stroke-width="2"/><text x="${x}" y="${y+4}" text-anchor="middle">${k}</text></g>`; }
+      else g += `<text class="skip" x="${x}" y="${y+4}" text-anchor="middle">×</text>`;
+    });
+  }
+  TOKENS.forEach(([p,n])=>{
+    const gone = pub && n===S.x, [x,y]=pt(R+W/2,p), [lx,ly]=pt(R-16,p);
+    const failed = down && n===S.x;
+    g += `<g class="tok ${gone?'gone':''}"><circle cx="${x}" cy="${y}" r="6" fill="${gone?'var(--box)':color(n)}" stroke="${failed?'var(--bad)':'var(--box)'}" stroke-width="${failed?3:2}"/>`+
+         `<text class="toklabel" x="${lx}" y="${ly+4}" text-anchor="middle">${n}${p}</text></g>`;
+  });
+  if(selR){
+    const unavailable = down && selR.list[0]===S.x;
+    g += `<text class="center-t" x="${C}" y="${C-30}" text-anchor="middle">选中区间</text>`+
+         `<text class="center-b" x="${C}" y="${C-2}" text-anchor="middle">(${selR.start}, ${selR.end}]</text>`+
+         `<text class="center-s" x="${C}" y="${C+24}" text-anchor="middle">${unavailable?'owner 失联，暂不可用':'副本：'+selR.list.join(' → ')}</text>`+
+         `<text class="center-s" x="${C}" y="${C+44}" text-anchor="middle">${unavailable?'':'① owner，②③ follower'}</text>`;
+  }
+  $('ring').innerHTML = g;
+  $('ring').querySelectorAll('.arc').forEach(el=>el.addEventListener('click',()=>{S.sel=+el.dataset.end;render();}));
+
+  $('dots').innerHTML = steps.map((_,i)=>`<i class="${i<=S.step?'on':''}"></i>`).join('');
+  $('stitle').textContent = `${S.step+1} / ${steps.length} · ${esc(steps[S.step][0])}`;
+  $('sbody').textContent = esc(steps[S.step][1]);
+  $('prev').disabled = S.step===0; $('next').disabled = S.step===steps.length-1;
+
+  const ex = before.find(r=>r.list[0]===S.x), nr = rangeAt(after, ex.end);
+  const oldC = ex.list.map(n=>chip(n, n===S.x?'x':'')).join('');
+  const newC = nr.list.map((n,i)=>chip(n, i===0?'own':(ex.list.includes(n)?'':'miss'))).join('');
+  $('chips').innerHTML = `<span class="muted" style="font-size:15px">区间 (${ex.start}, ${ex.end}] 的副本</span>${oldC}<span class="arrow">→</span>${newC}`+
+    `<span class="muted" style="font-size:15px">黑框 = 接管者（原第一个 follower），虚线 = 需后台补数据</span>`;
+}
+$('nodes').innerHTML = NODES.map(n=>`<button class="chipbtn" data-v="${n}" style="background:${color(n)}" aria-pressed="${n===S.x}" aria-label="节点 ${n}">${n}</button>`).join('');
+function seg(id, key){
+  $(id).addEventListener('click', e=>{
+    const b = e.target.closest('button'); if(!b) return;
+    S[key]=b.dataset.v; S.step=0; S.sel=null; S.lastPublished=false;
+    $(id).querySelectorAll('button').forEach(x=>x.setAttribute('aria-pressed', x===b));
+    render();
+  });
+}
+seg('mode','mode'); seg('nodes','x');
+$('next').onclick=()=>{S.step++;render();};
+$('prev').onclick=()=>{S.step--; if(S.step<PUBLISH[S.mode]) S.lastPublished=false; render();};
+$('reset').onclick=()=>{S.step=0;S.sel=null;S.lastPublished=false;render();};
+$('rep').step = {
+  next(){ if (S.step < STEPS[S.mode].length - 1){ S.step++; render(); return true; } return false; },
+  prev(){ if (S.step > 0){ S.step--; if(S.step<PUBLISH[S.mode]) S.lastPublished=false; render(); return true; } return false; },
+  reset(end){ S.step = end ? STEPS[S.mode].length - 1 : 0; S.lastPublished = false; render(); },
+};
+render();
+})();
+
+/* ---------- deck navigation ---------- */
+(() => {
+  const deck = document.getElementById('deck');
+  const slides = [...document.querySelectorAll('.slide')];
+  const bar = document.getElementById('bar'), notes = document.getElementById('notes'), hint = document.getElementById('hint');
+  slides.forEach((s, j) => { const pg = s.querySelector('.pg'); if (pg) pg.textContent = `${String(j + 1).padStart(2, '0')} / ${String(slides.length).padStart(2, '0')}`; });
+  let i = Math.min(Math.max((parseInt(location.hash.slice(1)) || 1) - 1, 0), slides.length - 1);
+  const fit = () => { const s = Math.min(innerWidth / 1280, innerHeight / 720); deck.style.transform = `translate(-50%,-50%) scale(${s})`; };
+  const show = (k, fromEnd) => {
+    i = Math.min(Math.max(k, 0), slides.length - 1);
+    slides.forEach((s, j) => s.classList.toggle('on', j === i));
+    bar.style.width = ((i + 1) / slides.length * 100) + '%';
+    const n = slides[i].querySelector('.notes'); notes.innerHTML = n ? n.innerHTML : '';
+    history.replaceState(null, '', '#' + (i + 1));
+    slides[i].step?.reset(fromEnd);
+    slides[i].querySelectorAll('.bar .fill').forEach(f => { f.style.width = 0; requestAnimationFrame(() => requestAnimationFrame(() => f.style.width = f.dataset.w + '%')); });
+  };
+  addEventListener('resize', fit); fit(); show(i);
+  setTimeout(() => hint.style.opacity = 0, 4000);
+  addEventListener('keydown', e => {
+    if (e.target.closest('button') && (e.key === ' ' || e.key === 'Enter')) return;
+    const st = slides[i].step;
+    if (['ArrowRight', 'PageDown', ' '].includes(e.key)){ e.preventDefault(); if (!(st && st.next())) show(i + 1); }
+    else if (['ArrowLeft', 'PageUp'].includes(e.key)){ e.preventDefault(); if (!(st && st.prev())) show(i - 1, true); }
+    else if (e.key === 'Home') show(0);
+    else if (e.key === 'End') show(slides.length - 1);
+    else if (e.key === 'n' || e.key === 'N') notes.style.display = notes.style.display === 'block' ? 'none' : 'block';
+    else if (e.key === 'f' || e.key === 'F'){ document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen?.(); }
+  });
+  addEventListener('beforeprint', () => {
+    slides.forEach(s => s.step?.reset(true));
+    document.querySelectorAll('.bar .fill').forEach(f => f.style.width = f.dataset.w + '%');
+  });
+})();
+</script>
+</body>
+</html>
