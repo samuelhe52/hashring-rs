@@ -5,6 +5,11 @@
 [implementation-and-verification.md](implementation-and-verification.md) contain
 supporting material.
 
+[preliminary-slides.html](preliminary-slides.html) is the self-contained
+defense deck (Chinese, about 6–7 minutes). Open it in a browser: arrow keys
+change slides, `N` shows speaker notes, `F` toggles fullscreen, and printing
+to PDF produces one 16:9 page per slide.
+
 ## Build the PDF
 
 From this directory:
