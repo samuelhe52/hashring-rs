@@ -3,7 +3,9 @@
 Removing the extra `NodeState` read-lock acquisition from Put and Delete produced
 about 5% higher median PUT throughput on this host, but the paired runs were too
 variable to establish a repeatable improvement. The candidate remains a benchmark
-patch; production source was restored after building it.
+patch; production source was restored after building it. The change is below
+what this benchmark can resolve, so any case for merging it rests on code
+clarity, not throughput.
 
 ## Comparison
 
@@ -38,7 +40,26 @@ The geometric mean of paired ratios was +15.0% and +6.3%, respectively.
 Exploratory paired-bootstrap 95% intervals (20,000 resamples, seed 5, on log
 ratios) were [-3.4%, +45.1%] and [-3.4%, +17.5%]. Both include no improvement.
 Six pairs on one shared host are limited evidence; these intervals do not remove
-systematic environmental effects.
+systematic environmental effects. The candidate was faster in three of six pairs
+at each concurrency, so a sign test gives no evidence either way.
+
+At concurrency 64, run order explains more than the variant does. The first run
+of each pair averaged 25,625 PUT/s and the second 29,808 PUT/s. Both large
+candidate gains (+29.57% and +95.32%) came from pairs where the baseline ran
+first; where the candidate ran first the changes were -7.87%, -5.61% and +4.90%.
+The +15.0% geometric mean at 64 is therefore an order and outlier effect, not a
+candidate effect. Concurrency 256 shows no order effect (42,686 versus 42,622
+PUT/s).
+
+The run is also far too small for the effect in question. The standard deviation
+of paired log ratios was 0.287 at 64 and 0.137 at 256; detecting a true 5% change
+with 80% power at a 5% two-sided level would take roughly 270 and 60 pairs. The
+expected effect is much smaller than 5%: the patch removes one uncontended Tokio
+`RwLock` read acquisition per Put or Delete, an estimated sub-microsecond cost
+against requests of about 140 microseconds. The earlier routing-token and
+fingerprint change in [write-path-saturation.md](write-path-saturation.md),
+which removed more work from the same path, moved mean owner hold by only
+0.27 microseconds.
 
 Median sequential direct-owner p50 latency was unchanged at concurrency 64
 (138.5 microseconds for both) and fell from 138 to 134 microseconds at 256.
