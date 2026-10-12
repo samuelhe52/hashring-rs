@@ -26,7 +26,7 @@ struct Cli {
     /// in a local experiment means 24 workers in each of the driver,
     /// coordinator and data nodes running on the same host.
     #[arg(long, global = true)]
-    worker_threads: Option<usize>,
+    worker_threads: Option<NonZeroUsize>,
 }
 
 #[derive(Subcommand)]
@@ -263,6 +263,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let worker_threads = cli
         .worker_threads
+        .map(NonZeroUsize::get)
         .unwrap_or_else(|| default_worker_threads(&cli));
     // Built explicitly rather than via #[tokio::main] so the worker count can be
     // set and inspected. A standalone node keeps tokio's one-worker-per-CPU
@@ -281,7 +282,13 @@ fn main() -> Result<()> {
 /// processes, letting each take 24 workers (275 threads total) cost initial-put
 /// throughput against a shared budget of 4.
 fn default_worker_threads(cli: &Cli) -> usize {
-    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    default_worker_threads_for_cpus(
+        cli,
+        std::thread::available_parallelism().map_or(1, |n| n.get()),
+    )
+}
+
+fn default_worker_threads_for_cpus(cli: &Cli, cpus: usize) -> usize {
     let Command::Experiment(args) = &cli.command else {
         return cpus;
     };
@@ -292,7 +299,7 @@ fn default_worker_threads(cli: &Cli) -> usize {
     });
     // Driver, coordinator, and every data node share the host.
     let processes = peak_nodes + 2;
-    (cpus / processes).clamp(2, cpus)
+    (cpus / processes).clamp(2.min(cpus), cpus)
 }
 
 async fn run(cli: Cli, worker_threads: usize) -> Result<()> {
@@ -710,5 +717,34 @@ fn bytes_arg(text: Option<String>, encoded: Option<String>, name: &str) -> Resul
 async fn shutdown_signal() {
     if let Err(error) = tokio::signal::ctrl_c().await {
         tracing::error!(%error, "failed to install shutdown signal handler");
+    }
+}
+
+#[cfg(test)]
+mod worker_thread_tests {
+    use super::*;
+
+    #[test]
+    fn worker_defaults_support_one_cpu_and_shared_hosts() {
+        let cli = Cli::try_parse_from([
+            "hashring-rs",
+            "experiment",
+            "--output",
+            "unused-test-output",
+        ])
+        .unwrap();
+        assert_eq!(default_worker_threads_for_cpus(&cli, 1), 1);
+        assert_eq!(default_worker_threads_for_cpus(&cli, 24), 2);
+        let cli = Cli::try_parse_from(["hashring-rs", "topology"]).unwrap();
+        assert_eq!(default_worker_threads_for_cpus(&cli, 1), 1);
+        assert_eq!(default_worker_threads_for_cpus(&cli, 24), 24);
+    }
+
+    #[test]
+    fn worker_threads_must_be_positive() {
+        assert!(Cli::try_parse_from(["hashring-rs", "--worker-threads", "0", "topology"]).is_err());
+        let cli =
+            Cli::try_parse_from(["hashring-rs", "--worker-threads", "1", "topology"]).unwrap();
+        assert_eq!(cli.worker_threads.unwrap().get(), 1);
     }
 }
