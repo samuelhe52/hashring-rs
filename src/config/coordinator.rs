@@ -1,17 +1,8 @@
 //! YAML settings for the `coordinator` command.
-//!
-//! Every key is optional and named after the coordinator flag it mirrors. A flag
-//! given on the command line wins over the file, and the file wins over the
-//! built-in default.
 
-use std::{
-    fs,
-    net::SocketAddr,
-    num::NonZeroUsize,
-    path::{Path, PathBuf},
-};
+use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use hashring_coordinator::DEFAULT_RANGE_MOVE_CONCURRENCY;
 use hashring_core::topology::{
     DEFAULT_DESIRED_REPLICATION_FACTOR, DEFAULT_MAX_REPLICA_LAG_MILLIS,
@@ -19,6 +10,7 @@ use hashring_core::topology::{
 };
 use serde::Deserialize;
 
+use super::LoadedFile;
 use crate::{CoordinatorArgs, parse_member};
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:50050";
@@ -52,25 +44,6 @@ pub struct FileMember {
     pub endpoint: String,
 }
 
-#[derive(Debug)]
-pub struct LoadedFile {
-    pub path: PathBuf,
-    pub body: CoordinatorFile,
-}
-
-impl CoordinatorFile {
-    pub fn load(path: &Path) -> Result<LoadedFile> {
-        let text =
-            fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let body =
-            serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        Ok(LoadedFile {
-            path: path.to_owned(),
-            body,
-        })
-    }
-}
-
 /// Where the bootstrap membership came from. File members are skipped for an
 /// existing store; explicit `--member` flags keep the strict match check.
 #[derive(Debug, PartialEq, Eq)]
@@ -96,16 +69,18 @@ pub struct CoordinatorSettings {
     pub member_source: MemberSource,
 }
 
-pub fn resolve(args: &CoordinatorArgs, file: Option<LoadedFile>) -> Result<CoordinatorSettings> {
+pub fn resolve(
+    args: &CoordinatorArgs,
+    file: Option<LoadedFile<CoordinatorFile>>,
+) -> Result<CoordinatorSettings> {
+    let file_dir = file
+        .as_ref()
+        .map(|loaded| loaded.dir().to_owned())
+        .unwrap_or_default();
     let (path, file) = match file {
         Some(loaded) => (Some(loaded.path), loaded.body),
         None => (None, CoordinatorFile::default()),
     };
-    let file_dir = path
-        .as_deref()
-        .and_then(Path::parent)
-        .map(Path::to_owned)
-        .unwrap_or_default();
 
     let (members, member_source) = if !args.members.is_empty() {
         let members = args
@@ -177,10 +152,12 @@ pub fn resolve(args: &CoordinatorArgs, file: Option<LoadedFile>) -> Result<Coord
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::Path};
+
     use clap::Parser;
 
     use super::*;
-    use crate::{Cli, Command};
+    use crate::{Cli, Command, config::load};
 
     fn coordinator_args(extra: &[&str]) -> CoordinatorArgs {
         let mut argv = vec!["hashring-rs", "coordinator"];
@@ -206,7 +183,7 @@ mod tests {
              members:\n  - { node_id: node-1, endpoint: http://127.0.0.1:50051 }\n",
         );
         let args = coordinator_args(&["--seed", "7"]);
-        let settings = resolve(&args, Some(CoordinatorFile::load(&path).unwrap())).unwrap();
+        let settings = resolve(&args, Some(load::<CoordinatorFile>(&path).unwrap())).unwrap();
         assert_eq!(settings.listen, "0.0.0.0:6000".parse().unwrap());
         assert_eq!(settings.seed, 7);
         assert_eq!(settings.virtual_nodes, 64);
@@ -227,7 +204,7 @@ mod tests {
             "members:\n  - { node_id: a, endpoint: http://a }\n  - { node_id: b, endpoint: http://b }\n",
         );
         let args = coordinator_args(&["--member", "c=http://c", "--state", "x.redb"]);
-        let settings = resolve(&args, Some(CoordinatorFile::load(&path).unwrap())).unwrap();
+        let settings = resolve(&args, Some(load::<CoordinatorFile>(&path).unwrap())).unwrap();
         assert_eq!(settings.member_source, MemberSource::Flags);
         assert_eq!(settings.members.len(), 1);
         assert_eq!(settings.members[0].node_id, "c");
@@ -250,7 +227,7 @@ mod tests {
     fn unknown_keys_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let top_level = write(dir.path(), "replication_factor: 3\n");
-        let error = format!("{:#}", CoordinatorFile::load(&top_level).unwrap_err());
+        let error = format!("{:#}", load::<CoordinatorFile>(&top_level).unwrap_err());
         assert!(
             error.contains("unknown field `replication_factor`"),
             "{error}"
@@ -260,7 +237,7 @@ mod tests {
             dir.path(),
             "members:\n  - { node_id: a, endpoint: http://a, port: 1 }\n",
         );
-        let error = format!("{:#}", CoordinatorFile::load(&in_member).unwrap_err());
+        let error = format!("{:#}", load::<CoordinatorFile>(&in_member).unwrap_err());
         assert!(error.contains("unknown field `port`"), "{error}");
     }
 }

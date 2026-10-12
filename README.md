@@ -240,6 +240,15 @@ target/release/hashring-rs experiment --mode availability --policy first-success
   --output results/availability
 ```
 
+Experiment settings can also come from a YAML file whose keys are the flag
+names with `_` for `-` (see [`examples/experiment.yaml`](examples/experiment.yaml)).
+Flags on the command line win over the file:
+
+```sh
+target/release/hashring-rs experiment --config examples/experiment.yaml \
+  --output results/availability
+```
+
 The output directory holds a manifest of the configuration and build, an
 event log, per-process logs, the coordinator database, and a JSON summary. See
 [docs/experiments.md](docs/experiments.md) for defaults, summary fields,

@@ -2,11 +2,10 @@ use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf, sync::Arc, time::Du
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use config::{CoordinatorFile, CoordinatorSettings, MemberSource};
+use config::coordinator::{CoordinatorFile, CoordinatorSettings, MemberSource};
 use hashring_client::HashringClient;
 use hashring_coordinator::{
-    CoordinatorRepository, CoordinatorService, DEFAULT_RANGE_MOVE_CONCURRENCY,
-    RedbTopologyRepository, load_or_initialize,
+    CoordinatorRepository, CoordinatorService, RedbTopologyRepository, load_or_initialize,
 };
 use hashring_core::{
     limits::MAX_CONTROL_MESSAGE_BYTES,
@@ -15,6 +14,7 @@ use hashring_core::{
 };
 use hashring_experiment::{ExperimentConfig, ExperimentMode, run_experiment};
 use hashring_node::DataNodeService;
+use serde::Deserialize;
 use tonic::transport::Server;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -182,11 +182,22 @@ struct ChangeArgs {
     members: Vec<String>,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
 enum PolicyArg {
     OwnerOnly,
     FirstSuccessor,
     AllReplicas,
+}
+
+impl From<PolicyArg> for WriteAckPolicy {
+    fn from(policy: PolicyArg) -> Self {
+        match policy {
+            PolicyArg::OwnerOnly => WriteAckPolicy::OwnerOnly,
+            PolicyArg::FirstSuccessor => WriteAckPolicy::FirstSuccessor,
+            PolicyArg::AllReplicas => WriteAckPolicy::AllReplicas,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -225,61 +236,93 @@ struct ExecuteChangeArgs {
     target_epoch: u64,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Clone, Copy, Debug, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
 enum ExperimentModeArg {
     Correctness,
     Performance,
     Availability,
 }
 
+impl From<ExperimentModeArg> for ExperimentMode {
+    fn from(mode: ExperimentModeArg) -> Self {
+        match mode {
+            ExperimentModeArg::Correctness => ExperimentMode::Correctness,
+            ExperimentModeArg::Performance => ExperimentMode::Performance,
+            ExperimentModeArg::Availability => ExperimentMode::Availability,
+        }
+    }
+}
+
 #[derive(Args)]
 struct ExperimentArgs {
-    #[arg(long, value_enum, default_value_t = ExperimentModeArg::Correctness)]
-    mode: ExperimentModeArg,
-    /// Empty or not-yet-created directory for the manifest, raw logs, and summary.
+    /// YAML file with experiment settings. Keys use the flag names with `_`
+    /// for `-`, and values match the flag values. A flag on the command line
+    /// wins over the file; a boolean flag can only turn its setting on.
     #[arg(long)]
-    output: PathBuf,
-    /// Peak node count. Correctness mode starts with one fewer node, then scales out and in.
+    config: Option<PathBuf>,
+    /// [default: correctness]
+    #[arg(long, value_enum)]
+    mode: Option<ExperimentModeArg>,
+    /// Empty or not-yet-created directory for the manifest, raw logs, and
+    /// summary. Required here or as `output` in the config file, where a
+    /// relative path is resolved against the file's directory.
+    #[arg(long)]
+    output: Option<PathBuf>,
+    /// Peak node count. Correctness mode starts with one fewer node, then
+    /// scales out and in. [default: 4 for availability, 10 otherwise]
     #[arg(long)]
     nodes: Option<usize>,
-    /// Logical keys. Defaults to 20,000 for correctness and 1,000,000 for performance.
+    /// Logical keys. [default: 20,000 for correctness, 1,000,000 for
+    /// performance, 1,000 for availability]
     #[arg(long)]
     keys: Option<u64>,
-    #[arg(long, default_value_t = 128)]
-    value_bytes: usize,
-    #[arg(long, default_value_t = 64)]
-    concurrency: usize,
-    #[arg(long, default_value_t = 1)]
-    seed: u64,
-    #[arg(long, default_value_t = 128)]
-    virtual_nodes: u32,
-    #[arg(long, default_value_t = 30_000)]
-    operation_timeout_ms: u64,
-    #[arg(long, default_value_t = 600_000)]
-    migration_timeout_ms: u64,
-    /// Maximum number of disjoint ranges moved concurrently within one topology change.
-    #[arg(long, default_value_t = DEFAULT_RANGE_MOVE_CONCURRENCY)]
-    range_move_concurrency: usize,
-    /// Deterministic pre-publication observation window for migration stress runs.
-    #[arg(long, default_value_t = 250)]
-    pre_publish_delay_ms: u64,
+    /// [default: 128]
+    #[arg(long)]
+    value_bytes: Option<usize>,
+    /// [default: 64]
+    #[arg(long)]
+    concurrency: Option<usize>,
+    /// [default: 1]
+    #[arg(long)]
+    seed: Option<u64>,
+    /// [default: 128]
+    #[arg(long)]
+    virtual_nodes: Option<u32>,
+    /// [default: 30000]
+    #[arg(long)]
+    operation_timeout_ms: Option<u64>,
+    /// [default: 600000]
+    #[arg(long)]
+    migration_timeout_ms: Option<u64>,
+    /// Maximum number of disjoint ranges moved concurrently within one
+    /// topology change. [default: 16]
+    #[arg(long)]
+    range_move_concurrency: Option<usize>,
+    /// Deterministic pre-publication observation window for migration stress
+    /// runs. [default: 250]
+    #[arg(long)]
+    pre_publish_delay_ms: Option<u64>,
     /// Refuse the run unless build and runtime source match the same clean commit.
     #[arg(long)]
     require_clean_source: bool,
     /// Log client retries and migration/repair progress for diagnosis.
     #[arg(long)]
     verbose: bool,
-    #[arg(long, default_value_t = 3)]
-    desired_replication_factor: u32,
-    #[arg(long, default_value_t = 1)]
-    minimum_admitted_copies: u32,
-    #[arg(long, default_value_t = 0)]
-    minimum_healthy_followers: u32,
-    /// Defaults to FirstSuccessor for availability and OwnerOnly otherwise.
+    /// [default: 3]
+    #[arg(long)]
+    desired_replication_factor: Option<u32>,
+    /// [default: 1]
+    #[arg(long)]
+    minimum_admitted_copies: Option<u32>,
+    /// [default: 0]
+    #[arg(long)]
+    minimum_healthy_followers: Option<u32>,
+    /// [default: first-successor for availability, owner-only otherwise]
     #[arg(long, value_enum)]
     policy: Option<PolicyArg>,
     /// Tokio worker threads for the driver and for each data node it starts.
-    /// Defaults to the CPU count divided by peak nodes + 2, at least 2.
+    /// [default: the CPU count divided by peak nodes + 2, at least 2]
     #[arg(long)]
     worker_threads: Option<NonZeroUsize>,
 }
@@ -287,61 +330,57 @@ struct ExperimentArgs {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cpus = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
-    // Built explicitly rather than via #[tokio::main] so each role can size its
-    // own runtime; see docs/optimizations/worker-pool-sizing.md.
-    let runtime = match runtime_threads(&cli.command, cpus) {
-        Some(workers) => tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(workers)
-            .enable_all()
-            .build()?,
-        None => tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?,
+    // The experiment's config file decides its runtime size, so it is resolved
+    // before the runtime is built.
+    if let Command::Experiment(args) = &cli.command {
+        let file = args.config.as_deref().map(config::load).transpose()?;
+        let config = config::experiment::resolve(args, file, cpus)?;
+        init_tracing(config.verbose)?;
+        return build_runtime(Some(config.worker_threads))?.block_on(run_local_experiment(config));
+    }
+    init_tracing(false)?;
+    build_runtime(runtime_threads(&cli.command, cpus))?.block_on(run(cli.command))
+}
+
+/// Built explicitly rather than via #[tokio::main] so each role can size its
+/// own runtime; see docs/optimizations/worker-pool-sizing.md. `None` builds a
+/// single-threaded runtime.
+fn build_runtime(worker_threads: Option<usize>) -> Result<tokio::runtime::Runtime> {
+    let mut builder = match worker_threads {
+        Some(workers) => {
+            let mut builder = tokio::runtime::Builder::new_multi_thread();
+            builder.worker_threads(workers);
+            builder
+        }
+        None => tokio::runtime::Builder::new_current_thread(),
     };
-    runtime.block_on(run(cli, cpus))
+    Ok(builder.enable_all().build()?)
 }
 
 /// Worker threads for the process's runtime, or `None` for a single-threaded
 /// runtime. Servers take one worker per available CPU because in a deployment
 /// they own their machine. One-shot client and admin commands issue a few RPCs
-/// and need no worker pool.
+/// and need no worker pool. The experiment command sizes its runtime in
+/// [`config::experiment::resolve`].
 fn runtime_threads(command: &Command, cpus: usize) -> Option<usize> {
     match command {
         Command::Node(args) => Some(args.worker_threads.map_or(cpus, NonZeroUsize::get)),
         Command::Coordinator(_) => Some(cpus),
-        Command::Experiment(args) => Some(experiment_worker_threads(args, cpus)),
         _ => None,
     }
 }
 
-/// The `experiment` command starts the coordinator, every data node and its own
-/// load driver on one host, so the driver and each node get the host budget
-/// divided by the number of processes. A per-role A/B showed both the driver
-/// and the nodes slow down when uncapped, while the coordinator does not, so the
-/// coordinator keeps its own per-CPU default.
-fn experiment_worker_threads(args: &ExperimentArgs, cpus: usize) -> usize {
-    if let Some(workers) = args.worker_threads {
-        return workers.get();
-    }
-    let peak_nodes = args.nodes.unwrap_or(match args.mode {
-        ExperimentModeArg::Correctness => 10,
-        ExperimentModeArg::Performance => 10,
-        ExperimentModeArg::Availability => 4,
-    });
-    // Driver, coordinator, and every data node share the host.
-    let processes = peak_nodes + 2;
-    (cpus / processes).clamp(2.min(cpus), cpus)
-}
-
-async fn run(cli: Cli, cpus: usize) -> Result<()> {
-    let verbose_experiment = matches!(&cli.command, Command::Experiment(args) if args.verbose);
+fn init_tracing(verbose_experiment: bool) -> Result<()> {
     let mut filter = EnvFilter::from_default_env().add_directive("hashring_rs=info".parse()?);
     if verbose_experiment {
         filter = filter.add_directive("hashring_client=debug".parse()?);
     }
     tracing_subscriber::fmt().with_env_filter(filter).init();
+    Ok(())
+}
 
-    match cli.command {
+async fn run(command: Command) -> Result<()> {
+    match command {
         Command::Coordinator(args) => run_coordinator(args).await,
         Command::Node(args) => run_node(args).await,
         Command::Put(args) => run_put(args).await,
@@ -354,65 +393,12 @@ async fn run(cli: Cli, cpus: usize) -> Result<()> {
         Command::ChangeStatus(args) => run_change_status(args).await,
         Command::ReplicaStatus(args) => run_replica_status(args).await,
         Command::ExecuteChange(args) => run_execute_change(args).await,
-        Command::Experiment(args) => {
-            let worker_threads = experiment_worker_threads(&args, cpus);
-            run_local_experiment(args, worker_threads).await
-        }
+        Command::Experiment(_) => unreachable!("main runs the experiment command"),
     }
 }
 
-async fn run_local_experiment(args: ExperimentArgs, worker_threads: usize) -> Result<()> {
-    let mode = match args.mode {
-        ExperimentModeArg::Correctness => ExperimentMode::Correctness,
-        ExperimentModeArg::Performance => ExperimentMode::Performance,
-        ExperimentModeArg::Availability => ExperimentMode::Availability,
-    };
-    let key_count = args.keys.unwrap_or(match mode {
-        ExperimentMode::Correctness => 20_000,
-        ExperimentMode::Performance => 1_000_000,
-        ExperimentMode::Availability => 1_000,
-    });
-    let summary = run_experiment(
-        ExperimentConfig {
-            mode,
-            output_dir: args.output,
-            node_count: args
-                .nodes
-                .unwrap_or(if matches!(mode, ExperimentMode::Availability) {
-                    4
-                } else {
-                    10
-                }),
-            key_count,
-            value_bytes: args.value_bytes,
-            concurrency: args.concurrency,
-            hash_seed: args.seed,
-            virtual_nodes: args.virtual_nodes,
-            operation_timeout_ms: args.operation_timeout_ms,
-            migration_timeout_ms: args.migration_timeout_ms,
-            range_move_concurrency: args.range_move_concurrency,
-            pre_publish_delay_ms: args.pre_publish_delay_ms,
-            require_clean_source: args.require_clean_source,
-            verbose: args.verbose,
-            worker_threads,
-            desired_replication_factor: args.desired_replication_factor,
-            minimum_admitted_copies: args.minimum_admitted_copies,
-            minimum_healthy_followers: args.minimum_healthy_followers,
-            write_ack_policy: match args.policy.unwrap_or(
-                if matches!(mode, ExperimentMode::Availability) {
-                    PolicyArg::FirstSuccessor
-                } else {
-                    PolicyArg::OwnerOnly
-                },
-            ) {
-                PolicyArg::OwnerOnly => WriteAckPolicy::OwnerOnly,
-                PolicyArg::FirstSuccessor => WriteAckPolicy::FirstSuccessor,
-                PolicyArg::AllReplicas => WriteAckPolicy::AllReplicas,
-            },
-        },
-        std::env::current_exe()?,
-    )
-    .await?;
+async fn run_local_experiment(config: ExperimentConfig) -> Result<()> {
+    let summary = run_experiment(config, std::env::current_exe()?).await?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
 }
@@ -421,9 +407,9 @@ async fn run_coordinator(args: CoordinatorArgs) -> Result<()> {
     let file = args
         .config
         .as_deref()
-        .map(CoordinatorFile::load)
+        .map(config::load::<CoordinatorFile>)
         .transpose()?;
-    let settings = config::resolve(&args, file)?;
+    let settings = config::coordinator::resolve(&args, file)?;
     let repository = Arc::new(
         RedbTopologyRepository::open(&settings.state)
             .with_context(|| format!("opening {}", settings.state.display()))?,
@@ -615,12 +601,7 @@ async fn run_begin_change(args: ChangeArgs) -> Result<()> {
 
 async fn run_begin_policy_change(args: PolicyChangeArgs) -> Result<()> {
     let client = connect_client(&args.client).await?;
-    let policy = match args.policy {
-        PolicyArg::OwnerOnly => WriteAckPolicy::OwnerOnly,
-        PolicyArg::FirstSuccessor => WriteAckPolicy::FirstSuccessor,
-        PolicyArg::AllReplicas => WriteAckPolicy::AllReplicas,
-    };
-    let change = client.begin_write_policy_change(policy).await?;
+    let change = client.begin_write_policy_change(args.policy.into()).await?;
     println!("{}", serde_json::to_string_pretty(&change)?);
     Ok(())
 }
@@ -785,9 +766,6 @@ mod worker_thread_tests {
 
     #[test]
     fn each_role_sizes_its_own_runtime() {
-        let experiment = command(&["hashring-rs", "experiment", "--output", "unused"]);
-        assert_eq!(runtime_threads(&experiment, 1), Some(1));
-        assert_eq!(runtime_threads(&experiment, 24), Some(2));
         let node = command(&[
             "hashring-rs",
             "node",
@@ -821,8 +799,7 @@ mod worker_thread_tests {
         let cli = Cli::try_parse_from(node.iter().chain(&["--worker-threads", "3"])).unwrap();
         assert_eq!(runtime_threads(&cli.command, 24), Some(3));
         let experiment = ["hashring-rs", "experiment", "--output", "unused"];
-        let cli = Cli::try_parse_from(experiment.iter().chain(&["--worker-threads", "5"])).unwrap();
-        assert_eq!(runtime_threads(&cli.command, 24), Some(5));
+        assert!(Cli::try_parse_from(experiment.iter().chain(&["--worker-threads", "0"])).is_err());
     }
 
     #[test]
@@ -846,8 +823,8 @@ mod coordinator_bootstrap_tests {
         let Command::Coordinator(args) = Cli::try_parse_from(argv).unwrap().command else {
             unreachable!()
         };
-        let file = file.map(|path| CoordinatorFile::load(&path).unwrap());
-        config::resolve(&args, file).unwrap()
+        let file = file.map(|path| config::load(&path).unwrap());
+        config::coordinator::resolve(&args, file).unwrap()
     }
 
     #[test]

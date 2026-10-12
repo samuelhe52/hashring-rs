@@ -1,0 +1,26 @@
+# Settings for `hashring-rs experiment --config examples/experiment.yaml`.
+# Every key is optional and named after an experiment flag (`_` for `-`), with
+# the same values (`first-successor`, not `FirstSuccessor`). A flag given on the
+# command line wins over the same key here; `--verbose` and
+# `--require-clean-source` can turn a setting on but not off.
+mode: availability
+# Usually given per run with --output, since the directory must be new or
+# empty. A relative path here is resolved against this file's directory.
+# output: ../results/availability
+nodes: 4
+keys: 1000
+value_bytes: 128
+concurrency: 64
+seed: 1
+virtual_nodes: 128
+operation_timeout_ms: 30000
+migration_timeout_ms: 600000
+range_move_concurrency: 16
+pre_publish_delay_ms: 250
+require_clean_source: false
+verbose: false
+desired_replication_factor: 3
+minimum_admitted_copies: 1
+minimum_healthy_followers: 0
+policy: first-successor
+# worker_threads: 2   # default: CPUs / (nodes + 2), at least 2

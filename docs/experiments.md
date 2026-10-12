@@ -17,6 +17,14 @@ nodes, and a 30-second operation deadline. The default ACK policy is
 `FirstSuccessor` for availability mode and `OwnerOnly` for the others. Run
 `hashring-rs experiment --help` for every flag.
 
+`experiment --config <file>` reads the same settings from YAML; see
+[`examples/experiment.yaml`](../examples/experiment.yaml). Keys are the flag
+names with `_` for `-` and take the flag values. A flag on the command line wins
+over the file, except that `--verbose` and `--require-clean-source` can only
+turn a setting on. Unknown keys are an error, and a relative `output` in the
+file is resolved against the file's directory. The manifest records the resolved
+configuration, so a run is reproducible without the file.
+
 All processes run on one host, so the driver and each data node get an equal
 share of the CPUs: `cpus / (peak_nodes + 2)` tokio workers, at least 2. Override
 it with `experiment --worker-threads N`. The coordinator keeps one worker per
