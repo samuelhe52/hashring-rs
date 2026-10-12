@@ -79,23 +79,57 @@ workload:
 
 Neither appears in `/proc` counters, which is a reason to read `/proc` as well.
 
+## Counting wakeups with perf stat
+
+`perf stat` software counters work on this host at
+`kernel.perf_event_paranoid = 1` and need no privilege. Measured against a live
+experiment's driver process:
+
+```sh
+target/release/hashring-rs experiment --mode correctness --output results/cs2 &
+pid=$!
+sleep 3
+perf stat -e context-switches,cpu-migrations,task-clock -p "$pid" -- sleep 5
+wait "$pid"
+```
+
+```
+     405      context-switches
+      57      cpu-migrations
+   58.90 msec task-clock
+```
+
+The ratios matter more than the absolute counts. `cpu-migrations / context-switches`
+at 14% says an eighth of all switches moved the task to a different CPU, which
+is the population that shrinking the thread pool removes. `task-clock` divided by
+elapsed wall time gives the CPU utilisation of that process alone.
+
+Two ways this gets reported wrong:
+
+- Passing both `-p <pid>` and a command to run is contradictory; perf attaches
+  to the pid, ignores the command, and reports `<not counted>`. Use `-p` alone
+  with `-- sleep <n>`, or a bare command with no `-p`.
+- `-a` (system wide) is what actually needs privilege. Per-process counting does
+  not.
+
 ## Counting wakeups exactly
 
-`sched:sched_wakeup` tracepoints give exact wakeup counts, but they need
-privilege this host does not grant:
+`sched:sched_wakeup` and `sched:sched_switch` tracepoints give exact per-wakeup
+counts rather than per-switch totals, but they are not available at
+`perf_event_paranoid = 1` here:
 
 ```sh
 perf trace -e sched:sched_wakeup -e sched:sched_switch -a -- sleep 10
-perf stat -e context-switches,cpu-migrations -a -- sleep 10
 ```
 
-Both are blocked at `kernel.perf_event_paranoid = 1` here (tracepoints need
-`-2` or root). The software counters report `<not counted>`; `/proc` is the
-workaround. Raising the setting needs root:
+They need root:
 
 ```sh
 sudo sysctl -w kernel.perf_event_paranoid=0
 ```
+
+Without tracepoints, `context-switches` plus `cpu-migrations` plus the `/proc`
+`schedstat` fields above bracket the same ground.
 
 ## Comparing worker-pool sizes
 
