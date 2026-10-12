@@ -2,10 +2,10 @@
 
 Removing the extra `NodeState` read-lock acquisition from Put and Delete produced
 about 5% higher median PUT throughput on this host, but the paired runs were too
-variable to establish a repeatable improvement. The candidate remains a benchmark
-patch; production source was restored after building it. The change is below
-what this benchmark can resolve, so any case for merging it rests on code
-clarity, not throughput.
+variable to establish a repeatable improvement. The change is below what this
+benchmark can resolve. It was later applied as a code-clarity cleanup, not as a
+throughput optimization; the measured binaries remain the baseline and the
+benchmark patch described below.
 
 ## Comparison
 
