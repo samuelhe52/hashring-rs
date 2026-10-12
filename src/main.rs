@@ -26,11 +26,6 @@ mod config;
 struct Cli {
     #[command(subcommand)]
     command: Command,
-    /// Tokio worker threads per process. Defaults to one per logical CPU, which
-    /// in a local experiment means 24 workers in each of the driver,
-    /// coordinator and data nodes running on the same host.
-    #[arg(long, global = true)]
-    worker_threads: Option<NonZeroUsize>,
 }
 
 #[derive(Subcommand)]
@@ -120,6 +115,11 @@ struct NodeArgs {
     listen: SocketAddr,
     #[arg(long, default_value = "http://127.0.0.1:50050")]
     coordinator: String,
+    /// Tokio worker threads. Defaults to one per CPU available to the process
+    /// (affinity and cgroup limits included); set it lower when the node shares
+    /// its host with other busy processes.
+    #[arg(long)]
+    worker_threads: Option<NonZeroUsize>,
     #[arg(long, default_value_t = 0, hide = true)]
     stop_response_delay_ms: u64,
 }
@@ -278,41 +278,51 @@ struct ExperimentArgs {
     /// Defaults to FirstSuccessor for availability and OwnerOnly otherwise.
     #[arg(long, value_enum)]
     policy: Option<PolicyArg>,
+    /// Tokio worker threads for the driver and for each data node it starts.
+    /// Defaults to the CPU count divided by peak nodes + 2, at least 2.
+    #[arg(long)]
+    worker_threads: Option<NonZeroUsize>,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let worker_threads = cli
-        .worker_threads
-        .map(NonZeroUsize::get)
-        .unwrap_or_else(|| default_worker_threads(&cli));
-    // Built explicitly rather than via #[tokio::main] so the worker count can be
-    // set and inspected. A standalone node keeps tokio's one-worker-per-CPU
-    // default; the local experiment divides the host between its processes.
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(worker_threads)
-        .enable_all()
-        .build()?
-        .block_on(run(cli, worker_threads))
-}
-
-/// Tokio's default of one worker per logical CPU is right when a process owns its
-/// machine. The `experiment` command instead starts a coordinator, every data node
-/// and the driver on one host, so the per-process default must be the host budget
-/// divided by the number of processes it will start. Measured on 24 cores with 11
-/// processes, letting each take 24 workers (275 threads total) cost initial-put
-/// throughput against a shared budget of 4.
-fn default_worker_threads(cli: &Cli) -> usize {
-    default_worker_threads_for_cpus(
-        cli,
-        std::thread::available_parallelism().map_or(1, |n| n.get()),
-    )
-}
-
-fn default_worker_threads_for_cpus(cli: &Cli, cpus: usize) -> usize {
-    let Command::Experiment(args) = &cli.command else {
-        return cpus;
+    let cpus = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    // Built explicitly rather than via #[tokio::main] so each role can size its
+    // own runtime; see docs/optimizations/worker-pool-sizing.md.
+    let runtime = match runtime_threads(&cli.command, cpus) {
+        Some(workers) => tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .enable_all()
+            .build()?,
+        None => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?,
     };
+    runtime.block_on(run(cli, cpus))
+}
+
+/// Worker threads for the process's runtime, or `None` for a single-threaded
+/// runtime. Servers take one worker per available CPU because in a deployment
+/// they own their machine. One-shot client and admin commands issue a few RPCs
+/// and need no worker pool.
+fn runtime_threads(command: &Command, cpus: usize) -> Option<usize> {
+    match command {
+        Command::Node(args) => Some(args.worker_threads.map_or(cpus, NonZeroUsize::get)),
+        Command::Coordinator(_) => Some(cpus),
+        Command::Experiment(args) => Some(experiment_worker_threads(args, cpus)),
+        _ => None,
+    }
+}
+
+/// The `experiment` command starts the coordinator, every data node and its own
+/// load driver on one host, so the driver and each node get the host budget
+/// divided by the number of processes. A per-role A/B showed both the driver
+/// and the nodes slow down when uncapped, while the coordinator does not, so the
+/// coordinator keeps its own per-CPU default.
+fn experiment_worker_threads(args: &ExperimentArgs, cpus: usize) -> usize {
+    if let Some(workers) = args.worker_threads {
+        return workers.get();
+    }
     let peak_nodes = args.nodes.unwrap_or(match args.mode {
         ExperimentModeArg::Correctness => 10,
         ExperimentModeArg::Performance => 10,
@@ -323,7 +333,7 @@ fn default_worker_threads_for_cpus(cli: &Cli, cpus: usize) -> usize {
     (cpus / processes).clamp(2.min(cpus), cpus)
 }
 
-async fn run(cli: Cli, worker_threads: usize) -> Result<()> {
+async fn run(cli: Cli, cpus: usize) -> Result<()> {
     let verbose_experiment = matches!(&cli.command, Command::Experiment(args) if args.verbose);
     let mut filter = EnvFilter::from_default_env().add_directive("hashring_rs=info".parse()?);
     if verbose_experiment {
@@ -344,7 +354,10 @@ async fn run(cli: Cli, worker_threads: usize) -> Result<()> {
         Command::ChangeStatus(args) => run_change_status(args).await,
         Command::ReplicaStatus(args) => run_replica_status(args).await,
         Command::ExecuteChange(args) => run_execute_change(args).await,
-        Command::Experiment(args) => run_local_experiment(args, worker_threads).await,
+        Command::Experiment(args) => {
+            let worker_threads = experiment_worker_threads(&args, cpus);
+            run_local_experiment(args, worker_threads).await
+        }
     }
 }
 
@@ -766,28 +779,59 @@ async fn shutdown_signal() {
 mod worker_thread_tests {
     use super::*;
 
-    #[test]
-    fn worker_defaults_support_one_cpu_and_shared_hosts() {
-        let cli = Cli::try_parse_from([
-            "hashring-rs",
-            "experiment",
-            "--output",
-            "unused-test-output",
-        ])
-        .unwrap();
-        assert_eq!(default_worker_threads_for_cpus(&cli, 1), 1);
-        assert_eq!(default_worker_threads_for_cpus(&cli, 24), 2);
-        let cli = Cli::try_parse_from(["hashring-rs", "topology"]).unwrap();
-        assert_eq!(default_worker_threads_for_cpus(&cli, 1), 1);
-        assert_eq!(default_worker_threads_for_cpus(&cli, 24), 24);
+    fn command(argv: &[&str]) -> Command {
+        Cli::try_parse_from(argv).unwrap().command
     }
 
     #[test]
-    fn worker_threads_must_be_positive() {
-        assert!(Cli::try_parse_from(["hashring-rs", "--worker-threads", "0", "topology"]).is_err());
-        let cli =
-            Cli::try_parse_from(["hashring-rs", "--worker-threads", "1", "topology"]).unwrap();
-        assert_eq!(cli.worker_threads.unwrap().get(), 1);
+    fn each_role_sizes_its_own_runtime() {
+        let experiment = command(&["hashring-rs", "experiment", "--output", "unused"]);
+        assert_eq!(runtime_threads(&experiment, 1), Some(1));
+        assert_eq!(runtime_threads(&experiment, 24), Some(2));
+        let node = command(&[
+            "hashring-rs",
+            "node",
+            "--id",
+            "n",
+            "--listen",
+            "127.0.0.1:1",
+        ]);
+        assert_eq!(runtime_threads(&node, 24), Some(24));
+        assert_eq!(
+            runtime_threads(&command(&["hashring-rs", "coordinator"]), 24),
+            Some(24)
+        );
+        assert_eq!(
+            runtime_threads(&command(&["hashring-rs", "topology"]), 24),
+            None
+        );
+    }
+
+    #[test]
+    fn worker_thread_overrides_must_be_positive() {
+        let node = [
+            "hashring-rs",
+            "node",
+            "--id",
+            "n",
+            "--listen",
+            "127.0.0.1:1",
+        ];
+        assert!(Cli::try_parse_from(node.iter().chain(&["--worker-threads", "0"])).is_err());
+        let cli = Cli::try_parse_from(node.iter().chain(&["--worker-threads", "3"])).unwrap();
+        assert_eq!(runtime_threads(&cli.command, 24), Some(3));
+        let experiment = ["hashring-rs", "experiment", "--output", "unused"];
+        let cli = Cli::try_parse_from(experiment.iter().chain(&["--worker-threads", "5"])).unwrap();
+        assert_eq!(runtime_threads(&cli.command, 24), Some(5));
+    }
+
+    #[test]
+    fn worker_threads_is_not_a_client_or_coordinator_flag() {
+        assert!(Cli::try_parse_from(["hashring-rs", "--worker-threads", "2", "topology"]).is_err());
+        assert!(Cli::try_parse_from(["hashring-rs", "topology", "--worker-threads", "2"]).is_err());
+        assert!(
+            Cli::try_parse_from(["hashring-rs", "coordinator", "--worker-threads", "2"]).is_err()
+        );
     }
 }
 

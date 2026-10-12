@@ -95,6 +95,9 @@ BINARY --worker-threads 2 experiment --mode performance --nodes 10 \
   --keys 100000 --value-bytes 128 --concurrency 64 --output UNIQUE_OUTPUT
 ```
 
+These binaries predate the move of `--worker-threads` onto the subcommands;
+with current builds the equivalent is `experiment --worker-threads 2 ...`.
+
 Repeat with concurrency 256. Each executable spawns its own matching child
 processes. Build/runtime manifests can report dirty or differing source because
 this comparison used saved binaries and restored source; identify the artifacts

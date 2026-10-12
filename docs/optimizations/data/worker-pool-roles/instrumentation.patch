@@ -1,0 +1,14 @@
+Temporary per-role override used only to build the A/B binary (applied to
+change eeb56011, then reverted). It lets HASHRING_AB_COORD_THREADS and
+HASHRING_AB_NODE_THREADS replace the --worker-threads value that the experiment
+passed to each child; the driver used the experiment's own value.
+
+--- a/crates/hashring-experiment/src/lib.rs
++++ b/crates/hashring-experiment/src/lib.rs
+@@ ProcessGroup::spawn @@
+-            .args(["--worker-threads", &self.worker_threads.to_string()])
++            .args(["--worker-threads", &{
++                // TEMPORARY A/B instrumentation: per-role overrides.
++                let var = if name == "coordinator" { "HASHRING_AB_COORD_THREADS" } else { "HASHRING_AB_NODE_THREADS" };
++                std::env::var(var).unwrap_or_else(|_| self.worker_threads.to_string())
++            }])

@@ -50,7 +50,8 @@ pub struct ExperimentConfig {
     pub pre_publish_delay_ms: u64,
     pub require_clean_source: bool,
     pub verbose: bool,
-    /// Tokio worker threads for the driver, the coordinator and every data node.
+    /// Tokio worker threads for the driver and every data node. The coordinator
+    /// keeps its own default; it is not on the data path.
     pub worker_threads: usize,
     pub desired_replication_factor: u32,
     pub minimum_admitted_copies: u32,
@@ -173,19 +174,24 @@ struct ProcessGroup {
     executable: PathBuf,
     log_dir: PathBuf,
     verbose: bool,
-    /// Propagated to every child so a single flag sizes the worker pool of the
-    /// driver, the coordinator and each data node together.
-    worker_threads: usize,
+    /// Passed to every data node so the nodes share the host budget with the
+    /// driver.
+    node_worker_threads: usize,
     processes: Vec<ManagedProcess>,
 }
 
 impl ProcessGroup {
-    fn new(executable: PathBuf, log_dir: PathBuf, verbose: bool, worker_threads: usize) -> Self {
+    fn new(
+        executable: PathBuf,
+        log_dir: PathBuf,
+        verbose: bool,
+        node_worker_threads: usize,
+    ) -> Self {
         Self {
             executable,
             log_dir,
             verbose,
-            worker_threads,
+            node_worker_threads,
             processes: Vec::new(),
         }
     }
@@ -207,7 +213,6 @@ impl ProcessGroup {
                     "hashring_rs=info"
                 },
             )
-            .args(["--worker-threads", &self.worker_threads.to_string()])
             .spawn()
             .with_context(|| format!("spawning {name}"))?;
         self.processes.push(ManagedProcess { name, child });
@@ -1515,6 +1520,7 @@ fn spawn_node(
     port: u16,
     coordinator_endpoint: &str,
 ) -> Result<()> {
+    let worker_threads = processes.node_worker_threads.to_string();
     processes.spawn(
         node_id.clone(),
         &[
@@ -1525,6 +1531,8 @@ fn spawn_node(
             format!("127.0.0.1:{port}"),
             "--coordinator".into(),
             coordinator_endpoint.into(),
+            "--worker-threads".into(),
+            worker_threads,
         ],
     )
 }

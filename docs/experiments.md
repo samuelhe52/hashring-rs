@@ -17,6 +17,12 @@ nodes, and a 30-second operation deadline. The default ACK policy is
 `FirstSuccessor` for availability mode and `OwnerOnly` for the others. Run
 `hashring-rs experiment --help` for every flag.
 
+All processes run on one host, so the driver and each data node get an equal
+share of the CPUs: `cpus / (peak_nodes + 2)` tokio workers, at least 2. Override
+it with `experiment --worker-threads N`. The coordinator keeps one worker per
+CPU, since it is not on the data path. See
+[worker-pool-sizing.md](optimizations/worker-pool-sizing.md) for the evidence.
+
 ## Output
 
 The output directory must be new or empty. The runner never overwrites a

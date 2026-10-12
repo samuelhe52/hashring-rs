@@ -111,6 +111,8 @@ treated as healthy.
 | Migration snapshot page | 8 MiB |
 | Migration journal per node (default) | 16 MiB |
 | Control-plane message limit | 64 MiB |
+| Tokio workers: `node`, `coordinator` | one per available CPU (`node --worker-threads N` overrides) |
+| Tokio workers: client and admin commands | single-threaded |
 
 The cluster-size limits in the README (1,024 members, 4,096 virtual nodes per
 member, 1,048,576 assignments, 16,384 moved ranges per change) keep topology

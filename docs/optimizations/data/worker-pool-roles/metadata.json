@@ -1,0 +1,12 @@
+{
+  "base_change": "eeb56011",
+  "instrumentation_patch": "instrumentation.patch",
+  "runner": "run_ab.sh",
+  "cpu": "Apple M1 Pro, 8 logical CPUs (6 performance + 2 efficiency)",
+  "memory_bytes": 17179869184,
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "binary_sha256": "14bbf71b926766f382a77577b31e1ebce47e264142c259acb7387ac9acfcdb6a",
+  "workload": "experiment --mode correctness (20,000 keys, concurrency 64, RF=3, OwnerOnly, 128-byte values, 10 peak nodes), HASHRING_PROFILE_WRITES=1",
+  "design": "5 variants x 6 reps, variant order rotated each rep; threads given as driver/coordinator/node",
+  "note": "Two runs (all2-1, coord8-2) failed at scale-out with 'concurrent mutator finished without a successful mutation'; their initial put/get and node pressure were recorded before the failure and are included."
+}
