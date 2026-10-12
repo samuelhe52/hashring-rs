@@ -1017,10 +1017,23 @@ impl DataNode for DataNodeService {
                 "replication batch must not be empty",
             ));
         }
+        let first = &batch.entries[0];
+        if batch.entries.iter().any(|entry| {
+            entry.topology_epoch != first.topology_epoch
+                || entry.owner_node_id != first.owner_node_id
+        }) {
+            return Err(Status::invalid_argument(
+                "replication batch must contain one stream",
+            ));
+        }
         let mut state = diagnostics::write(&self.state, &self.pressure.follower_write_timing).await;
         let mut applied_stream_sequence = 0;
         for entry in batch.entries {
-            applied_stream_sequence = apply_replication_entry(self, &mut state, entry)?;
+            match apply_replication_entry(self, &mut state, entry) {
+                Ok(sequence) => applied_stream_sequence = sequence,
+                Err(_) if applied_stream_sequence > 0 => break,
+                Err(error) => return Err(error),
+            }
         }
         Ok(Response::new(ReplicateMutationsResponse {
             process_instance_id: self.process_instance_id.clone(),
