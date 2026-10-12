@@ -1,5 +1,6 @@
 # Settings for `hashring-rs coordinator --config examples/coordinator.yaml`.
-# Every key is optional and named after a coordinator flag (`_` for `-`).
+# Every key is optional and named after a coordinator flag (`_` for `-`);
+# `--member` becomes the `members` list below.
 # A flag given on the command line wins over the same key here.
 listen: 127.0.0.1:50050
 state: ../coordinator.redb      # relative to this file's directory

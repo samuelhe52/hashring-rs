@@ -65,8 +65,9 @@ enum Command {
 
 #[derive(Args)]
 struct CoordinatorArgs {
-    /// YAML file with coordinator settings. Keys match the flag names with `_`
-    /// for `-`; a flag given here wins over the same key in the file.
+    /// YAML file with coordinator settings. Keys use the flag names with `_`
+    /// for `-`, except that `--member` becomes a `members` list of
+    /// `{node_id, endpoint}`. A flag on the command line wins over the file.
     #[arg(long)]
     config: Option<PathBuf>,
     /// [default: 127.0.0.1:50050]
@@ -75,22 +76,22 @@ struct CoordinatorArgs {
     /// [default: ./coordinator.redb]
     #[arg(long)]
     state: Option<PathBuf>,
-    /// [default: 1]
+    /// Used only when creating a new store. [default: 1]
     #[arg(long)]
     seed: Option<u64>,
-    /// [default: 128]
+    /// Used only when creating a new store. [default: 128]
     #[arg(long)]
     virtual_nodes: Option<u32>,
-    /// [default: 3]
+    /// Used only when creating a new store. [default: 3]
     #[arg(long)]
     desired_replication_factor: Option<u32>,
-    /// [default: 1]
+    /// Used only when creating a new store. [default: 1]
     #[arg(long)]
     minimum_admitted_copies: Option<u32>,
-    /// [default: 0]
+    /// Used only when creating a new store. [default: 0]
     #[arg(long)]
     minimum_healthy_followers: Option<u32>,
-    /// [default: 5000]
+    /// Used only when creating a new store. [default: 5000]
     #[arg(long)]
     max_replica_lag_ms: Option<u64>,
     /// [default: 120000]
@@ -104,8 +105,9 @@ struct CoordinatorArgs {
     pre_publish_delay_ms: u64,
     #[arg(long, default_value_t = 0, hide = true)]
     post_publish_delay_ms: u64,
-    /// Bootstrap member in NODE_ID=HTTP_ENDPOINT form. Required only for a new
-    /// store; replaces the `members` list of the config file.
+    /// Bootstrap member in NODE_ID=HTTP_ENDPOINT form. Used only when creating
+    /// a new store, and must match the stored topology on restart. Replaces the
+    /// `members` list of the config file.
     #[arg(long = "member")]
     members: Vec<String>,
 }

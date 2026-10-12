@@ -58,8 +58,9 @@ cargo run -- replica-status  # per-range owner, followers, lag, and repair state
 `--member` is only read when the state file is first created. To restart the
 coordinator, pass just `--state`. Everything else is loaded from the file.
 
-The same settings can live in a YAML file instead. Keys are the flag names with
-`_` for `-`, and a flag on the command line wins over the file (see
+The same settings can live in a YAML file instead. Keys use the flag names with
+`_` for `-`, except that `--member` becomes a `members` list of
+`{node_id, endpoint}`. A flag on the command line wins over the file (see
 [`examples/coordinator.yaml`](examples/coordinator.yaml)):
 
 ```sh
