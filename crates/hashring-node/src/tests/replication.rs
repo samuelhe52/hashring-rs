@@ -114,6 +114,67 @@ async fn follower_applies_only_contiguous_authorized_replication() {
 }
 
 #[tokio::test]
+async fn follower_applies_a_replication_batch_in_order() {
+    let topology = replication_topology(3);
+    let key = key_with_placement(&topology, |replicas| replicas[1..].contains(&"node-2"));
+    let service = service_for("node-2", topology.clone());
+    let entries = vec![
+        replication_entry(&topology, key.clone(), 1, 10, b"one", false),
+        replication_entry(&topology, key.clone(), 2, 11, b"two", false),
+        replication_entry(&topology, key.clone(), 3, 12, b"", true),
+    ];
+    let applied = service
+        .replicate_mutations(Request::new(ReplicationBatch { entries }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(applied.applied_stream_sequence, 3);
+    let owner_node_id = topology.owner(&key).unwrap().node_id.clone();
+    let state = service.state.read().await;
+    assert!(state.records[&key].deleted);
+    assert_eq!(
+        state
+            .follower_streams
+            .get(&(topology.epoch, owner_node_id))
+            .unwrap()
+            .applied_sequence,
+        3
+    );
+}
+
+#[tokio::test]
+async fn replication_batch_acknowledges_prefix_before_a_gap() {
+    let topology = replication_topology(3);
+    let key = key_with_placement(&topology, |replicas| replicas[1..].contains(&"node-2"));
+    let service = service_for("node-2", topology.clone());
+    let first = replication_entry(&topology, key.clone(), 1, 10, b"one", false);
+    let gap = replication_entry(&topology, key.clone(), 3, 11, b"three", false);
+    // Replay also returns the applied prefix; the failing suffix alone still errors.
+    for _ in 0..2 {
+        let response = service
+            .replicate_mutations(Request::new(ReplicationBatch {
+                entries: vec![first.clone(), gap.clone()],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.applied_stream_sequence, 1);
+        assert_eq!(
+            service.state.read().await.records[&key].value.as_ref(),
+            b"one"
+        );
+    }
+    assert_eq!(
+        service
+            .replicate_mutations(Request::new(ReplicationBatch { entries: vec![gap] }))
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Aborted
+    );
+}
+
+#[tokio::test]
 async fn full_stream_checkpoint_repairs_a_gap_without_replaying_old_entries() {
     let topology = replication_topology(3);
     let follower = service_for("node-2", topology.clone());
@@ -462,6 +523,7 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
         owner_sequence: 1,
         owner_node_id: "node-1".into(),
     };
+    let token = state.topology.key_token(&key);
     let first = prepare_replication_entries(
         &mut state,
         &key,
@@ -469,6 +531,7 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
         false,
         &version,
         "mutation-1".into(),
+        token,
     )
     .unwrap();
     let second = prepare_replication_entries(
@@ -481,6 +544,7 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
             ..version
         },
         "mutation-2".into(),
+        token,
     )
     .unwrap();
 
@@ -875,7 +939,10 @@ async fn unavailable_follower_backpressures_before_unbounded_queue_growth() {
             break error;
         }
         successful += 1;
-        assert!(successful <= REPLICATION_STREAM_QUEUE_CAPACITY + 1);
+        // Backpressure is bounded by the per-stream channel plus at most one
+        // in-flight replication batch that the delivery task drained before
+        // blocking on the unavailable follower.
+        assert!(successful <= REPLICATION_STREAM_QUEUE_CAPACITY + REPLICATION_BATCH_MAX_ENTRIES);
     };
 
     assert_eq!(rejected.code, ErrorCode::ResourceExhausted as i32);
@@ -1250,16 +1317,14 @@ async fn local_readiness_requires_admission_and_bounds_unacknowledged_lag() {
     let service = service_for("node-1", topology);
     let key = b"local-readiness";
     let follower;
+    let token;
     {
         let mut state = service.state.write().await;
         state.topology.write_ack_policy = WriteAckPolicy::FirstSuccessor;
-        follower = state
-            .topology
-            .replica_node_ids_for_token(state.topology.key_token(key))
-            .unwrap()[1]
-            .to_owned();
+        token = state.topology.key_token(key);
+        follower = state.topology.replica_node_ids_for_token(token).unwrap()[1].to_owned();
     }
-    assert!(service.ready_followers(key).await.is_err());
+    assert!(service.ready_followers(token).await.is_err());
     {
         let mut state = service.state.write().await;
         state
@@ -1267,7 +1332,7 @@ async fn local_readiness_requires_admission_and_bounds_unacknowledged_lag() {
             .insert(follower.clone(), "process".into());
     }
     assert_eq!(
-        service.ready_followers(key).await.unwrap().1,
+        service.ready_followers(token).await.unwrap().1,
         std::slice::from_ref(&follower)
     );
     {
@@ -1283,9 +1348,9 @@ async fn local_readiness_requires_admission_and_bounds_unacknowledged_lag() {
             .owner_stream_unacked
             .insert((1, follower.clone()), [(1, old)].into());
     }
-    assert!(service.ready_followers(key).await.is_err());
+    assert!(service.ready_followers(token).await.is_err());
     service.state.write().await.owner_stream_unacked.clear();
-    assert_eq!(service.ready_followers(key).await.unwrap().1, [follower]);
+    assert_eq!(service.ready_followers(token).await.unwrap().1, [follower]);
 }
 
 #[tokio::test]
@@ -1343,4 +1408,216 @@ async fn ack_pruning_preserves_live_old_requirements_and_skips_current_epoch_sca
         .insert(orphan.clone(), "late-instance".into());
     prune_ack_progress(&mut state);
     assert!(!state.ack_process_instances.contains_key(&orphan));
+}
+
+// Run alone: RSS is process-wide and requires the Unix `ps` utility.
+#[tokio::test]
+#[ignore = "isolated RSS regression check; run with --ignored --nocapture"]
+async fn unreachable_streams_do_not_copy_unbudgeted_payloads() {
+    fn rss_kib() -> usize {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+    let service = service_for("node-1", replication_topology(3));
+    let mutation = Arc::new(ReplicationMutation {
+        topology_epoch: 1,
+        owner_node_id: "node-1".into(),
+        key: Arc::from(b"memory-reproduction".as_slice()),
+        value: Arc::from(vec![7_u8; 8 * 1024 * 1024]),
+        deleted: false,
+        version: RecordVersion {
+            topology_epoch: 1,
+            owner_sequence: 1,
+            owner_node_id: "node-1".into(),
+        },
+        mutation_id: "memory-reproduction".into(),
+    });
+    let bytes = replication_mutation_bytes(&mutation);
+    let retained = Arc::new(Semaphore::new(MAX_PENDING_REPLICATION_BYTES));
+    let budget = Arc::new(ReplicationBudget(
+        retained
+            .clone()
+            .acquire_many_owned(bytes as u32)
+            .await
+            .unwrap(),
+    ));
+    let active = Arc::new(Semaphore::new(MAX_PENDING_REPLICATION_BYTES));
+    let failed = Arc::new(StdMutex::new(HashSet::new()));
+    let before = rss_kib();
+    let mut tasks = Vec::new();
+    for index in 0..32 {
+        let follower = format!("follower-{index}");
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .send(PendingReplication {
+                prepared: PreparedReplication {
+                    follower_node_id: follower.clone(),
+                    follower_endpoint: "http://127.0.0.1:1".into(),
+                    stream_sequence: 1,
+                    mutation: mutation.clone(),
+                },
+                _budget: budget.clone(),
+            })
+            .await
+            .unwrap();
+        tasks.push(tokio::spawn(deliver_replication_stream(
+            service.state.clone(),
+            failed.clone(),
+            active.clone(),
+            service.pressure.clone(),
+            (1, "node-1".into(), follower),
+            receiver,
+        )));
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let growth = rss_kib().saturating_sub(before);
+    eprintln!(
+        "32 unreachable streams, shared 8 MiB payload: RSS growth {growth} KiB; active permits {}",
+        active.available_permits()
+    );
+    for task in tasks {
+        task.abort();
+        let _ = task.await;
+    }
+    assert_eq!(active.available_permits(), MAX_PENDING_REPLICATION_BYTES);
+    assert!(
+        growth < MAX_PENDING_REPLICATION_BYTES / 1024,
+        "unbudgeted payload growth: {growth} KiB"
+    );
+}
+
+#[tokio::test]
+async fn delivery_publishes_partial_ack_and_retries_suffix_after_capacity_returns() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut topology = replication_topology(2);
+    topology
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == "node-2")
+        .unwrap()
+        .endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let key = key_with_placement(&topology, |replicas| {
+        replicas[0] == "node-1" && replicas[1] == "node-2"
+    });
+    let mut follower = service_for("node-2", topology.clone());
+    follower.max_dedup_bytes = dedup_retained_bytes("mutation-1", key.len(), "node-1".len());
+    let follower_state = follower.state.clone();
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(proto::data_node_server::DataNodeServer::new(follower))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+    );
+    let owner = service_for("node-1", topology.clone());
+    let (sender, receiver) = mpsc::channel(2);
+    let retained = Arc::new(Semaphore::new(MAX_PENDING_REPLICATION_BYTES));
+    let mut state = owner.state.write().await;
+    for sequence in 1..=2 {
+        let version = RecordVersion {
+            topology_epoch: topology.epoch,
+            owner_sequence: sequence,
+            owner_node_id: "node-1".into(),
+        };
+        let token = topology.key_token(&key);
+        let prepared = prepare_replication_entries(
+            &mut state,
+            &key,
+            &[sequence as u8],
+            false,
+            &version,
+            format!("mutation-{sequence}"),
+            token,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        let bytes = replication_mutation_bytes(&prepared.mutation);
+        sender
+            .send(PendingReplication {
+                prepared,
+                _budget: Arc::new(ReplicationBudget(
+                    retained
+                        .clone()
+                        .acquire_many_owned(bytes as u32)
+                        .await
+                        .unwrap(),
+                )),
+            })
+            .await
+            .unwrap();
+    }
+    let stream = (topology.epoch, "node-2".to_owned());
+    state
+        .owner_stream_unacked
+        .insert(stream.clone(), [(1, 0), (2, 0)].into());
+    let mut progress = state.ack_progress[&stream].subscribe();
+    drop(state);
+    drop(sender);
+    let failed = Arc::new(StdMutex::new(HashSet::new()));
+    let active = Arc::new(Semaphore::new(MAX_PENDING_REPLICATION_BYTES));
+    let delivery = tokio::spawn(deliver_replication_stream(
+        owner.state.clone(),
+        failed.clone(),
+        active.clone(),
+        owner.pressure.clone(),
+        (topology.epoch, "node-1".into(), "node-2".into()),
+        receiver,
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if *progress.borrow_and_update() == 1 {
+                break;
+            }
+            progress.changed().await.unwrap();
+        }
+        while owner
+            .pressure
+            .replication_rpc_retries
+            .load(AtomicOrdering::Relaxed)
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        owner.state.read().await.owner_stream_unacked[&stream]
+            .front()
+            .unwrap()
+            .0,
+        2
+    );
+    assert_eq!(
+        follower_state.read().await.records[&key].value.as_ref(),
+        &[1]
+    );
+    // Model receipt expiry freeing capacity while the failed suffix is pending.
+    {
+        let mut state = follower_state.write().await;
+        state.dedup.clear();
+        state.dedup_expirations.clear();
+        state.dedup_bytes = 0;
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(3), delivery)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(*progress.borrow(), 2);
+    assert!(owner.state.read().await.owner_stream_unacked[&stream].is_empty());
+    assert_eq!(
+        follower_state.read().await.records[&key].value.as_ref(),
+        &[2]
+    );
+    assert!(failed.lock().unwrap().is_empty());
+    assert_eq!(active.available_permits(), MAX_PENDING_REPLICATION_BYTES);
+    assert_eq!(retained.available_permits(), MAX_PENDING_REPLICATION_BYTES);
+    server.abort();
 }

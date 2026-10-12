@@ -49,11 +49,10 @@ impl DataNodeService {
 
     pub(super) async fn ready_followers(
         &self,
-        key: &[u8],
+        token: u64,
     ) -> Result<(u64, Vec<String>), OperationError> {
         let state = self.state.read().await;
         let topology = &state.topology;
-        let token = topology.key_token(key);
         let guard = &topology.write_availability_guard;
         let needs_status = guard.minimum_admitted_copies > 1
             || guard.minimum_healthy_followers > 0
@@ -498,11 +497,11 @@ impl DataNodeService {
     pub(super) fn owner_error(
         &self,
         state: &NodeState,
-        key: &[u8],
+        token: u64,
     ) -> Result<Option<OperationError>, Status> {
         let owner = state
             .topology
-            .owner(key)
+            .owner_for_token(token)
             .map_err(|error| Status::internal(error.to_string()))?;
         if owner.node_id == self.node_id {
             if state.lease.is_none_or(|(epoch, expires_at)| {

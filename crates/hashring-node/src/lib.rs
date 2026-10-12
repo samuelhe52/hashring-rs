@@ -32,8 +32,9 @@ use hashring_core::{
         PolicyWriteFenceRequest, PrepareDestinationRangeResponse, PrepareRangeRequest,
         PrepareSourceRangeResponse, PutRequest, PutResponse, RangeControlRequest,
         RangeDigestResponse, RecordVersion, RegisterNodeRequest, ReplicateMutationResponse,
-        ReplicationCheckpointRequest, ReplicationEntry, ReplicationProgressRequest,
-        ReplicationProgressResponse, SnapshotPageRequest, SnapshotPageResponse, StopRequest,
+        ReplicateMutationsResponse, ReplicationBatch, ReplicationCheckpointRequest,
+        ReplicationEntry, ReplicationProgressRequest, ReplicationProgressResponse,
+        SnapshotPageRequest, SnapshotPageResponse, StopRequest,
         coordinator_client::CoordinatorClient, data_node_client::DataNodeClient,
         data_node_server::DataNode,
     },
@@ -43,6 +44,9 @@ use hashring_core::{
 
 pub const DEFAULT_MAX_MIGRATION_JOURNAL_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_REPLICATION_BYTES: usize = 64 * 1024 * 1024;
+const REPLICATION_BATCH_MAX_ENTRIES: usize = 64;
+// Stay under the data-node client's encode limit so one batch fits a message.
+const REPLICATION_BATCH_MAX_BYTES: usize = MAX_DATA_MESSAGE_BYTES - 64 * 1024;
 const REPLICATION_STREAM_QUEUE_CAPACITY: usize = 32;
 const MAX_REPLICATION_FINGERPRINTS: u64 = 4_096;
 const REPLICATION_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);

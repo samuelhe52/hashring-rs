@@ -94,8 +94,8 @@ pub(super) fn prepare_replication_entries(
     deleted: bool,
     version: &RecordVersion,
     mutation_id: String,
+    token: u64,
 ) -> Result<Vec<PreparedReplication>, ()> {
-    let token = state.topology.key_token(key);
     let follower_ids: Vec<_> = state
         .topology
         .replica_node_ids_for_token(token)
@@ -402,17 +402,49 @@ pub(super) async fn deliver_replication_stream(
     mut entries: mpsc::Receiver<PendingReplication>,
 ) {
     let mut client = None;
-    while let Some(pending) = entries.recv().await {
-        let prepared = &pending.prepared;
+    let mut carry: Option<PendingReplication> = None;
+    loop {
+        let first = match carry.take() {
+            Some(pending) => pending,
+            None => match entries.recv().await {
+                Some(pending) => pending,
+                None => return,
+            },
+        };
+        // Accumulate a contiguous run of queued entries for this follower so a
+        // single RPC carries many mutations. Entries that would overflow the
+        // byte or count budget are carried to the next batch instead of being
+        // dropped, preserving the per-stream ordering that gap detection needs.
+        let mut batch: Vec<PendingReplication> = Vec::with_capacity(REPLICATION_BATCH_MAX_ENTRIES);
+        let mut batch_bytes = replication_mutation_bytes(&first.prepared.mutation);
+        batch.push(first);
+        while batch.len() < REPLICATION_BATCH_MAX_ENTRIES {
+            match entries.try_recv() {
+                Ok(next) => {
+                    let next_bytes = replication_mutation_bytes(&next.prepared.mutation);
+                    if batch_bytes.saturating_add(next_bytes) > REPLICATION_BATCH_MAX_BYTES {
+                        carry = Some(next);
+                        break;
+                    }
+                    batch_bytes += next_bytes;
+                    batch.push(next);
+                }
+                Err(_) => break,
+            }
+        }
+        let epoch = batch[0].prepared.mutation.topology_epoch;
+        let follower_node_id = batch[0].prepared.follower_node_id.clone();
+        let follower_endpoint = batch[0].prepared.follower_endpoint.clone();
+        let last_sequence = batch[batch.len() - 1].prepared.stream_sequence;
         let mut retry_delay = std::time::Duration::from_millis(25);
         loop {
-            if state.read().await.topology.epoch != prepared.mutation.topology_epoch {
+            if state.read().await.topology.epoch != epoch {
                 return;
             }
             if client.is_none() {
                 match tokio::time::timeout(
                     REPLICATION_RPC_TIMEOUT,
-                    DataNodeClient::connect(prepared.follower_endpoint.clone()),
+                    DataNodeClient::connect(follower_endpoint.clone()),
                 )
                 .await
                 {
@@ -424,8 +456,8 @@ pub(super) async fn deliver_replication_stream(
                     }
                 }
             }
-            let active_bytes = u32::try_from(replication_mutation_bytes(&prepared.mutation))
-                .expect("validated replication size fits u32");
+            let active_bytes =
+                u32::try_from(batch_bytes).expect("validated replication batch size fits u32");
             let Ok(active_budget) = active_rpc_budget
                 .clone()
                 .acquire_many_owned(active_bytes)
@@ -433,12 +465,19 @@ pub(super) async fn deliver_replication_stream(
             else {
                 return;
             };
+            // Own payload copies only while the aggregate RPC budget is held.
+            let request = ReplicationBatch {
+                entries: batch
+                    .iter()
+                    .map(|pending| pending.prepared.to_proto())
+                    .collect(),
+            };
             let result = tokio::time::timeout(
                 REPLICATION_RPC_TIMEOUT,
                 client
                     .as_mut()
                     .expect("replication client was connected above")
-                    .replicate_mutation(prepared.to_proto()),
+                    .replicate_mutations(request),
             )
             .await
             .map(|result| result.map(Response::into_inner));
@@ -446,22 +485,19 @@ pub(super) async fn deliver_replication_stream(
             match result {
                 Ok(Ok(response))
                     if !response.process_instance_id.is_empty()
-                        && response.applied_stream_sequence >= prepared.stream_sequence =>
+                        && response.applied_stream_sequence
+                            >= batch[0].prepared.stream_sequence =>
                 {
                     let mut state = diagnostics::write(&state, &pressure.ack_write_timing).await;
-                    let stream = (
-                        prepared.mutation.topology_epoch,
-                        prepared.follower_node_id.clone(),
-                    );
+                    let stream = (epoch, follower_node_id.clone());
                     let previous_instance = state
                         .ack_process_instances
                         .insert(stream, response.process_instance_id.clone());
                     let instance_changed =
                         previous_instance.as_ref() != Some(&response.process_instance_id);
-                    if let Some(progress) = state.ack_progress.get(&(
-                        prepared.mutation.topology_epoch,
-                        prepared.follower_node_id.clone(),
-                    )) {
+                    if let Some(progress) =
+                        state.ack_progress.get(&(epoch, follower_node_id.clone()))
+                    {
                         progress.send_if_modified(|sequence| {
                             if instance_changed || *sequence < response.applied_stream_sequence {
                                 *sequence = response.applied_stream_sequence;
@@ -471,17 +507,30 @@ pub(super) async fn deliver_replication_stream(
                             }
                         });
                     }
-                    if let Some(queue) = state.owner_stream_unacked.get_mut(&(
-                        prepared.mutation.topology_epoch,
-                        prepared.follower_node_id.clone(),
-                    )) {
+                    if let Some(queue) = state
+                        .owner_stream_unacked
+                        .get_mut(&(epoch, follower_node_id.clone()))
+                    {
                         while queue.front().is_some_and(|(sequence, _)| {
                             *sequence <= response.applied_stream_sequence
                         }) {
                             queue.pop_front();
                         }
                     }
-                    break;
+                    drop(state);
+                    if response.applied_stream_sequence >= last_sequence {
+                        break;
+                    }
+                    // Publish the successful prefix immediately, then retry only
+                    // the suffix. Its first failure retains the normal status handling.
+                    batch.retain(|pending| {
+                        pending.prepared.stream_sequence > response.applied_stream_sequence
+                    });
+                    batch_bytes = batch
+                        .iter()
+                        .map(|pending| replication_mutation_bytes(&pending.prepared.mutation))
+                        .sum();
+                    retry_delay = std::time::Duration::from_millis(25);
                 }
                 Ok(Err(status)) if retryable_replication_status(status.code()) => {
                     let count = pressure
