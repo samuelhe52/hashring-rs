@@ -510,6 +510,7 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
         owner_sequence: 1,
         owner_node_id: "node-1".into(),
     };
+    let token = state.topology.key_token(&key);
     let first = prepare_replication_entries(
         &mut state,
         &key,
@@ -517,6 +518,7 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
         false,
         &version,
         "mutation-1".into(),
+        token,
     )
     .unwrap();
     let second = prepare_replication_entries(
@@ -529,6 +531,7 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
             ..version
         },
         "mutation-2".into(),
+        token,
     )
     .unwrap();
 
@@ -926,9 +929,7 @@ async fn unavailable_follower_backpressures_before_unbounded_queue_growth() {
         // Backpressure is bounded by the per-stream channel plus at most one
         // in-flight replication batch that the delivery task drained before
         // blocking on the unavailable follower.
-        assert!(
-            successful <= REPLICATION_STREAM_QUEUE_CAPACITY + REPLICATION_BATCH_MAX_ENTRIES
-        );
+        assert!(successful <= REPLICATION_STREAM_QUEUE_CAPACITY + REPLICATION_BATCH_MAX_ENTRIES);
     };
 
     assert_eq!(rejected.code, ErrorCode::ResourceExhausted as i32);
@@ -1303,16 +1304,14 @@ async fn local_readiness_requires_admission_and_bounds_unacknowledged_lag() {
     let service = service_for("node-1", topology);
     let key = b"local-readiness";
     let follower;
+    let token;
     {
         let mut state = service.state.write().await;
         state.topology.write_ack_policy = WriteAckPolicy::FirstSuccessor;
-        follower = state
-            .topology
-            .replica_node_ids_for_token(state.topology.key_token(key))
-            .unwrap()[1]
-            .to_owned();
+        token = state.topology.key_token(key);
+        follower = state.topology.replica_node_ids_for_token(token).unwrap()[1].to_owned();
     }
-    assert!(service.ready_followers(key).await.is_err());
+    assert!(service.ready_followers(token).await.is_err());
     {
         let mut state = service.state.write().await;
         state
@@ -1320,7 +1319,7 @@ async fn local_readiness_requires_admission_and_bounds_unacknowledged_lag() {
             .insert(follower.clone(), "process".into());
     }
     assert_eq!(
-        service.ready_followers(key).await.unwrap().1,
+        service.ready_followers(token).await.unwrap().1,
         std::slice::from_ref(&follower)
     );
     {
@@ -1336,9 +1335,9 @@ async fn local_readiness_requires_admission_and_bounds_unacknowledged_lag() {
             .owner_stream_unacked
             .insert((1, follower.clone()), [(1, old)].into());
     }
-    assert!(service.ready_followers(key).await.is_err());
+    assert!(service.ready_followers(token).await.is_err());
     service.state.write().await.owner_stream_unacked.clear();
-    assert_eq!(service.ready_followers(key).await.unwrap().1, [follower]);
+    assert_eq!(service.ready_followers(token).await.unwrap().1, [follower]);
 }
 
 #[tokio::test]
