@@ -1,0 +1,21 @@
+# Settings for `hashring-rs coordinator --config examples/coordinator.yaml`.
+# Every key is optional and named after a coordinator flag (`_` for `-`).
+# A flag given on the command line wins over the same key here.
+listen: 127.0.0.1:50050
+state: ../coordinator.redb      # relative to this file's directory
+migration_timeout_ms: 120000
+range_move_concurrency: 16
+
+# Bootstrap keys: used only to create a new state store. When the store
+# already exists, the coordinator ignores them and loads the committed topology,
+# so the same file works for restarts after membership or config changes.
+seed: 1
+virtual_nodes: 128
+desired_replication_factor: 3
+minimum_admitted_copies: 1
+minimum_healthy_followers: 0
+max_replica_lag_ms: 5000
+members:
+  - { node_id: node-1, endpoint: http://127.0.0.1:50051 }
+  - { node_id: node-2, endpoint: http://127.0.0.1:50052 }
+  - { node_id: node-3, endpoint: http://127.0.0.1:50053 }

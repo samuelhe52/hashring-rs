@@ -58,6 +58,21 @@ cargo run -- replica-status  # per-range owner, followers, lag, and repair state
 `--member` is only read when the state file is first created. To restart the
 coordinator, pass just `--state`. Everything else is loaded from the file.
 
+The same settings can live in a YAML file instead. Keys are the flag names with
+`_` for `-`, and a flag on the command line wins over the file (see
+[`examples/coordinator.yaml`](examples/coordinator.yaml)):
+
+```sh
+cargo run -- coordinator --config examples/coordinator.yaml
+```
+
+A relative `state` path in the file is resolved against the file's directory.
+Unknown keys are an error. When the state file already exists, the coordinator
+ignores the bootstrap keys in the config file (`members`, `seed`,
+`virtual_nodes`, replication factor, and write guard), so the same file works
+for every restart. Explicit `--member` flags must still match the stored
+topology.
+
 ## Commands
 
 | Command | Purpose |

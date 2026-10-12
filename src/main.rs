@@ -2,9 +2,11 @@ use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf, sync::Arc, time::Du
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use config::{CoordinatorFile, CoordinatorSettings, MemberSource};
 use hashring_client::HashringClient;
 use hashring_coordinator::{
-    CoordinatorService, DEFAULT_RANGE_MOVE_CONCURRENCY, RedbTopologyRepository, load_or_initialize,
+    CoordinatorRepository, CoordinatorService, DEFAULT_RANGE_MOVE_CONCURRENCY,
+    RedbTopologyRepository, load_or_initialize,
 };
 use hashring_core::{
     limits::MAX_CONTROL_MESSAGE_BYTES,
@@ -16,6 +18,8 @@ use hashring_node::DataNodeService;
 use tonic::transport::Server;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+
+mod config;
 
 #[derive(Parser)]
 #[command(version, about = "A process-distributed consistent-hash cache")]
@@ -61,32 +65,47 @@ enum Command {
 
 #[derive(Args)]
 struct CoordinatorArgs {
-    #[arg(long, default_value = "127.0.0.1:50050")]
-    listen: SocketAddr,
-    #[arg(long, default_value = "./coordinator.redb")]
-    state: PathBuf,
-    #[arg(long, default_value_t = 1)]
-    seed: u64,
-    #[arg(long, default_value_t = 128)]
-    virtual_nodes: u32,
-    #[arg(long, default_value_t = 3)]
-    desired_replication_factor: u32,
-    #[arg(long, default_value_t = 1)]
-    minimum_admitted_copies: u32,
-    #[arg(long, default_value_t = 0)]
-    minimum_healthy_followers: u32,
-    #[arg(long, default_value_t = 5_000)]
-    max_replica_lag_ms: u64,
-    #[arg(long, default_value_t = 120_000)]
-    migration_timeout_ms: u64,
-    /// Maximum number of disjoint ranges moved concurrently within one topology change.
-    #[arg(long, default_value_t = NonZeroUsize::new(DEFAULT_RANGE_MOVE_CONCURRENCY).unwrap())]
-    range_move_concurrency: NonZeroUsize,
+    /// YAML file with coordinator settings. Keys match the flag names with `_`
+    /// for `-`; a flag given here wins over the same key in the file.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// [default: 127.0.0.1:50050]
+    #[arg(long)]
+    listen: Option<SocketAddr>,
+    /// [default: ./coordinator.redb]
+    #[arg(long)]
+    state: Option<PathBuf>,
+    /// [default: 1]
+    #[arg(long)]
+    seed: Option<u64>,
+    /// [default: 128]
+    #[arg(long)]
+    virtual_nodes: Option<u32>,
+    /// [default: 3]
+    #[arg(long)]
+    desired_replication_factor: Option<u32>,
+    /// [default: 1]
+    #[arg(long)]
+    minimum_admitted_copies: Option<u32>,
+    /// [default: 0]
+    #[arg(long)]
+    minimum_healthy_followers: Option<u32>,
+    /// [default: 5000]
+    #[arg(long)]
+    max_replica_lag_ms: Option<u64>,
+    /// [default: 120000]
+    #[arg(long)]
+    migration_timeout_ms: Option<u64>,
+    /// Maximum number of disjoint ranges moved concurrently within one topology
+    /// change. [default: 16]
+    #[arg(long)]
+    range_move_concurrency: Option<NonZeroUsize>,
     #[arg(long, default_value_t = 0, hide = true)]
     pre_publish_delay_ms: u64,
     #[arg(long, default_value_t = 0, hide = true)]
     post_publish_delay_ms: u64,
-    /// Bootstrap member in NODE_ID=HTTP_ENDPOINT form. Required only for a new store.
+    /// Bootstrap member in NODE_ID=HTTP_ENDPOINT form. Required only for a new
+    /// store; replaces the `members` list of the config file.
     #[arg(long = "member")]
     members: Vec<String>,
 }
@@ -384,48 +403,33 @@ async fn run_local_experiment(args: ExperimentArgs, worker_threads: usize) -> Re
 }
 
 async fn run_coordinator(args: CoordinatorArgs) -> Result<()> {
+    let file = args
+        .config
+        .as_deref()
+        .map(CoordinatorFile::load)
+        .transpose()?;
+    let settings = config::resolve(&args, file)?;
     let repository = Arc::new(
-        RedbTopologyRepository::open(&args.state)
-            .with_context(|| format!("opening {}", args.state.display()))?,
+        RedbTopologyRepository::open(&settings.state)
+            .with_context(|| format!("opening {}", settings.state.display()))?,
     );
-    let bootstrap = if args.members.is_empty() {
-        None
-    } else {
-        Some(TopologySnapshot::new_with_config(
-            1,
-            args.seed,
-            args.virtual_nodes,
-            args.members
-                .iter()
-                .map(|member| parse_member(member))
-                .collect::<Result<Vec<_>>>()?,
-            TopologyConfig {
-                desired_replication_factor: args.desired_replication_factor,
-                write_availability_guard: WriteAvailabilityGuard {
-                    minimum_admitted_copies: args.minimum_admitted_copies,
-                    minimum_healthy_followers: args.minimum_healthy_followers,
-                    max_replica_lag_millis: args.max_replica_lag_ms,
-                },
-                ..TopologyConfig::default()
-            },
-        )?)
-    };
+    let bootstrap = coordinator_bootstrap(&settings, repository.as_ref())?;
     let state = load_or_initialize(repository.as_ref(), bootstrap)?;
     info!(
-        listen = %args.listen,
+        listen = %settings.listen,
         epoch = state.committed.epoch,
         digest = %state.committed.digest,
         members = state.committed.members.len(),
         active_change = state.active_change.is_some(),
-        range_move_concurrency = args.range_move_concurrency.get(),
+        range_move_concurrency = settings.range_move_concurrency.get(),
         "coordinator ready"
     );
     let service = CoordinatorService::new(
         state,
         repository,
-        Duration::from_millis(args.migration_timeout_ms),
+        Duration::from_millis(settings.migration_timeout_ms),
     )
-    .with_range_move_concurrency(args.range_move_concurrency.get())
+    .with_range_move_concurrency(settings.range_move_concurrency.get())
     .with_pre_publish_delay(Duration::from_millis(args.pre_publish_delay_ms))
     .with_post_publish_delay(Duration::from_millis(args.post_publish_delay_ms));
     let recovery_service = service.clone();
@@ -463,9 +467,45 @@ async fn run_coordinator(args: CoordinatorArgs) -> Result<()> {
                 .max_decoding_message_size(MAX_CONTROL_MESSAGE_BYTES)
                 .max_encoding_message_size(MAX_CONTROL_MESSAGE_BYTES),
         )
-        .serve_with_shutdown(args.listen, shutdown_signal())
+        .serve_with_shutdown(settings.listen, shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// Builds the epoch-1 topology for a new store. Members from a config file are
+/// skipped when the store already exists, so one file serves both the first
+/// start and every restart; `--member` flags still must match the store.
+fn coordinator_bootstrap(
+    settings: &CoordinatorSettings,
+    repository: &impl CoordinatorRepository,
+) -> Result<Option<TopologySnapshot>> {
+    if settings.members.is_empty() {
+        return Ok(None);
+    }
+    if let MemberSource::File(path) = &settings.member_source
+        && repository.load_state()?.is_some()
+    {
+        info!(
+            config = %path.display(),
+            "state store exists; ignoring bootstrap keys from the config file"
+        );
+        return Ok(None);
+    }
+    Ok(Some(TopologySnapshot::new_with_config(
+        1,
+        settings.seed,
+        settings.virtual_nodes,
+        settings.members.clone(),
+        TopologyConfig {
+            desired_replication_factor: settings.desired_replication_factor,
+            write_availability_guard: WriteAvailabilityGuard {
+                minimum_admitted_copies: settings.minimum_admitted_copies,
+                minimum_healthy_followers: settings.minimum_healthy_followers,
+                max_replica_lag_millis: settings.max_replica_lag_ms,
+            },
+            ..TopologyConfig::default()
+        },
+    )?))
 }
 
 async fn run_node(args: NodeArgs) -> Result<()> {
@@ -746,5 +786,53 @@ mod worker_thread_tests {
         let cli =
             Cli::try_parse_from(["hashring-rs", "--worker-threads", "1", "topology"]).unwrap();
         assert_eq!(cli.worker_threads.unwrap().get(), 1);
+    }
+}
+
+#[cfg(test)]
+mod coordinator_bootstrap_tests {
+    use super::*;
+
+    fn settings(state: PathBuf, extra: &[&str], file: Option<PathBuf>) -> CoordinatorSettings {
+        let state = state.display().to_string();
+        let mut argv = vec!["hashring-rs", "coordinator", "--state", &state];
+        argv.extend_from_slice(extra);
+        let Command::Coordinator(args) = Cli::try_parse_from(argv).unwrap().command else {
+            unreachable!()
+        };
+        let file = file.map(|path| CoordinatorFile::load(&path).unwrap());
+        config::resolve(&args, file).unwrap()
+    }
+
+    #[test]
+    fn file_members_restart_an_existing_store_but_member_flags_must_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("coordinator.redb");
+        let config = dir.path().join("cluster.yaml");
+        std::fs::write(
+            &config,
+            "members:\n  - { node_id: a, endpoint: http://a }\n  - { node_id: b, endpoint: http://b }\n",
+        )
+        .unwrap();
+        let repository = RedbTopologyRepository::open(&state).unwrap();
+
+        // The first start creates the store from the file.
+        let first = settings(state.clone(), &[], Some(config.clone()));
+        let bootstrap = coordinator_bootstrap(&first, &repository).unwrap();
+        assert!(bootstrap.is_some());
+        load_or_initialize(&repository, bootstrap).unwrap();
+
+        // A changed file no longer matches, but its bootstrap keys are ignored.
+        let restart = settings(state.clone(), &["--seed", "9"], Some(config));
+        assert!(
+            coordinator_bootstrap(&restart, &repository)
+                .unwrap()
+                .is_none()
+        );
+
+        // Explicit flags still get the strict BootstrapMismatch check.
+        let flags = settings(state, &["--member", "c=http://c"], None);
+        let bootstrap = coordinator_bootstrap(&flags, &repository).unwrap();
+        assert!(load_or_initialize(&repository, bootstrap).is_err());
     }
 }

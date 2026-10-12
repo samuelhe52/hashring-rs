@@ -30,7 +30,9 @@ hashring-core = { version = "0.1.0", path = "crates/hashring-core" }
 hashring-experiment = { version = "0.1.0", path = "crates/hashring-experiment" }
 hashring-node = { version = "0.1.0", path = "crates/hashring-node" }
 hex = "0.4"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tonic = { version = "0.12", features = ["transport"] }
 tracing = "0.1"
