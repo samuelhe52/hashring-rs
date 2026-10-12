@@ -94,8 +94,8 @@ pub(super) fn prepare_replication_entries(
     deleted: bool,
     version: &RecordVersion,
     mutation_id: String,
+    token: u64,
 ) -> Result<Vec<PreparedReplication>, ()> {
-    let token = state.topology.key_token(key);
     let follower_ids: Vec<_> = state
         .topology
         .replica_node_ids_for_token(token)
@@ -432,8 +432,8 @@ pub(super) async fn deliver_replication_stream(
                 Err(_) => break,
             }
         }
-        let active_bytes = u32::try_from(batch_bytes)
-            .expect("validated replication batch size fits u32");
+        let active_bytes =
+            u32::try_from(batch_bytes).expect("validated replication batch size fits u32");
         let epoch = batch[0].prepared.mutation.topology_epoch;
         let follower_node_id = batch[0].prepared.follower_node_id.clone();
         let follower_endpoint = batch[0].prepared.follower_endpoint.clone();
@@ -493,7 +493,9 @@ pub(super) async fn deliver_replication_stream(
                         .insert(stream, response.process_instance_id.clone());
                     let instance_changed =
                         previous_instance.as_ref() != Some(&response.process_instance_id);
-                    if let Some(progress) = state.ack_progress.get(&(epoch, follower_node_id.clone())) {
+                    if let Some(progress) =
+                        state.ack_progress.get(&(epoch, follower_node_id.clone()))
+                    {
                         progress.send_if_modified(|sequence| {
                             if instance_changed || *sequence < response.applied_stream_sequence {
                                 *sequence = response.applied_stream_sequence;

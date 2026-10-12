@@ -156,7 +156,6 @@ fn apply_replication_entry(
     Ok(applied_stream_sequence)
 }
 
-
 #[tonic::async_trait]
 impl DataNode for DataNodeService {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
@@ -169,7 +168,7 @@ impl DataNode for DataNodeService {
         }
         self.refresh_if_newer(request.topology_epoch).await?;
         let state = self.state.read().await;
-        if let Some(error) = self.owner_error(&state, &request.key)? {
+        if let Some(error) = self.owner_error(&state, state.topology.key_token(&request.key))? {
             return Ok(Response::new(GetResponse {
                 current_epoch: error.current_epoch,
                 error: Some(error),
@@ -227,9 +226,14 @@ impl DataNode for DataNodeService {
             }));
         }
         self.refresh_if_newer(request.topology_epoch).await?;
+        // The hash seed is invariant for the process lifetime, so the routing
+        // token and the mutation fingerprint can be computed once and reused by
+        // every check below instead of being recomputed under each lock.
+        let token = self.state.read().await.topology.key_token(&request.key);
+        let fingerprint = mutation_fingerprint(&request.key, &request.value, false);
         {
             let state = self.state.read().await;
-            if let Some(error) = self.owner_error(&state, &request.key)? {
+            if let Some(error) = self.owner_error(&state, token)? {
                 return Ok(Response::new(PutResponse {
                     current_epoch: error.current_epoch,
                     error: Some(error),
@@ -241,9 +245,7 @@ impl DataNode for DataNodeService {
                 .get(request.request_id.as_str())
                 .filter(|entry| entry.expires_at > Instant::now())
             {
-                if existing.fingerprint != mutation_fingerprint(&request.key, &request.value, false)
-                    || existing.deleted
-                {
+                if existing.fingerprint != fingerprint || existing.deleted {
                     return Ok(Response::new(PutResponse {
                         current_epoch: state.topology.epoch,
                         error: Some(operation_error(
@@ -269,7 +271,7 @@ impl DataNode for DataNodeService {
                 }));
             }
         }
-        let (readiness_epoch, ready_followers) = match self.ready_followers(&request.key).await {
+        let (readiness_epoch, ready_followers) = match self.ready_followers(token).await {
             Ok(ready) => ready,
             Err(error) => {
                 return Ok(Response::new(PutResponse {
@@ -280,7 +282,7 @@ impl DataNode for DataNodeService {
             }
         };
         let mut state = diagnostics::write(&self.state, &self.pressure.owner_write_timing).await;
-        if let Some(error) = self.owner_error(&state, &request.key)? {
+        if let Some(error) = self.owner_error(&state, token)? {
             return Ok(Response::new(PutResponse {
                 current_epoch: error.current_epoch,
                 error: Some(error),
@@ -300,7 +302,6 @@ impl DataNode for DataNodeService {
         }
         let dedup_now = Instant::now();
         purge_expired_dedup(&mut state, dedup_now);
-        let fingerprint = mutation_fingerprint(&request.key, &request.value, false);
         if let Some(existing) = state.dedup.get(request.request_id.as_str()) {
             if existing.fingerprint == fingerprint && !existing.deleted {
                 let version = existing.version.clone();
@@ -353,7 +354,6 @@ impl DataNode for DataNodeService {
                 ..Default::default()
             }));
         }
-        let token = state.topology.key_token(&request.key);
         let journal_record_bytes =
             request.key.len() + request.value.len() + request.request_id.len() + 128;
         let matching_sources = state
@@ -429,6 +429,7 @@ impl DataNode for DataNodeService {
             false,
             &version,
             request.request_id,
+            token,
         ) {
             Ok(replications) => replications,
             Err(()) => {
@@ -553,9 +554,11 @@ impl DataNode for DataNodeService {
             }));
         }
         self.refresh_if_newer(request.topology_epoch).await?;
+        let token = self.state.read().await.topology.key_token(&request.key);
+        let fingerprint = mutation_fingerprint(&request.key, &[], true);
         {
             let state = self.state.read().await;
-            if let Some(error) = self.owner_error(&state, &request.key)? {
+            if let Some(error) = self.owner_error(&state, token)? {
                 return Ok(Response::new(DeleteResponse {
                     current_epoch: error.current_epoch,
                     error: Some(error),
@@ -566,9 +569,7 @@ impl DataNode for DataNodeService {
                 .get(request.request_id.as_str())
                 .filter(|entry| entry.expires_at > Instant::now())
             {
-                if existing.fingerprint != mutation_fingerprint(&request.key, &[], true)
-                    || !existing.deleted
-                {
+                if existing.fingerprint != fingerprint || !existing.deleted {
                     return Ok(Response::new(DeleteResponse {
                         current_epoch: state.topology.epoch,
                         error: Some(operation_error(
@@ -592,7 +593,7 @@ impl DataNode for DataNodeService {
                 }));
             }
         }
-        let (readiness_epoch, ready_followers) = match self.ready_followers(&request.key).await {
+        let (readiness_epoch, ready_followers) = match self.ready_followers(token).await {
             Ok(ready) => ready,
             Err(error) => {
                 return Ok(Response::new(DeleteResponse {
@@ -602,7 +603,7 @@ impl DataNode for DataNodeService {
             }
         };
         let mut state = diagnostics::write(&self.state, &self.pressure.owner_write_timing).await;
-        if let Some(error) = self.owner_error(&state, &request.key)? {
+        if let Some(error) = self.owner_error(&state, token)? {
             return Ok(Response::new(DeleteResponse {
                 current_epoch: error.current_epoch,
                 error: Some(error),
@@ -620,7 +621,6 @@ impl DataNode for DataNodeService {
         }
         let dedup_now = Instant::now();
         purge_expired_dedup(&mut state, dedup_now);
-        let fingerprint = mutation_fingerprint(&request.key, &[], true);
         if let Some(existing) = state.dedup.get(request.request_id.as_str()) {
             if existing.fingerprint == fingerprint && existing.deleted {
                 let version = existing.version.clone();
@@ -669,7 +669,6 @@ impl DataNode for DataNodeService {
                 }),
             }));
         }
-        let token = state.topology.key_token(&request.key);
         for source in state
             .sources
             .values()
@@ -742,6 +741,7 @@ impl DataNode for DataNodeService {
             true,
             &version,
             request.request_id,
+            token,
         ) {
             Ok(replications) => replications,
             Err(()) => {
