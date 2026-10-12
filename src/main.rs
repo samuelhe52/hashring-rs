@@ -22,6 +22,11 @@ use tracing_subscriber::EnvFilter;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Tokio worker threads per process. Defaults to one per logical CPU, which
+    /// in a local experiment means 24 workers in each of the driver,
+    /// coordinator and data nodes running on the same host.
+    #[arg(long, global = true)]
+    worker_threads: Option<usize>,
 }
 
 #[derive(Subcommand)]
@@ -254,9 +259,43 @@ struct ExperimentArgs {
     policy: Option<PolicyArg>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
+    let worker_threads = cli
+        .worker_threads
+        .unwrap_or_else(|| default_worker_threads(&cli));
+    // Built explicitly rather than via #[tokio::main] so the worker count can be
+    // set and inspected. A standalone node keeps tokio's one-worker-per-CPU
+    // default; the local experiment divides the host between its processes.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()?
+        .block_on(run(cli, worker_threads))
+}
+
+/// Tokio's default of one worker per logical CPU is right when a process owns its
+/// machine. The `experiment` command instead starts a coordinator, every data node
+/// and the driver on one host, so the per-process default must be the host budget
+/// divided by the number of processes it will start. Measured on 24 cores with 11
+/// processes, letting each take 24 workers (275 threads total) cost initial-put
+/// throughput against a shared budget of 4.
+fn default_worker_threads(cli: &Cli) -> usize {
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let Command::Experiment(args) = &cli.command else {
+        return cpus;
+    };
+    let peak_nodes = args.nodes.unwrap_or(match args.mode {
+        ExperimentModeArg::Correctness => 10,
+        ExperimentModeArg::Performance => 10,
+        ExperimentModeArg::Availability => 4,
+    });
+    // Driver, coordinator, and every data node share the host.
+    let processes = peak_nodes + 2;
+    (cpus / processes).clamp(2, cpus)
+}
+
+async fn run(cli: Cli, worker_threads: usize) -> Result<()> {
     let verbose_experiment = matches!(&cli.command, Command::Experiment(args) if args.verbose);
     let mut filter = EnvFilter::from_default_env().add_directive("hashring_rs=info".parse()?);
     if verbose_experiment {
@@ -277,11 +316,11 @@ async fn main() -> Result<()> {
         Command::ChangeStatus(args) => run_change_status(args).await,
         Command::ReplicaStatus(args) => run_replica_status(args).await,
         Command::ExecuteChange(args) => run_execute_change(args).await,
-        Command::Experiment(args) => run_local_experiment(args).await,
+        Command::Experiment(args) => run_local_experiment(args, worker_threads).await,
     }
 }
 
-async fn run_local_experiment(args: ExperimentArgs) -> Result<()> {
+async fn run_local_experiment(args: ExperimentArgs, worker_threads: usize) -> Result<()> {
     let mode = match args.mode {
         ExperimentModeArg::Correctness => ExperimentMode::Correctness,
         ExperimentModeArg::Performance => ExperimentMode::Performance,
@@ -314,6 +353,7 @@ async fn run_local_experiment(args: ExperimentArgs) -> Result<()> {
             pre_publish_delay_ms: args.pre_publish_delay_ms,
             require_clean_source: args.require_clean_source,
             verbose: args.verbose,
+            worker_threads,
             desired_replication_factor: args.desired_replication_factor,
             minimum_admitted_copies: args.minimum_admitted_copies,
             minimum_healthy_followers: args.minimum_healthy_followers,

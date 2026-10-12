@@ -50,6 +50,8 @@ pub struct ExperimentConfig {
     pub pre_publish_delay_ms: u64,
     pub require_clean_source: bool,
     pub verbose: bool,
+    /// Tokio worker threads for the driver, the coordinator and every data node.
+    pub worker_threads: usize,
     pub desired_replication_factor: u32,
     pub minimum_admitted_copies: u32,
     pub minimum_healthy_followers: u32,
@@ -171,15 +173,19 @@ struct ProcessGroup {
     executable: PathBuf,
     log_dir: PathBuf,
     verbose: bool,
+    /// Propagated to every child so a single flag sizes the worker pool of the
+    /// driver, the coordinator and each data node together.
+    worker_threads: usize,
     processes: Vec<ManagedProcess>,
 }
 
 impl ProcessGroup {
-    fn new(executable: PathBuf, log_dir: PathBuf, verbose: bool) -> Self {
+    fn new(executable: PathBuf, log_dir: PathBuf, verbose: bool, worker_threads: usize) -> Self {
         Self {
             executable,
             log_dir,
             verbose,
+            worker_threads,
             processes: Vec::new(),
         }
     }
@@ -201,6 +207,7 @@ impl ProcessGroup {
                     "hashring_rs=info"
                 },
             )
+            .args(["--worker-threads", &self.worker_threads.to_string()])
             .spawn()
             .with_context(|| format!("spawning {name}"))?;
         self.processes.push(ManagedProcess { name, child });
@@ -411,7 +418,8 @@ async fn run_cluster(
         ExperimentMode::Availability => 3,
     };
     let initial_members = &members[..initial_count];
-    let mut processes = ProcessGroup::new(executable, log_dir, config.verbose);
+    let mut processes =
+        ProcessGroup::new(executable, log_dir, config.verbose, config.worker_threads);
     let state_path = config.output_dir.join("coordinator.redb");
     let mut coordinator_args = vec![
         "coordinator".into(),
