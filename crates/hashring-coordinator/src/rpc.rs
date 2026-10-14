@@ -71,7 +71,7 @@ impl Coordinator for CoordinatorService {
                     suspected: failures.iter().any(|((target, reporter), failure)| {
                         target == &node_id
                             && live_nodes.contains(reporter)
-                            && failure.last_seen + Duration::from_secs(2) >= now
+                            && failure.last_seen + PEER_FAILURE_REPORT_FRESHNESS >= now
                     }),
                     fenced: state.fenced_nodes.contains(&node_id),
                     joining: !state
@@ -714,7 +714,7 @@ impl Coordinator for CoordinatorService {
             failures
                 .entry(key)
                 .and_modify(|failure| {
-                    if failure.last_seen + Duration::from_secs(2) < now {
+                    if failure.last_seen + PEER_FAILURE_REPORT_FRESHNESS < now {
                         failure.first_seen = now;
                     }
                     failure.last_seen = now;

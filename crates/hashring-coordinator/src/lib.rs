@@ -52,6 +52,9 @@ fn unix_millis_now() -> u64 {
 pub const DEFAULT_RANGE_MOVE_CONCURRENCY: usize = 16;
 const MAX_REPAIR_GROUPS_PER_PASS: usize = 32;
 const MAX_PENDING_PROBES_PER_PASS: usize = 32;
+/// A peer-failure report stays current this long after its latest probe.
+/// Nodes probe their peers every second, so one missed report is tolerated.
+const PEER_FAILURE_REPORT_FRESHNESS: Duration = Duration::from_secs(2);
 /// How long a migration participant may stay unreachable before publication
 /// before the coordinator treats it as failed and recovers the change.
 pub const DEFAULT_PREPUBLICATION_FAILURE_GRACE: Duration = Duration::from_secs(30);
