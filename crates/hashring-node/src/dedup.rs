@@ -225,7 +225,7 @@ pub(super) fn insert_dedup_until(
     state
         .dedup_expirations
         .push(Reverse((expires_at, mutation_id.clone())));
-    state.dedup.insert(
+    let replaced = state.dedup.insert(
         mutation_id.clone(),
         DedupEntry {
             key: key.clone(),
@@ -238,7 +238,11 @@ pub(super) fn insert_dedup_until(
         },
     );
     // Migration finds a range's receipts through this index, so it has to see
-    // every insert and every removal.
+    // every insert and every removal. A repeated id would otherwise leave two
+    // entries for one receipt.
+    if let Some(previous) = replaced {
+        state.remove_dedup_index(&mutation_id, &previous.key);
+    }
     state.insert_dedup_index(&mutation_id, &key);
     state.dedup_bytes += retained_bytes;
     state.dedup_peak_bytes = state.dedup_peak_bytes.max(state.dedup_bytes);
