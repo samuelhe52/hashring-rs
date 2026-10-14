@@ -69,13 +69,65 @@ Raw data: [phase-c-linger-runs.tsv](data/grpc-io-bottleneck/phase-c-linger-runs.
   (`initial_full_rf_seconds`), since milliseconds of linger are small against
   it.
 
-The default is 2 ms rather than 5. At concurrency 64, 2 ms already reaches the
-top of the range (5 ms is not better), and the smaller value keeps the
-added `OwnerOnly` loss window (below) short. At concurrency 256, 5 ms gains a further 10%
-for operators who accept that.
+The default is 2 ms rather than 5. In this sweep 5 ms was no better at
+concurrency 64 and 10% better at concurrency 256. Repeats at 256 (below) put the
+typical gain at about 6%, so the smaller value, which keeps the added
+`OwnerOnly` loss window (below) short, gives up little.
 
-RF=3 under `OwnerOnly` is still about 30% below RF=1 at concurrency 64. The
-remaining gap is the replication RPCs that are left plus follower apply work.
+## Why a longer linger adds little
+
+Going from 2 ms to 5 ms halves the replication RPCs again, so a follow-up
+tested whether the driver was hiding the gain. Concurrency 256, three runs
+each, under heavier background load (one disk-image service and `logd` busy,
+so the first repetition was slow in every configuration). A temporary build
+gave only the driver 4 workers and spawned writer tasks, while nodes kept
+2 workers. Raw data:
+[phase-d-driver-runs.tsv](data/grpc-io-bottleneck/phase-d-driver-runs.tsv).
+
+| PUT ops/s, median | linger 0 | 2 ms | 5 ms | RF=1 |
+| --- | --- | --- | --- | --- |
+| driver 2 workers (default) | 47,398 | 64,202 | 56,062 | 92,005 |
+| driver 4 workers, spawned tasks | 46,383 | 69,793 | 65,918 | 116,363 |
+
+Comparing within each repetition, 5 ms against 2 ms was -4%, -29% and +3% with
+the default driver, and -27%, +3% and +8% with the faster one: no gain that
+stands out from the noise either way. 0 to 2 ms was +29% to +41% with the
+default driver. Across all nine paired comparisons of 5 ms against 2 ms at
+concurrency 256 with the default driver (this run, the sweep above, and the lock
+profile below), the median gain is **+6.5%**, with a range of -29% to +30%.
+
+- **The driver is not the RF=3 limit.** It does cap RF=1: at concurrency 256 the
+  default driver runs both workers at 1.94 cores, and giving it more lifts RF=1
+  from 92k to 116k. RF=3 stays well below either ceiling, and a faster driver
+  does not widen the 2 to 5 ms gap. (Comparing RF=3 at concurrency 256 with RF=1
+  at concurrency 64, as an earlier version of this note did, uses a ceiling that
+  is itself latency-bound. At equal concurrency and the default 2 ms, RF=3 is
+  about 30% below RF=1.)
+- **Halving a small share of RPCs gains little.** With about 300k client `Put`
+  RPCs per run, replication was 35% of the RPCs that nodes serve at linger 0,
+  12% at 2 ms and 6% at 5 ms. By Amdahl's law, halving the replication RPCs at
+  2 ms can speed the RPC load up by at most about 6%. Removing them entirely
+  would give at most about 14%.
+- **The write lock is not the remaining limit.** A third run added
+  `HASHRING_PROFILE_WRITES=1`. Same workload and default driver, Time Machine
+  busy throughout, so throughput is noisy but the lock counters agree across
+  repetitions. Raw data:
+  [phase-e-lock-runs.tsv](data/grpc-io-bottleneck/phase-e-lock-runs.tsv).
+
+  | linger | PUT ops/s | owner lock wait per write | follower lock hold, total | per batch | per entry | owner `Put` handler |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | 0 | 52,777 | 73 µs | 3.13 s | 22 µs | 5.2 µs | 456 µs |
+  | 2 ms | 64,565 | 43 µs | 2.75 s | 72 µs | 4.6 µs | 280 µs |
+  | 5 ms | 74,943 | 35 µs | 2.34 s | 127 µs | 3.9 µs | 230 µs |
+  | RF=1 | 91,704 | 12 µs | | | | 72 µs |
+
+  Each follower batch holds the lock longer as batches grow, but total hold
+  time falls, because per-entry cost shrinks with batching, and owner writes
+  wait *less* for the lock. At 5 ms the lock accounts for about 23 µs of the
+  158 µs gap between the RF=3 and RF=1 owner handlers. The rest is time the
+  handler spends outside the write lock, most likely waiting for one of the
+  node's two workers, which also serve replication sends and follower applies,
+  or for the state read lock. Pinning that down needs a scheduling profile.
 
 ## Tradeoffs
 
