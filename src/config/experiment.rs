@@ -61,6 +61,7 @@ pub struct ExperimentFile {
     pub replication_stream_queue_capacity: Option<NonZeroUsize>,
     pub required_ack_timeout_ms: Option<u64>,
     pub replication_rpc_timeout_ms: Option<u64>,
+    pub replication_batch_linger_ms: Option<u64>,
 }
 
 /// Resolves the run's configuration. Boolean flags can only turn a setting on,
@@ -84,6 +85,7 @@ pub fn resolve(
             replication_stream_queue_capacity: file.replication_stream_queue_capacity,
             required_ack_timeout_ms: file.required_ack_timeout_ms,
             replication_rpc_timeout_ms: file.replication_rpc_timeout_ms,
+            replication_batch_linger_ms: file.replication_batch_linger_ms,
         },
     );
     node_settings.validate()?;

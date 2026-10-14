@@ -77,6 +77,7 @@ pub struct NodeOptions {
     pub replication_stream_queue_capacity: usize,
     pub required_ack_timeout_ms: u64,
     pub replication_rpc_timeout_ms: u64,
+    pub replication_batch_linger_ms: u64,
 }
 
 impl NodeOptions {
@@ -102,6 +103,10 @@ impl NodeOptions {
             (
                 "--replication-rpc-timeout-ms",
                 self.replication_rpc_timeout_ms.to_string(),
+            ),
+            (
+                "--replication-batch-linger-ms",
+                self.replication_batch_linger_ms.to_string(),
             ),
         ]
         .into_iter()

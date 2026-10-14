@@ -187,6 +187,10 @@ struct NodeTuningArgs {
     /// Bounds each replication connect and batch RPC. [default: 2000]
     #[arg(long)]
     replication_rpc_timeout_ms: Option<u64>,
+    /// How long a follower stream waits to fill a replication batch when no
+    /// write waits for its ACK. 0 sends at once. [default: 2]
+    #[arg(long)]
+    replication_batch_linger_ms: Option<u64>,
 }
 
 #[derive(Args, Clone)]

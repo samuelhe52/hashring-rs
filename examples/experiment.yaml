@@ -38,3 +38,4 @@ max_migration_journal_bytes: 16777216   # 16 MiB
 replication_stream_queue_capacity: 32
 required_ack_timeout_ms: 2000
 replication_rpc_timeout_ms: 2000
+replication_batch_linger_ms: 2

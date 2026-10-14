@@ -548,6 +548,7 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
         "mutation-1".into(),
         token,
         DEFAULT_MAX_PENDING_REPLICATION_BYTES,
+        &[],
     )
     .unwrap();
     let second = prepare_replication_entries(
@@ -562,6 +563,7 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
         "mutation-2".into(),
         token,
         DEFAULT_MAX_PENDING_REPLICATION_BYTES,
+        &[],
     )
     .unwrap();
 
@@ -1492,6 +1494,7 @@ async fn unreachable_streams_do_not_copy_unbudgeted_payloads() {
                     follower_endpoint: "http://127.0.0.1:1".into(),
                     stream_sequence: 1,
                     mutation: mutation.clone(),
+                    ack_awaited: false,
                 },
                 _budget: budget.clone(),
             })
@@ -1502,6 +1505,7 @@ async fn unreachable_streams_do_not_copy_unbudgeted_payloads() {
             failed.clone(),
             active.clone(),
             DEFAULT_REPLICATION_RPC_TIMEOUT,
+            std::time::Duration::ZERO,
             service.pressure.clone(),
             (1, "node-1".into(), follower),
             receiver,
@@ -1568,6 +1572,7 @@ async fn delivery_publishes_partial_ack_and_retries_suffix_after_capacity_return
             format!("mutation-{sequence}"),
             token,
             DEFAULT_MAX_PENDING_REPLICATION_BYTES,
+            &[],
         )
         .unwrap()
         .pop()
@@ -1601,6 +1606,7 @@ async fn delivery_publishes_partial_ack_and_retries_suffix_after_capacity_return
         failed.clone(),
         active.clone(),
         DEFAULT_REPLICATION_RPC_TIMEOUT,
+        std::time::Duration::ZERO,
         owner.pressure.clone(),
         (topology.epoch, "node-1".into(), "node-2".into()),
         receiver,
@@ -1665,4 +1671,100 @@ async fn delivery_publishes_partial_ack_and_retries_suffix_after_capacity_return
         DEFAULT_MAX_PENDING_REPLICATION_BYTES
     );
     server.abort();
+}
+
+async fn linger_test_entry(sequence: u64, ack_awaited: bool) -> PendingReplication {
+    let mutation = Arc::new(ReplicationMutation {
+        topology_epoch: 1,
+        owner_node_id: "node-1".into(),
+        key: Arc::from(format!("key-{sequence}").into_bytes()),
+        value: Arc::from(b"value".as_slice()),
+        deleted: false,
+        version: RecordVersion {
+            topology_epoch: 1,
+            owner_sequence: sequence,
+            owner_node_id: "node-1".into(),
+        },
+        mutation_id: format!("mutation-{sequence}"),
+    });
+    let budget = Arc::new(Semaphore::new(1 << 20))
+        .acquire_many_owned(replication_mutation_bytes(&mutation) as u32)
+        .await
+        .unwrap();
+    PendingReplication {
+        prepared: PreparedReplication {
+            follower_node_id: "node-2".into(),
+            follower_endpoint: "http://127.0.0.1:1".into(),
+            stream_sequence: sequence,
+            mutation,
+            ack_awaited,
+        },
+        _budget: Arc::new(ReplicationBudget(budget)),
+    }
+}
+
+/// Collects one batch whose first entry is queued at once and whose later
+/// entries arrive 1 ms after the start, returning the batch's sequences and
+/// how long collection took.
+async fn collect_with_late_entries(
+    linger_ms: u64,
+    first_awaited: bool,
+    late: &[(u64, bool)],
+) -> (Vec<u64>, std::time::Duration) {
+    let (sender, mut receiver) = mpsc::channel(8);
+    let first = linger_test_entry(1, first_awaited).await;
+    let late = late.to_vec();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        for (sequence, awaited) in late {
+            sender
+                .send(linger_test_entry(sequence, awaited).await)
+                .await
+                .unwrap();
+        }
+        // Keep the stream open past any linger so closing never ends a batch.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    });
+    let started = tokio::time::Instant::now();
+    let (batch, _, carry) = collect_replication_batch(
+        first,
+        &mut receiver,
+        std::time::Duration::from_millis(linger_ms),
+    )
+    .await;
+    assert!(carry.is_none());
+    let sequences = batch
+        .iter()
+        .map(|pending| pending.prepared.stream_sequence)
+        .collect();
+    (sequences, started.elapsed())
+}
+
+#[tokio::test(start_paused = true)]
+async fn batch_linger_collects_entries_that_arrive_while_waiting() {
+    let ms = std::time::Duration::from_millis;
+    assert_eq!(
+        collect_with_late_entries(0, false, &[(2, false), (3, false)]).await,
+        (vec![1], ms(0))
+    );
+    assert_eq!(
+        collect_with_late_entries(5, false, &[(2, false), (3, false)]).await,
+        (vec![1, 2, 3], ms(5))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn batch_linger_never_delays_an_acknowledged_write() {
+    let ms = std::time::Duration::from_millis;
+    // A first entry with a waiting write is sent at once.
+    assert_eq!(
+        collect_with_late_entries(5, true, &[(2, false)]).await,
+        (vec![1], ms(0))
+    );
+    // An awaited entry that arrives during the linger ends the wait; entries
+    // already queued behind it still join the batch.
+    assert_eq!(
+        collect_with_late_entries(5, false, &[(2, true), (3, false)]).await,
+        (vec![1, 2, 3], ms(1))
+    );
 }

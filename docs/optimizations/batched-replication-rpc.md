@@ -129,3 +129,10 @@ handling. A batch must name one stream so its single acknowledgement is unambigu
 The integration regression fills follower receipt capacity partway through a
 batch, verifies the prefix reaches owner acknowledgement progress, then frees
 capacity and verifies delivery of the suffix.
+
+## Batch size at moderate load
+
+A stream sends whatever queued during its previous round trip, which is one or
+two entries per batch at moderate load on one host.
+[replication-batch-linger.md](replication-batch-linger.md) lets a stream wait
+briefly to fill batches that no write is waiting on.

@@ -48,6 +48,8 @@ const REPLICATION_BATCH_MAX_ENTRIES: usize = 64;
 // Stay under the data-node client's encode limit so one batch fits a message.
 const REPLICATION_BATCH_MAX_BYTES: usize = MAX_DATA_MESSAGE_BYTES - 64 * 1024;
 pub const DEFAULT_REPLICATION_STREAM_QUEUE_CAPACITY: usize = 32;
+pub const DEFAULT_REPLICATION_BATCH_LINGER: std::time::Duration =
+    std::time::Duration::from_millis(2);
 const MAX_REPLICATION_FINGERPRINTS: u64 = 4_096;
 pub const DEFAULT_REPLICATION_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Bounds the replica-readiness calls a node makes to the coordinator. Lease
@@ -306,6 +308,8 @@ struct PreparedReplication {
     follower_endpoint: String,
     stream_sequence: u64,
     mutation: Arc<ReplicationMutation>,
+    /// A write waits for this follower's ACK, so its batch is sent without lingering.
+    ack_awaited: bool,
 }
 
 struct ReplicationMutation {
@@ -357,6 +361,7 @@ struct ReplicationDispatcher {
     max_pending_bytes: usize,
     stream_queue_capacity: usize,
     rpc_timeout: std::time::Duration,
+    batch_linger: std::time::Duration,
     pressure: Arc<NodePressureStats>,
 }
 
@@ -569,6 +574,9 @@ pub struct NodeSettings {
     pub required_ack_timeout: std::time::Duration,
     /// Bounds each replication connect and batch RPC.
     pub replication_rpc_timeout: std::time::Duration,
+    /// How long a follower stream waits for more entries before sending a
+    /// batch that no write is waiting on. Zero sends at once.
+    pub replication_batch_linger: std::time::Duration,
 }
 
 impl Default for NodeSettings {
@@ -580,6 +588,7 @@ impl Default for NodeSettings {
             replication_stream_queue_capacity: DEFAULT_REPLICATION_STREAM_QUEUE_CAPACITY,
             required_ack_timeout: DEFAULT_REQUIRED_ACK_TIMEOUT,
             replication_rpc_timeout: DEFAULT_REPLICATION_RPC_TIMEOUT,
+            replication_batch_linger: DEFAULT_REPLICATION_BATCH_LINGER,
         }
     }
 }
