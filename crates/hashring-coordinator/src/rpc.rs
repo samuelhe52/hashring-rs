@@ -568,6 +568,12 @@ impl Coordinator for CoordinatorService {
             .store_state(&next)
             .map_err(|error| Status::internal(error.to_string()))?;
         *state = next;
+        // A repair pass cannot seed a group until both of its endpoints are
+        // registered, so a registration is exactly what makes one runnable.
+        // Without this the pass that follows a boot has nothing to do and the
+        // cluster waits out a whole recovery interval before one can start.
+        drop(state);
+        self.repair_wake.notify_one();
         Ok(Response::new(proto::Empty {}))
     }
 

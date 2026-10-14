@@ -8,6 +8,7 @@
 The capture came from commit `3091ddb`. Line references below are against
 `cmach-2` as of this commit; `e926711` moved several of them, and
 [Current state](#current-state-vs-the-capture) records what changed.
+[Result](#result) records the fix and its measurement.
 Code references (file and line) are to the tree this capture was taken on,
 before `e926711` made the repair pipeline width a setting and `a1cfcfc` made
 the lease duration a cluster timing. Where those commits changed what is
@@ -253,6 +254,48 @@ Ordered by how much of the 61% they recover.
 None of these touches the data path, the failure handling, or the durable state
 format.
 
+## Result
+
+Items 1-4 are implemented. `MAX_REPAIR_GROUPS_PER_PASS` is gone: `resume_replica_repairs`
+now drains every due group instead of truncating to a batch and leaving the
+remainder for the next tick, bounded by the same `migration_timeout` every other
+operation in that file uses. The ordering gained three keys so `retry_count`
+cannot degenerate into node-name order. `register_node` wakes the recovery loop,
+so a pass starts when its registrations land instead of on the next tick.
+
+Paired A/B on this host, 24-core AMD Ryzen 9 7845HX, the capture's own config
+(8 nodes, 100,000 keys, RF=3, `FirstSuccessor`, concurrency 64,
+`worker_threads` 2), baseline `cedac8e` in a separate worktree against the
+branch head, three runs each, alternating:
+
+| metric | base median | after median | change | speedup |
+| --- | --- | --- | --- | --- |
+| `initial_full_rf_seconds` | 10.367 | **1.580** | -84.8% | **6.56x** |
+| `scale_in_transition_to_full_rf_seconds` | 9.325 | 5.388 | -42.2% | 1.73x |
+| `initial_put` | 3.189 | 2.949 | -7.5% | 1.08x |
+| `elapsed_seconds` | 31.756 | **18.894** | -40.5% | **1.68x** |
+
+All six runs returned `success: true` at epoch 4, so the full correctness suite
+— put, verify, scale-out under mutation, scale-in under mutation, verify — still
+passes.
+
+The spread is small enough that the comparison does not depend on run-to-run
+variance: the baseline's three `initial_full_rf_seconds` are 10.339, 10.367 and
+10.367, and the fixed ones are 1.304, 1.580 and 1.583. The baseline also
+reproduces the 10.265811039 recorded in the capture, which is what makes it
+usable as the reference.
+
+Two things did not move, and should not have:
+
+- **`scale_out_transition_to_full_rf_seconds` is unchanged at 5.6-5.9 s.** That
+  path seeds through `seed_repairs_for_activation`, reached from `change.rs:909`
+  during the change. None of these four items touch it.
+- **The seeding width is unchanged at 4.** That is item 5, which is still a
+  configuration change: set `replica_repair_concurrency` above 4.
+
+The 1.58 s that remains is one pass's worth of work at width 4, which is item 5's
+territory. The 10 s floor is gone; what is left is the pipeline width.
+
 ## Current state vs. the capture
 
 `e926711 feat: Expose coordinator repair concurrency, failure grace, and workers`
@@ -277,11 +320,11 @@ Everything the analysis rests on is unchanged:
   (`lib.rs:497`).
 - The t=0 tick being a guaranteed no-op (`repair.rs:256-257`).
 
-**Item 1 is the one that matters and it is still open.** It is worth
-re-measuring before acting on item 5: raising `replica_repair_concurrency`
-without first checking whether 42 groups still need two ticks will make each
-pass faster without reducing the number of passes, and the 10 s floor will
-survive unchanged.
+**Item 1 was the one that mattered and it is closed** — see
+[Result](#result): `initial_full_rf_seconds` fell from 10.37 s to 1.58 s.
+Item 5 is now the only open recommendation. Raising
+`replica_repair_concurrency` shortens each pass but no longer changes the number
+of passes, so it now buys what it should: the remaining 1.58 s.
 
 ## What this profile cannot answer
 

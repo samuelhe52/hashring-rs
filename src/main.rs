@@ -27,6 +27,11 @@ use tracing_subscriber::EnvFilter;
 
 mod config;
 
+/// How often the coordinator retries a topology change and drains follower
+/// repairs. A registration interrupts the wait, so this is the ceiling between
+/// repair passes rather than their period.
+const RECOVERY_INTERVAL: Duration = Duration::from_secs(5);
+
 #[derive(Parser)]
 #[command(version, about = "A process-distributed consistent-hash cache")]
 struct Cli {
@@ -537,9 +542,17 @@ async fn run_coordinator(
     .with_post_publish_delay(Duration::from_millis(post_publish_delay_ms));
     let recovery_service = service.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        let mut interval = tokio::time::interval(RECOVERY_INTERVAL);
         loop {
-            interval.tick().await;
+            // A registration can make a repair pass runnable that the last tick
+            // could not start, so wake on whichever arrives first. Without this
+            // a cluster booting with an empty ring converges only on a tick,
+            // which is a whole interval of doing nothing after the last node
+            // has already registered.
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = recovery_service.wait_for_repair_wake() => {}
+            }
             match recovery_service.resume_interrupted_change().await {
                 Ok(Some(change)) => {
                     tracing::info!(change_id = %change.change_id, phase = ?change.phase, "resumed topology change");
