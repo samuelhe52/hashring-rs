@@ -119,10 +119,8 @@ fn apply_replication_entry(
     }
     let mutation_id = entry.mutation_id.clone();
     let dedup_key: Arc<[u8]> = Arc::from(entry.key.as_slice());
-
-    apply_internal_record(
-        &mut state.records,
-        entry.key,
+    state.apply_record(
+        dedup_key.clone(),
         Record {
             value: entry.value.into(),
             version: version.clone(),
@@ -177,7 +175,7 @@ impl DataNode for DataNodeService {
         }
         let Some(record) = state
             .records
-            .get(&request.key)
+            .get(request.key.as_slice())
             .filter(|record| !record.deleted)
         else {
             return Ok(Response::new(GetResponse {
@@ -226,14 +224,17 @@ impl DataNode for DataNodeService {
             }));
         }
         self.refresh_if_newer(request.topology_epoch).await?;
-        // The hash seed is invariant for the process lifetime, so the routing
-        // token and the mutation fingerprint can be computed once and reused by
-        // every check below instead of being recomputed under each lock.
+        // The routing token and the mutation fingerprint are computed once and
+        // reused by every check below instead of being recomputed under each
+        // lock. The token is only valid for the seed it was hashed with, which
+        // the write lock checks again.
         let token;
+        let token_seed;
         let fingerprint = mutation_fingerprint(&request.key, &request.value, false);
         {
             let state = self.state.read().await;
             token = state.topology.key_token(&request.key);
+            token_seed = state.topology.hash_seed;
             if let Some(error) = self.owner_error(&state, token)? {
                 return Ok(Response::new(PutResponse {
                     current_epoch: error.current_epoch,
@@ -290,7 +291,9 @@ impl DataNode for DataNodeService {
                 ..Default::default()
             }));
         }
-        if state.topology.epoch != readiness_epoch {
+        // A reseed at the same epoch moves every key, so the routing token,
+        // ownership and readiness above were computed for a different ring.
+        if state.topology.epoch != readiness_epoch || state.topology.hash_seed != token_seed {
             let error = temporarily_unavailable(
                 state.topology.epoch,
                 "topology changed while checking replica readiness",
@@ -481,7 +484,8 @@ impl DataNode for DataNodeService {
             version: version.clone(),
             deleted: false,
         };
-        state.records.insert(request.key.clone(), record.clone());
+        let record_key: Arc<[u8]> = Arc::from(request.key.as_slice());
+        state.insert_record(record_key.clone(), record.clone());
         for source in state
             .sources
             .values_mut()
@@ -505,7 +509,7 @@ impl DataNode for DataNodeService {
         insert_dedup(
             &mut state,
             mutation_id.clone(),
-            Arc::from(request.key.as_slice()),
+            record_key,
             fingerprint,
             version.clone(),
             false,
@@ -557,10 +561,12 @@ impl DataNode for DataNodeService {
         }
         self.refresh_if_newer(request.topology_epoch).await?;
         let token;
+        let token_seed;
         let fingerprint = mutation_fingerprint(&request.key, &[], true);
         {
             let state = self.state.read().await;
             token = state.topology.key_token(&request.key);
+            token_seed = state.topology.hash_seed;
             if let Some(error) = self.owner_error(&state, token)? {
                 return Ok(Response::new(DeleteResponse {
                     current_epoch: error.current_epoch,
@@ -612,7 +618,9 @@ impl DataNode for DataNodeService {
                 error: Some(error),
             }));
         }
-        if state.topology.epoch != readiness_epoch {
+        // A reseed at the same epoch moves every key, so the routing token,
+        // ownership and readiness above were computed for a different ring.
+        if state.topology.epoch != readiness_epoch || state.topology.hash_seed != token_seed {
             let error = temporarily_unavailable(
                 state.topology.epoch,
                 "topology changed while checking replica readiness",
@@ -788,9 +796,10 @@ impl DataNode for DataNodeService {
                 .or_default()
                 .push_back((entry.stream_sequence, now));
         }
-        apply_internal_record(
-            &mut state.records,
-            request.key.clone(),
+        // One allocation shared by the record, its index entry and the receipt.
+        let record_key: Arc<[u8]> = Arc::from(request.key.as_slice());
+        state.apply_record(
+            record_key.clone(),
             Record {
                 value: Arc::from([]),
                 version: version.clone(),
@@ -820,7 +829,7 @@ impl DataNode for DataNodeService {
         insert_dedup(
             &mut state,
             mutation_id.clone(),
-            Arc::from(request.key.as_slice()),
+            record_key,
             fingerprint,
             version.clone(),
             true,
@@ -1060,7 +1069,7 @@ impl DataNode for DataNodeService {
             ));
         }
         let key = range.key();
-        let (all_keys, dedup_keys, topology, ready) = {
+        {
             let mut state = self.state.write().await;
             if let Some(existing) = state.sources.get(&key) {
                 if existing.range != range {
@@ -1068,73 +1077,34 @@ impl DataNode for DataNodeService {
                         "source range retry conflicts with the prepared specification",
                     ));
                 }
-                let mut ready = existing.snapshot_ready.subscribe();
-                drop(state);
-                if !*ready.borrow() {
-                    ready.changed().await.map_err(|_| {
-                        Status::aborted("source snapshot preparation was cancelled")
-                    })?;
-                }
                 return Ok(Response::new(PrepareSourceRangeResponse {
                     process_instance_id: self.process_instance_id.clone(),
                 }));
             }
-            let all_keys = state.records.keys().cloned().collect::<Vec<_>>();
-            let dedup_keys = state
-                .dedup
-                .iter()
-                .map(|(id, entry)| (id.clone(), entry.key.clone()))
-                .collect::<Vec<_>>();
-            let topology = state.topology.clone();
-            let (ready, _) = watch::channel(false);
+            // The token indices answer "which of my keys and receipts are in this
+            // range" without hashing the whole key set, so the write lock is held
+            // for the size of the range rather than the size of the node. Values
+            // are materialized later, one bounded page at a time, by
+            // `read_snapshot_page`.
+            let snapshot_keys = state
+                .record_keys_in_range(&range)
+                .into_iter()
+                .map(|(_, key)| key)
+                .collect();
+            let snapshot_dedup_ids = state.dedup_ids_in_range(&range);
             state.sources.insert(
                 key.clone(),
                 SourceMigration {
                     range: range.clone(),
-                    snapshot_keys: None,
-                    snapshot_dedup_ids: Vec::new(),
-                    snapshot_ready: ready.clone(),
+                    snapshot_keys,
+                    snapshot_dedup_ids,
                     journal: Vec::new(),
                     journal_bytes: 0,
                     watermark: 0,
                     writes_paused: false,
                 },
             );
-            (all_keys, dedup_keys, topology, ready)
-        };
-        let mut preparation = SnapshotPreparationGuard {
-            state: self.state.clone(),
-            key: Some(key.clone()),
-        };
-
-        // Only keys are captured while traffic is locked. Filtering and sorting
-        // happen outside the lock, and values are materialized one bounded page
-        // at a time by `read_snapshot_page`.
-        let mut snapshot_keys: Vec<_> = all_keys
-            .into_iter()
-            .filter(|record_key| range.contains(topology.key_token(record_key)))
-            .collect();
-        snapshot_keys.sort();
-        let mut snapshot_dedup_ids: Vec<_> = dedup_keys
-            .into_iter()
-            .filter(|(_, record_key)| range.contains(topology.key_token(record_key)))
-            .map(|(id, _)| id)
-            .collect();
-        snapshot_dedup_ids.sort();
-        let mut state = self.state.write().await;
-        let source = state
-            .sources
-            .get_mut(&key)
-            .ok_or_else(|| Status::aborted("source migration was reset during preparation"))?;
-        if source.range != range {
-            return Err(Status::failed_precondition(
-                "source range changed during preparation",
-            ));
         }
-        source.snapshot_keys = Some(snapshot_keys);
-        source.snapshot_dedup_ids = snapshot_dedup_ids;
-        ready.send_replace(true);
-        preparation.disarm();
         Ok(Response::new(PrepareSourceRangeResponse {
             process_instance_id: self.process_instance_id.clone(),
         }))
@@ -1231,10 +1201,7 @@ impl DataNode for DataNodeService {
             .sources
             .get(&(request.change_id, request.range_id))
             .ok_or_else(|| Status::not_found("source migration not prepared"))?;
-        let snapshot_keys = source
-            .snapshot_keys
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("source snapshot is still being prepared"))?;
+        let snapshot_keys = &source.snapshot_keys;
         let start = usize::try_from(request.cursor)
             .map_err(|_| Status::invalid_argument("snapshot cursor is too large"))?;
         if start > snapshot_keys.len() {
@@ -1245,12 +1212,12 @@ impl DataNode for DataNodeService {
         let mut records = Vec::new();
         let mut next_cursor = start;
         for key in &snapshot_keys[start..] {
-            let Some(record) = state.records.get(key) else {
+            let Some(record) = state.records.get(key.as_ref()) else {
                 next_cursor += 1;
                 continue;
             };
             let record = MigrationRecord {
-                key: key.clone(),
+                key: key.to_vec(),
                 value: record.value.to_vec(),
                 version: Some(record.version.clone()),
                 deleted: record.deleted,
@@ -1282,11 +1249,6 @@ impl DataNode for DataNodeService {
             .sources
             .get(&(request.change_id, request.range_id))
             .ok_or_else(|| Status::not_found("source migration not prepared"))?;
-        if source.snapshot_keys.is_none() {
-            return Err(Status::unavailable(
-                "source snapshot is still being prepared",
-            ));
-        }
         let ids = &source.snapshot_dedup_ids;
         let start = usize::try_from(request.cursor)
             .map_err(|_| Status::invalid_argument("dedup cursor is too large"))?;
@@ -1514,11 +1476,17 @@ impl DataNode for DataNodeService {
             .get(&(request.change_id, request.range_id))
             .ok_or_else(|| Status::not_found("source migration not prepared"))?;
         let watermark = source.watermark;
+        // Only the range's own records, taken from the token index rather than
+        // by hashing every key on this node.
         let records: HashMap<_, _> = state
-            .records
-            .iter()
-            .filter(|(key, _)| source.range.contains(state.topology.key_token(key)))
-            .map(|(key, record)| (key.clone(), record.clone()))
+            .record_keys_in_range(&source.range)
+            .into_iter()
+            .filter_map(|(_, key)| {
+                state
+                    .records
+                    .get(&key)
+                    .map(|record| (key.to_vec(), record.clone()))
+            })
             .collect();
         drop(state);
         Ok(Response::new(range_digest(&records, watermark)))
@@ -1596,12 +1564,14 @@ impl DataNode for DataNodeService {
                 "destination deduplication receipt store is full",
             ));
         }
-        let topology = state.topology.clone();
-        state
-            .records
-            .retain(|record_key, _| !range.contains(topology.key_token(record_key)));
+        // Only the range's own records leave this node, taken from the token
+        // index. The previous `records.retain` hashed every key on the node while
+        // holding this write lock.
+        for (token, record_key) in state.record_keys_in_range(&range) {
+            state.remove_record_at(token, &record_key);
+        }
         for (key, record) in records {
-            apply_internal_record(&mut state.records, key, record);
+            state.apply_record(Arc::from(key.as_slice()), record);
         }
         for (id, staged) in dedup {
             if state.dedup.contains_key(id.as_str()) {
@@ -1658,21 +1628,20 @@ impl DataNode for DataNodeService {
         let Some(range) = state.sources.get(&key).map(|source| source.range.clone()) else {
             return Ok(Response::new(proto::Empty {}));
         };
-        let topology = state.topology.clone();
+        // The replica check now runs on the range's keys instead of on every
+        // key this node holds.
         let keys: Vec<_> = state
-            .records
-            .keys()
-            .filter(|record_key| {
-                let token = topology.key_token(record_key);
-                range.contains(token)
-                    && topology
-                        .replica_node_ids_for_token(token)
-                        .is_ok_and(|replicas| !replicas.contains(&self.node_id.as_str()))
+            .record_keys_in_range(&range)
+            .into_iter()
+            .filter(|(token, _)| {
+                state
+                    .topology
+                    .replica_node_ids_for_token(*token)
+                    .is_ok_and(|replicas| !replicas.contains(&self.node_id.as_str()))
             })
-            .cloned()
             .collect();
-        for record_key in keys {
-            state.records.remove(&record_key);
+        for (token, record_key) in keys {
+            state.remove_record_at(token, &record_key);
         }
         if let Some(source) = state.sources.remove(&key) {
             state.journal_bytes_total = state
@@ -1737,7 +1706,7 @@ impl DataNode for DataNodeService {
             state.admitted_followers.clear();
             clear_replica_repair_staging(&mut state);
         }
-        state.topology = topology;
+        state.set_topology(topology);
         state
             .owner_stream_sequences
             .retain(|(stream_epoch, _), _| *stream_epoch == epoch);

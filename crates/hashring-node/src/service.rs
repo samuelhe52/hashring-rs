@@ -247,6 +247,7 @@ impl DataNodeService {
         let state = Arc::new(RwLock::new(NodeState {
             topology,
             records: HashMap::new(),
+            records_by_token: TokenIndex::default(),
             next_sequence: 0,
             owner_stream_sequences: HashMap::new(),
             owner_stream_unacked: HashMap::new(),
@@ -260,6 +261,7 @@ impl DataNodeService {
             lease: None,
             policy_write_fence: None,
             dedup: HashMap::new(),
+            dedup_by_token: TokenIndex::default(),
             dedup_expirations: BinaryHeap::new(),
             dedup_bytes: 0,
             dedup_peak_bytes: 0,
@@ -476,7 +478,7 @@ impl DataNodeService {
                 state.admitted_followers.clear();
                 clear_replica_repair_staging(&mut state);
             }
-            state.topology = topology;
+            state.set_topology(topology);
             state
                 .owner_stream_sequences
                 .retain(|(stream_epoch, _), _| *stream_epoch == epoch);
