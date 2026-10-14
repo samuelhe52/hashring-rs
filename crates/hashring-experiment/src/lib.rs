@@ -1239,8 +1239,14 @@ async fn migrate_while_mutating(
             match wait_for_mutation_overlap(admin_client, &completed_mutations, &writer).await {
                 Ok(overlap) => overlap,
                 Err(error) => {
-                    writer.abort();
                     execution.abort();
+                    if writer.is_finished() {
+                        if let Ok(Err(writer_error)) = writer.await {
+                            return Err(writer_error.context(error));
+                        }
+                    } else {
+                        writer.abort();
+                    }
                     return Err(error);
                 }
             };
@@ -1366,7 +1372,9 @@ async fn wait_for_mutation_overlap(
                 _ => {}
             }
         }
-        if writer.is_finished() && mutations == 0 {
+        // Reload the count: the writer may have completed every mutation
+        // during the topology poll, after `mutations` was read.
+        if writer.is_finished() && completed_mutations.load(AtomicOrdering::Acquire) == 0 {
             bail!("concurrent mutator finished without a successful mutation");
         }
         tokio::time::sleep(Duration::from_millis(2)).await;
