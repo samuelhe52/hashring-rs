@@ -112,8 +112,9 @@ The script profiles whatever `experiment` runs, so it needs a settings file;
 default and used the flag defaults listed above, so it needs its own file. The
 manifest in `<out>/run/` records what was actually resolved.
 
-The script builds its own `target/fp` binary with frame pointers on first use
-and never touches `target/release`, so no `cargo build` is needed first. Measure
+The script runs `cargo build` for its own frame-pointer `target/fp` binary on
+every run (a no-op when it is current) and never touches `target/release`, so
+no separate build is needed first. Measure
 with one build and profile with the other: frame pointers cost throughput.
 
 Check `perf-record.log` in the output directory for sample loss before trusting
