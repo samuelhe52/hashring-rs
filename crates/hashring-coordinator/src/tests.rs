@@ -5,8 +5,10 @@ use std::sync::{
 
 use super::policy::policy_readiness_verified;
 use super::*;
-use hashring_core::topology::Member;
+use hashring_core::topology::{DEFAULT_LEASE_DURATION_MILLIS, Member};
 use tokio::sync::Barrier;
+
+const NODE_LEASE_DURATION: Duration = Duration::from_millis(DEFAULT_LEASE_DURATION_MILLIS);
 
 struct ActiveWork(Arc<AtomicUsize>);
 
@@ -946,4 +948,43 @@ async fn stream_admission_batch_does_not_publish_a_partial_group() {
             .iter()
             .all(|task| task.phase == ReplicaRepairPhase::Complete)
     );
+}
+
+#[tokio::test]
+async fn leases_use_the_stored_cluster_lease_duration_across_restarts() {
+    let timings = hashring_core::topology::ClusterTimings {
+        lease_duration_millis: 3_000,
+        ..Default::default()
+    };
+    let topology = TopologySnapshot::new_with_timings(
+        1,
+        7,
+        8,
+        topology().members,
+        hashring_core::topology::TopologyConfig::default(),
+        timings,
+    )
+    .unwrap();
+    let repository = Arc::new(MemoryRepository::default());
+    let mut state = load_or_initialize(repository.as_ref(), Some(topology)).unwrap();
+    state
+        .process_instances
+        .insert("n1".into(), "n1-process".into());
+    let service = CoordinatorService::new(state, repository.clone(), Duration::from_secs(1));
+    let response = service
+        .renew_node_lease(Request::new(proto::RenewNodeLeaseRequest {
+            node_id: "n1".into(),
+            process_instance_id: "n1-process".into(),
+            topology_epoch: 1,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.lease_duration_millis, 3_000);
+
+    // A restarted coordinator has no grants in memory; its startup quarantine
+    // must cover the stored duration rather than a compiled-in default.
+    let restored = load_or_initialize(repository.as_ref(), None).unwrap();
+    let restarted = CoordinatorService::new(restored, repository, Duration::from_secs(1));
+    assert_eq!(restarted.lease_duration, Duration::from_millis(3_000));
 }

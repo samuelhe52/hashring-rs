@@ -217,7 +217,7 @@ impl CoordinatorService {
             .collect::<Result<Vec<_>, _>>()?;
         try_map_bounded(
             groups,
-            self.range_move_concurrency.min(4),
+            self.replica_repair_concurrency,
             |tasks| async move { self.seed_replica_group(&tasks).await },
         )
         .await?;

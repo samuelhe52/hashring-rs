@@ -16,11 +16,25 @@ virtual_nodes: 128
 operation_timeout_ms: 30000
 migration_timeout_ms: 600000
 range_move_concurrency: 16
+replica_repair_concurrency: 4
+prepublication_failure_grace_ms: 30000
 pre_publish_delay_ms: 250
 require_clean_source: false
 verbose: false
 desired_replication_factor: 3
 minimum_admitted_copies: 1
 minimum_healthy_followers: 0
+max_replica_lag_ms: 5000
+receipt_retention_ms: 60000
+lease_duration_ms: 5000
 policy: first-successor
 # worker_threads: 2   # default: CPUs / (nodes + 2), at least 2
+# coordinator_worker_threads: 4   # default: one per available CPU
+
+# Forwarded to every data node the run starts; see the node flags.
+max_dedup_bytes: 134217728              # 128 MiB
+max_pending_replication_bytes: 67108864 # 64 MiB
+max_migration_journal_bytes: 16777216   # 16 MiB
+replication_stream_queue_capacity: 32
+required_ack_timeout_ms: 2000
+replication_rpc_timeout_ms: 2000

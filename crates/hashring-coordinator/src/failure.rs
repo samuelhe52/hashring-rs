@@ -24,8 +24,8 @@ pub(super) fn failure_confirmed(
             reported_target == target
                 && reporter != reported_target
                 && has_lease(reporter)
-                && report.first_seen + NODE_LEASE_DURATION <= now
-                && report.last_seen + Duration::from_secs(2) >= now
+                && report.first_seen + state.committed.timings.lease_duration() <= now
+                && report.last_seen + PEER_FAILURE_REPORT_FRESHNESS >= now
         })
         .count()
         >= 2

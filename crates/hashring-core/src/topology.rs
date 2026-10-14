@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -15,6 +15,12 @@ pub const DEFAULT_DESIRED_REPLICATION_FACTOR: u32 = 3;
 pub const DEFAULT_MINIMUM_ADMITTED_COPIES: u32 = 1;
 pub const DEFAULT_MINIMUM_HEALTHY_FOLLOWERS: u32 = 0;
 pub const DEFAULT_MAX_REPLICA_LAG_MILLIS: u64 = 5_000;
+pub const DEFAULT_RECEIPT_RETENTION_MILLIS: u64 = 60_000;
+pub const DEFAULT_LEASE_DURATION_MILLIS: u64 = 5_000;
+/// Bounds both cluster timings, so deadlines computed from them cannot
+/// overflow and a lease outlives a renewal round trip.
+pub const MIN_CLUSTER_TIMING_MILLIS: u64 = 1_000;
+pub const MAX_CLUSTER_TIMING_MILLIS: u64 = 24 * 60 * 60 * 1_000;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum WriteAckPolicy {
@@ -58,6 +64,51 @@ impl Default for TopologyConfig {
     }
 }
 
+/// Timings every process in the cluster must agree on. They are chosen when the
+/// coordinator creates its store and never change afterwards: every later
+/// topology copies them, like the hash seed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterTimings {
+    /// Every replica keeps a deduplication receipt for at least this long after
+    /// it applies a mutation. A client must stop retrying one mutation ID
+    /// within this window, or a retry could apply the mutation a second time.
+    pub receipt_retention_millis: u64,
+    /// How long a coordinator lease grant lasts. Nodes renew at a fifth of it.
+    /// A restarted coordinator waits this long before acting on any lease,
+    /// which is safe only because the duration cannot change.
+    pub lease_duration_millis: u64,
+}
+
+impl Default for ClusterTimings {
+    fn default() -> Self {
+        Self {
+            receipt_retention_millis: DEFAULT_RECEIPT_RETENTION_MILLIS,
+            lease_duration_millis: DEFAULT_LEASE_DURATION_MILLIS,
+        }
+    }
+}
+
+impl ClusterTimings {
+    pub fn receipt_retention(&self) -> Duration {
+        Duration::from_millis(self.receipt_retention_millis)
+    }
+
+    pub fn lease_duration(&self) -> Duration {
+        Duration::from_millis(self.lease_duration_millis)
+    }
+
+    pub fn validate(&self) -> Result<(), TopologyError> {
+        let range = MIN_CLUSTER_TIMING_MILLIS..=MAX_CLUSTER_TIMING_MILLIS;
+        if !range.contains(&self.receipt_retention_millis) {
+            return Err(TopologyError::ReceiptRetentionOutOfRange);
+        }
+        if !range.contains(&self.lease_duration_millis) {
+            return Err(TopologyError::LeaseDurationOutOfRange);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Member {
     pub node_id: String,
@@ -89,6 +140,7 @@ pub struct TopologySnapshot {
     pub desired_replication_factor: u32,
     pub write_ack_policy: WriteAckPolicy,
     pub write_availability_guard: WriteAvailabilityGuard,
+    pub timings: ClusterTimings,
     pub members: Vec<Member>,
     pub assignments: Vec<TokenAssignment>,
     pub digest: String,
@@ -147,6 +199,16 @@ pub enum TopologyError {
     MinimumHealthyFollowersExceedReplicationFactor,
     #[error("unknown write acknowledgement policy: {0}")]
     UnknownWriteAckPolicy(i32),
+    #[error(
+        "receipt retention must be between {MIN_CLUSTER_TIMING_MILLIS} and \
+         {MAX_CLUSTER_TIMING_MILLIS} ms"
+    )]
+    ReceiptRetentionOutOfRange,
+    #[error(
+        "lease duration must be between {MIN_CLUSTER_TIMING_MILLIS} and \
+         {MAX_CLUSTER_TIMING_MILLIS} ms"
+    )]
+    LeaseDurationOutOfRange,
 }
 
 impl TopologySnapshot {
@@ -169,11 +231,30 @@ impl TopologySnapshot {
         epoch: u64,
         hash_seed: u64,
         virtual_nodes: u32,
+        members: Vec<Member>,
+        config: TopologyConfig,
+    ) -> Result<Self, TopologyError> {
+        Self::new_with_timings(
+            epoch,
+            hash_seed,
+            virtual_nodes,
+            members,
+            config,
+            ClusterTimings::default(),
+        )
+    }
+
+    pub fn new_with_timings(
+        epoch: u64,
+        hash_seed: u64,
+        virtual_nodes: u32,
         mut members: Vec<Member>,
         config: TopologyConfig,
+        timings: ClusterTimings,
     ) -> Result<Self, TopologyError> {
         validate_members(&members, virtual_nodes)?;
         validate_config(&config)?;
+        timings.validate()?;
         members.sort_by(|left, right| left.node_id.cmp(&right.node_id));
 
         let assignment_count = members
@@ -209,6 +290,7 @@ impl TopologySnapshot {
             desired_replication_factor: config.desired_replication_factor,
             write_ack_policy: config.write_ack_policy,
             write_availability_guard: config.write_availability_guard,
+            timings,
             members,
             assignments,
             digest: String::new(),
@@ -237,12 +319,13 @@ impl TopologySnapshot {
                 ));
             }
         }
-        let canonical = Self::new_with_config(
+        let canonical = Self::new_with_timings(
             self.epoch,
             self.hash_seed,
             self.virtual_nodes,
             self.members.clone(),
             self.config(),
+            self.timings.clone(),
         )?;
         if canonical.digest != self.digest {
             return Err(TopologyError::DigestMismatch);
@@ -430,6 +513,8 @@ impl From<&TopologySnapshot> for crate::proto::TopologySnapshot {
             desired_replication_factor: snapshot.desired_replication_factor,
             write_ack_policy: crate::proto::WriteAckPolicy::from(snapshot.write_ack_policy).into(),
             write_availability_guard: Some((&snapshot.write_availability_guard).into()),
+            receipt_retention_millis: snapshot.timings.receipt_retention_millis,
+            lease_duration_millis: snapshot.timings.lease_duration_millis,
             members: snapshot.members.iter().map(Into::into).collect(),
             assignments: snapshot
                 .assignments
@@ -501,6 +586,10 @@ impl TryFrom<crate::proto::TopologySnapshot> for TopologySnapshot {
                     max_replica_lag_millis: guard.max_replica_lag_millis,
                 })
                 .ok_or(TopologyError::NoMinimumAdmittedCopies)?,
+            timings: ClusterTimings {
+                receipt_retention_millis: snapshot.receipt_retention_millis,
+                lease_duration_millis: snapshot.lease_duration_millis,
+            },
             members: snapshot
                 .members
                 .into_iter()
@@ -802,6 +891,67 @@ mod tests {
         };
         let wire = crate::proto::TopologyChangeSnapshot::from(&change);
         assert!(wire.encoded_len() <= crate::limits::MAX_CONTROL_MESSAGE_BYTES);
+    }
+
+    #[test]
+    fn cluster_timings_travel_with_every_later_topology() {
+        let timings = ClusterTimings {
+            receipt_retention_millis: 90_000,
+            lease_duration_millis: 3_000,
+        };
+        let committed = TopologySnapshot::new_with_timings(
+            1,
+            42,
+            16,
+            members(),
+            TopologyConfig::default(),
+            timings.clone(),
+        )
+        .unwrap();
+        let wire = crate::proto::TopologySnapshot::from(&committed);
+        assert_eq!(TopologySnapshot::try_from(wire).unwrap(), committed);
+
+        let mut target_members = members();
+        target_members.push(Member {
+            node_id: "node-c".into(),
+            endpoint: "http://127.0.0.1:5003".into(),
+        });
+        let change = crate::migration::TopologyChange::plan(&committed, target_members).unwrap();
+        assert_eq!(change.target_topology.timings, timings);
+
+        // The timings are covered by the digest like the hash seed.
+        let mut tampered = committed;
+        tampered.timings.lease_duration_millis = 4_000;
+        assert!(matches!(
+            tampered.validate(),
+            Err(TopologyError::DigestMismatch)
+        ));
+    }
+
+    #[test]
+    fn cluster_timings_are_bounded() {
+        let build = |receipt_retention_millis, lease_duration_millis| {
+            TopologySnapshot::new_with_timings(
+                1,
+                42,
+                16,
+                members(),
+                TopologyConfig::default(),
+                ClusterTimings {
+                    receipt_retention_millis,
+                    lease_duration_millis,
+                },
+            )
+        };
+        assert!(build(MIN_CLUSTER_TIMING_MILLIS, MAX_CLUSTER_TIMING_MILLIS).is_ok());
+        assert!(matches!(
+            build(MIN_CLUSTER_TIMING_MILLIS - 1, 5_000),
+            Err(TopologyError::ReceiptRetentionOutOfRange)
+        ));
+        assert!(matches!(
+            build(60_000, MAX_CLUSTER_TIMING_MILLIS + 1),
+            Err(TopologyError::LeaseDurationOutOfRange)
+        ));
     }
 
     #[test]

@@ -87,6 +87,7 @@ pub(super) fn required_followers(
     Ok(desired.into_iter().map(str::to_owned).collect())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn prepare_replication_entries(
     state: &mut NodeState,
     key: &[u8],
@@ -95,6 +96,7 @@ pub(super) fn prepare_replication_entries(
     version: &RecordVersion,
     mutation_id: String,
     token: u64,
+    max_pending_bytes: usize,
 ) -> Result<Vec<PreparedReplication>, ()> {
     let follower_ids: Vec<_> = state
         .topology
@@ -126,7 +128,7 @@ pub(super) fn prepare_replication_entries(
         .and_then(|bytes| bytes.checked_add(mutation_id.len()))
         .and_then(|bytes| bytes.checked_add(256))
         .ok_or(())?;
-    if per_entry_bytes > MAX_PENDING_REPLICATION_BYTES {
+    if per_entry_bytes > max_pending_bytes {
         return Err(());
     }
     let mutation = Arc::new(ReplicationMutation {
@@ -264,18 +266,27 @@ pub(super) fn prune_ack_progress(state: &mut NodeState) {
 pub(super) fn start_replication_dispatch(
     state: Arc<RwLock<NodeState>>,
     pressure: Arc<NodePressureStats>,
+    settings: &NodeSettings,
 ) -> ReplicationDispatcher {
+    let max_pending_bytes = settings.max_pending_replication_bytes;
     ReplicationDispatcher {
         state,
         streams: Arc::new(StdMutex::new(HashMap::new())),
         failed_streams: Arc::new(StdMutex::new(HashSet::new())),
-        retained_budget: Arc::new(Semaphore::new(MAX_PENDING_REPLICATION_BYTES)),
-        active_rpc_budget: Arc::new(Semaphore::new(MAX_PENDING_REPLICATION_BYTES)),
+        retained_budget: Arc::new(Semaphore::new(max_pending_bytes)),
+        active_rpc_budget: Arc::new(Semaphore::new(max_pending_bytes)),
+        max_pending_bytes,
+        stream_queue_capacity: settings.replication_stream_queue_capacity,
+        rpc_timeout: settings.replication_rpc_timeout,
         pressure,
     }
 }
 
 impl ReplicationDispatcher {
+    pub(super) fn max_pending_bytes(&self) -> usize {
+        self.max_pending_bytes
+    }
+
     fn record_reservation_rejection(&self, reason: &'static str, stream: &ReplicationStreamKey) {
         let count = self
             .pressure
@@ -336,11 +347,12 @@ impl ReplicationDispatcher {
                 return Err(());
             }
             let sender = streams.entry(stream_key.clone()).or_insert_with(|| {
-                let (sender, receiver) = mpsc::channel(REPLICATION_STREAM_QUEUE_CAPACITY);
+                let (sender, receiver) = mpsc::channel(self.stream_queue_capacity);
                 tokio::spawn(deliver_replication_stream(
                     self.state.clone(),
                     self.failed_streams.clone(),
                     self.active_rpc_budget.clone(),
+                    self.rpc_timeout,
                     self.pressure.clone(),
                     stream_key.clone(),
                     receiver,
@@ -397,6 +409,7 @@ pub(super) async fn deliver_replication_stream(
     state: Arc<RwLock<NodeState>>,
     failed_streams: Arc<StdMutex<HashSet<ReplicationStreamKey>>>,
     active_rpc_budget: Arc<Semaphore>,
+    rpc_timeout: std::time::Duration,
     pressure: Arc<NodePressureStats>,
     stream_key: ReplicationStreamKey,
     mut entries: mpsc::Receiver<PendingReplication>,
@@ -443,7 +456,7 @@ pub(super) async fn deliver_replication_stream(
             }
             if client.is_none() {
                 match tokio::time::timeout(
-                    REPLICATION_RPC_TIMEOUT,
+                    rpc_timeout,
                     DataNodeClient::connect(follower_endpoint.clone()),
                 )
                 .await
@@ -473,7 +486,7 @@ pub(super) async fn deliver_replication_stream(
                     .collect(),
             };
             let result = tokio::time::timeout(
-                REPLICATION_RPC_TIMEOUT,
+                rpc_timeout,
                 client
                     .as_mut()
                     .expect("replication client was connected above")

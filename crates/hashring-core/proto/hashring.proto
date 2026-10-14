@@ -26,6 +26,8 @@ message TopologySnapshot {
   uint32 desired_replication_factor = 9;
   WriteAckPolicy write_ack_policy = 10;
   WriteAvailabilityGuard write_availability_guard = 11;
+  uint64 receipt_retention_millis = 12;
+  uint64 lease_duration_millis = 13;
 }
 
 enum WriteAckPolicy {

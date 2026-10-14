@@ -3,16 +3,20 @@
 use std::{num::NonZeroUsize, path::PathBuf};
 
 use anyhow::{Result, bail};
-use hashring_coordinator::DEFAULT_RANGE_MOVE_CONCURRENCY;
+use hashring_coordinator::{
+    DEFAULT_PREPUBLICATION_FAILURE_GRACE, DEFAULT_RANGE_MOVE_CONCURRENCY,
+    DEFAULT_REPLICA_REPAIR_CONCURRENCY,
+};
 use hashring_core::topology::{
-    DEFAULT_DESIRED_REPLICATION_FACTOR, DEFAULT_MINIMUM_ADMITTED_COPIES,
-    DEFAULT_MINIMUM_HEALTHY_FOLLOWERS,
+    DEFAULT_DESIRED_REPLICATION_FACTOR, DEFAULT_LEASE_DURATION_MILLIS,
+    DEFAULT_MAX_REPLICA_LAG_MILLIS, DEFAULT_MINIMUM_ADMITTED_COPIES,
+    DEFAULT_MINIMUM_HEALTHY_FOLLOWERS, DEFAULT_RECEIPT_RETENTION_MILLIS,
 };
 use hashring_experiment::{ExperimentConfig, ExperimentMode};
 use serde::Deserialize;
 
-use super::LoadedFile;
-use crate::{ExperimentArgs, ExperimentModeArg, PolicyArg};
+use super::{LoadedFile, node};
+use crate::{ExperimentArgs, ExperimentModeArg, NodeTuningArgs, PolicyArg};
 
 pub const DEFAULT_VALUE_BYTES: usize = 128;
 pub const DEFAULT_CONCURRENCY: usize = 64;
@@ -37,14 +41,26 @@ pub struct ExperimentFile {
     pub operation_timeout_ms: Option<u64>,
     pub migration_timeout_ms: Option<u64>,
     pub range_move_concurrency: Option<usize>,
+    pub replica_repair_concurrency: Option<NonZeroUsize>,
+    pub prepublication_failure_grace_ms: Option<u64>,
     pub pre_publish_delay_ms: Option<u64>,
     pub require_clean_source: Option<bool>,
     pub verbose: Option<bool>,
     pub desired_replication_factor: Option<u32>,
     pub minimum_admitted_copies: Option<u32>,
     pub minimum_healthy_followers: Option<u32>,
+    pub max_replica_lag_ms: Option<u64>,
+    pub receipt_retention_ms: Option<u64>,
+    pub lease_duration_ms: Option<u64>,
     pub policy: Option<PolicyArg>,
     pub worker_threads: Option<NonZeroUsize>,
+    pub coordinator_worker_threads: Option<NonZeroUsize>,
+    pub max_dedup_bytes: Option<usize>,
+    pub max_pending_replication_bytes: Option<usize>,
+    pub max_migration_journal_bytes: Option<usize>,
+    pub replication_stream_queue_capacity: Option<NonZeroUsize>,
+    pub required_ack_timeout_ms: Option<u64>,
+    pub replication_rpc_timeout_ms: Option<u64>,
 }
 
 /// Resolves the run's configuration. Boolean flags can only turn a setting on,
@@ -59,6 +75,18 @@ pub fn resolve(
         .map(|loaded| loaded.dir().to_owned())
         .unwrap_or_default();
     let file = file.map(|loaded| loaded.body).unwrap_or_default();
+    let node_settings = node::settings(
+        &args.node_tuning,
+        &NodeTuningArgs {
+            max_dedup_bytes: file.max_dedup_bytes,
+            max_pending_replication_bytes: file.max_pending_replication_bytes,
+            max_migration_journal_bytes: file.max_migration_journal_bytes,
+            replication_stream_queue_capacity: file.replication_stream_queue_capacity,
+            required_ack_timeout_ms: file.required_ack_timeout_ms,
+            replication_rpc_timeout_ms: file.replication_rpc_timeout_ms,
+        },
+    );
+    node_settings.validate()?;
 
     let Some(output_dir) = args
         .output
@@ -115,6 +143,14 @@ pub fn resolve(
             .range_move_concurrency
             .or(file.range_move_concurrency)
             .unwrap_or(DEFAULT_RANGE_MOVE_CONCURRENCY),
+        replica_repair_concurrency: args
+            .replica_repair_concurrency
+            .or(file.replica_repair_concurrency)
+            .map_or(DEFAULT_REPLICA_REPAIR_CONCURRENCY, NonZeroUsize::get),
+        prepublication_failure_grace_ms: args
+            .prepublication_failure_grace_ms
+            .or(file.prepublication_failure_grace_ms)
+            .unwrap_or(DEFAULT_PREPUBLICATION_FAILURE_GRACE.as_millis() as u64),
         pre_publish_delay_ms: args
             .pre_publish_delay_ms
             .or(file.pre_publish_delay_ms)
@@ -127,6 +163,10 @@ pub fn resolve(
             node_count,
             cpus,
         ),
+        coordinator_worker_threads: args
+            .coordinator_worker_threads
+            .or(file.coordinator_worker_threads)
+            .map(NonZeroUsize::get),
         desired_replication_factor: args
             .desired_replication_factor
             .or(file.desired_replication_factor)
@@ -139,7 +179,20 @@ pub fn resolve(
             .minimum_healthy_followers
             .or(file.minimum_healthy_followers)
             .unwrap_or(DEFAULT_MINIMUM_HEALTHY_FOLLOWERS),
+        max_replica_lag_ms: args
+            .max_replica_lag_ms
+            .or(file.max_replica_lag_ms)
+            .unwrap_or(DEFAULT_MAX_REPLICA_LAG_MILLIS),
+        receipt_retention_ms: args
+            .receipt_retention_ms
+            .or(file.receipt_retention_ms)
+            .unwrap_or(DEFAULT_RECEIPT_RETENTION_MILLIS),
+        lease_duration_ms: args
+            .lease_duration_ms
+            .or(file.lease_duration_ms)
+            .unwrap_or(DEFAULT_LEASE_DURATION_MILLIS),
         write_ack_policy: policy.into(),
+        node: node::options(&node_settings),
     })
 }
 
@@ -236,6 +289,12 @@ mod tests {
             config.range_move_concurrency,
             DEFAULT_RANGE_MOVE_CONCURRENCY
         );
+        assert_eq!(
+            config.replica_repair_concurrency,
+            DEFAULT_REPLICA_REPAIR_CONCURRENCY
+        );
+        assert_eq!(config.max_replica_lag_ms, DEFAULT_MAX_REPLICA_LAG_MILLIS);
+        assert_eq!(config.coordinator_worker_threads, None);
         assert!(matches!(config.write_ack_policy, WriteAckPolicy::OwnerOnly));
     }
 
@@ -255,6 +314,27 @@ mod tests {
 
         let zero = write(dir.path(), "worker_threads: 0\n");
         assert!(load::<ExperimentFile>(&zero).is_err());
+    }
+
+    #[test]
+    fn node_tuning_is_resolved_for_every_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "max_dedup_bytes: 4096\nreplication_stream_queue_capacity: 8\n",
+        );
+        let args = experiment_args(&["--output", "out", "--max-dedup-bytes", "8192"]);
+        let config = resolve(&args, Some(load(&path).unwrap()), 24).unwrap();
+        assert_eq!(config.node.max_dedup_bytes, 8192);
+        assert_eq!(config.node.replication_stream_queue_capacity, 8);
+        assert_eq!(
+            config.node.max_pending_replication_bytes,
+            hashring_node::DEFAULT_MAX_PENDING_REPLICATION_BYTES
+        );
+        assert_eq!(config.node.required_ack_timeout_ms, 2_000);
+
+        let args = experiment_args(&["--output", "out", "--required-ack-timeout-ms", "0"]);
+        assert!(resolve(&args, None, 24).is_err());
     }
 
     #[test]

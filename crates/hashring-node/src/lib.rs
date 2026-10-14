@@ -43,19 +43,21 @@ use hashring_core::{
 };
 
 pub const DEFAULT_MAX_MIGRATION_JOURNAL_BYTES: usize = 16 * 1024 * 1024;
-const MAX_PENDING_REPLICATION_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_MAX_PENDING_REPLICATION_BYTES: usize = 64 * 1024 * 1024;
 const REPLICATION_BATCH_MAX_ENTRIES: usize = 64;
 // Stay under the data-node client's encode limit so one batch fits a message.
 const REPLICATION_BATCH_MAX_BYTES: usize = MAX_DATA_MESSAGE_BYTES - 64 * 1024;
-const REPLICATION_STREAM_QUEUE_CAPACITY: usize = 32;
+pub const DEFAULT_REPLICATION_STREAM_QUEUE_CAPACITY: usize = 32;
 const MAX_REPLICATION_FINGERPRINTS: u64 = 4_096;
-const REPLICATION_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-const RECEIPT_RETENTION_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
+pub const DEFAULT_REPLICATION_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Bounds the replica-readiness calls a node makes to the coordinator. Lease
+/// renewal derives its own timeout from the cluster's lease duration.
+const COORDINATOR_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 // A node retains deduplication receipts for the full retention period on owner and
 // follower paths. Account for live entries separately from staged migration
 // records so the default limit bounds retained data without double charging.
-const MAX_DEDUP_BYTES: usize = 128 * 1024 * 1024;
-const REQUIRED_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+pub const DEFAULT_MAX_DEDUP_BYTES: usize = 128 * 1024 * 1024;
+pub const DEFAULT_REQUIRED_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const PEER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
 type RequiredAck = (u64, String, u64);
@@ -320,6 +322,9 @@ struct ReplicationDispatcher {
     failed_streams: Arc<StdMutex<HashSet<ReplicationStreamKey>>>,
     retained_budget: Arc<Semaphore>,
     active_rpc_budget: Arc<Semaphore>,
+    max_pending_bytes: usize,
+    stream_queue_capacity: usize,
+    rpc_timeout: std::time::Duration,
     pressure: Arc<NodePressureStats>,
 }
 
@@ -476,6 +481,65 @@ impl NodeState {
     }
 }
 
+/// Per-node resource budgets and timeouts. Nodes in one cluster may use
+/// different values; none of them affects correctness, only when a node
+/// rejects or gives up on work.
+#[derive(Clone, Debug)]
+pub struct NodeSettings {
+    /// Retained deduplication receipts, and separately each migration
+    /// destination's staged receipts.
+    pub max_dedup_bytes: usize,
+    /// Mutations queued for followers, and separately the payload copies held
+    /// by in-flight replication RPCs.
+    pub max_pending_replication_bytes: usize,
+    /// Writes journaled across this node's active migrations.
+    pub max_migration_journal_bytes: usize,
+    /// Mutations queued per follower stream, regardless of their size.
+    pub replication_stream_queue_capacity: usize,
+    /// How long a write waits for its required follower ACKs.
+    pub required_ack_timeout: std::time::Duration,
+    /// Bounds each replication connect and batch RPC.
+    pub replication_rpc_timeout: std::time::Duration,
+}
+
+impl Default for NodeSettings {
+    fn default() -> Self {
+        Self {
+            max_dedup_bytes: DEFAULT_MAX_DEDUP_BYTES,
+            max_pending_replication_bytes: DEFAULT_MAX_PENDING_REPLICATION_BYTES,
+            max_migration_journal_bytes: DEFAULT_MAX_MIGRATION_JOURNAL_BYTES,
+            replication_stream_queue_capacity: DEFAULT_REPLICATION_STREAM_QUEUE_CAPACITY,
+            required_ack_timeout: DEFAULT_REQUIRED_ACK_TIMEOUT,
+            replication_rpc_timeout: DEFAULT_REPLICATION_RPC_TIMEOUT,
+        }
+    }
+}
+
+impl NodeSettings {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.max_dedup_bytes > 0, "max_dedup_bytes must be positive");
+        anyhow::ensure!(
+            self.max_pending_replication_bytes > 0
+                && self.max_pending_replication_bytes <= Semaphore::MAX_PERMITS,
+            "max_pending_replication_bytes must be positive and at most {}",
+            Semaphore::MAX_PERMITS
+        );
+        anyhow::ensure!(
+            self.max_migration_journal_bytes > 0,
+            "max_migration_journal_bytes must be positive"
+        );
+        anyhow::ensure!(
+            self.replication_stream_queue_capacity > 0,
+            "replication_stream_queue_capacity must be positive"
+        );
+        anyhow::ensure!(
+            !self.required_ack_timeout.is_zero() && !self.replication_rpc_timeout.is_zero(),
+            "timeouts must be positive"
+        );
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct DataNodeService {
     node_id: String,
@@ -490,6 +554,7 @@ pub struct DataNodeService {
     max_value_bytes: usize,
     max_journal_bytes: usize,
     max_dedup_bytes: usize,
+    required_ack_timeout: std::time::Duration,
     stop_response_delay: std::time::Duration,
     stop_prepared: Arc<AtomicBool>,
     shutdown: watch::Sender<bool>,

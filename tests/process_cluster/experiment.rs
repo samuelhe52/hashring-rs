@@ -26,6 +26,8 @@ async fn experiment_runner_preserves_reproducibility_artifacts() {
             "10000",
             "--migration-timeout-ms",
             "60000",
+            "--max-dedup-bytes",
+            "33554432",
             "--verbose",
         ])
         .output()
@@ -41,7 +43,9 @@ async fn experiment_runner_preserves_reproducibility_artifacts() {
             .unwrap();
     assert_eq!(manifest["config"]["node_count"], 4);
     assert_eq!(manifest["config"]["key_count"], 300);
-    assert_eq!(manifest["schema_version"], 4);
+    assert_eq!(manifest["schema_version"], 5);
+    // Every node is started with the run's tuning, so it must parse.
+    assert_eq!(manifest["config"]["node"]["max_dedup_bytes"], 33_554_432);
     assert_eq!(manifest["executable_blake3"].as_str().unwrap().len(), 64);
     assert!(manifest["build"]["git_commit"].is_string());
     assert_eq!(manifest["config"]["pre_publish_delay_ms"], 250);

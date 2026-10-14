@@ -1,0 +1,16 @@
+# Settings for `hashring-rs node --config examples/node.yaml`.
+# Every key is optional and named after a node flag (`_` for `-`); `id` and
+# `listen` are required here or on the command line. A flag given on the
+# command line wins over the same key here. See docs/configuration.md.
+id: node-1
+listen: 127.0.0.1:50051
+coordinator: http://127.0.0.1:50050
+# worker_threads: 4   # default: one per available CPU
+
+# Per-node budgets and timeouts. Nodes in one cluster may use different values.
+max_dedup_bytes: 134217728              # 128 MiB
+max_pending_replication_bytes: 67108864 # 64 MiB
+max_migration_journal_bytes: 16777216   # 16 MiB
+replication_stream_queue_capacity: 32
+required_ack_timeout_ms: 2000
+replication_rpc_timeout_ms: 2000

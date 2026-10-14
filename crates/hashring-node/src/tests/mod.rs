@@ -63,7 +63,8 @@ fn service_for(node_id: &str, topology: TopologySnapshot) -> DataNodeService {
         cleanup_timing: proto::ReceiptCleanupTiming::default(),
     }));
     let pressure = Arc::new(NodePressureStats::default());
-    let replication_dispatch = start_replication_dispatch(state.clone(), pressure.clone());
+    let replication_dispatch =
+        start_replication_dispatch(state.clone(), pressure.clone(), &NodeSettings::default());
     DataNodeService {
         node_id: node_id.into(),
         process_instance_id: "instance-1".into(),
@@ -76,7 +77,8 @@ fn service_for(node_id: &str, topology: TopologySnapshot) -> DataNodeService {
         max_key_bytes: DEFAULT_MAX_KEY_BYTES,
         max_value_bytes: DEFAULT_MAX_VALUE_BYTES,
         max_journal_bytes: DEFAULT_MAX_MIGRATION_JOURNAL_BYTES,
-        max_dedup_bytes: MAX_DEDUP_BYTES,
+        max_dedup_bytes: DEFAULT_MAX_DEDUP_BYTES,
+        required_ack_timeout: DEFAULT_REQUIRED_ACK_TIMEOUT,
         stop_response_delay: std::time::Duration::ZERO,
         stop_prepared: Arc::new(AtomicBool::new(false)),
         shutdown,

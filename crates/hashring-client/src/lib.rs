@@ -168,6 +168,8 @@ pub struct HashringClient {
 
 struct ClientInner {
     coordinator_endpoint: String,
+    /// Fixed for the cluster's lifetime, so it is read once at connect.
+    receipt_retention: Duration,
     topology: RwLock<TopologySnapshot>,
     channels: RwLock<HashMap<String, Channel>>,
     operation_timeout: Duration,
@@ -200,6 +202,7 @@ impl HashringClient {
         .map_err(|_| ClientError::deadline(false))??;
         let inner = Arc::new(ClientInner {
             coordinator_endpoint,
+            receipt_retention: topology.timings.receipt_retention(),
             topology: RwLock::new(topology),
             channels: RwLock::new(HashMap::new()),
             operation_timeout: config.operation_timeout,
@@ -466,7 +469,7 @@ impl HashringClient {
                 "value exceeds {DEFAULT_MAX_VALUE_BYTES} bytes"
             )));
         }
-        let deadline = Instant::now() + self.inner.operation_timeout;
+        let deadline = self.mutation_deadline();
         let request_id = uuid::Uuid::new_v4().to_string();
         let mut attempt = 0_u32;
         let mut unknown_write_outcome = false;
@@ -553,7 +556,7 @@ impl HashringClient {
 
     pub async fn delete(&self, key: Vec<u8>) -> Result<DeleteOutput, ClientError> {
         validate_key_size(&key)?;
-        let deadline = Instant::now() + self.inner.operation_timeout;
+        let deadline = self.mutation_deadline();
         let request_id = uuid::Uuid::new_v4().to_string();
         let mut attempt = 0_u32;
         let mut unknown_write_outcome = false;
@@ -789,6 +792,18 @@ impl HashringClient {
         }
         let inner = Arc::clone(&self.inner);
         tokio::spawn(run_background_refresh(inner));
+    }
+
+    /// Bounds the retries of one mutation ID by the cluster's receipt
+    /// retention period: a receipt's clock starts when a replica applies the
+    /// mutation, after the first attempt was sent, so retries before this
+    /// deadline find it.
+    fn mutation_deadline(&self) -> Instant {
+        Instant::now()
+            + self
+                .inner
+                .operation_timeout
+                .min(self.inner.receipt_retention)
     }
 
     async fn retry_delay(
@@ -1080,6 +1095,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use hashring_core::proto::coordinator_server::{Coordinator, CoordinatorServer};
+    use hashring_core::topology::{ClusterTimings, TopologyConfig};
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::{Request, Response, Status};
 
@@ -1418,9 +1434,16 @@ mod tests {
         server.abort();
     }
 
-    #[tokio::test]
-    async fn moved_refresh_preserves_an_unknown_write_outcome_through_its_deadline() {
-        let topology = TopologySnapshot::new(
+    /// A client whose coordinator and node endpoints are unreachable.
+    fn unreachable_client(operation_timeout: Duration) -> HashringClient {
+        unreachable_client_with(operation_timeout, ClusterTimings::default())
+    }
+
+    fn unreachable_client_with(
+        operation_timeout: Duration,
+        timings: ClusterTimings,
+    ) -> HashringClient {
+        let topology = TopologySnapshot::new_with_timings(
             1,
             1,
             1,
@@ -1428,22 +1451,48 @@ mod tests {
                 node_id: "node-1".into(),
                 endpoint: "http://127.0.0.1:1".into(),
             }],
+            TopologyConfig::default(),
+            timings,
         )
         .unwrap();
-        let client = HashringClient {
+        HashringClient {
             inner: Arc::new(ClientInner {
                 coordinator_endpoint: "http://127.0.0.1:1".into(),
+                receipt_retention: topology.timings.receipt_retention(),
                 topology: RwLock::new(topology),
                 channels: RwLock::new(HashMap::new()),
-                operation_timeout: Duration::from_millis(100),
-                topology_refresh_timeout: Duration::from_millis(100),
+                operation_timeout,
+                topology_refresh_timeout: operation_timeout,
                 refresh_lock: Mutex::new(()),
                 refresh_generation: AtomicU64::new(0),
                 background_refresh_running: AtomicBool::new(false),
                 background_minimum_epoch: AtomicU64::new(0),
                 background_trigger_generation: AtomicU64::new(0),
             }),
+        }
+    }
+
+    #[test]
+    fn mutation_retries_stop_within_receipt_retention() {
+        let timings = ClusterTimings {
+            receipt_retention_millis: 5_000,
+            ..ClusterTimings::default()
         };
+        let retention = timings.receipt_retention();
+        let before = Instant::now();
+        let long = unreachable_client_with(retention * 2, timings).mutation_deadline();
+        assert!(long <= Instant::now() + retention);
+        assert!(long >= before + retention);
+
+        let short = Duration::from_millis(100);
+        let before = Instant::now();
+        let deadline = unreachable_client(short).mutation_deadline();
+        assert!(deadline >= before + short && deadline <= Instant::now() + short);
+    }
+
+    #[tokio::test]
+    async fn moved_refresh_preserves_an_unknown_write_outcome_through_its_deadline() {
+        let client = unreachable_client(Duration::from_millis(100));
         let deadline = Instant::now() + client.inner.operation_timeout;
         let error = client
             .handle_retryable(

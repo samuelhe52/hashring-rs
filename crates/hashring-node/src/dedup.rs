@@ -80,6 +80,7 @@ pub(super) fn stage_dedup(
     destination: &mut DestinationMigration,
     record: DeduplicationRecord,
     max_dedup_bytes: usize,
+    retention_millis: u64,
 ) -> Result<(), Status> {
     if record.remaining_retention_millis == 0 {
         return Ok(());
@@ -92,7 +93,7 @@ pub(super) fn stage_dedup(
         return Err(Status::invalid_argument("invalid deduplication record"));
     }
     let expires_at = Instant::now()
-        + std::time::Duration::from_millis(record.remaining_retention_millis.min(60_000));
+        + std::time::Duration::from_millis(record.remaining_retention_millis.min(retention_millis));
     if let Some(existing) = destination.dedup.get_mut(&record.mutation_id) {
         let same = existing.record.key == record.key
             && existing.record.fingerprint == record.fingerprint
@@ -138,14 +139,18 @@ pub(super) fn purge_staged_dedup(destination: &mut DestinationMigration, now: In
         .sum();
 }
 
-pub(super) fn remaining_retention_millis(expires_at: Instant, now: Instant) -> u64 {
+pub(super) fn remaining_retention_millis(
+    expires_at: Instant,
+    now: Instant,
+    retention_millis: u64,
+) -> u64 {
     let remaining = expires_at.saturating_duration_since(now);
     if remaining.is_zero() {
         return 0;
     }
     u64::try_from(remaining.as_nanos().div_ceil(1_000_000))
         .unwrap_or(u64::MAX)
-        .min(60_000)
+        .min(retention_millis)
 }
 
 pub(super) fn purge_expired_dedup(state: &mut NodeState, now: Instant) {
@@ -199,7 +204,7 @@ pub(super) fn insert_dedup(
     deleted: bool,
     now: Instant,
 ) {
-    let expires_at = now + RECEIPT_RETENTION_PERIOD;
+    let expires_at = now + state.topology.timings.receipt_retention();
     insert_dedup_until(
         state,
         mutation_id,
@@ -252,7 +257,14 @@ pub(super) fn dedup_retry_after_millis(state: &NodeState, now: Instant) -> u64 {
     state
         .dedup_expirations
         .peek()
-        .map(|Reverse((expires_at, _))| remaining_retention_millis(*expires_at, now).max(1))
+        .map(|Reverse((expires_at, _))| {
+            remaining_retention_millis(
+                *expires_at,
+                now,
+                state.topology.timings.receipt_retention_millis,
+            )
+            .max(1)
+        })
         .unwrap_or(1)
 }
 

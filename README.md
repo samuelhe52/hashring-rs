@@ -74,6 +74,10 @@ ignores the bootstrap keys in the config file (`members`, `seed`,
 for every restart. Explicit `--member` flags must still match the stored
 topology.
 
+Nodes take a config file too (see [`examples/node.yaml`](examples/node.yaml)).
+[docs/configuration.md](docs/configuration.md) lists every flag and key with
+its default and scope.
+
 ## Commands
 
 | Command | Purpose |
@@ -137,9 +141,10 @@ only; it does not make data durable.
   final error reports `unknown_write_outcome=true`. A follow-up `DELETE` that
   succeeds confirms the key is absent.
 - **Deduplication.** The client keeps one request ID across retries of a
-  logical write. Nodes keep in-memory receipts for 60 seconds, so a retry is
-  not applied twice. A new CLI invocation uses a new ID, and receipts are lost
-  if the node restarts.
+  logical write. Nodes keep in-memory receipts for the cluster's receipt
+  retention period (60 seconds by default), so a retry is not applied twice,
+  and the client stops retrying a mutation within that period. A new CLI
+  invocation uses a new ID, and receipts are lost if the node restarts.
 
 ### Limits
 
@@ -265,6 +270,7 @@ profiling, and how to compare runs.
 | `crates/hashring-node` | In-memory storage, replication, and the data-node service |
 | `crates/hashring-experiment` | Multi-process experiment runner |
 | `docs/report/` | [Preliminary report](docs/report/preliminary-report.md) on the design and results |
+| `docs/configuration.md` | Every flag and config key, with defaults and scopes |
 | `docs/rfcs/` | Design RFCs |
 | `docs/optimizations/` | Performance work, with measurements |
 

@@ -3,10 +3,14 @@
 use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf};
 
 use anyhow::Result;
-use hashring_coordinator::DEFAULT_RANGE_MOVE_CONCURRENCY;
+use hashring_coordinator::{
+    DEFAULT_PREPUBLICATION_FAILURE_GRACE, DEFAULT_RANGE_MOVE_CONCURRENCY,
+    DEFAULT_REPLICA_REPAIR_CONCURRENCY,
+};
 use hashring_core::topology::{
-    DEFAULT_DESIRED_REPLICATION_FACTOR, DEFAULT_MAX_REPLICA_LAG_MILLIS,
-    DEFAULT_MINIMUM_ADMITTED_COPIES, DEFAULT_MINIMUM_HEALTHY_FOLLOWERS, Member,
+    DEFAULT_DESIRED_REPLICATION_FACTOR, DEFAULT_LEASE_DURATION_MILLIS,
+    DEFAULT_MAX_REPLICA_LAG_MILLIS, DEFAULT_MINIMUM_ADMITTED_COPIES,
+    DEFAULT_MINIMUM_HEALTHY_FOLLOWERS, DEFAULT_RECEIPT_RETENTION_MILLIS, Member,
 };
 use serde::Deserialize;
 
@@ -27,12 +31,17 @@ pub struct CoordinatorFile {
     pub state: Option<PathBuf>,
     pub migration_timeout_ms: Option<u64>,
     pub range_move_concurrency: Option<NonZeroUsize>,
+    pub replica_repair_concurrency: Option<NonZeroUsize>,
+    pub prepublication_failure_grace_ms: Option<u64>,
+    pub worker_threads: Option<NonZeroUsize>,
     pub seed: Option<u64>,
     pub virtual_nodes: Option<u32>,
     pub desired_replication_factor: Option<u32>,
     pub minimum_admitted_copies: Option<u32>,
     pub minimum_healthy_followers: Option<u32>,
     pub max_replica_lag_ms: Option<u64>,
+    pub receipt_retention_ms: Option<u64>,
+    pub lease_duration_ms: Option<u64>,
     pub members: Vec<FileMember>,
 }
 
@@ -59,12 +68,18 @@ pub struct CoordinatorSettings {
     pub state: PathBuf,
     pub migration_timeout_ms: u64,
     pub range_move_concurrency: NonZeroUsize,
+    pub replica_repair_concurrency: NonZeroUsize,
+    pub prepublication_failure_grace_ms: u64,
+    /// `None` takes one worker per available CPU.
+    pub worker_threads: Option<NonZeroUsize>,
     pub seed: u64,
     pub virtual_nodes: u32,
     pub desired_replication_factor: u32,
     pub minimum_admitted_copies: u32,
     pub minimum_healthy_followers: u32,
     pub max_replica_lag_ms: u64,
+    pub receipt_retention_ms: u64,
+    pub lease_duration_ms: u64,
     pub members: Vec<Member>,
     pub member_source: MemberSource,
 }
@@ -124,6 +139,18 @@ pub fn resolve(
                 NonZeroUsize::new(DEFAULT_RANGE_MOVE_CONCURRENCY)
                     .expect("default range move concurrency is positive"),
             ),
+        replica_repair_concurrency: args
+            .replica_repair_concurrency
+            .or(file.replica_repair_concurrency)
+            .unwrap_or(
+                NonZeroUsize::new(DEFAULT_REPLICA_REPAIR_CONCURRENCY)
+                    .expect("default replica repair concurrency is positive"),
+            ),
+        prepublication_failure_grace_ms: args
+            .prepublication_failure_grace_ms
+            .or(file.prepublication_failure_grace_ms)
+            .unwrap_or(DEFAULT_PREPUBLICATION_FAILURE_GRACE.as_millis() as u64),
+        worker_threads: args.worker_threads.or(file.worker_threads),
         seed: args.seed.or(file.seed).unwrap_or(DEFAULT_SEED),
         virtual_nodes: args
             .virtual_nodes
@@ -145,9 +172,23 @@ pub fn resolve(
             .max_replica_lag_ms
             .or(file.max_replica_lag_ms)
             .unwrap_or(DEFAULT_MAX_REPLICA_LAG_MILLIS),
+        receipt_retention_ms: args
+            .receipt_retention_ms
+            .or(file.receipt_retention_ms)
+            .unwrap_or(DEFAULT_RECEIPT_RETENTION_MILLIS),
+        lease_duration_ms: args
+            .lease_duration_ms
+            .or(file.lease_duration_ms)
+            .unwrap_or(DEFAULT_LEASE_DURATION_MILLIS),
         members,
         member_source,
     })
+}
+
+impl CoordinatorSettings {
+    pub fn runtime_workers(&self, cpus: usize) -> usize {
+        self.worker_threads.map_or(cpus, NonZeroUsize::get)
+    }
 }
 
 #[cfg(test)]
@@ -180,10 +221,13 @@ mod tests {
         let path = write(
             dir.path(),
             "listen: 0.0.0.0:6000\nseed: 9\nvirtual_nodes: 64\nstate: data/c.redb\n\
+             replica_repair_concurrency: 6\nworker_threads: 3\n\
              members:\n  - { node_id: node-1, endpoint: http://127.0.0.1:50051 }\n",
         );
-        let args = coordinator_args(&["--seed", "7"]);
+        let args = coordinator_args(&["--seed", "7", "--replica-repair-concurrency", "8"]);
         let settings = resolve(&args, Some(load::<CoordinatorFile>(&path).unwrap())).unwrap();
+        assert_eq!(settings.replica_repair_concurrency.get(), 8);
+        assert_eq!(settings.runtime_workers(24), 3);
         assert_eq!(settings.listen, "0.0.0.0:6000".parse().unwrap());
         assert_eq!(settings.seed, 7);
         assert_eq!(settings.virtual_nodes, 64);
@@ -221,6 +265,12 @@ mod tests {
             DEFAULT_RANGE_MOVE_CONCURRENCY
         );
         assert_eq!(settings.member_source, MemberSource::None);
+        assert_eq!(
+            settings.replica_repair_concurrency.get(),
+            DEFAULT_REPLICA_REPAIR_CONCURRENCY
+        );
+        assert_eq!(settings.prepublication_failure_grace_ms, 30_000);
+        assert_eq!(settings.runtime_workers(24), 24);
     }
 
     #[test]

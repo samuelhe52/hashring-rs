@@ -47,16 +47,67 @@ pub struct ExperimentConfig {
     pub operation_timeout_ms: u64,
     pub migration_timeout_ms: u64,
     pub range_move_concurrency: usize,
+    pub replica_repair_concurrency: usize,
+    pub prepublication_failure_grace_ms: u64,
     pub pre_publish_delay_ms: u64,
     pub require_clean_source: bool,
     pub verbose: bool,
-    /// Tokio worker threads for the driver and every data node. The coordinator
-    /// keeps its own default; it is not on the data path.
+    /// Tokio worker threads for the driver and every data node.
     pub worker_threads: usize,
+    /// `None` keeps the coordinator's default of one worker per CPU; it is not
+    /// on the data path.
+    pub coordinator_worker_threads: Option<usize>,
     pub desired_replication_factor: u32,
     pub minimum_admitted_copies: u32,
     pub minimum_healthy_followers: u32,
+    pub max_replica_lag_ms: u64,
+    pub receipt_retention_ms: u64,
+    pub lease_duration_ms: u64,
     pub write_ack_policy: WriteAckPolicy,
+    /// Forwarded to every data node the run starts.
+    pub node: NodeOptions,
+}
+
+/// The `node` command's tuning flags, in their flag units.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct NodeOptions {
+    pub max_dedup_bytes: usize,
+    pub max_pending_replication_bytes: usize,
+    pub max_migration_journal_bytes: usize,
+    pub replication_stream_queue_capacity: usize,
+    pub required_ack_timeout_ms: u64,
+    pub replication_rpc_timeout_ms: u64,
+}
+
+impl NodeOptions {
+    fn arguments(&self) -> Vec<String> {
+        [
+            ("--max-dedup-bytes", self.max_dedup_bytes.to_string()),
+            (
+                "--max-pending-replication-bytes",
+                self.max_pending_replication_bytes.to_string(),
+            ),
+            (
+                "--max-migration-journal-bytes",
+                self.max_migration_journal_bytes.to_string(),
+            ),
+            (
+                "--replication-stream-queue-capacity",
+                self.replication_stream_queue_capacity.to_string(),
+            ),
+            (
+                "--required-ack-timeout-ms",
+                self.required_ack_timeout_ms.to_string(),
+            ),
+            (
+                "--replication-rpc-timeout-ms",
+                self.replication_rpc_timeout_ms.to_string(),
+            ),
+        ]
+        .into_iter()
+        .flat_map(|(flag, value)| [flag.to_owned(), value])
+        .collect()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -174,9 +225,9 @@ struct ProcessGroup {
     executable: PathBuf,
     log_dir: PathBuf,
     verbose: bool,
-    /// Passed to every data node so the nodes share the host budget with the
-    /// driver.
-    node_worker_threads: usize,
+    /// Passed to every data node: its share of the host's worker threads and
+    /// the run's node tuning.
+    node_arguments: Vec<String>,
     processes: Vec<ManagedProcess>,
 }
 
@@ -185,13 +236,13 @@ impl ProcessGroup {
         executable: PathBuf,
         log_dir: PathBuf,
         verbose: bool,
-        node_worker_threads: usize,
+        node_arguments: Vec<String>,
     ) -> Self {
         Self {
             executable,
             log_dir,
             verbose,
-            node_worker_threads,
+            node_arguments,
             processes: Vec::new(),
         }
     }
@@ -301,7 +352,7 @@ pub async fn run_experiment(
         runtime_tree_hash.as_deref(),
     );
     let manifest = ExperimentManifest {
-        schema_version: 4,
+        schema_version: 5,
         started_unix_ms: unix_ms(),
         executable_path: executable.display().to_string(),
         executable_blake3: file_digest(&executable)?,
@@ -424,7 +475,7 @@ async fn run_cluster(
     };
     let initial_members = &members[..initial_count];
     let mut processes =
-        ProcessGroup::new(executable, log_dir, config.verbose, config.worker_threads);
+        ProcessGroup::new(executable, log_dir, config.verbose, node_arguments(config));
     let state_path = config.output_dir.join("coordinator.redb");
     let mut coordinator_args = vec![
         "coordinator".into(),
@@ -446,7 +497,20 @@ async fn run_cluster(
         config.migration_timeout_ms.to_string(),
         "--range-move-concurrency".into(),
         config.range_move_concurrency.to_string(),
+        "--replica-repair-concurrency".into(),
+        config.replica_repair_concurrency.to_string(),
+        "--prepublication-failure-grace-ms".into(),
+        config.prepublication_failure_grace_ms.to_string(),
+        "--max-replica-lag-ms".into(),
+        config.max_replica_lag_ms.to_string(),
+        "--receipt-retention-ms".into(),
+        config.receipt_retention_ms.to_string(),
+        "--lease-duration-ms".into(),
+        config.lease_duration_ms.to_string(),
     ];
+    if let Some(workers) = config.coordinator_worker_threads {
+        coordinator_args.extend(["--worker-threads".into(), workers.to_string()]);
+    }
     coordinator_args.extend([
         "--pre-publish-delay-ms".into(),
         config.pre_publish_delay_ms.to_string(),
@@ -1175,8 +1239,14 @@ async fn migrate_while_mutating(
             match wait_for_mutation_overlap(admin_client, &completed_mutations, &writer).await {
                 Ok(overlap) => overlap,
                 Err(error) => {
-                    writer.abort();
                     execution.abort();
+                    if writer.is_finished() {
+                        if let Ok(Err(writer_error)) = writer.await {
+                            return Err(writer_error.context(error));
+                        }
+                    } else {
+                        writer.abort();
+                    }
                     return Err(error);
                 }
             };
@@ -1302,7 +1372,9 @@ async fn wait_for_mutation_overlap(
                 _ => {}
             }
         }
-        if writer.is_finished() && mutations == 0 {
+        // Reload the count: the writer may have completed every mutation
+        // during the topology poll, after `mutations` was read.
+        if writer.is_finished() && completed_mutations.load(AtomicOrdering::Acquire) == 0 {
             bail!("concurrent mutator finished without a successful mutation");
         }
         tokio::time::sleep(Duration::from_millis(2)).await;
@@ -1520,21 +1592,23 @@ fn spawn_node(
     port: u16,
     coordinator_endpoint: &str,
 ) -> Result<()> {
-    let worker_threads = processes.node_worker_threads.to_string();
-    processes.spawn(
+    let mut arguments = vec![
+        "node".into(),
+        "--id".into(),
         node_id.clone(),
-        &[
-            "node".into(),
-            "--id".into(),
-            node_id,
-            "--listen".into(),
-            format!("127.0.0.1:{port}"),
-            "--coordinator".into(),
-            coordinator_endpoint.into(),
-            "--worker-threads".into(),
-            worker_threads,
-        ],
-    )
+        "--listen".into(),
+        format!("127.0.0.1:{port}"),
+        "--coordinator".into(),
+        coordinator_endpoint.into(),
+    ];
+    arguments.extend(processes.node_arguments.iter().cloned());
+    processes.spawn(node_id, &arguments)
+}
+
+fn node_arguments(config: &ExperimentConfig) -> Vec<String> {
+    let mut arguments = vec!["--worker-threads".into(), config.worker_threads.to_string()];
+    arguments.extend(config.node.arguments());
+    arguments
 }
 
 async fn connect_eventually(
@@ -1622,8 +1696,8 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
     );
     ensure!(config.concurrency > 0, "concurrency must be positive");
     ensure!(
-        config.range_move_concurrency > 0,
-        "range_move_concurrency must be positive"
+        config.range_move_concurrency > 0 && config.replica_repair_concurrency > 0,
+        "range_move_concurrency and replica_repair_concurrency must be positive"
     );
     ensure!(config.value_bytes > 0, "value_bytes must be positive");
     ensure!(
@@ -1634,6 +1708,12 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
     ensure!(
         config.operation_timeout_ms > 0 && config.migration_timeout_ms > 0,
         "timeouts must be positive"
+    );
+    ensure!(
+        config.operation_timeout_ms <= config.receipt_retention_ms,
+        "operation_timeout_ms exceeds the {} ms receipt retention period, which caps every \
+         mutation's retries",
+        config.receipt_retention_ms
     );
     Ok(())
 }

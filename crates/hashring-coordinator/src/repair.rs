@@ -7,12 +7,16 @@ impl CoordinatorService {
         migration_timeout: Duration,
     ) -> Self {
         let (repair_interrupt, _) = watch::channel(0);
+        let lease_duration = state.committed.timings.lease_duration();
         Self {
             state: Arc::new(RwLock::new(state)),
             repository,
             execution_lock: Arc::new(Mutex::new(())),
             migration_timeout,
             range_move_concurrency: DEFAULT_RANGE_MOVE_CONCURRENCY,
+            replica_repair_concurrency: DEFAULT_REPLICA_REPAIR_CONCURRENCY,
+            prepublication_failure_grace: DEFAULT_PREPUBLICATION_FAILURE_GRACE,
+            lease_duration,
             pre_publish_delay: Duration::ZERO,
             post_publish_delay: Duration::ZERO,
             lease_grants: Arc::new(Mutex::new(BTreeMap::new())),
@@ -28,6 +32,20 @@ impl CoordinatorService {
     pub fn with_range_move_concurrency(mut self, concurrency: usize) -> Self {
         assert!(concurrency > 0, "range move concurrency must be positive");
         self.range_move_concurrency = concurrency;
+        self
+    }
+
+    pub fn with_replica_repair_concurrency(mut self, concurrency: usize) -> Self {
+        assert!(
+            concurrency > 0,
+            "replica repair concurrency must be positive"
+        );
+        self.replica_repair_concurrency = concurrency;
+        self
+    }
+
+    pub fn with_prepublication_failure_grace(mut self, grace: Duration) -> Self {
+        self.prepublication_failure_grace = grace;
         self
     }
 
@@ -60,7 +78,7 @@ impl CoordinatorService {
             return Ok(());
         }
         let now = Instant::now();
-        if now < self.startup_at + NODE_LEASE_DURATION {
+        if now < self.startup_at + self.lease_duration {
             return Ok(());
         }
         let grants = self.lease_grants.lock().await;
@@ -172,9 +190,9 @@ impl CoordinatorService {
             change.phase,
             MigrationPhase::Published | MigrationPhase::CleaningUp
         ) {
-            NODE_LEASE_DURATION
+            self.lease_duration
         } else {
-            PREPUBLICATION_FAILURE_GRACE
+            self.prepublication_failure_grace
         };
         let mut outages = self.pending_change_outages.lock().await;
         outages.retain(|node_id, _| candidate_ids.contains(node_id));
@@ -266,27 +284,23 @@ impl CoordinatorService {
             due.truncate(MAX_REPAIR_GROUPS_PER_PASS);
             due
         };
-        let work = try_map_bounded(
-            tasks,
-            self.range_move_concurrency.min(4),
-            |tasks| async move {
-                // Keep other ranges available if one destination is down. Failed
-                // tasks retain durable Pending state for the next retry.
-                match self.seed_replica_group(&tasks).await {
-                    Ok(()) => Ok::<_, Status>(tasks.len()),
-                    Err(error) => {
-                        self.record_repair_failure(&tasks, &error).await?;
-                        tracing::warn!(
-                            owner = %tasks[0].owner_node_id,
-                            follower = %tasks[0].node_id,
-                            %error,
-                            "replica seed remains pending"
-                        );
-                        Ok(0)
-                    }
+        let work = try_map_bounded(tasks, self.replica_repair_concurrency, |tasks| async move {
+            // Keep other ranges available if one destination is down. Failed
+            // tasks retain durable Pending state for the next retry.
+            match self.seed_replica_group(&tasks).await {
+                Ok(()) => Ok::<_, Status>(tasks.len()),
+                Err(error) => {
+                    self.record_repair_failure(&tasks, &error).await?;
+                    tracing::warn!(
+                        owner = %tasks[0].owner_node_id,
+                        follower = %tasks[0].node_id,
+                        %error,
+                        "replica seed remains pending"
+                    );
+                    Ok(0)
                 }
-            },
-        );
+            }
+        });
         let results = tokio::select! {
             results = work => results?,
             changed = interrupt.changed() => {
@@ -485,7 +499,7 @@ impl CoordinatorService {
         );
         try_map_bounded(
             groups,
-            self.range_move_concurrency.min(4),
+            self.replica_repair_concurrency,
             |group| async move { self.seed_replica_group(&group).await },
         )
         .await?;
@@ -723,7 +737,7 @@ impl CoordinatorService {
                 .await?;
             let copied = try_map_bounded(
                 tasks.to_vec(),
-                self.range_move_concurrency.min(4),
+                self.replica_repair_concurrency,
                 |task| async move { self.copy_replica(&task).await },
             )
             .await?;
@@ -740,7 +754,7 @@ impl CoordinatorService {
                 .await?;
             prepared = try_map_bounded(
                 paused,
-                self.range_move_concurrency.min(4),
+                self.replica_repair_concurrency,
                 |(copied, watermark)| async move {
                     self.finish_replica(copied, watermark, deadline).await
                 },

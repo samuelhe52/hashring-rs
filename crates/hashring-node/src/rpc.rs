@@ -432,6 +432,7 @@ impl DataNode for DataNodeService {
             &version,
             request.request_id,
             token,
+            self.replication_dispatch.max_pending_bytes(),
         ) {
             Ok(replications) => replications,
             Err(()) => {
@@ -746,6 +747,7 @@ impl DataNode for DataNodeService {
             &version,
             request.request_id,
             token,
+            self.replication_dispatch.max_pending_bytes(),
         ) {
             Ok(replications) => replications,
             Err(()) => {
@@ -1280,7 +1282,11 @@ impl DataNode for DataNodeService {
                 fingerprint: entry.fingerprint.to_vec(),
                 version: Some(entry.version.clone()),
                 deleted: entry.deleted,
-                remaining_retention_millis: remaining_retention_millis(entry.expires_at, now),
+                remaining_retention_millis: remaining_retention_millis(
+                    entry.expires_at,
+                    now,
+                    state.topology.timings.receipt_retention_millis,
+                ),
             };
             let size = dedup_record_size(&record);
             if !records.is_empty() && bytes + size > page_limit(request.max_bytes) {
@@ -1336,7 +1342,11 @@ impl DataNode for DataNodeService {
                             && Some(&dedup.version) == record.version.as_ref()
                     })
                     .map_or(0, |dedup| {
-                        remaining_retention_millis(dedup.expires_at, Instant::now())
+                        remaining_retention_millis(
+                            dedup.expires_at,
+                            Instant::now(),
+                            state.topology.timings.receipt_retention_millis,
+                        )
                     });
             }
             records.push(copied);
@@ -1401,7 +1411,12 @@ impl DataNode for DataNodeService {
                     deleted: record.deleted,
                     remaining_retention_millis: record.remaining_retention_millis,
                 };
-                stage_dedup(destination, dedup, self.max_dedup_bytes)?;
+                stage_dedup(
+                    destination,
+                    dedup,
+                    self.max_dedup_bytes,
+                    topology.timings.receipt_retention_millis,
+                )?;
             }
             apply_record(&mut destination.records, record)?;
             destination.watermark = entry.watermark;
@@ -1432,7 +1447,12 @@ impl DataNode for DataNodeService {
                     "dedup record is outside the prepared range",
                 ));
             }
-            stage_dedup(destination, record, self.max_dedup_bytes)?;
+            stage_dedup(
+                destination,
+                record,
+                self.max_dedup_bytes,
+                topology.timings.receipt_retention_millis,
+            )?;
         }
         Ok(Response::new(proto::Empty {}))
     }
