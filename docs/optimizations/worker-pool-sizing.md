@@ -51,9 +51,9 @@ adds a global `--worker-threads` override.
 The default is role-dependent. A standalone `node` or `coordinator` keeps tokio's
 one-worker-per-CPU, because in a real deployment the process owns its machine.
 The `experiment` command divides the host budget across the processes it will
-start (`cpus / (peak_nodes + 2)`, clamped to at least 2), because it is the one
-case that knowingly colocates them. The experiment passes that value to every
-child it spawns, so all 11 processes agree.
+start (`cpus / (peak_nodes + 2)`, clamped to at least 2, or 1 on a single-CPU
+host), because it is the one case that knowingly colocates them. The experiment
+passes that value to every child it spawns, so all 11 processes agree.
 
 Splitting the budget evenly beats pinning every process to 4, which the table
 above shows: the driver and the nodes do not carry equal load, and 24 cores across

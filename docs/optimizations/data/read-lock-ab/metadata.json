@@ -1,0 +1,12 @@
+{
+  "base_commit": "1a586254",
+  "candidate_patch": "candidate.patch",
+  "cpu": "Apple M1 Pro, 8 logical CPUs",
+  "memory_bytes": 17179869184,
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "binaries": {
+    "baseline": "d6daf0c81cb9dceeba16f0fbe66220c88e6da93b6ecb7f75ae1730ed56dd6de4",
+    "candidate": "e436848a5b4cb200f652e0914e7ba435f85866370a261d57c5e99d3d66a254a3"
+  },
+  "note": "Benchmark-only candidate; source restored before runs. Manifests may report dirty or differing runtime source. Saved binary hashes and patch identify the comparison."
+}

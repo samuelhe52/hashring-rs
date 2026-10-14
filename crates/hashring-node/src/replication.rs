@@ -432,18 +432,10 @@ pub(super) async fn deliver_replication_stream(
                 Err(_) => break,
             }
         }
-        let active_bytes =
-            u32::try_from(batch_bytes).expect("validated replication batch size fits u32");
         let epoch = batch[0].prepared.mutation.topology_epoch;
         let follower_node_id = batch[0].prepared.follower_node_id.clone();
         let follower_endpoint = batch[0].prepared.follower_endpoint.clone();
         let last_sequence = batch[batch.len() - 1].prepared.stream_sequence;
-        let request = ReplicationBatch {
-            entries: batch
-                .iter()
-                .map(|pending| pending.prepared.to_proto())
-                .collect(),
-        };
         let mut retry_delay = std::time::Duration::from_millis(25);
         loop {
             if state.read().await.topology.epoch != epoch {
@@ -464,6 +456,8 @@ pub(super) async fn deliver_replication_stream(
                     }
                 }
             }
+            let active_bytes =
+                u32::try_from(batch_bytes).expect("validated replication batch size fits u32");
             let Ok(active_budget) = active_rpc_budget
                 .clone()
                 .acquire_many_owned(active_bytes)
@@ -471,12 +465,19 @@ pub(super) async fn deliver_replication_stream(
             else {
                 return;
             };
+            // Own payload copies only while the aggregate RPC budget is held.
+            let request = ReplicationBatch {
+                entries: batch
+                    .iter()
+                    .map(|pending| pending.prepared.to_proto())
+                    .collect(),
+            };
             let result = tokio::time::timeout(
                 REPLICATION_RPC_TIMEOUT,
                 client
                     .as_mut()
                     .expect("replication client was connected above")
-                    .replicate_mutations(request.clone()),
+                    .replicate_mutations(request),
             )
             .await
             .map(|result| result.map(Response::into_inner));
@@ -484,7 +485,8 @@ pub(super) async fn deliver_replication_stream(
             match result {
                 Ok(Ok(response))
                     if !response.process_instance_id.is_empty()
-                        && response.applied_stream_sequence >= last_sequence =>
+                        && response.applied_stream_sequence
+                            >= batch[0].prepared.stream_sequence =>
                 {
                     let mut state = diagnostics::write(&state, &pressure.ack_write_timing).await;
                     let stream = (epoch, follower_node_id.clone());
@@ -515,7 +517,20 @@ pub(super) async fn deliver_replication_stream(
                             queue.pop_front();
                         }
                     }
-                    break;
+                    drop(state);
+                    if response.applied_stream_sequence >= last_sequence {
+                        break;
+                    }
+                    // Publish the successful prefix immediately, then retry only
+                    // the suffix. Its first failure retains the normal status handling.
+                    batch.retain(|pending| {
+                        pending.prepared.stream_sequence > response.applied_stream_sequence
+                    });
+                    batch_bytes = batch
+                        .iter()
+                        .map(|pending| replication_mutation_bytes(&pending.prepared.mutation))
+                        .sum();
+                    retry_delay = std::time::Duration::from_millis(25);
                 }
                 Ok(Err(status)) if retryable_replication_status(status.code()) => {
                     let count = pressure

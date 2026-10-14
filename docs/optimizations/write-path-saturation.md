@@ -70,7 +70,7 @@ moves throughput is reducing the number of write-lock acquisitions or the time
 each holds it.
 
 Shrinking per-request work inside the critical section does not help much. The
-`e4156a6` change removed three of four routing-token hashes and one of two
+`683b337c` change removed three of four routing-token hashes and one of two
 mutation-fingerprint hashes from the owner path, and mean owner hold moved 11.88 us
 to 11.61 us: real, but under the noise floor. The 11 us is dominated by the dedup
 probe, the record insert and the replication reservation, all of which are real

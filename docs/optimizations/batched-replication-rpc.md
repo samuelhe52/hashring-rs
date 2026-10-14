@@ -45,9 +45,9 @@ the existing tests and any single-entry callers.
   the effective in-flight backlog grows from one entry to one batch
   (`REPLICATION_BATCH_MAX_ENTRIES`). The backpressure test now asserts this wider but
   still bounded limit.
-- A retryable failure retries the whole batch, so a transient follower error can
-  resend up to a batch of already-pending entries. The follower's dedup receipts and
-  fingerprint checks make re-delivery idempotent.
+- A lost response can retry the whole batch. A received partial acknowledgement
+  advances the owner and retries only the suffix. The follower's dedup receipts
+  and fingerprint checks make re-delivery idempotent.
 - A batch is applied under a single write lock. The lock is held for the batch's
   duration rather than one entry, but the total work per entry is unchanged and the
   number of acquisitions drops.
@@ -101,3 +101,31 @@ See also [replication-backpressure.md](replication-backpressure.md) for the queu
 retained-byte limits this change builds on, and
 [state-write-lock-profile.md](state-write-lock-profile.md) for the measured wait and
 hold times of the three write paths this change touches.
+
+## Payload accounting and partial progress correction
+
+Batch payloads are materialized only after connecting and acquiring the aggregate
+RPC byte permits. The owned protobuf request is consumed by the RPC instead of
+keeping a second request across retries. Pending entries continue to share their
+original mutation and retained-byte reservation. The request future completes or
+is dropped on timeout before the active permits are released. Transport and
+allocator overhead still make this an accounting bound, not a process RSS cap.
+
+An isolated reproduction on macOS with 32 unreachable follower streams sharing
+one 8 MiB mutation measured 256,240 KiB of RSS growth before this correction,
+while all 64 MiB of active RPC permits remained available. The same reproduction
+afterwards measured 1,664 KiB. These are single-run measurements, not a general
+memory-overhead guarantee. Run the process-wide RSS check alone:
+
+```sh
+cargo test -p hashring-node unreachable_streams_do_not_copy_unbudgeted_payloads -- --ignored --nocapture
+```
+
+A follower now returns the applied prefix if a later entry fails. The owner
+publishes that acknowledgement, releases the corresponding pending entries, and
+retries only the remaining suffix with a recalculated byte reservation. A failure
+on the first remaining entry still follows the normal retryable/permanent status
+handling. A batch must name one stream so its single acknowledgement is unambiguous.
+The integration regression fills follower receipt capacity partway through a
+batch, verifies the prefix reaches owner acknowledgement progress, then frees
+capacity and verifies delivery of the suffix.
