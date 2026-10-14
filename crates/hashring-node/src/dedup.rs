@@ -245,8 +245,11 @@ pub(super) fn insert_dedup_until(
     // Migration finds a range's receipts through this index, so it has to see
     // every insert and every removal. A repeated id would otherwise leave two
     // entries for one receipt.
+    // The replaced entry's bytes, including any ACK state charged to it, leave
+    // the store with it; otherwise each repeat inflates the budget for good.
     if let Some(previous) = replaced {
         state.remove_dedup_index(&mutation_id, &previous.key);
+        state.dedup_bytes -= previous.retained_bytes;
     }
     state.insert_dedup_index(&mutation_id, &key);
     state.dedup_bytes += retained_bytes;

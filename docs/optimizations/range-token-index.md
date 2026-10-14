@@ -35,7 +35,9 @@ Captured with `scripts/flamegraph.sh correctness` on a 24-core AMD Ryzen 9
 7845HX, rustc 1.93.0, frame-pointer build (`target/fp`), `--call-graph fp`.
 Config: correctness mode, 8 nodes, 100,000 keys, 128-byte values, RF=3,
 `FirstSuccessor`, concurrency 64, seed 114514. 78.74 s, 15,512 samples,
-672.6 G cycles, 0 lost samples, and 74.1% of cycles carrying a project frame.
+672.6 G cycles, 0 lost samples, and 74.1% of cycles carrying a project frame
+(as computed by the script's first coverage check, which mis-parsed some
+stacks; see [frame-pointer-profiling.md](frame-pointer-profiling.md#result)).
 Raw artifacts are under `results/flamegraph-correctness-20261014-111934/`
 (ignored by Git).
 
@@ -83,9 +85,13 @@ The cost is visible from the outside, not just in the profile:
 | scale-in with concurrent mutations | 9,095 | 0.563 | **16,153 ops/s** |
 
 The same 9,095 mutations are 54x slower while a scan holds the state write lock.
-Scale-in avoids it because that transition took the `direct_merge` path (the run
-recorded `direct_merge_cutover_observed`), which does not prepare ranges one by
-one.
+Scale-in's mutations avoid it because that transition took the `direct_merge`
+path (the run recorded `direct_merge_cutover_observed`), which does not move
+ranges one by one before the cutover. The scans themselves still run in that
+phase: replica repair back to full RF goes through the same `copy_range`,
+`source_range_digest` and `cleanup_source_range` calls. That is why the four
+handlers' 58.8% of cycles exceeds the scale-out window's 43.7% share of the
+run.
 
 The scale-out window is also 30.46 s against a 30 s `operation_timeout_ms`.
 [dedup-receipt-store-memory.md](dedup-receipt-store-memory.md) records a
@@ -105,43 +111,54 @@ each map:
   `[u8]` and not as `Vec<u8>`. Cloning a key becomes a refcount bump instead of
   a `Vec` allocation, and the map, the index and the receipt share one
   allocation instead of two.
-- `records_by_token: BTreeMap<u64, Vec<Arc<[u8]>>>` shares those same `Arc`s. A
-  `Vec` rather than a one-per-token set because two distinct keys colliding on a
-  64-bit xxh3 token is possible in principle and must not lose a key.
-- `dedup_by_token: BTreeMap<u64, Vec<Arc<str>>>` holds mutation IDs, which are
-  already `Arc<str>` shared with the dedup map, so this index costs no extra key
-  allocation either.
+- `records_by_token: TokenIndex<Arc<[u8]>>` shares those same `Arc`s. It is a
+  `BTreeMap<u64, TokenBucket<T>>`, where a bucket is one inline value or, once
+  tokens collide, a `BTreeSet`: two distinct keys colliding on a 64-bit xxh3
+  token is possible in principle and must not lose a key, but the common case
+  should not pay a `Vec` allocation per record for it. An overwrite leaves the
+  index alone, because `HashMap::insert` keeps the map's original `Arc`, which
+  the index already holds.
+- `dedup_by_token: TokenIndex<Arc<str>>` holds mutation IDs, which are already
+  `Arc<str>` shared with the dedup map, so this index costs no extra key
+  allocation either. Receipts collide routinely: every retained receipt for one
+  key shares that key's token. The `BTreeSet` bucket keeps expiring a hot key's
+  backlog `O(k log k)`; the first version used a `Vec` per token, whose linear
+  search per removal made it quadratic under the write lock (about 736 ms for
+  40,000 receipts of one key in an isolated release harness).
 
 Range extraction becomes a `BTreeMap::range` bounded lookup:
 `O(log n + k)` for the `k` keys actually in the range, instead of `O(n)` hashes
 and clones. `commit_destination_range`'s `retain` and `cleanup_source_range`'s
-scan become removals of the `k` keys the index returns. All four handlers stop
+scan become removals of the `k` keys the index returns, using the tokens the
+index returns with them rather than hashing each key again. All four handlers stop
 touching keys outside their range, and the two that hold the write lock now hold
 it for `k` operations instead of `n`.
 
-**The load-bearing invariant: a key's token never changes.** `key_token` is
-`xxh3_64_with_seed(key, hash_seed)` and `hash_seed` is a field of the snapshot,
-so it would be invalidated by any topology change that reseeded the ring — and
-the index would then answer range queries with stale positions.
+**The load-bearing invariant: a key's token changes only with the seed.**
+`key_token` is `xxh3_64_with_seed(key, hash_seed)` and `hash_seed` is a field of
+the snapshot, so a topology that reseeded the ring would leave the index
+answering range queries with stale positions.
 `crates/hashring-core/src/migration.rs:138` builds every target topology with
-`committed.hash_seed`, so a seed change cannot be expressed through a topology
-change. Members, virtual nodes and epoch change freely and do not affect a key's
+`committed.hash_seed`, so a topology change never reseeds; a recreated
+coordinator does pick a fresh seed, though, and a node can receive it. Members, virtual nodes and epoch change freely and do not affect a key's
 token. `TopologySnapshot::key_token` is not public state a caller can vary
 independently of the snapshot it came from, so the index cannot observe a
 different seed than the snapshot it was built with.
 
 That invariant is what makes an incrementally maintained index safe here rather
 than a correctness hazard. Both places that swap a node's topology —
-`install_topology` and `refresh_topology` — assert that the seed did not change,
-so a future reseeding fails in debug builds instead of silently answering range
-queries with stale positions, and `tests/index.rs` pins the behaviour across an
-epoch bump.
+`install_topology` and `refresh_topology` — go through
+`NodeState::set_topology`, which rebuilds both indices when the seed differs.
+An earlier version only asserted the seed in debug builds, so a release node
+would have migrated and cleaned up the wrong keys without error.
+`tests/index.rs` pins the behaviour across an epoch bump and a reseed.
 
 Every mutation goes through `NodeState` helpers rather than touching `records`
 or `dedup` directly, because the failure mode of this change is a map and an
 index that disagree — a key invisible to migration, or a migrated key that
-reappears. A debug-only consistency check walks both structures and compares
-them; `tests/index.rs` checks that indexed range answers equal hashing every key
+reappears. A test-only consistency check walks both structures and compares
+them (it rehashes every key, so it must not run under the write lock in a
+handler); `tests/index.rs` checks that indexed range answers equal hashing every key
 for wrapping, covering and empty ranges, that replacement, stale-version and
 removal all leave the two structures equal, and that the answers survive an
 epoch bump; and the existing migration and replication tests exercise the same
@@ -151,9 +168,11 @@ paths.
 
 - **The write path gets more expensive.** Every applied mutation now also
   inserts into a `BTreeMap`: a binary search plus a potential node split, on the
-  hot path, under a lock that was already held. The put path already has the
-  token in hand from the ownership check, so no extra hashing is needed, but the
-  tree insert is new work. This is the cost of moving the scan off the write
+  hot path, under a lock that was already held. It also adds hashing: the
+  record index hashes a new key under the write lock rather than trusting the
+  token the put path computed before taking it (a reseed in between would
+  misplace the key), and every receipt is hashed once when indexed and once
+  when it expires, on owners and followers alike. This is the cost of moving the scan off the write
   path and onto the migration path; the measurement below is where it was paid
   for or not.
 - **Memory grows in the steady state.** Roughly one `BTreeMap` entry per record
@@ -166,7 +185,7 @@ paths.
   in the same accounting.
 - **Two structures to keep consistent.** Handled by funneling mutations through
   helpers and checking the invariant in tests, but it is a real cost and the
-  reason the debug assertion exists.
+  reason the test-only consistency check exists.
 - **`source_range_digest` loses nothing.** It still clones the records it
   digests, so its working set for the range is unchanged; only the discovery of
   which records to clone gets cheaper.
@@ -181,9 +200,11 @@ were interleaved (before, after, before, after) so neither side always had the
 quiet machine, and the tables give the median with the observed range across
 three correctness pairs and two performance pairs. The before binary is the
 frame-pointer build of `deb5928`, the after one of `3091ddb`. Later commits add
-a guard that de-indexes a replaced receipt id, the two debug-only seed
-assertions and test scaffolding; that guard runs once per committed receipt and
-is the only one of them that exists in a release build. Captures are in
+a guard that de-indexes a replaced receipt id, the seed handling and test
+scaffolding; that guard runs once per committed receipt. The bucketed index,
+the reseed rebuild and the token-carrying range lookups came after these
+captures and were not re-measured; they remove allocations and hashes from the
+measured paths rather than adding work, apart from a rebuild on a reseed. Captures are in
 `results/flamegraph-correctness-{before,after}{,-2,-3}` and
 `results/flamegraph-performance-{before,after}{,-2}`, ignored by Git.
 
@@ -219,8 +240,8 @@ Nothing else moved, which is what the write-path tradeoff needed to show.
 `initial_put` was 40,335 → 39,593 ops/s (0.98x); the three read measurements
 (`initial_get_verify`, `scale_out_verify`, `scale_in_verify`) all landed within
 1.14x of their before values; and `initial_full_rf_seconds`, which is
-replication rather than migration, was 10.30 s on both sides. Scale-in, which
-takes the direct merge path and never scans either way, went 14,506 → 15,306
+replication rather than migration, was 10.30 s on both sides. Scale-in, whose
+mutations run against the direct merge path and not against range moves, went 14,506 → 15,306
 ops/s at the median, but that phase ranged from 1,535 to 16,322 ops/s across the
 six runs, so it shows no consistent movement in either direction.
 
@@ -277,6 +298,107 @@ across the mutations they apply, and they only ever read it —
 `Arc<TopologySnapshot>` in `NodeState` would turn those three deep clones into
 reference-count bumps.
 
+### On an 8-core Mac
+
+A second, independent run on different hardware: an Apple M1 Pro (6
+performance and 2 efficiency cores, 16 GB), macOS, release builds without frame
+pointers. `perf` does not exist there, so this run has no cycle shares; it
+checks the externally visible rows. The before binary is `main` at `394b975`,
+the after binary is this branch at `c120f33`, which includes the review fixes
+(bucketed index, reseed handling, write-path seed check). The runs were
+interleaved as above, in two sizes, and all 20 runs passed. The machine was
+shared with other work: the 1-minute load average was between 4.2 and 15.1
+when runs started.
+
+Memory, not cores, sets the size limit. The largest run here used 2.7 GB across
+all its processes for 1M keys, so 10M keys (about 3M records per node) would
+not fit in 16 GB, and the before binary's per-range key copies rule out
+correctness mode at 1M keys.
+
+**Small: 5 and 8 nodes.** The first size keeps records per node close to the
+Linux runs: correctness with 5 nodes (4 → 5 → 4) and 50,000 keys, about
+37k records per node against about 43k; performance with 8 nodes and 250,000
+keys, about 94k records per node against 150k. Both use concurrency 32 and
+otherwise `experiments/experiment_cmach.yaml`'s settings. Peak RSS is the
+largest `ps` sample of any node process, taken every 0.5 s, so short spikes can
+be missed.
+
+Correctness, median (range) of three runs:
+
+| | before | after | after / before |
+| --- | ---: | ---: | ---: |
+| mutations during scale-out | 832 ops/s (821–836) | 1,457 ops/s (1,453–1,483) | **1.75x** |
+| scale-out transition to full RF | 7.61 s (7.57–7.71) | 4.35 s (4.27–4.36) | 0.57x |
+| scale-in transition to full RF | 6.56 s (6.44–6.84) | 2.36 s (2.34–2.39) | 0.36x |
+| whole experiment | 24.4 s (24.4–24.7) | 16.8 s (16.7–16.8) | 0.69x |
+| peak per-node RSS | 718 MiB (674–733) | 76.3 MiB (76.2–76.6) | 0.11x |
+| initial put | 36,290 ops/s (36,127–36,310) | 35,412 ops/s (34,073–35,883) | 0.98x |
+| scale-in mutations | 12,172 ops/s (10,152–12,190) | 11,833 ops/s (11,024–11,858) | 0.97x |
+
+Performance, median (range) of two runs:
+
+| | before | after | after / before |
+| --- | ---: | ---: | ---: |
+| initial put | 27,551 ops/s (27,219–27,884) | 27,022 ops/s (26,761–27,284) | 0.98x |
+| get verify | 68,291 ops/s (67,936–68,646) | 67,993 ops/s (67,871–68,115) | 1.00x |
+| time to full RF after the put | 10.82 s | 10.83 s | 1.00x |
+| peak per-node RSS | 109.0 MiB (108.7–109.3) | 119.8 MiB (118.1–121.6) | 1.10x |
+
+What carries over, and what does not:
+
+**Large: 10 nodes.** Correctness at 10 nodes (9 → 10 → 9) and 100,000 keys,
+the Linux key count; performance at 10 nodes and 1,000,000 keys. Concurrency
+64, as in `experiment_cmach.yaml`.
+
+Correctness, median (range) of three runs:
+
+| | before | after | after / before |
+| --- | ---: | ---: | ---: |
+| mutations during scale-out | 505 ops/s (497–511) | 858 ops/s (857–863) | **1.70x** |
+| scale-out transition to full RF | 12.81 s (12.67–13.02) | 7.55 s (7.50–7.56) | 0.59x |
+| scale-in transition to full RF | 11.69 s (11.55–16.18) | 11.33 s (11.25–11.38) | 0.97x |
+| whole experiment | 47.8 s (47.7–52.8) | 41.9 s (41.7–41.9) | 0.88x |
+| peak per-node RSS | 375 MiB (374–417) | 63.5 MiB (61.6–72.6) | 0.17x |
+| initial put | 31,574 ops/s (31,175–31,687) | 31,185 ops/s (30,806–31,411) | 0.99x |
+| scale-in mutations | 9,885 ops/s (6,586–10,762) | 10,572 ops/s (10,561–10,840) | 1.07x |
+
+Performance, median (range) of two runs:
+
+| | before | after | after / before |
+| --- | ---: | ---: | ---: |
+| initial put | 29,365 ops/s (29,132–29,598) | 28,559 ops/s (28,465–28,652) | 0.97x |
+| get verify | 77,258 ops/s (75,871–78,644) | 79,046 ops/s (78,669–79,423) | 1.02x |
+| time to full RF after the put | 15.94 s | 15.88 s | 1.00x |
+| peak per-node RSS | 289.9 MiB (286.0–293.8) | 310.9 MiB (309.8–312.0) | 1.07x |
+
+What carries over, and what does not:
+
+- **The migration win reproduces in direction, at a smaller size.** Scale-out
+  mutations are 1.75x faster at 5 nodes and 1.70x at 10, rather than 9.8x,
+  with no overlap between the two sides' ranges in either size. With a quarter as many ranges and fewer keys per node, each
+  scan was shorter to begin with, so there was less to remove.
+- **Scale-in's convergence gets faster at 5 nodes (0.36x) but not at 10
+  (0.97x).** At 5 nodes it is the replica repair after the direct merge, which
+  runs the same handlers, as described under Evidence. At 10 nodes the wait is
+  about 11.3 s on both sides, close to two 5 s repair ticks, and 9 members give
+  up to 72 repair groups against a cap of 32 per pass. That points at the
+  pass timing in
+  [replica-repair-convergence-latency.md](replica-repair-convergence-latency.md)
+  rather than the scans, but these runs did not record per-group timings to
+  confirm it. Scale-in's own mutations do not move, as on Linux.
+- **The migration memory peak falls 9x at 5 nodes and 6x at 10**, in line
+  with Linux's 7x.
+- **The steady-state cost reproduces: +10% and +7% peak RSS** in the two
+  performance runs, about 11 MiB per node at 250k keys and 21 MiB at 1M,
+  against +23% on Linux.
+- **The put speed-up does not reproduce.** Initial put is 0.97x–0.99x in all
+  four comparisons here, against 1.18x on Linux. The weaker claim above, that the index insert
+  costs nothing measurable, holds; the stronger one, that the put got faster,
+  is not supported by this run.
+
+Configs, logs, RSS samples and the runner are in
+`results/macos-bench-20261014/` (ignored by Git).
+
 ### Reproducing both sides
 
 Each side is the same script pointed at a different binary. Build the tree under
@@ -290,9 +412,11 @@ BINARY=$PWD/target/fp/release/hashring-rs BUILD=0 \
 
 The second table needs a copy of that config with `mode: performance`,
 `nodes: 20` and `keys: 1000000`, passed the same way through `CONFIG`, plus the
-`performance` argument. `BUILD=0` is load-bearing: `BUILD=auto` only builds when
-the binary is missing, so a stale `target/fp` measures the wrong tree without
-saying so.
+`performance` argument. `BUILD=0` keeps the script from building the current
+tree over the binary under test: `BUILD=auto` now runs `cargo build` for its own
+`target/fp` binary on every run (a no-op when it is current), because building
+only when the binary was missing let a stale `target/fp` measure the wrong tree
+without saying so.
 
 ## Source
 

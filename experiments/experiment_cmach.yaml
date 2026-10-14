@@ -1,4 +1,5 @@
-# Settings for `hashring-rs experiment --config examples/experiment.yaml`.
+# Settings for `hashring-rs experiment --config experiments/experiment_cmach.yaml`,
+# and the default profile of `scripts/flamegraph.sh`.
 # Every key is optional and named after an experiment flag (`_` for `-`), with
 # the same values (`first-successor`, not `FirstSuccessor`). A flag given on the
 # command line wins over the same key here; `--verbose` and

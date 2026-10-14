@@ -81,8 +81,8 @@ to reproduce).
   the number as unmeasured: measure with `target/release`, profile with
   `target/fp`, and never ship the profiling build.
 - **A separate build costs disk and a cold rebuild.** `target/fp` is a full
-  dependency tree. `scripts/flamegraph.sh` builds it on first use and leaves
-  `target/release` alone.
+  dependency tree. `scripts/flamegraph.sh` runs `cargo build` for it on every
+  run (a no-op when it is current) and leaves `target/release` alone.
 - **FP unwinding is unsound through hand-written assembly and some libc
   frames.** Those frames resolve wrong or stop the walk. That is the same
   failure the old capture had, at a much smaller scale, and it is why the script
@@ -104,9 +104,17 @@ share of folded weight carrying a project frame. A capture taken that way:
   which perf records no user stack at all;
 - `perf.data` shrank from 500 MB to 952 KB for a comparable run.
 
-The script warns and exits non-zero-worthy noise above stderr when that share
-drops below 5%, which is where a truncated capture lands (1.8%) and where a
-working one does not.
+The script prints a warning on stderr, without failing, when that share drops
+below 5%, which is where a truncated capture lands (1.8%) and where a working
+one does not.
+
+The 29.6% and 1.8% shares were computed by the first version of that check,
+which tested the process-name field as if it were a frame (so the main thread's
+`hashring-rs` counted as project code), never tested the leaf frame, and read a
+zero weight for any stack whose leaf symbol contains a space. They were not
+recomputed after the parser was fixed and may be off in either direction; the
+1.8% also sits oddly against the 8.5% of samples with at least one project
+frame in the table at the top.
 
 ## What the profile then said
 

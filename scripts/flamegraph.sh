@@ -187,7 +187,20 @@ build_binary() {
 }
 
 case "$BUILD" in
-  auto) [[ -x "$BINARY" ]] || build_binary ;;
+  # cargo build is a no-op when the frame-pointer target is current, so auto
+  # always asks: building only when the binary is missing would profile a stale
+  # one after any source change. A BINARY from elsewhere is used as given.
+  auto)
+    if [[ "$BINARY" == "$TARGET_DIR/release/hashring-rs" ]]; then
+      # Without cargo an existing build is still usable; with neither,
+      # build_binary reports the missing cargo.
+      if command -v cargo >/dev/null 2>&1 || [[ ! -x "$BINARY" ]]; then
+        build_binary
+      else
+        echo "==> WARNING: 'cargo' not found; profiling '$BINARY' as built." >&2
+      fi
+    fi
+    ;;
   1 | yes | true) build_binary ;;
   0 | no | false) ;;
   *)
@@ -200,7 +213,9 @@ if [[ ! -x "$BINARY" ]]; then
   echo "error: binary '$BINARY' not found or not executable." >&2
   echo "       build it with:" >&2
   echo "         RUSTFLAGS='-C force-frame-pointers=yes' cargo build --release --target-dir $TARGET_DIR" >&2
-  echo "       or drop BUILD=0 and let this script build it." >&2
+  case "$BUILD" in
+    0 | no | false) echo "       or drop BUILD=0 and let this script build it." >&2 ;;
+  esac
   exit 1
 fi
 
@@ -264,10 +279,15 @@ echo "    $(wc -l < "$FOLDED") folded stacks"
 # Truncated stacks look like a deep, plausible graph, because kernel frames still
 # unwind. This share is the honest check: a real profile puts project frames
 # almost everywhere, a truncated one puts them nowhere.
+# A folded line is `comm;frame;...;leaf weight`. Symbols can contain spaces
+# (`<A as B>::f`), so the weight is the text after the last space, and the leaf
+# is the last field once that is stripped; the first field is the process name,
+# not a frame.
 RESOLVED="$(awk -F';' '
-  { last = $NF; sub(/^ /, "", last); split(last, parts, " "); weight = parts[2] + 0
-    project = 0
-    for (i = 1; i < NF; i++) if ($i ~ /^<?hashring[_-]/) project = 1
+  { weight = $0; sub(/.* /, "", weight); weight += 0
+    leaf = $NF; sub(/ [^ ]*$/, "", leaf)
+    project = (NF > 1 && leaf ~ /^<?hashring[_-]/)
+    for (i = 2; i < NF; i++) if ($i ~ /^<?hashring[_-]/) project = 1
     total += weight; if (project) resolved += weight }
   END { if (total > 0) printf "%.1f", 100 * resolved / total; else print "0.0" }
 ' "$FOLDED")"

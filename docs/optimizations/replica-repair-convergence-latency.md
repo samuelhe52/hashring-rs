@@ -8,6 +8,10 @@
 The capture came from commit `3091ddb`. Line references below are against
 `cmach-2` as of this commit; `e926711` moved several of them, and
 [Current state](#current-state-vs-the-capture) records what changed.
+Code references (file and line) are to the tree this capture was taken on,
+before `e926711` made the repair pipeline width a setting and `a1cfcfc` made
+the lease duration a cluster timing. Where those commits changed what is
+described, the text says so; line numbers elsewhere have drifted.
 
 ## The headline
 
@@ -29,8 +33,9 @@ Read on a time axis, against `run/summary.json`, it says something else:
 | `scale_out_transition_to_full_rf_seconds` | 4.76, but 4.75 of it is the concurrent mutation workload, so its own convergence wait is ~0 | ~0% |
 | `scale_in_with_mutations` | 0.54 | 2.1% |
 
-**Both `wait_for_full_rf` calls account for 16.9 s, 64% of the run, and they burn
-almost nothing.** The initial one averages **0.10 cores** over its 10.27 s. The
+**Both `wait_for_full_rf` calls account for 16.2 s (10.27 s + 5.94 s), 61% of
+the run, and they burn almost nothing.** (The 6.48 s scale-in observation above
+also includes the 0.54 s `scale_in_with_mutations` phase listed beside it.) The initial one averages **0.10 cores** over its 10.27 s. The
 per-second CPU histogram from `perf script` is unambiguous: the three seconds
 `t = 22 s .. 25 s` of the post-scale-in wait, which are inside that wait, carry
 **0.22% of the whole run's CPU** between them.
@@ -212,12 +217,13 @@ CPU. The floor is a property of the constants, not of the load.
 
 Scaling up makes it worse rather than better. At 8 members the group count grows
 toward 8 x 7 = 56, so `ceil(56/32)` is still 2 ticks but the second tick carries
-24 groups instead of 10, and the truncation is worse in absolute terms. There is
-no member count at which this constant stops being the binding constraint.
+24 groups instead of 10, and the truncation is worse in absolute terms. Only
+small clusters escape it: with 6 or fewer members there are at most 6 x 5 = 30
+groups, which fit in one pass. From 7 members up the cap is binding.
 
 ## What follows
 
-Ordered by how much of the 64% they recover.
+Ordered by how much of the 61% they recover.
 
 1. **Make the periodic pass able to finish.** With 42 groups and a cap of 32,
    every convergence costs at least two ticks, and each extra tick is a hard
@@ -291,7 +297,7 @@ survive unchanged.
   pipeline's share is inferred, not measured — it needs per-group timings,
   which the coordinator does not emit. `repair.rs:680` already has a
   `tracing::debug!` on group start; enabling it would settle this directly.
-- **Anything about the steady-state data path.** This capture is 64% idle
+- **Anything about the steady-state data path.** This capture is 61% idle
   convergence. The put phase averages 5.95 cores over 2.09 s and the initial
   verify 5.33 cores over 0.80 s; those are shaped by the write lock described in
   [state-write-lock-profile.md](state-write-lock-profile.md) and

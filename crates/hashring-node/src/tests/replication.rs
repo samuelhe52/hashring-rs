@@ -1046,7 +1046,6 @@ async fn source_cleanup_retains_records_needed_as_follower_copies() {
         replicas[0] == "node-2" && replicas[1] == "node-1"
     });
     let service = service_for("node-1", topology);
-    let (snapshot_ready, _) = watch::channel(true);
     {
         let mut state = service.state.write().await;
         seed_record(
@@ -1073,9 +1072,8 @@ async fn source_cleanup_retains_records_needed_as_follower_copies() {
                     source_node_id: "node-1".into(),
                     destination_node_id: "node-2".into(),
                 },
-                snapshot_keys: Some(Vec::new()),
+                snapshot_keys: Vec::new(),
                 snapshot_dedup_ids: Vec::new(),
-                snapshot_ready,
                 journal: Vec::new(),
                 journal_bytes: 0,
                 watermark: 0,
