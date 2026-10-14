@@ -90,8 +90,20 @@ at `y-16`. Reading it as a normal flame graph produces self times that sum to
 
 ```sh
 cargo build --release
-./scripts/flamegraph.sh correctness
+cat > /tmp/experiment_cpu_profile.yaml <<'YAML'
+mode: correctness
+nodes: 10
+keys: 20000
+concurrency: 64
+policy: owner-only
+YAML
+CONFIG=/tmp/experiment_cpu_profile.yaml ./scripts/flamegraph.sh
 ```
+
+The script profiles whatever `experiment` runs, so it needs a settings file;
+`examples/experiment_cmach.yaml` is its default. This capture predates that
+default and used the flag defaults listed above, so it needs its own file. The
+manifest in `<out>/run/` records what was actually resolved.
 
 Check `perf-record.log` in the output directory for sample loss before trusting
 the graph. Aggregate self time with:
