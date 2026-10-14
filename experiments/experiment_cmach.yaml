@@ -7,8 +7,10 @@ mode: correctness
 # Usually given per run with --output, since the directory must be new or
 # empty. A relative path here is resolved against this file's directory.
 # output: ../results/availability
-nodes: 8
-keys: 100000
+
+worker_threads: 2   # default: one per available CPU
+nodes: 4
+keys: 1000000
 value_bytes: 128
 concurrency: 64
 seed: 114514
@@ -24,3 +26,8 @@ minimum_admitted_copies: 1
 minimum_healthy_followers: 0
 policy: first-successor
 # worker_threads: 2   # default: CPUs / (nodes + 2), at least 2
+
+# 一次性为本次运行的所有 node 设置
+max_dedup_bytes: 1073741824               # 1 GiB, 8x
+max_pending_replication_bytes: 536870912  # 512 MiB, 8x
+max_migration_journal_bytes: 134217728    # 128 MiB, 8

@@ -5,6 +5,10 @@
 24-core AMD Ryzen 9 7845HX, `perf record -F 99 --call-graph fp` against
 `target/fp/release/hashring-rs`, 26.36 s, 7,829 samples, **0 lost**.
 
+The capture came from commit `3091ddb`. Line references below are against
+`cmach-2` as of this commit; `e926711` moved several of them, and
+[Current state](#current-state-vs-the-capture) records what changed.
+
 ## The headline
 
 **The flame graph does not contain the bottleneck.** Its shape is flat, exactly
@@ -79,19 +83,19 @@ limits in the code serialise it, and they compound.
 **1. No one seeds the initial replicas. A background poll does.**
 
 `load_or_initialize` calls `reconcile_replica_repairs`
-(`crates/hashring-coordinator/src/lib.rs:490`), which pushes a `Pending`
+(`crates/hashring-coordinator/src/lib.rs:497`), which pushes a `Pending`
 `ReplicaRepair` for every follower slot of every derived range. For this
 topology that is **1,792 tasks in 42 `(owner, follower)` groups** (896 ranges x
 2 followers; 7 owners x 6 possible followers), read directly out of
 `run/coordinator.redb`. It only *reconciles*; it seeds nothing. The only seeders
 are `seed_repairs_for_activation`, reached from a topology change
 (`change.rs:449`, `change.rs:909`), and `resume_replica_repairs`, reached only
-from the recovery loop (`src/main.rs:450`).
+from the recovery loop (`src/main.rs:552`).
 
 On a fresh bootstrap there is no topology change. So all 1,792 tasks sit
 `Pending` until the recovery loop's first tick — and the recovery task is
-spawned at `src/main.rs:437`, immediately before the server starts being
-awaited at `src/main.rs:471`. `tokio::time::interval` fires its first tick at
+spawned at `src/main.rs:539`, immediately before the server starts being
+awaited at `src/main.rs:573`. `tokio::time::interval` fires its first tick at
 once, so that tick runs within milliseconds of the coordinator process starting.
 Nodes 1-7 did not call `register_node` until 40 ms later
 (`run/process-logs/node-*.stdout.log`). The first tick is not a race the cluster
@@ -103,14 +107,14 @@ can win; it is a guaranteed no-op.
 // crates/hashring-coordinator/src/lib.rs:53
 const MAX_REPAIR_GROUPS_PER_PASS: usize = 32;
 
-// crates/hashring-coordinator/src/repair.rs:258-266
+// crates/hashring-coordinator/src/repair.rs:276-284
 let mut due = groups.into_values().collect::<Vec<_>>();
 due.sort_by_key(|group| group.iter().map(|r| r.retry_count).max().unwrap_or(0));
 due.truncate(MAX_REPAIR_GROUPS_PER_PASS);
 ```
 
 This is **a rate limiter, not a defect on its own**, and the code says so:
-`repair.rs:256-257` states that remaining groups "stay durable and are
+`repair.rs:274-275` states that remaining groups "stay durable and are
 considered on the next periodic pass". Nothing is lost — the 10 excluded groups
 keep their `Pending` phase in redb and are selected on the following tick.
 
@@ -138,22 +142,22 @@ actually failed.
 **3. Passes only happen every 5 s.**
 
 ```rust
-// src/main.rs:438
+// src/main.rs:540
 let mut interval = tokio::time::interval(Duration::from_secs(5));
 ```
 
 `run_failure_pass`, which runs on its own 1 s loop, cannot cover the gap: it
-returns early for the first `NODE_LEASE_DURATION` (`repair.rs:63`, 5 s at
-`lib.rs:56`), and it does not seed replicas at all — the only three callers of
-`seed_replica_group` are `merge.rs:221`, `repair.rs:275` and `repair.rs:489`.
-Ticks land at t = 0, 5, 10, 15, 20, 25 s.
+returns early for the first lease duration (`repair.rs:81`, `self.lease_duration`
+read from the committed topology, 5 s by default), and it does not seed replicas
+at all — the only three callers of `seed_replica_group` are `merge.rs:221`,
+`repair.rs:289` and `repair.rs:504`. Ticks land at t = 0, 5, 10, 15, 20, 25 s.
 
 The arithmetic matches the measurement to within the driver's own poll
 granularity:
 
 - t=0 tick: no-op, as above.
 - t=5 tick: `resume_replica_repairs` now has both endpoints registered for all
-  42 groups (`repair.rs:238`), takes the first 32 in the degenerate
+  42 groups (`repair.rs:256-257`), takes the first 32 in the degenerate
   lexicographic order, leaves the 10 `node-6`/`node-7`-owned ones.
 - t=10 tick: the remaining 10, complete at ~10.27 s. **This is the observed
   `initial_full_rf_seconds` of 10.265811039.**
@@ -163,28 +167,33 @@ only 0.54 s, node-8 exits at t=19.665 s, and then `wait_for_full_rf` blocks for
 **5.94 s** until t=25.6 s — the t=20 tick lands mid-transition, and the t=25 tick
 is what finally satisfies it. Nothing is computing during that time.
 
-**4. And each pass is a 4-wide RPC pipeline.**
+**4. And each pass is a narrow RPC pipeline.**
 
 ```rust
-// repair.rs:271 (periodic) and repair.rs:488 (activation)
-try_map_bounded(groups, self.range_move_concurrency.min(4), ...)
+// repair.rs:287 (periodic) and repair.rs:502 (activation)
+try_map_bounded(groups, self.replica_repair_concurrency, ...)
 ```
 
-`range_move_concurrency` is 16 here, so `min(4)` is 4. Inside a group,
-`copy_replica` is also `min(4)` (`repair.rs:726`) while only `pause_range` gets
-the full 16 (`repair.rs:732`). `seed_replica_group` then does a further serial
-round of `get_replication_progress` -> `install_replication_checkpoint` ->
-install/verify RPCs (`repair.rs:749-800`).
+This is the one limit the code has since made configurable — see
+[Current state](#current-state-vs-the-capture). At capture time the width was
+hardcoded: `3091ddb` had `self.range_move_concurrency.min(4)` at the equivalent
+of today's `repair.rs:287`, `502` and `740`, and `range_move_concurrency` was 16
+in this run, so the effective width was 4. Inside a group, `copy_replica` is also
+bounded by the same value (`repair.rs:740`) while only `pause_range` gets
+`range_move_concurrency` (`repair.rs:746`). `seed_replica_group` then does a
+further serial round of `get_replication_progress` ->
+`install_replication_checkpoint` -> `cleanup_source_range` RPCs
+(`repair.rs:771`, `repair.rs:779`, `repair.rs:800`).
 
-So even a pass that *could* finish runs 42 groups 4 at a time. This is the limit
+So a pass that *could* finish still ran 42 groups 4 at a time. This is the limit
 that does **not** produce a round number, so it is not proven by the two timings
 above; see the caveats. It is visible as the bulk of the 4.71 s the scale-out
 change spends before activation completes, where `seed_repairs_for_activation`
-is reached from `change.rs:909` at the same width of 4.
+is reached from `change.rs:909` at the same width.
 
 The driver's own poll is a fifth, smaller quantiser: `wait_for_full_rf` sleeps
 250 ms between `replica_status` calls
-(`crates/hashring-experiment/src/lib.rs:894`), so even a perfect convergence
+(`crates/hashring-experiment/src/lib.rs:958`), so even a perfect convergence
 would be reported up to 250 ms late.
 
 ## Cost model
@@ -192,13 +201,14 @@ would be reported up to 250 ms late.
 Convergence is bounded below by
 
 ```
-ceil(groups / MAX_REPAIR_GROUPS_PER_PASS) x 5 s   (the tick quantisation)
-  + ceil(groups / 4) x per-group latency           (the pipeline width)
+ceil(groups / MAX_REPAIR_GROUPS_PER_PASS) x 5 s      (the tick quantisation)
+  + ceil(groups / width) x per-group latency          (the seeding pipeline)
 ```
 
-With 42 groups the first term alone is `ceil(42/32) x 5 s = 10 s`, regardless of
-cluster size, key count, or available CPU. The floor is a property of the
-constants, not of the load.
+where `width` is `replica_repair_concurrency` — 4 in this run, and now
+configurable. With 42 groups the first term alone is
+`ceil(42/32) x 5 s = 10 s`, regardless of cluster size, key count, or available
+CPU. The floor is a property of the constants, not of the load.
 
 Scaling up makes it worse rather than better. At 8 members the group count grows
 toward 8 x 7 = 56, so `ceil(56/32)` is still 2 ticks but the second tick carries
@@ -230,13 +240,42 @@ Ordered by how much of the 64% they recover.
    liveness: it turns the t=0 tick into a guaranteed no-op. Re-ticking on
    registration completion, or making the pass wait for registrations with a
    short timeout, recovers a tick.
-5. **Widen the seed pipeline.** `min(4)` is applied twice over the same 42
-   groups, while `range_move_concurrency` is already 16 and unused here. This
-   does not move the 10 s floor, but it is the whole cost of the scale-out
-   activation path.
+5. **Widen the seed pipeline.** This is now a configuration change rather than a
+   code change: set `replica_repair_concurrency` above 4. It does not move the
+   10 s floor, but it is the whole cost of the scale-out activation path.
 
 None of these touches the data path, the failure handling, or the durable state
 format.
+
+## Current state vs. the capture
+
+`e926711 feat: Expose coordinator repair concurrency, failure grace, and workers`
+replaced the hardcoded `range_move_concurrency.min(4)` with a
+`--replica-repair-concurrency` flag (`replica_repair_concurrency` in YAML,
+default 4, documented at `docs/configuration.md:39`). That landed after the
+capture, so **item 5 above is a settings change, not a code change**, and the
+`min(4)` call sites no longer exist.
+
+`a1cfcfc feat: Make receipt retention and lease duration cluster timings` made
+the lease duration a committed-topology setting (`self.lease_duration`, read at
+`repair.rs:10`, guarded at `repair.rs:81`), replacing the
+`NODE_LEASE_DURATION` constant. The default is still 5 s, so the 5 s quantisation
+analysis is unaffected — only the line references moved.
+
+Everything the analysis rests on is unchanged:
+
+- `MAX_REPAIR_GROUPS_PER_PASS = 32` (`lib.rs:53`) against 42 groups.
+- The degenerate `sort_by_key` and the `node-7` tail.
+- The 5 s recovery interval (`main.rs:540`).
+- `reconcile_replica_repairs` creating `Pending` tasks without seeding
+  (`lib.rs:497`).
+- The t=0 tick being a guaranteed no-op (`repair.rs:256-257`).
+
+**Item 1 is the one that matters and it is still open.** It is worth
+re-measuring before acting on item 5: raising `replica_repair_concurrency`
+without first checking whether 42 groups still need two ticks will make each
+pass faster without reducing the number of passes, and the 10 s floor will
+survive unchanged.
 
 ## What this profile cannot answer
 
@@ -246,11 +285,11 @@ format.
   prediction from the code, not an observation — this run never sustains 32 or
   more pending groups after the first pass. A soak with a slow or flapping
   follower would show whether it starves or merely delays.
-- **How much of the 10.27 s is the 4-wide pipeline rather than the 5 s
+- **How much of the 10.27 s is the seeding pipeline rather than the 5 s
   quantisation.** The quantisation is proven: 10.27 s and 5.94 s both land on
   tick boundaries, and 42 > 32 is arithmetic from the state file. The
   pipeline's share is inferred, not measured — it needs per-group timings,
-  which the coordinator does not emit. `repair.rs:666` already has a
+  which the coordinator does not emit. `repair.rs:680` already has a
   `tracing::debug!` on group start; enabling it would settle this directly.
 - **Anything about the steady-state data path.** This capture is 64% idle
   convergence. The put phase averages 5.95 cores over 2.09 s and the initial
