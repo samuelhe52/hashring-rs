@@ -19,6 +19,9 @@ desired_replication_factor: 3
 minimum_admitted_copies: 1
 minimum_healthy_followers: 0
 max_replica_lag_ms: 5000
+# Fixed for the store's lifetime; see docs/configuration.md.
+receipt_retention_ms: 60000
+lease_duration_ms: 5000
 members:
   - { node_id: node-1, endpoint: http://127.0.0.1:50051 }
   - { node_id: node-2, endpoint: http://127.0.0.1:50052 }

@@ -133,12 +133,13 @@ impl TopologyChange {
             .epoch
             .checked_add(1)
             .ok_or(MigrationError::EpochOverflow)?;
-        let target_topology = TopologySnapshot::new_with_config(
+        let target_topology = TopologySnapshot::new_with_timings(
             target_epoch,
             committed.hash_seed,
             committed.virtual_nodes,
             target_members,
             config,
+            committed.timings.clone(),
         )?;
         if target_topology.members == committed.members
             && target_topology.config() == committed.config()

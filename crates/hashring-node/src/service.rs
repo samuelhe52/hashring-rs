@@ -297,11 +297,17 @@ impl DataNodeService {
     }
 
     pub(super) async fn renew_lease_once(&self) -> anyhow::Result<()> {
-        let epoch = self.state.read().await.topology.epoch;
+        let (epoch, lease_duration) = {
+            let state = self.state.read().await;
+            (
+                state.topology.epoch,
+                state.topology.timings.lease_duration(),
+            )
+        };
         // Discount the entire RPC round trip from the granted lifetime. This
         // makes local authority expire no later than the coordinator's grant.
         let sent_at = Instant::now();
-        let response = tokio::time::timeout(COORDINATOR_RPC_TIMEOUT, async {
+        let response = tokio::time::timeout(lease_renewal_timeout(lease_duration), async {
             let mut client = configure_coordinator_client(CoordinatorClient::new(
                 self.coordinator_channel.clone(),
             ));
@@ -338,7 +344,10 @@ impl DataNodeService {
         let service = self.clone();
         let mut shutdown = self.shutdown.subscribe();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            // The cluster's lease duration never changes, so the cadence is
+            // fixed for the process.
+            let lease_duration = service.state.read().await.topology.timings.lease_duration();
+            let mut interval = tokio::time::interval(lease_renewal_interval(lease_duration));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
@@ -531,4 +540,14 @@ impl DataNodeService {
             retry_after_millis: 0,
         }))
     }
+}
+
+/// A node renews five times per lease, so a lease survives a lost renewal
+/// or one that times out.
+pub(super) fn lease_renewal_interval(lease_duration: std::time::Duration) -> std::time::Duration {
+    lease_duration / 5
+}
+
+pub(super) fn lease_renewal_timeout(lease_duration: std::time::Duration) -> std::time::Duration {
+    lease_renewal_interval(lease_duration) * 2
 }

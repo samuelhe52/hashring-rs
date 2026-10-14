@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail, ensure};
 use futures::{StreamExt, TryStreamExt, stream};
 use hashring_client::{ClientError, HashringClient};
 use hashring_core::{
-    limits::{DEFAULT_MAX_VALUE_BYTES, RECEIPT_RETENTION_MILLIS},
+    limits::DEFAULT_MAX_VALUE_BYTES,
     migration::{MigrationPhase, TopologyChange},
     proto::{ErrorCode, PutRequest, data_node_client::DataNodeClient},
     topology::{Member, WriteAckPolicy},
@@ -61,6 +61,8 @@ pub struct ExperimentConfig {
     pub minimum_admitted_copies: u32,
     pub minimum_healthy_followers: u32,
     pub max_replica_lag_ms: u64,
+    pub receipt_retention_ms: u64,
+    pub lease_duration_ms: u64,
     pub write_ack_policy: WriteAckPolicy,
     /// Forwarded to every data node the run starts.
     pub node: NodeOptions,
@@ -501,6 +503,10 @@ async fn run_cluster(
         config.prepublication_failure_grace_ms.to_string(),
         "--max-replica-lag-ms".into(),
         config.max_replica_lag_ms.to_string(),
+        "--receipt-retention-ms".into(),
+        config.receipt_retention_ms.to_string(),
+        "--lease-duration-ms".into(),
+        config.lease_duration_ms.to_string(),
     ];
     if let Some(workers) = config.coordinator_worker_threads {
         coordinator_args.extend(["--worker-threads".into(), workers.to_string()]);
@@ -1696,9 +1702,10 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
         "timeouts must be positive"
     );
     ensure!(
-        config.operation_timeout_ms <= RECEIPT_RETENTION_MILLIS,
-        "operation_timeout_ms exceeds the {RECEIPT_RETENTION_MILLIS} ms receipt retention \
-         period, which caps every mutation's retries"
+        config.operation_timeout_ms <= config.receipt_retention_ms,
+        "operation_timeout_ms exceeds the {} ms receipt retention period, which caps every \
+         mutation's retries",
+        config.receipt_retention_ms
     );
     Ok(())
 }

@@ -25,6 +25,8 @@ desired_replication_factor: 3
 minimum_admitted_copies: 1
 minimum_healthy_followers: 0
 max_replica_lag_ms: 5000
+receipt_retention_ms: 60000
+lease_duration_ms: 5000
 policy: first-successor
 # worker_threads: 2   # default: CPUs / (nodes + 2), at least 2
 # coordinator_worker_threads: 4   # default: one per available CPU

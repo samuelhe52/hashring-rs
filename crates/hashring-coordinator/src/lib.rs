@@ -58,7 +58,6 @@ pub const DEFAULT_PREPUBLICATION_FAILURE_GRACE: Duration = Duration::from_secs(3
 /// Follower groups seeded, merged, or repaired at once, and ranges copied at
 /// once within one group.
 pub const DEFAULT_REPLICA_REPAIR_CONCURRENCY: usize = 4;
-pub const NODE_LEASE_DURATION: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterState {
@@ -506,6 +505,10 @@ pub struct CoordinatorService {
     range_move_concurrency: usize,
     replica_repair_concurrency: usize,
     prepublication_failure_grace: Duration,
+    /// The cluster's fixed lease duration, read from the persisted topology. A
+    /// restart waits this long before acting on leases, so it must be the
+    /// duration every earlier grant used.
+    lease_duration: Duration,
     pre_publish_delay: Duration,
     post_publish_delay: Duration,
     lease_grants: Arc<Mutex<BTreeMap<String, NodeLeaseGrant>>>,

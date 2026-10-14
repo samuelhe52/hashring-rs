@@ -23,7 +23,8 @@ The examples list every key: [`coordinator.yaml`](../examples/coordinator.yaml),
 | --- | --- |
 | process | Affects only the process that reads it. Change it on any restart. |
 | per node | A node's own budget or timeout. Nodes in one cluster may differ. |
-| bootstrap | Read only when the coordinator creates a new state store, then stored in the topology. Later values are ignored. |
+| bootstrap | Read only when the coordinator creates a new state store, then stored in the topology. For an existing store they are ignored, except that with `--member` flags every bootstrap setting must match the store. |
+| bootstrap, fixed | Bootstrap settings with no later change command. Every topology copies them, which is what makes them safe to depend on. |
 | experiment | Shapes an experiment run; recorded in its manifest. |
 
 ## `coordinator`
@@ -45,6 +46,8 @@ The examples list every key: [`coordinator.yaml`](../examples/coordinator.yaml),
 | `--minimum-admitted-copies` | `minimum_admitted_copies` | 1 | bootstrap | Write guard; change later with `begin-config-change`. |
 | `--minimum-healthy-followers` | `minimum_healthy_followers` | 0 | bootstrap | Write guard; change later with `begin-config-change`. |
 | `--max-replica-lag-ms` | `max_replica_lag_ms` | 5000 | bootstrap | Write guard; change later with `begin-config-change`. |
+| `--receipt-retention-ms` | `receipt_retention_ms` | 60000 | bootstrap, fixed | How long every replica keeps a deduplication receipt after applying a mutation. Clients stop retrying a mutation within it, so a retry cannot apply twice. Between 1 s and 24 h. |
+| `--lease-duration-ms` | `lease_duration_ms` | 5000 | bootstrap, fixed | Node lease grants. Nodes renew every fifth of it, with a renewal timeout of two fifths. It also sets how long peer failures must persist before failover and how long a restarted coordinator waits before acting on leases. Between 1 s and 24 h. |
 
 ## `node`
 
@@ -77,7 +80,7 @@ replaced during the run.
 | `--keys` | `keys` | 20,000 / 1,000,000 / 1,000 by mode | experiment | |
 | `--value-bytes` | `value_bytes` | 128 | experiment | |
 | `--concurrency` | `concurrency` | 64 | experiment | |
-| `--operation-timeout-ms` | `operation_timeout_ms` | 30000 | experiment | At most the receipt retention period (60 s), since mutations stop retrying there. |
+| `--operation-timeout-ms` | `operation_timeout_ms` | 30000 | experiment | At most `--receipt-retention-ms`, since mutations stop retrying there. |
 | `--migration-timeout-ms` | `migration_timeout_ms` | 600000 | experiment | |
 | `--pre-publish-delay-ms` | `pre_publish_delay_ms` | 250 | experiment | Observation window before each publication. |
 | `--require-clean-source` | `require_clean_source` | off | experiment | Refuse a run whose source is not one clean commit. |
@@ -85,7 +88,7 @@ replaced during the run.
 | `--policy` | `policy` | `first-successor` for availability, `owner-only` otherwise | experiment | ACK policy. |
 | `--worker-threads` | `worker_threads` | CPUs / (nodes + 2), at least 2 | process | For the driver and each node. |
 | `--coordinator-worker-threads` | `coordinator_worker_threads` | one per available CPU | process | For the run's coordinator, which is not on the data path. |
-| `--seed`, `--virtual-nodes`, `--range-move-concurrency`, `--replica-repair-concurrency`, `--prepublication-failure-grace-ms`, `--desired-replication-factor`, `--minimum-admitted-copies`, `--minimum-healthy-followers`, `--max-replica-lag-ms` | as for `coordinator` | as for `coordinator` | as for `coordinator` | Passed to the run's coordinator. |
+| `--seed`, `--virtual-nodes`, `--range-move-concurrency`, `--replica-repair-concurrency`, `--prepublication-failure-grace-ms`, `--desired-replication-factor`, `--minimum-admitted-copies`, `--minimum-healthy-followers`, `--max-replica-lag-ms`, `--receipt-retention-ms`, `--lease-duration-ms` | as for `coordinator` | as for `coordinator` | as for `coordinator` | Passed to the run's coordinator. |
 | `--max-dedup-bytes`, `--max-pending-replication-bytes`, `--max-migration-journal-bytes`, `--replication-stream-queue-capacity`, `--required-ack-timeout-ms`, `--replication-rpc-timeout-ms` | as for `node` | as for `node` | per node | Passed to every node of the run. |
 
 ## Client and admin commands
@@ -93,6 +96,6 @@ replaced during the run.
 `put`, `get`, `delete`, `topology`, `change-status`, `replica-status` and the
 `begin-*` commands take `--coordinator` (default `http://127.0.0.1:50050`) and
 `--deadline-ms` (default 2000). `put` and `delete` stop retrying after the
-receipt retention period (60 s), even with a longer deadline, because a later
-retry of the same mutation could apply it twice. `execute-change` defaults to a
-120000 ms deadline. These commands have no config file.
+cluster's receipt retention period, even with a longer deadline, because a
+later retry of the same mutation could apply it twice. `execute-change`
+defaults to a 120000 ms deadline. These commands have no config file.

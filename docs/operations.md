@@ -98,18 +98,16 @@ treated as healthy.
 
 ## Timers and budgets
 
-These values are fixed in the code. The configurable ones, such as the node
-budgets and worker threads, are listed with their defaults in
-[configuration.md](configuration.md).
+These values are fixed in the code. The configurable ones, such as the lease
+duration, receipt retention, node budgets, and worker threads, are listed with
+their defaults in [configuration.md](configuration.md).
 
 | Setting | Value |
 | --- | --- |
-| Lease duration / renewal interval | 5 s / 1 s |
 | Failure detection interval | 1 s |
 | Repair and recovery interval | 5 s |
 | Repair groups per pass | 32 |
 | Repair retry backoff cap | 60 s (exponential, per group) |
-| Deduplication receipt retention | 60 s |
 | Migration snapshot page | 8 MiB |
 | Control-plane message limit | 64 MiB |
 | Tokio workers: client and admin commands | single-threaded |

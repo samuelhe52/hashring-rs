@@ -16,10 +16,7 @@ use tonic::Code;
 use tonic::transport::{Channel, Endpoint};
 
 use hashring_core::{
-    limits::{
-        DEFAULT_MAX_KEY_BYTES, DEFAULT_MAX_VALUE_BYTES, MAX_DATA_MESSAGE_BYTES,
-        RECEIPT_RETENTION_MILLIS,
-    },
+    limits::{DEFAULT_MAX_KEY_BYTES, DEFAULT_MAX_VALUE_BYTES, MAX_DATA_MESSAGE_BYTES},
     migration::TopologyChange,
     proto::{
         self, BeginTopologyChangeRequest, DeleteRequest, ErrorCode, ExecuteTopologyChangeRequest,
@@ -171,6 +168,8 @@ pub struct HashringClient {
 
 struct ClientInner {
     coordinator_endpoint: String,
+    /// Fixed for the cluster's lifetime, so it is read once at connect.
+    receipt_retention: Duration,
     topology: RwLock<TopologySnapshot>,
     channels: RwLock<HashMap<String, Channel>>,
     operation_timeout: Duration,
@@ -203,6 +202,7 @@ impl HashringClient {
         .map_err(|_| ClientError::deadline(false))??;
         let inner = Arc::new(ClientInner {
             coordinator_endpoint,
+            receipt_retention: topology.timings.receipt_retention(),
             topology: RwLock::new(topology),
             channels: RwLock::new(HashMap::new()),
             operation_timeout: config.operation_timeout,
@@ -794,15 +794,16 @@ impl HashringClient {
         tokio::spawn(run_background_refresh(inner));
     }
 
-    /// Bounds the retries of one mutation ID by the receipt retention period:
-    /// a receipt's clock starts when a replica applies the mutation, after the
-    /// first attempt was sent, so retries before this deadline find it.
+    /// Bounds the retries of one mutation ID by the cluster's receipt
+    /// retention period: a receipt's clock starts when a replica applies the
+    /// mutation, after the first attempt was sent, so retries before this
+    /// deadline find it.
     fn mutation_deadline(&self) -> Instant {
         Instant::now()
             + self
                 .inner
                 .operation_timeout
-                .min(Duration::from_millis(RECEIPT_RETENTION_MILLIS))
+                .min(self.inner.receipt_retention)
     }
 
     async fn retry_delay(
@@ -1094,6 +1095,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use hashring_core::proto::coordinator_server::{Coordinator, CoordinatorServer};
+    use hashring_core::topology::{ClusterTimings, TopologyConfig};
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::{Request, Response, Status};
 
@@ -1434,7 +1436,14 @@ mod tests {
 
     /// A client whose coordinator and node endpoints are unreachable.
     fn unreachable_client(operation_timeout: Duration) -> HashringClient {
-        let topology = TopologySnapshot::new(
+        unreachable_client_with(operation_timeout, ClusterTimings::default())
+    }
+
+    fn unreachable_client_with(
+        operation_timeout: Duration,
+        timings: ClusterTimings,
+    ) -> HashringClient {
+        let topology = TopologySnapshot::new_with_timings(
             1,
             1,
             1,
@@ -1442,11 +1451,14 @@ mod tests {
                 node_id: "node-1".into(),
                 endpoint: "http://127.0.0.1:1".into(),
             }],
+            TopologyConfig::default(),
+            timings,
         )
         .unwrap();
         HashringClient {
             inner: Arc::new(ClientInner {
                 coordinator_endpoint: "http://127.0.0.1:1".into(),
+                receipt_retention: topology.timings.receipt_retention(),
                 topology: RwLock::new(topology),
                 channels: RwLock::new(HashMap::new()),
                 operation_timeout,
@@ -1462,9 +1474,13 @@ mod tests {
 
     #[test]
     fn mutation_retries_stop_within_receipt_retention() {
-        let retention = Duration::from_millis(RECEIPT_RETENTION_MILLIS);
+        let timings = ClusterTimings {
+            receipt_retention_millis: 5_000,
+            ..ClusterTimings::default()
+        };
+        let retention = timings.receipt_retention();
         let before = Instant::now();
-        let long = unreachable_client(retention * 2).mutation_deadline();
+        let long = unreachable_client_with(retention * 2, timings).mutation_deadline();
         assert!(long <= Instant::now() + retention);
         assert!(long >= before + retention);
 

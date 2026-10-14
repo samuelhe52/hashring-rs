@@ -8,8 +8,9 @@ use hashring_coordinator::{
     DEFAULT_REPLICA_REPAIR_CONCURRENCY,
 };
 use hashring_core::topology::{
-    DEFAULT_DESIRED_REPLICATION_FACTOR, DEFAULT_MAX_REPLICA_LAG_MILLIS,
-    DEFAULT_MINIMUM_ADMITTED_COPIES, DEFAULT_MINIMUM_HEALTHY_FOLLOWERS, Member,
+    DEFAULT_DESIRED_REPLICATION_FACTOR, DEFAULT_LEASE_DURATION_MILLIS,
+    DEFAULT_MAX_REPLICA_LAG_MILLIS, DEFAULT_MINIMUM_ADMITTED_COPIES,
+    DEFAULT_MINIMUM_HEALTHY_FOLLOWERS, DEFAULT_RECEIPT_RETENTION_MILLIS, Member,
 };
 use serde::Deserialize;
 
@@ -39,6 +40,8 @@ pub struct CoordinatorFile {
     pub minimum_admitted_copies: Option<u32>,
     pub minimum_healthy_followers: Option<u32>,
     pub max_replica_lag_ms: Option<u64>,
+    pub receipt_retention_ms: Option<u64>,
+    pub lease_duration_ms: Option<u64>,
     pub members: Vec<FileMember>,
 }
 
@@ -75,6 +78,8 @@ pub struct CoordinatorSettings {
     pub minimum_admitted_copies: u32,
     pub minimum_healthy_followers: u32,
     pub max_replica_lag_ms: u64,
+    pub receipt_retention_ms: u64,
+    pub lease_duration_ms: u64,
     pub members: Vec<Member>,
     pub member_source: MemberSource,
 }
@@ -167,6 +172,14 @@ pub fn resolve(
             .max_replica_lag_ms
             .or(file.max_replica_lag_ms)
             .unwrap_or(DEFAULT_MAX_REPLICA_LAG_MILLIS),
+        receipt_retention_ms: args
+            .receipt_retention_ms
+            .or(file.receipt_retention_ms)
+            .unwrap_or(DEFAULT_RECEIPT_RETENTION_MILLIS),
+        lease_duration_ms: args
+            .lease_duration_ms
+            .or(file.lease_duration_ms)
+            .unwrap_or(DEFAULT_LEASE_DURATION_MILLIS),
         members,
         member_source,
     })

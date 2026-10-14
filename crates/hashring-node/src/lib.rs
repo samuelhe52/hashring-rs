@@ -20,7 +20,6 @@ use tonic::{
 pub use hashring_core::limits::{
     DEFAULT_MAX_KEY_BYTES, DEFAULT_MAX_VALUE_BYTES, MAX_CONTROL_MESSAGE_BYTES,
     MAX_DATA_MESSAGE_BYTES, MAX_MIGRATION_PAGE_BYTES, MAX_MUTATION_ID_BYTES,
-    RECEIPT_RETENTION_MILLIS,
 };
 pub use hashring_core::transport::{configure_coordinator_client, fetch_topology};
 
@@ -51,10 +50,9 @@ const REPLICATION_BATCH_MAX_BYTES: usize = MAX_DATA_MESSAGE_BYTES - 64 * 1024;
 pub const DEFAULT_REPLICATION_STREAM_QUEUE_CAPACITY: usize = 32;
 const MAX_REPLICATION_FINGERPRINTS: u64 = 4_096;
 pub const DEFAULT_REPLICATION_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-/// Bounds the readiness and lease-renewal calls a node makes to the coordinator.
+/// Bounds the replica-readiness calls a node makes to the coordinator. Lease
+/// renewal derives its own timeout from the cluster's lease duration.
 const COORDINATOR_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-const RECEIPT_RETENTION_PERIOD: std::time::Duration =
-    std::time::Duration::from_millis(RECEIPT_RETENTION_MILLIS);
 // A node retains deduplication receipts for the full retention period on owner and
 // follower paths. Account for live entries separately from staged migration
 // records so the default limit bounds retained data without double charging.

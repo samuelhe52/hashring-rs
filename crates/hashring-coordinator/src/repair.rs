@@ -7,6 +7,7 @@ impl CoordinatorService {
         migration_timeout: Duration,
     ) -> Self {
         let (repair_interrupt, _) = watch::channel(0);
+        let lease_duration = state.committed.timings.lease_duration();
         Self {
             state: Arc::new(RwLock::new(state)),
             repository,
@@ -15,6 +16,7 @@ impl CoordinatorService {
             range_move_concurrency: DEFAULT_RANGE_MOVE_CONCURRENCY,
             replica_repair_concurrency: DEFAULT_REPLICA_REPAIR_CONCURRENCY,
             prepublication_failure_grace: DEFAULT_PREPUBLICATION_FAILURE_GRACE,
+            lease_duration,
             pre_publish_delay: Duration::ZERO,
             post_publish_delay: Duration::ZERO,
             lease_grants: Arc::new(Mutex::new(BTreeMap::new())),
@@ -76,7 +78,7 @@ impl CoordinatorService {
             return Ok(());
         }
         let now = Instant::now();
-        if now < self.startup_at + NODE_LEASE_DURATION {
+        if now < self.startup_at + self.lease_duration {
             return Ok(());
         }
         let grants = self.lease_grants.lock().await;
@@ -188,7 +190,7 @@ impl CoordinatorService {
             change.phase,
             MigrationPhase::Published | MigrationPhase::CleaningUp
         ) {
-            NODE_LEASE_DURATION
+            self.lease_duration
         } else {
             self.prepublication_failure_grace
         };

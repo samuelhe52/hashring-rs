@@ -662,15 +662,15 @@ impl Coordinator for CoordinatorService {
             NodeLeaseGrant {
                 process_instance_id: request.process_instance_id,
                 epoch,
-                expires_at: granted_at + NODE_LEASE_DURATION,
+                expires_at: granted_at + self.lease_duration,
                 expires_unix_millis: renewed_unix_millis
-                    .saturating_add(NODE_LEASE_DURATION.as_millis() as u64),
+                    .saturating_add(self.lease_duration.as_millis() as u64),
                 last_renewal_unix_millis: renewed_unix_millis,
             },
         );
         Ok(Response::new(proto::RenewNodeLeaseResponse {
             topology_epoch: epoch,
-            lease_duration_millis: NODE_LEASE_DURATION.as_millis() as u64,
+            lease_duration_millis: self.lease_duration.as_millis() as u64,
             admitted_followers,
         }))
     }

@@ -428,7 +428,7 @@ impl CoordinatorService {
             .map(|grant| grant.expires_at)
             .max()
             .unwrap_or(self.startup_at);
-        tokio::time::sleep_until(last_grant.max(self.startup_at + NODE_LEASE_DURATION)).await;
+        tokio::time::sleep_until(last_grant.max(self.startup_at + self.lease_duration)).await;
         let deadline = Instant::now() + self.migration_timeout;
         for range in &original.ranges {
             let mut source = self.connect_node(&range.source_endpoint, deadline).await?;
@@ -526,7 +526,7 @@ impl CoordinatorService {
             .get(failed_node_id)
             .map(|grant| grant.expires_at)
             .unwrap_or(self.startup_at);
-        let safe_at = last_grant.max(self.startup_at + NODE_LEASE_DURATION);
+        let safe_at = last_grant.max(self.startup_at + self.lease_duration);
         tokio::time::sleep_until(safe_at).await;
 
         let publication = {

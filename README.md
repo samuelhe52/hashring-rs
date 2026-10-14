@@ -141,9 +141,10 @@ only; it does not make data durable.
   final error reports `unknown_write_outcome=true`. A follow-up `DELETE` that
   succeeds confirms the key is absent.
 - **Deduplication.** The client keeps one request ID across retries of a
-  logical write. Nodes keep in-memory receipts for 60 seconds, so a retry is
-  not applied twice. A new CLI invocation uses a new ID, and receipts are lost
-  if the node restarts.
+  logical write. Nodes keep in-memory receipts for the cluster's receipt
+  retention period (60 seconds by default), so a retry is not applied twice,
+  and the client stops retrying a mutation within that period. A new CLI
+  invocation uses a new ID, and receipts are lost if the node restarts.
 
 ### Limits
 

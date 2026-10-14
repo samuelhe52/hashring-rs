@@ -8,8 +8,9 @@ use hashring_coordinator::{
     DEFAULT_REPLICA_REPAIR_CONCURRENCY,
 };
 use hashring_core::topology::{
-    DEFAULT_DESIRED_REPLICATION_FACTOR, DEFAULT_MAX_REPLICA_LAG_MILLIS,
-    DEFAULT_MINIMUM_ADMITTED_COPIES, DEFAULT_MINIMUM_HEALTHY_FOLLOWERS,
+    DEFAULT_DESIRED_REPLICATION_FACTOR, DEFAULT_LEASE_DURATION_MILLIS,
+    DEFAULT_MAX_REPLICA_LAG_MILLIS, DEFAULT_MINIMUM_ADMITTED_COPIES,
+    DEFAULT_MINIMUM_HEALTHY_FOLLOWERS, DEFAULT_RECEIPT_RETENTION_MILLIS,
 };
 use hashring_experiment::{ExperimentConfig, ExperimentMode};
 use serde::Deserialize;
@@ -49,6 +50,8 @@ pub struct ExperimentFile {
     pub minimum_admitted_copies: Option<u32>,
     pub minimum_healthy_followers: Option<u32>,
     pub max_replica_lag_ms: Option<u64>,
+    pub receipt_retention_ms: Option<u64>,
+    pub lease_duration_ms: Option<u64>,
     pub policy: Option<PolicyArg>,
     pub worker_threads: Option<NonZeroUsize>,
     pub coordinator_worker_threads: Option<NonZeroUsize>,
@@ -180,6 +183,14 @@ pub fn resolve(
             .max_replica_lag_ms
             .or(file.max_replica_lag_ms)
             .unwrap_or(DEFAULT_MAX_REPLICA_LAG_MILLIS),
+        receipt_retention_ms: args
+            .receipt_retention_ms
+            .or(file.receipt_retention_ms)
+            .unwrap_or(DEFAULT_RECEIPT_RETENTION_MILLIS),
+        lease_duration_ms: args
+            .lease_duration_ms
+            .or(file.lease_duration_ms)
+            .unwrap_or(DEFAULT_LEASE_DURATION_MILLIS),
         write_ack_policy: policy.into(),
         node: node::options(&node_settings),
     })

@@ -13,7 +13,10 @@ use hashring_coordinator::{
 use hashring_core::{
     limits::MAX_CONTROL_MESSAGE_BYTES,
     proto::{coordinator_server::CoordinatorServer, data_node_server::DataNodeServer},
-    topology::{Member, TopologyConfig, TopologySnapshot, WriteAckPolicy, WriteAvailabilityGuard},
+    topology::{
+        ClusterTimings, Member, TopologyConfig, TopologySnapshot, WriteAckPolicy,
+        WriteAvailabilityGuard,
+    },
 };
 use hashring_experiment::{ExperimentConfig, ExperimentMode, run_experiment};
 use hashring_node::DataNodeService;
@@ -92,6 +95,15 @@ struct CoordinatorArgs {
     /// Used only when creating a new store. [default: 5000]
     #[arg(long)]
     max_replica_lag_ms: Option<u64>,
+    /// How long every replica keeps a deduplication receipt; mutations stop
+    /// retrying within it. Used only when creating a new store, then fixed.
+    /// [default: 60000]
+    #[arg(long)]
+    receipt_retention_ms: Option<u64>,
+    /// Node lease duration; nodes renew at a fifth of it. Used only when
+    /// creating a new store, then fixed. [default: 5000]
+    #[arg(long)]
+    lease_duration_ms: Option<u64>,
     /// [default: 120000]
     #[arg(long)]
     migration_timeout_ms: Option<u64>,
@@ -181,8 +193,8 @@ struct NodeTuningArgs {
 struct ClientArgs {
     #[arg(long, default_value = "http://127.0.0.1:50050")]
     coordinator: String,
-    /// `put` and `delete` stop retrying after the 60 s receipt retention
-    /// period even when this is longer.
+    /// `put` and `delete` stop retrying after the cluster's receipt retention
+    /// period (default 60 s) even when this is longer.
     #[arg(long, default_value_t = 2_000)]
     deadline_ms: u64,
 }
@@ -344,7 +356,7 @@ struct ExperimentArgs {
     /// [default: 128]
     #[arg(long)]
     virtual_nodes: Option<u32>,
-    /// At most the 60 s receipt retention period, which caps mutation retries.
+    /// At most --receipt-retention-ms, which caps mutation retries.
     /// [default: 30000]
     #[arg(long)]
     operation_timeout_ms: Option<u64>,
@@ -383,6 +395,12 @@ struct ExperimentArgs {
     /// [default: 5000]
     #[arg(long)]
     max_replica_lag_ms: Option<u64>,
+    /// [default: 60000]
+    #[arg(long)]
+    receipt_retention_ms: Option<u64>,
+    /// [default: 5000]
+    #[arg(long)]
+    lease_duration_ms: Option<u64>,
     /// [default: first-successor for availability, owner-only otherwise]
     #[arg(long, value_enum)]
     policy: Option<PolicyArg>,
@@ -576,7 +594,7 @@ fn coordinator_bootstrap(
         );
         return Ok(None);
     }
-    Ok(Some(TopologySnapshot::new_with_config(
+    Ok(Some(TopologySnapshot::new_with_timings(
         1,
         settings.seed,
         settings.virtual_nodes,
@@ -589,6 +607,10 @@ fn coordinator_bootstrap(
                 max_replica_lag_millis: settings.max_replica_lag_ms,
             },
             ..TopologyConfig::default()
+        },
+        ClusterTimings {
+            receipt_retention_millis: settings.receipt_retention_ms,
+            lease_duration_millis: settings.lease_duration_ms,
         },
     )?))
 }
@@ -912,6 +934,30 @@ mod coordinator_bootstrap_tests {
         // Explicit flags still get the strict BootstrapMismatch check.
         let flags = settings(state, &["--member", "c=http://c"], None);
         let bootstrap = coordinator_bootstrap(&flags, &repository).unwrap();
+        assert!(load_or_initialize(&repository, bootstrap).is_err());
+    }
+
+    #[test]
+    fn cluster_timings_are_stored_and_cannot_change_on_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("coordinator.redb");
+        let repository = RedbTopologyRepository::open(&state).unwrap();
+        let member = ["--member", "a=http://a"];
+        let timings = [
+            "--receipt-retention-ms",
+            "90000",
+            "--lease-duration-ms",
+            "3000",
+        ];
+        let first = settings(state.clone(), &[&member[..], &timings].concat(), None);
+        let bootstrap = coordinator_bootstrap(&first, &repository).unwrap();
+        let stored = load_or_initialize(&repository, bootstrap).unwrap();
+        assert_eq!(stored.committed.timings.receipt_retention_millis, 90_000);
+        assert_eq!(stored.committed.timings.lease_duration_millis, 3_000);
+
+        // Restarting with the default lease would shorten the startup quarantine.
+        let restart = settings(state, &member, None);
+        let bootstrap = coordinator_bootstrap(&restart, &repository).unwrap();
         assert!(load_or_initialize(&repository, bootstrap).is_err());
     }
 }
