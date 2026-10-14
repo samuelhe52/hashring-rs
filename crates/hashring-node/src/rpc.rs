@@ -157,6 +157,7 @@ fn apply_replication_entry(
 #[tonic::async_trait]
 impl DataNode for DataNodeService {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
+        let _timer = hashring_core::rpc_profile::NODE_GET.start();
         let request = request.into_inner();
         if let Some(error) = self.validate_key(&request.key) {
             return Ok(Response::new(GetResponse {
@@ -196,6 +197,7 @@ impl DataNode for DataNodeService {
     }
 
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
+        let _timer = hashring_core::rpc_profile::NODE_PUT.start();
         let request = request.into_inner();
         if let Some(error) = self.validate_key(&request.key) {
             return Ok(Response::new(PutResponse {
@@ -1024,6 +1026,7 @@ impl DataNode for DataNodeService {
         &self,
         request: Request<ReplicationBatch>,
     ) -> Result<Response<ReplicateMutationsResponse>, Status> {
+        let _timer = hashring_core::rpc_profile::NODE_REPLICATE_BATCH.start();
         let batch = request.into_inner();
         if batch.entries.is_empty() {
             return Err(Status::invalid_argument(

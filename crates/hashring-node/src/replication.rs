@@ -485,6 +485,8 @@ pub(super) async fn deliver_replication_stream(
                     .map(|pending| pending.prepared.to_proto())
                     .collect(),
             };
+            hashring_core::rpc_profile::REPLICATION_BATCH_ENTRIES.record_value(batch.len() as u64);
+            let rpc_timer = hashring_core::rpc_profile::OWNER_REPLICATION_RPC.start();
             let result = tokio::time::timeout(
                 rpc_timeout,
                 client
@@ -494,6 +496,7 @@ pub(super) async fn deliver_replication_stream(
             )
             .await
             .map(|result| result.map(Response::into_inner));
+            drop(rpc_timer);
             drop(active_budget);
             match result {
                 Ok(Ok(response))

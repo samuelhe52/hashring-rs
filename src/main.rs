@@ -426,6 +426,7 @@ fn main() -> Result<()> {
             let file = args.config.as_deref().map(config::load).transpose()?;
             let config = config::experiment::resolve(args, file, cpus)?;
             init_tracing(config.verbose)?;
+            hashring_core::rpc_profile::start_reporter("driver");
             return build_runtime(Some(config.worker_threads))?
                 .block_on(run_local_experiment(config));
         }
@@ -433,6 +434,7 @@ fn main() -> Result<()> {
             let file = args.config.as_deref().map(config::load).transpose()?;
             let config = config::node::resolve(args, file)?;
             init_tracing(false)?;
+            hashring_core::rpc_profile::start_reporter("node");
             return build_runtime(Some(config.runtime_workers(cpus)))?
                 .block_on(run_node(config, args.stop_response_delay_ms));
         }

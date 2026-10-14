@@ -1,0 +1,92 @@
+on-CPU sampled 6.51s over 5.58s window = 1.17 cores
+
+### coordinator  (1 proc)  on-CPU 0.00s = 0% of all on-CPU, 0.00 cores
+  of this role's CPU-delta: parked-at-sample 74.5%, mutexwait 0.0% (excluded below)
+  owner view:
+     69.7%  hashring
+     16.8%  tonic
+      7.7%  runtime
+      5.8%  hyper
+  self view (top 25); libsystem_kernel leaf total 6.8%:
+     27.9%  rust:alloc
+     26.7%  malloc/free
+     16.5%  rust:hashring_coordinator
+      7.9%  rust:http
+      7.7%  rust:tokio
+      6.6%  rust:axum
+      5.8%  sys:net __recvfrom
+      1.0%  sys:other mach_vm_reclaim_update_kernel_accounting_trap
+
+### driver  (1 proc)  on-CPU 5.17s = 79% of all on-CPU, 0.93 cores
+  of this role's CPU-delta: parked-at-sample 22.5%, mutexwait 14.8% (excluded below)
+  owner view:
+     49.8%  h2
+     15.8%  hyper
+     14.3%  hashring
+     10.0%  tonic
+      5.1%  runtime
+      4.1%  tower
+      0.9%  prost
+  self view (top 25); libsystem_kernel leaf total 39.1%:
+     22.0%  sys:net writev
+     13.7%  rust:h2
+     10.1%  rust:tokio
+      8.5%  sys:net __recvfrom
+      6.8%  malloc/free
+      5.2%  memcpy/platform _platform_memmove
+      4.8%  sys:other getentropy
+      4.0%  rust:http
+      2.8%  rust:tonic
+      2.6%  libsystem other (libsystem_pthread.dylib)
+      2.0%  rust:core
+      1.9%  sys:lock/park __psynch_mutexdrop
+      1.9%  rust:hyper
+      1.8%  rust:bytes
+      1.7%  rust:?
+      1.1%  rust:tower
+      1.0%  rust:futures_util
+      1.0%  sys:lock/park __psynch_cvsignal
+      0.9%  sys:other mach_absolute_time
+      0.8%  rust:tokio_util
+      0.7%  rust:std
+      0.6%  rust:hashring_client
+      0.5%  rust:alloc
+      0.5%  memcpy/platform _platform_memcmp
+      0.4%  rust:slab
+
+### node  (6 proc)  on-CPU 1.34s = 21% of all on-CPU, 0.24 cores
+  of this role's CPU-delta: parked-at-sample 83.4%, mutexwait 2.2% (excluded below)
+  owner view:
+     50.8%  h2
+     16.8%  hyper
+     12.7%  tonic
+      8.7%  hashring
+      6.9%  runtime
+      2.8%  tower
+      1.3%  prost
+  self view (top 25); libsystem_kernel leaf total 37.4%:
+     22.8%  sys:net writev
+     14.8%  rust:h2
+      8.5%  sys:net __recvfrom
+      7.0%  malloc/free
+      6.8%  rust:tokio
+      4.6%  rust:http
+      4.3%  memcpy/platform _platform_memmove
+      3.6%  rust:tonic
+      2.8%  rust:core
+      2.3%  libsystem other (libsystem_pthread.dylib)
+      2.2%  sys:other mach_absolute_time
+      2.1%  rust:?
+      1.9%  sys:lock/park __psynch_cvsignal
+      1.9%  rust:bytes
+      1.5%  sys:lock/park __psynch_mutexdrop
+      1.4%  rust:hashring_core
+      1.4%  rust:hyper
+      1.2%  rust:alloc
+      0.9%  rust:hashring_node
+      0.9%  rust:http_body_util
+      0.7%  rust:std
+      0.7%  rust:tokio_util
+      0.7%  memcpy/platform _platform_memcmp
+      0.6%  rust:tower
+      0.6%  rust:axum

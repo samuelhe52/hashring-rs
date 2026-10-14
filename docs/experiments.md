@@ -117,6 +117,21 @@ sample:
 These are cumulative wall-clock counters. Summed wait times can overlap across
 tasks and nodes. Without profiling, the timing fields are `null`.
 
+Set `HASHRING_PROFILE_RPC=1` to have the driver and every node print RPC
+latency histograms to their stderr twice a second as `rpc_profile` lines:
+
+- client-observed `Put` and `Get` RPC attempts, and whole logical `put`s
+  including retries
+- owner handler time for `Put` and `Get`
+- owner-observed replication batch round trips, follower handler time per
+  batch, and entries per batch
+
+Comparing a client-observed RPC with its handler time separates transport and
+scheduling from the node's own work. `scripts/perf/run.sh` runs one
+performance-mode experiment with per-process CPU sampling and this
+summary, and `scripts/perf/collect.py` tabulates a set of such runs. See
+[grpc-io-bottleneck.md](optimizations/grpc-io-bottleneck.md) for an example.
+
 When the owner's receipt store is full, the node returns a retry-delay hint.
 The client honors it within the same logical-operation deadline.
 

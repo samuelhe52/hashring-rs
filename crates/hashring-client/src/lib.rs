@@ -420,12 +420,11 @@ impl HashringClient {
                 topology_epoch: epoch,
                 request_id: request_id.clone(),
             };
-            let response = match tokio::time::timeout(
-                remaining(deadline, false)?,
-                client.get(request),
-            )
-            .await
-            {
+            let rpc_timer = hashring_core::rpc_profile::CLIENT_GET_RPC.start();
+            let response =
+                tokio::time::timeout(remaining(deadline, false)?, client.get(request)).await;
+            drop(rpc_timer);
+            let response = match response {
                 Ok(Ok(response)) => response.into_inner(),
                 Ok(Err(status)) => {
                     if retryable_status(&status) {
@@ -463,6 +462,7 @@ impl HashringClient {
     }
 
     pub async fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<PutOutput, ClientError> {
+        let _operation_timer = hashring_core::rpc_profile::CLIENT_PUT_OPERATION.start();
         validate_key_size(&key)?;
         if value.len() > DEFAULT_MAX_VALUE_BYTES {
             return Err(size_failure(format!(
@@ -496,12 +496,14 @@ impl HashringClient {
                 topology_epoch: epoch,
                 request_id: request_id.clone(),
             };
-            let response = match tokio::time::timeout(
+            let rpc_timer = hashring_core::rpc_profile::CLIENT_PUT_RPC.start();
+            let response = tokio::time::timeout(
                 remaining(deadline, unknown_write_outcome)?,
                 client.put(request),
             )
-            .await
-            {
+            .await;
+            drop(rpc_timer);
+            let response = match response {
                 Ok(Ok(response)) => response.into_inner(),
                 Ok(Err(status)) => {
                     unknown_write_outcome =
