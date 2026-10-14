@@ -10,6 +10,14 @@ directly and is therefore independent of call-graph quality. Kernel frames are
 grouped by symbol prefix; the two entries marked "unclassified" are spinlocks,
 RCU, and list traversal that fall outside the named buckets.
 
+That independence is not a stylistic choice. This capture predates the
+frame-pointer build and its call graph was truncated: 91.5% of its samples
+carried no Rust frame, so the rendered graph was `comm` -> libc -> kernel and
+could only be read as symbol self time. `scripts/flamegraph.sh` now builds
+`target/fp` with `-C force-frame-pointers=yes` and reads the graph with `fp`. In a
+capture taken that way, 99.0% of user-side samples reach project code and carry
+8-33 frames each. The numbers below are unaffected either way.
+
 ## Where the time goes
 
 | | share |
@@ -89,7 +97,6 @@ at `y-16`. Reading it as a normal flame graph produces self times that sum to
 ## Reproducing
 
 ```sh
-cargo build --release
 cat > /tmp/experiment_cpu_profile.yaml <<'YAML'
 mode: correctness
 nodes: 10
@@ -105,6 +112,10 @@ The script profiles whatever `experiment` runs, so it needs a settings file;
 default and used the flag defaults listed above, so it needs its own file. The
 manifest in `<out>/run/` records what was actually resolved.
 
+The script builds its own `target/fp` binary with frame pointers on first use
+and never touches `target/release`, so no `cargo build` is needed first. Measure
+with one build and profile with the other: frame pointers cost throughput.
+
 Check `perf-record.log` in the output directory for sample loss before trusting
 the graph. Aggregate self time with:
 
@@ -113,7 +124,9 @@ perf report -i <out>/perf.data --stdio --no-children --percent-limit 0.01 \
   --sort dso,symbol -F overhead,dso,symbol
 ```
 
-See also [state-write-lock-profile.md](state-write-lock-profile.md) for the
+See also [frame-pointer-profiling.md](frame-pointer-profiling.md) for why this
+capture's call graph was truncated and what the script does about it,
+[state-write-lock-profile.md](state-write-lock-profile.md) for the
 `HASHRING_PROFILE_WRITES` lock wait/hold counters, which measure the latency
 side that this CPU profile cannot see, and
 [batched-replication-rpc.md](batched-replication-rpc.md) for why the follower

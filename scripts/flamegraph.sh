@@ -13,7 +13,8 @@
 #   ./scripts/flamegraph.sh performance           # same file, mode from the argument
 #
 #   env CONFIG=examples/experiment.yaml ./scripts/flamegraph.sh
-#   env BINARY=target/release/hashring-rs OUT_DIR=/tmp/fg ./scripts/flamegraph.sh
+#   env BUILD=1 FREQ=199 ./scripts/flamegraph.sh # force a rebuild, sample harder
+#   env BINARY=/tmp/other OUT_DIR=/tmp/fg ./scripts/flamegraph.sh
 #
 # Settings
 # --------
@@ -35,18 +36,39 @@
 #
 # Notes
 # -----
-#   * The DWARF stack size is the setting that decides whether this profile is
-#     usable. perf's per-CPU ring buffer is bounded by
-#     /proc/sys/kernel/perf_event_mlock_kb (516 KB here) shared across every CPU,
-#     which leaves ~22 KB per CPU on a 24-core host. A 64000-byte stack makes
-#     each sample ~56 KB, so not even one sample fits and the kernel drops
-#     records wholesale: a capture with 64000 lost 12.33% of samples over 385
-#     chunks, while 8192 lost 0.4% over 8 chunks for the same run length.
-#   * Frame pointers are not forced in the release profile and Rust omits them
-#     by default, so --call-graph fp yields truncated Rust stacks. Keep dwarf.
-#   * Build first and profile the binary directly. Wrapping this in `cargo run`
-#     puts cargo and any rustc invocation into the profile alongside the
-#     experiment.
+#   * The profiled binary is built with -C force-frame-pointers=yes into its own
+#     target directory, and the call graph is read with fp. This is the whole
+#     difference between a usable profile and an unusable one, so it is not
+#     optional. Measured on this host with rustc 1.93.0, on a 30-line busy loop,
+#     as the share of samples carrying at least two Rust frames:
+#
+#         build                     fp        dwarf,8192
+#         default rustc -O         0.0%          1.1%
+#         force-frame-pointers    94.5%         93.8%
+#         force-unwind-tables       n/a          0.0%
+#
+#     A default release build cannot be unwound past the libc boundary by either
+#     method, so a capture of one is comm -> libc -> kernel and nothing else:
+#     91.5% of samples carried no Rust frame at all, and the profile could only
+#     be read by symbol self time. force-unwind-tables does not help; .eh_frame
+#     already covers 551 of 578 functions in that repro. Use this script's own
+#     build, or any build with frame pointers, and point BINARY at it.
+#   * fp also removes the DWARF sampling problem. perf's per-CPU ring buffer is
+#     bounded by /proc/sys/kernel/perf_event_mlock_kb (516 KB here) shared across
+#     every CPU, which leaves ~22 KB per CPU on a 24-core host. A 64000-byte
+#     DWARF stack makes each sample ~56 KB, so not even one sample fits and the
+#     kernel drops records wholesale: a capture with 64000 lost 12.33% of samples
+#     over 385 chunks, while 8192 lost 0.4% over 8 chunks for the same run
+#     length. CALL_GRAPH=dwarf,<DWARF_STACK> selects that path.
+#   * Frame pointers cost a little throughput, so the build lives in its own
+#     target directory and never touches target/release. Measure with one build,
+#     profile with the other; do not ship the frame-pointer binary.
+#   * The build runs before perf starts, never under it. Wrapping this in `cargo
+#     run` would put cargo and any rustc invocation into the profile alongside
+#     the experiment.
+#   * Every capture reports the share of samples that carry a project frame.
+#     Below a few percent the call graph is truncated and the SVG is a wall of
+#     comm -> libc -> kernel; the number is the check, not the graph's shape.
 #   * The rendered graph is inverted: "all" sits at the bottom and leaves at the
 #     top, so a frame's children are at y-16, not y+16. Reading the SVG as
 #     though it were a normal flame graph yields self times that sum to several
@@ -62,8 +84,13 @@ set -euo pipefail
 # applies, and this only names the output directory and the graph title.
 MODE="${1:-}"
 CONFIG="${CONFIG:-examples/experiment_cmach.yaml}"
-BINARY="${BINARY:-target/release/hashring-rs}"
+# Separate target directory: frame pointers are a profiling build, not the one to
+# benchmark or ship. TARGET_DIR only matters when building, and must match BINARY.
+TARGET_DIR="${TARGET_DIR:-target/fp}"
+BINARY="${BINARY:-$TARGET_DIR/release/hashring-rs}"
+BUILD="${BUILD:-auto}"
 FREQ="${FREQ:-99}"
+CALL_GRAPH="${CALL_GRAPH:-fp}"
 DWARF_STACK="${DWARF_STACK:-8192}"
 
 case "$MODE" in
@@ -73,6 +100,19 @@ case "$MODE" in
     exit 2
     ;;
 esac
+
+case "$CALL_GRAPH" in
+  fp | dwarf) ;;
+  *)
+    echo "error: CALL_GRAPH must be 'fp' or 'dwarf'." >&2
+    exit 2
+    ;;
+esac
+if [[ "$CALL_GRAPH" == "fp" ]]; then
+  CALL_GRAPH_ARG=fp
+else
+  CALL_GRAPH_ARG="dwarf,$DWARF_STACK"
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -108,9 +148,34 @@ for tool in perf inferno-collapse-perf inferno-flamegraph; do
 done
 [[ "$missing" -eq 0 ]] || exit 1
 
+# perf needs the frame-pointer build; see the note at the top of this file.
+build_binary() {
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "error: 'cargo' not found, and '$BINARY' has to be built." >&2
+    exit 1
+  fi
+  echo "==> building $BINARY with -C force-frame-pointers=yes"
+  echo "    (perf cannot unwind this code without frame pointers; see the header)"
+  RUSTFLAGS="-C force-frame-pointers=yes${RUSTFLAGS:+ $RUSTFLAGS}" \
+    cargo build --release --target-dir "$TARGET_DIR"
+  echo
+}
+
+case "$BUILD" in
+  auto) [[ -x "$BINARY" ]] || build_binary ;;
+  1 | yes | true) build_binary ;;
+  0 | no | false) ;;
+  *)
+    echo "error: BUILD must be auto, 1 or 0." >&2
+    exit 2
+    ;;
+esac
+
 if [[ ! -x "$BINARY" ]]; then
   echo "error: binary '$BINARY' not found or not executable." >&2
-  echo "       run 'cargo build --release' first." >&2
+  echo "       build it with:" >&2
+  echo "         RUSTFLAGS='-C force-frame-pointers=yes' cargo build --release --target-dir $TARGET_DIR" >&2
+  echo "       or drop BUILD=0 and let this script build it." >&2
   exit 1
 fi
 
@@ -129,8 +194,8 @@ SVG="$OUT_DIR/flamegraph.svg"
 echo "==> config      : $CONFIG"
 echo "==> mode        : $LABEL${MODE:+ (--mode overrides the file)}"
 echo "==> binary      : $BINARY"
+echo "==> call graph  : $CALL_GRAPH_ARG"
 echo "==> frequency   : ${FREQ} Hz"
-echo "==> dwarf stack : ${DWARF_STACK} bytes"
 echo "==> output dir  : $OUT_DIR"
 echo
 
@@ -144,7 +209,7 @@ echo "==> recording..."
 # in the log, so a failure must still print it: a stale binary rejects --config,
 # and nothing else in this script would say so.
 status=0
-perf record -o "$PERF_DATA" -F "$FREQ" --call-graph "dwarf,$DWARF_STACK" -- \
+perf record -o "$PERF_DATA" -F "$FREQ" --call-graph "$CALL_GRAPH_ARG" -- \
   "$BINARY" "${EXPERIMENT[@]}" 2>"$PERF_LOG" || status=$?
 
 echo "==> perf report:"
@@ -170,12 +235,32 @@ fi
 echo "==> collapsing stacks..."
 perf script -i "$PERF_DATA" 2>/dev/null | inferno-collapse-perf > "$FOLDED"
 echo "    $(wc -l < "$FOLDED") folded stacks"
+
+# Truncated stacks look like a deep, plausible graph, because kernel frames still
+# unwind. This share is the honest check: a real profile puts project frames
+# almost everywhere, a truncated one puts them nowhere.
+RESOLVED="$(awk -F';' '
+  { last = $NF; sub(/^ /, "", last); split(last, parts, " "); weight = parts[2] + 0
+    project = 0
+    for (i = 1; i < NF; i++) if ($i ~ /^<?hashring[_-]/) project = 1
+    total += weight; if (project) resolved += weight }
+  END { if (total > 0) printf "%.1f", 100 * resolved / total; else print "0.0" }
+' "$FOLDED")"
+printf '    %s%% of samples carry a hashring frame\n' "$RESOLVED"
 echo
+
+if awk -v share="$RESOLVED" 'BEGIN { exit !(share < 5) }'; then
+  echo "==> WARNING: the call graph looks truncated." >&2
+  echo "    Only $RESOLVED% of samples reached this project's code, so the graph" >&2
+  echo "    is comm -> libc -> kernel and cannot be read. Check that BINARY was" >&2
+  echo "    built with -C force-frame-pointers=yes, and that CALL_GRAPH matches it." >&2
+  echo >&2
+fi
 
 echo "==> rendering..."
 inferno-flamegraph \
   --title "hashring-rs $LABEL" \
-  --subtitle "perf cpu/cycles @${FREQ}Hz, --call-graph dwarf,${DWARF_STACK}, $(basename "$CONFIG")" \
+  --subtitle "perf cpu/cycles @${FREQ}Hz, --call-graph $CALL_GRAPH_ARG, $(basename "$CONFIG")" \
   --countname cycles \
   "$FOLDED" > "$SVG"
 
