@@ -64,87 +64,119 @@ type RequiredAck = (u64, String, u64);
 
 /// Keys or mutation IDs ordered by ring token.
 ///
-/// A `Vec` per token rather than a set: two distinct keys can collide on a
-/// 64-bit token, and dropping one would silently lose a record. Collisions are
-/// not expected, so the common case is a one-element `Vec` that never allocates
-/// beyond itself.
-#[derive(Debug, Default)]
+/// A bucket per token rather than a plain set: two distinct keys can collide
+/// on a 64-bit token, and dropping one would silently lose a record. Records
+/// almost never collide, so a bucket is usually `One` and costs no allocation
+/// beyond the tree node. Receipts do share tokens routinely, because every
+/// retained receipt for a hot key lands in that key's bucket; `Many` keeps
+/// their removal logarithmic in the bucket size.
+#[derive(Debug)]
 struct TokenIndex<T> {
-    by_token: std::collections::BTreeMap<u64, Vec<T>>,
+    by_token: std::collections::BTreeMap<u64, TokenBucket<T>>,
 }
 
-impl<T> TokenIndex<T> {
+#[derive(Debug)]
+enum TokenBucket<T> {
+    One(T),
+    Many(std::collections::BTreeSet<T>),
+}
+
+impl<T> Default for TokenIndex<T> {
+    fn default() -> Self {
+        Self {
+            by_token: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+impl<T: Ord + Clone> TokenIndex<T> {
     fn insert(&mut self, token: u64, value: T) {
-        self.by_token.entry(token).or_default().push(value);
+        use std::collections::btree_map::Entry;
+        match self.by_token.entry(token) {
+            Entry::Vacant(entry) => {
+                entry.insert(TokenBucket::One(value));
+            }
+            Entry::Occupied(mut entry) => {
+                let bucket = entry.get_mut();
+                match bucket {
+                    TokenBucket::One(existing) if *existing == value => {}
+                    TokenBucket::One(existing) => {
+                        *bucket = TokenBucket::Many([existing.clone(), value].into());
+                    }
+                    TokenBucket::Many(values) => {
+                        values.insert(value);
+                    }
+                }
+            }
+        }
     }
 
-    fn remove(&mut self, token: u64, value: &T) -> bool
+    /// Removes `value` from `token`'s bucket. Takes any borrowed form, so a
+    /// caller holding `&[u8]` or `&str` need not build an `Arc` to compare.
+    fn remove<Q>(&mut self, token: u64, value: &Q) -> bool
     where
-        T: PartialEq,
+        T: std::borrow::Borrow<Q>,
+        Q: Ord + ?Sized,
     {
-        let Some(values) = self.by_token.get_mut(&token) else {
+        let Some(bucket) = self.by_token.get_mut(&token) else {
             return false;
         };
-        let Some(position) = values.iter().position(|entry| entry == value) else {
-            return false;
+        let emptied = match bucket {
+            TokenBucket::One(existing) if existing.borrow() == value => true,
+            TokenBucket::One(_) => return false,
+            TokenBucket::Many(values) => {
+                if !values.remove(value) {
+                    return false;
+                }
+                values.is_empty()
+            }
         };
-        values.swap_remove(position);
-        if values.is_empty() {
+        if emptied {
             self.by_token.remove(&token);
         }
         true
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
-        self.by_token.values().map(Vec::len).sum()
+        self.by_token
+            .values()
+            .map(|bucket| match bucket {
+                TokenBucket::One(_) => 1,
+                TokenBucket::Many(values) => values.len(),
+            })
+            .sum()
     }
 
-    fn values_in_range(&self, range: &RangeSpec) -> Vec<T>
+    #[cfg(test)]
+    fn contains<Q>(&self, token: u64, value: &Q) -> bool
     where
-        T: Clone,
+        T: std::borrow::Borrow<Q>,
+        Q: Ord + ?Sized,
     {
-        range
-            .token_bounds()
-            .into_iter()
-            .flat_map(|bounds| self.by_token.range(bounds))
-            .flat_map(|(_, values)| values.iter())
-            .cloned()
-            .collect()
-    }
-
-    fn values_in_token(&self, token: u64) -> &[T] {
-        self.by_token.get(&token).map_or(&[], Vec::as_slice)
-    }
-}
-
-impl TokenIndex<Arc<[u8]>> {
-    /// Keys whose token falls in `range`, in token order. Equivalent to testing
-    /// `range.contains` on every key, without the hashing.
-    fn keys_in_range(&self, range: &RangeSpec) -> Vec<Arc<[u8]>> {
-        self.values_in_range(range)
-    }
-
-    /// Removes a key by its bytes, so callers holding a `&[u8]` do not have to
-    /// allocate an `Arc` to compare against the indexed one.
-    fn remove_key(&mut self, token: u64, key: &[u8]) -> bool {
-        let Some(keys) = self.by_token.get_mut(&token) else {
-            return false;
-        };
-        let Some(position) = keys.iter().position(|entry| &**entry == key) else {
-            return false;
-        };
-        keys.swap_remove(position);
-        if keys.is_empty() {
-            self.by_token.remove(&token);
+        match self.by_token.get(&token) {
+            Some(TokenBucket::One(existing)) => existing.borrow() == value,
+            Some(TokenBucket::Many(values)) => values.contains(value),
+            None => false,
         }
-        true
     }
-}
 
-impl TokenIndex<Arc<str>> {
-    /// Mutation IDs whose receipt key falls in `range`, in token order.
-    fn ids_in_range(&self, range: &RangeSpec) -> Vec<Arc<str>> {
-        self.values_in_range(range)
+    /// Every value whose token falls in `range`, with that token, in token
+    /// order. Equivalent to testing `range.contains` on every value, without
+    /// the hashing.
+    fn in_range(&self, range: &RangeSpec) -> Vec<(u64, T)> {
+        let mut found = Vec::new();
+        for bounds in range.token_bounds() {
+            for (&token, bucket) in self.by_token.range(bounds) {
+                match bucket {
+                    TokenBucket::One(value) => found.push((token, value.clone())),
+                    TokenBucket::Many(values) => {
+                        found.extend(values.iter().map(|value| (token, value.clone())))
+                    }
+                }
+            }
+        }
+        found
     }
 }
 
@@ -184,16 +216,17 @@ impl RangeSpec {
         }
     }
 
-    /// The `BTreeMap` bounds covering exactly the tokens `contains` accepts.
-    /// `start_exclusive` and `end_inclusive` are both inclusive bounds here:
-    /// every token of a range except the start, and the start belongs to the
-    /// previous range instead.
+    /// The `BTreeMap` bounds covering exactly the tokens `contains` accepts:
+    /// `(start_exclusive, end_inclusive]`. The start token belongs to the
+    /// previous range, so excluding it keeps a boundary key in exactly one
+    /// range.
     fn token_bounds(&self) -> Vec<(std::ops::Bound<&u64>, std::ops::Bound<&u64>)> {
         use std::ops::Bound;
         let start = Bound::Excluded(&self.start_exclusive);
         let end = Bound::Included(&self.end_inclusive);
         match self.start_exclusive.cmp(&self.end_inclusive) {
-            // A wrapping range covers the whole token space, in two pieces.
+            // A wrapping range crosses the end of the token space, so it is
+            // `[0, end]` plus `(start, MAX]`.
             Ordering::Greater => vec![(Bound::Unbounded, end), (start, Bound::Unbounded)],
             // An empty range would be `(Excluded(x), Included(x))`, which matches
             // nothing; `contains` treats start == end as covering everything.
@@ -235,9 +268,8 @@ struct SourceMigration {
     range: RangeSpec,
     /// The `Arc` keys the token index returned, in token order. Shared with
     /// `records`, so capturing a range's key list copies no key bytes.
-    snapshot_keys: Option<Vec<Arc<[u8]>>>,
+    snapshot_keys: Vec<Arc<[u8]>>,
     snapshot_dedup_ids: Vec<Arc<str>>,
-    snapshot_ready: watch::Sender<bool>,
     journal: Vec<JournalRecord>,
     journal_bytes: usize,
     watermark: u64,
@@ -375,21 +407,20 @@ struct NodeState {
 
 /// Every mutation of `records` and `dedup` goes through these, so the token
 /// indices cannot drift from the maps they mirror. Reaching into either map
-/// directly is the one way to break that, which is what `debug_assert_index`
-/// checks.
+/// directly is the one way to break that, which is what the tests'
+/// `debug_assert_index` checks.
 impl NodeState {
     fn token_of(&self, key: &[u8]) -> u64 {
         self.topology.key_token(key)
     }
 
     fn insert_record(&mut self, key: Arc<[u8]>, token: u64, record: Record) {
-        if self.records.insert(key.clone(), record).is_some() {
-            // Replacing an existing key: the index already holds an equal key,
-            // so drop that entry rather than indexing the same bytes twice.
-            let removed = self.records_by_token.remove_key(token, &key);
-            debug_assert!(removed, "replaced record was missing from the index");
+        // Replacing an existing key keeps the map's original `Arc`, which the
+        // index already holds, so only a new key is indexed. Indexing the new
+        // `Arc` instead would leave the map and index with separate copies.
+        if self.records.insert(key.clone(), record).is_none() {
+            self.records_by_token.insert(token, key);
         }
-        self.records_by_token.insert(token, key);
     }
 
     /// Applies a record only when it is newer than the stored one, matching
@@ -404,24 +435,35 @@ impl NodeState {
         true
     }
 
+    #[cfg(test)]
     fn remove_record(&mut self, key: &[u8]) -> Option<Record> {
+        let token = self.token_of(key);
+        self.remove_record_at(token, key)
+    }
+
+    /// [`remove_record`] for a caller that already has the key's token, such
+    /// as one walking [`record_keys_in_range`].
+    fn remove_record_at(&mut self, token: u64, key: &[u8]) -> Option<Record> {
         let removed = self.records.remove(key);
         if removed.is_some() {
-            let token = self.token_of(key);
-            let removed = self.records_by_token.remove_key(token, key);
+            let removed = self.records_by_token.remove(token, key);
             debug_assert!(removed, "removed record was missing from the index");
         }
         removed
     }
 
-    /// Every record key in `range`, in token order.
-    fn record_keys_in_range(&self, range: &RangeSpec) -> Vec<Arc<[u8]>> {
-        self.records_by_token.keys_in_range(range)
+    /// Every record key in `range` with its token, in token order.
+    fn record_keys_in_range(&self, range: &RangeSpec) -> Vec<(u64, Arc<[u8]>)> {
+        self.records_by_token.in_range(range)
     }
 
     /// Every live receipt id whose key falls in `range`, in token order.
     fn dedup_ids_in_range(&self, range: &RangeSpec) -> Vec<Arc<str>> {
-        self.dedup_by_token.ids_in_range(range)
+        self.dedup_by_token
+            .in_range(range)
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect()
     }
 
     /// Test-only reset. The indices cannot be cleared through `records.clear`,
@@ -445,12 +487,15 @@ impl NodeState {
 
     fn remove_dedup_index(&mut self, id: &Arc<str>, key: &[u8]) {
         let token = self.token_of(key);
-        let removed = self.dedup_by_token.remove(token, id);
+        let removed = self.dedup_by_token.remove(token, &**id);
         debug_assert!(removed, "removed receipt was missing from the index");
     }
 
-    /// The indices are load-bearing for migration correctness, so a divergence
-    /// must not survive a debug build unnoticed.
+    /// The indices are load-bearing for migration correctness, so tests check
+    /// them against the maps. Test-only: it rehashes every key on the node, so
+    /// running it under the write lock would bring back the full scan the
+    /// indices exist to avoid.
+    #[cfg(test)]
     fn debug_assert_index(&self) {
         debug_assert_eq!(
             self.records_by_token.len(),
@@ -464,17 +509,13 @@ impl NodeState {
         );
         for key in self.records.keys() {
             debug_assert!(
-                self.records_by_token
-                    .values_in_token(self.token_of(key))
-                    .contains(key),
+                self.records_by_token.contains(self.token_of(key), key),
                 "record is missing from records_by_token",
             );
         }
         for (id, entry) in &self.dedup {
             debug_assert!(
-                self.dedup_by_token
-                    .values_in_token(self.token_of(&entry.key))
-                    .contains(id),
+                self.dedup_by_token.contains(self.token_of(&entry.key), id),
                 "receipt is missing from dedup_by_token",
             );
         }

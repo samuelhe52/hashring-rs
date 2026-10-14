@@ -64,7 +64,7 @@ fn indexed(state: &NodeState, range: &RangeSpec) -> Vec<Vec<u8>> {
     let mut found: Vec<Vec<u8>> = state
         .record_keys_in_range(range)
         .into_iter()
-        .map(|key| key.to_vec())
+        .map(|(_, key)| key.to_vec())
         .collect();
     found.sort();
     found
@@ -238,4 +238,51 @@ async fn dedup_index_matches_hashing_every_receipt_key() {
     state.debug_assert_index();
     assert!(state.dedup.is_empty());
     assert_eq!(state.dedup_by_token.len(), 0);
+}
+
+#[test]
+fn token_index_keeps_colliding_values_apart() {
+    let mut index = TokenIndex::<Arc<str>>::default();
+    for id in ["a", "b", "c"] {
+        index.insert(7, Arc::from(id));
+    }
+    index.insert(7, Arc::from("b"));
+    index.insert(9, Arc::from("d"));
+    assert_eq!(index.len(), 4);
+
+    assert!(index.remove(7, "b"));
+    assert!(!index.remove(7, "b"));
+    assert!(!index.remove(9, "a"));
+    let left: Vec<(u64, String)> = index
+        .in_range(&spec(0, 0))
+        .into_iter()
+        .map(|(token, id)| (token, id.to_string()))
+        .collect();
+    assert_eq!(
+        left,
+        [(7, "a".into()), (7, "c".into()), (9, "d".into())].to_vec(),
+    );
+
+    for id in ["a", "c"] {
+        assert!(index.remove(7, id));
+    }
+    assert!(index.remove(9, "d"));
+    assert_eq!(index.len(), 0);
+    assert!(index.by_token.is_empty());
+}
+
+#[tokio::test]
+async fn overwriting_a_record_keeps_one_copy_of_its_key() {
+    let service = service();
+    let mut state = service.state.write().await;
+    let first: Arc<[u8]> = Arc::from(&b"key"[..]);
+    let token = state.token_of(&first);
+    state.insert_record(first.clone(), token, record(1));
+    state.insert_record(Arc::from(&b"key"[..]), token, record(2));
+    state.debug_assert_index();
+
+    let (stored, _) = state.records.get_key_value(&b"key"[..]).unwrap();
+    let indexed = state.record_keys_in_range(&spec(0, 0));
+    assert!(Arc::ptr_eq(stored, &first));
+    assert!(Arc::ptr_eq(&indexed[0].1, &first));
 }

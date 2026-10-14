@@ -790,8 +790,10 @@ impl DataNode for DataNodeService {
                 .or_default()
                 .push_back((entry.stream_sequence, now));
         }
+        // One allocation shared by the record, its index entry and the receipt.
+        let record_key: Arc<[u8]> = Arc::from(request.key.as_slice());
         state.apply_record(
-            Arc::from(request.key.as_slice()),
+            record_key.clone(),
             token,
             Record {
                 value: Arc::from([]),
@@ -822,7 +824,7 @@ impl DataNode for DataNodeService {
         insert_dedup(
             &mut state,
             mutation_id.clone(),
-            Arc::from(request.key.as_slice()),
+            record_key,
             fingerprint,
             version.clone(),
             true,
@@ -1070,13 +1072,6 @@ impl DataNode for DataNodeService {
                         "source range retry conflicts with the prepared specification",
                     ));
                 }
-                let mut ready = existing.snapshot_ready.subscribe();
-                drop(state);
-                if !*ready.borrow() {
-                    ready.changed().await.map_err(|_| {
-                        Status::aborted("source snapshot preparation was cancelled")
-                    })?;
-                }
                 return Ok(Response::new(PrepareSourceRangeResponse {
                     process_instance_id: self.process_instance_id.clone(),
                 }));
@@ -1086,24 +1081,24 @@ impl DataNode for DataNodeService {
             // for the size of the range rather than the size of the node. Values
             // are materialized later, one bounded page at a time, by
             // `read_snapshot_page`.
-            let snapshot_keys = state.record_keys_in_range(&range);
+            let snapshot_keys = state
+                .record_keys_in_range(&range)
+                .into_iter()
+                .map(|(_, key)| key)
+                .collect();
             let snapshot_dedup_ids = state.dedup_ids_in_range(&range);
-            state.debug_assert_index();
-            let (ready, _) = watch::channel(false);
             state.sources.insert(
                 key.clone(),
                 SourceMigration {
                     range: range.clone(),
-                    snapshot_keys: Some(snapshot_keys),
+                    snapshot_keys,
                     snapshot_dedup_ids,
-                    snapshot_ready: ready.clone(),
                     journal: Vec::new(),
                     journal_bytes: 0,
                     watermark: 0,
                     writes_paused: false,
                 },
             );
-            ready.send_replace(true);
         }
         Ok(Response::new(PrepareSourceRangeResponse {
             process_instance_id: self.process_instance_id.clone(),
@@ -1201,10 +1196,7 @@ impl DataNode for DataNodeService {
             .sources
             .get(&(request.change_id, request.range_id))
             .ok_or_else(|| Status::not_found("source migration not prepared"))?;
-        let snapshot_keys = source
-            .snapshot_keys
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("source snapshot is still being prepared"))?;
+        let snapshot_keys = &source.snapshot_keys;
         let start = usize::try_from(request.cursor)
             .map_err(|_| Status::invalid_argument("snapshot cursor is too large"))?;
         if start > snapshot_keys.len() {
@@ -1252,11 +1244,6 @@ impl DataNode for DataNodeService {
             .sources
             .get(&(request.change_id, request.range_id))
             .ok_or_else(|| Status::not_found("source migration not prepared"))?;
-        if source.snapshot_keys.is_none() {
-            return Err(Status::unavailable(
-                "source snapshot is still being prepared",
-            ));
-        }
         let ids = &source.snapshot_dedup_ids;
         let start = usize::try_from(request.cursor)
             .map_err(|_| Status::invalid_argument("dedup cursor is too large"))?;
@@ -1489,7 +1476,7 @@ impl DataNode for DataNodeService {
         let records: HashMap<_, _> = state
             .record_keys_in_range(&source.range)
             .into_iter()
-            .filter_map(|key| {
+            .filter_map(|(_, key)| {
                 state
                     .records
                     .get(&key)
@@ -1575,8 +1562,8 @@ impl DataNode for DataNodeService {
         // Only the range's own records leave this node, taken from the token
         // index. The previous `records.retain` hashed every key on the node while
         // holding this write lock.
-        for record_key in state.record_keys_in_range(&range) {
-            state.remove_record(&record_key);
+        for (token, record_key) in state.record_keys_in_range(&range) {
+            state.remove_record_at(token, &record_key);
         }
         for (key, record) in records {
             let token = state.token_of(&key);
@@ -1637,23 +1624,21 @@ impl DataNode for DataNodeService {
         let Some(range) = state.sources.get(&key).map(|source| source.range.clone()) else {
             return Ok(Response::new(proto::Empty {}));
         };
-        let topology = state.topology.clone();
         // The replica check now runs on the range's keys instead of on every
         // key this node holds.
         let keys: Vec<_> = state
             .record_keys_in_range(&range)
             .into_iter()
-            .filter(|record_key| {
-                let token = topology.key_token(record_key);
-                topology
-                    .replica_node_ids_for_token(token)
+            .filter(|(token, _)| {
+                state
+                    .topology
+                    .replica_node_ids_for_token(*token)
                     .is_ok_and(|replicas| !replicas.contains(&self.node_id.as_str()))
             })
             .collect();
-        for record_key in keys {
-            state.remove_record(&record_key);
+        for (token, record_key) in keys {
+            state.remove_record_at(token, &record_key);
         }
-        state.debug_assert_index();
         if let Some(source) = state.sources.remove(&key) {
             state.journal_bytes_total = state
                 .journal_bytes_total
