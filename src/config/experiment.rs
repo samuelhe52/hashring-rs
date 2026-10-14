@@ -3,10 +3,13 @@
 use std::{num::NonZeroUsize, path::PathBuf};
 
 use anyhow::{Result, bail};
-use hashring_coordinator::DEFAULT_RANGE_MOVE_CONCURRENCY;
+use hashring_coordinator::{
+    DEFAULT_PREPUBLICATION_FAILURE_GRACE, DEFAULT_RANGE_MOVE_CONCURRENCY,
+    DEFAULT_REPLICA_REPAIR_CONCURRENCY,
+};
 use hashring_core::topology::{
-    DEFAULT_DESIRED_REPLICATION_FACTOR, DEFAULT_MINIMUM_ADMITTED_COPIES,
-    DEFAULT_MINIMUM_HEALTHY_FOLLOWERS,
+    DEFAULT_DESIRED_REPLICATION_FACTOR, DEFAULT_MAX_REPLICA_LAG_MILLIS,
+    DEFAULT_MINIMUM_ADMITTED_COPIES, DEFAULT_MINIMUM_HEALTHY_FOLLOWERS,
 };
 use hashring_experiment::{ExperimentConfig, ExperimentMode};
 use serde::Deserialize;
@@ -37,14 +40,18 @@ pub struct ExperimentFile {
     pub operation_timeout_ms: Option<u64>,
     pub migration_timeout_ms: Option<u64>,
     pub range_move_concurrency: Option<usize>,
+    pub replica_repair_concurrency: Option<NonZeroUsize>,
+    pub prepublication_failure_grace_ms: Option<u64>,
     pub pre_publish_delay_ms: Option<u64>,
     pub require_clean_source: Option<bool>,
     pub verbose: Option<bool>,
     pub desired_replication_factor: Option<u32>,
     pub minimum_admitted_copies: Option<u32>,
     pub minimum_healthy_followers: Option<u32>,
+    pub max_replica_lag_ms: Option<u64>,
     pub policy: Option<PolicyArg>,
     pub worker_threads: Option<NonZeroUsize>,
+    pub coordinator_worker_threads: Option<NonZeroUsize>,
     pub max_dedup_bytes: Option<usize>,
     pub max_pending_replication_bytes: Option<usize>,
     pub max_migration_journal_bytes: Option<usize>,
@@ -133,6 +140,14 @@ pub fn resolve(
             .range_move_concurrency
             .or(file.range_move_concurrency)
             .unwrap_or(DEFAULT_RANGE_MOVE_CONCURRENCY),
+        replica_repair_concurrency: args
+            .replica_repair_concurrency
+            .or(file.replica_repair_concurrency)
+            .map_or(DEFAULT_REPLICA_REPAIR_CONCURRENCY, NonZeroUsize::get),
+        prepublication_failure_grace_ms: args
+            .prepublication_failure_grace_ms
+            .or(file.prepublication_failure_grace_ms)
+            .unwrap_or(DEFAULT_PREPUBLICATION_FAILURE_GRACE.as_millis() as u64),
         pre_publish_delay_ms: args
             .pre_publish_delay_ms
             .or(file.pre_publish_delay_ms)
@@ -145,6 +160,10 @@ pub fn resolve(
             node_count,
             cpus,
         ),
+        coordinator_worker_threads: args
+            .coordinator_worker_threads
+            .or(file.coordinator_worker_threads)
+            .map(NonZeroUsize::get),
         desired_replication_factor: args
             .desired_replication_factor
             .or(file.desired_replication_factor)
@@ -157,6 +176,10 @@ pub fn resolve(
             .minimum_healthy_followers
             .or(file.minimum_healthy_followers)
             .unwrap_or(DEFAULT_MINIMUM_HEALTHY_FOLLOWERS),
+        max_replica_lag_ms: args
+            .max_replica_lag_ms
+            .or(file.max_replica_lag_ms)
+            .unwrap_or(DEFAULT_MAX_REPLICA_LAG_MILLIS),
         write_ack_policy: policy.into(),
         node: node::options(&node_settings),
     })
@@ -255,6 +278,12 @@ mod tests {
             config.range_move_concurrency,
             DEFAULT_RANGE_MOVE_CONCURRENCY
         );
+        assert_eq!(
+            config.replica_repair_concurrency,
+            DEFAULT_REPLICA_REPAIR_CONCURRENCY
+        );
+        assert_eq!(config.max_replica_lag_ms, DEFAULT_MAX_REPLICA_LAG_MILLIS);
+        assert_eq!(config.coordinator_worker_threads, None);
         assert!(matches!(config.write_ack_policy, WriteAckPolicy::OwnerOnly));
     }
 

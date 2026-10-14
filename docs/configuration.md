@@ -35,6 +35,9 @@ The examples list every key: [`coordinator.yaml`](../examples/coordinator.yaml),
 | `--state` | `state` | `./coordinator.redb` | process | The durable store. |
 | `--migration-timeout-ms` | `migration_timeout_ms` | 120000 | process | Bounds one membership change. |
 | `--range-move-concurrency` | `range_move_concurrency` | 16 | process | Disjoint ranges moved at once in one change. |
+| `--replica-repair-concurrency` | `replica_repair_concurrency` | 4 | process | Follower groups seeded, merged, or repaired at once, and ranges copied at once within one group. Independent of `--range-move-concurrency`. |
+| `--prepublication-failure-grace-ms` | `prepublication_failure_grace_ms` | 30000 | process | How long a migration participant may stay unreachable before publication before the coordinator recovers the change without it. After publication, the lease duration applies instead. |
+| `--worker-threads` | `worker_threads` | one per available CPU | process | |
 | `--member` | `members` | none | bootstrap | `NODE_ID=ENDPOINT`; in YAML a list of `{node_id, endpoint}`. Explicit flags must match an existing store. |
 | `--seed` | `seed` | 1 | bootstrap | Hash seed. |
 | `--virtual-nodes` | `virtual_nodes` | 128 | bootstrap | Per member. |
@@ -81,7 +84,8 @@ replaced during the run.
 | `--verbose` | `verbose` | off | experiment | |
 | `--policy` | `policy` | `first-successor` for availability, `owner-only` otherwise | experiment | ACK policy. |
 | `--worker-threads` | `worker_threads` | CPUs / (nodes + 2), at least 2 | process | For the driver and each node. |
-| `--seed`, `--virtual-nodes`, `--range-move-concurrency`, `--desired-replication-factor`, `--minimum-admitted-copies`, `--minimum-healthy-followers` | as for `coordinator` | as for `coordinator` | as for `coordinator` | Passed to the run's coordinator. |
+| `--coordinator-worker-threads` | `coordinator_worker_threads` | one per available CPU | process | For the run's coordinator, which is not on the data path. |
+| `--seed`, `--virtual-nodes`, `--range-move-concurrency`, `--replica-repair-concurrency`, `--prepublication-failure-grace-ms`, `--desired-replication-factor`, `--minimum-admitted-copies`, `--minimum-healthy-followers`, `--max-replica-lag-ms` | as for `coordinator` | as for `coordinator` | as for `coordinator` | Passed to the run's coordinator. |
 | `--max-dedup-bytes`, `--max-pending-replication-bytes`, `--max-migration-journal-bytes`, `--replication-stream-queue-capacity`, `--required-ack-timeout-ms`, `--replication-rpc-timeout-ms` | as for `node` | as for `node` | per node | Passed to every node of the run. |
 
 ## Client and admin commands

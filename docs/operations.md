@@ -107,12 +107,11 @@ budgets and worker threads, are listed with their defaults in
 | Lease duration / renewal interval | 5 s / 1 s |
 | Failure detection interval | 1 s |
 | Repair and recovery interval | 5 s |
-| Repair groups per pass / concurrently | 32 / 4 |
+| Repair groups per pass | 32 |
 | Repair retry backoff cap | 60 s (exponential, per group) |
 | Deduplication receipt retention | 60 s |
 | Migration snapshot page | 8 MiB |
 | Control-plane message limit | 64 MiB |
-| Tokio workers: `coordinator` | one per available CPU |
 | Tokio workers: client and admin commands | single-threaded |
 
 The cluster-size limits in the README (1,024 members, 4,096 virtual nodes per

@@ -3,7 +3,7 @@ use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf, sync::Arc, time::Du
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use config::{
-    coordinator::{CoordinatorFile, CoordinatorSettings, MemberSource},
+    coordinator::{CoordinatorSettings, MemberSource},
     node::NodeConfig,
 };
 use hashring_client::HashringClient;
@@ -99,6 +99,17 @@ struct CoordinatorArgs {
     /// change. [default: 16]
     #[arg(long)]
     range_move_concurrency: Option<NonZeroUsize>,
+    /// Follower groups seeded, merged, or repaired at once, and ranges copied
+    /// at once within one group. [default: 4]
+    #[arg(long)]
+    replica_repair_concurrency: Option<NonZeroUsize>,
+    /// How long a migration participant may stay unreachable before
+    /// publication before the change is recovered without it. [default: 30000]
+    #[arg(long)]
+    prepublication_failure_grace_ms: Option<u64>,
+    /// Tokio worker threads. [default: one per available CPU]
+    #[arg(long)]
+    worker_threads: Option<NonZeroUsize>,
     #[arg(long, default_value_t = 0, hide = true)]
     pre_publish_delay_ms: u64,
     #[arg(long, default_value_t = 0, hide = true)]
@@ -344,6 +355,12 @@ struct ExperimentArgs {
     /// topology change. [default: 16]
     #[arg(long)]
     range_move_concurrency: Option<usize>,
+    /// Follower groups seeded, merged, or repaired at once. [default: 4]
+    #[arg(long)]
+    replica_repair_concurrency: Option<NonZeroUsize>,
+    /// [default: 30000]
+    #[arg(long)]
+    prepublication_failure_grace_ms: Option<u64>,
     /// Deterministic pre-publication observation window for migration stress
     /// runs. [default: 250]
     #[arg(long)]
@@ -363,6 +380,9 @@ struct ExperimentArgs {
     /// [default: 0]
     #[arg(long)]
     minimum_healthy_followers: Option<u32>,
+    /// [default: 5000]
+    #[arg(long)]
+    max_replica_lag_ms: Option<u64>,
     /// [default: first-successor for availability, owner-only otherwise]
     #[arg(long, value_enum)]
     policy: Option<PolicyArg>,
@@ -370,6 +390,9 @@ struct ExperimentArgs {
     /// [default: the CPU count divided by peak nodes + 2, at least 2]
     #[arg(long)]
     worker_threads: Option<NonZeroUsize>,
+    /// Tokio worker threads for the run's coordinator. [default: one per CPU]
+    #[arg(long)]
+    coordinator_worker_threads: Option<NonZeroUsize>,
     /// Forwarded to every data node the run starts.
     #[command(flatten)]
     node_tuning: NodeTuningArgs,
@@ -378,29 +401,44 @@ struct ExperimentArgs {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cpus = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
-    // The experiment's config file decides its runtime size, so it is resolved
-    // before the runtime is built.
-    if let Command::Experiment(args) = &cli.command {
-        let file = args.config.as_deref().map(config::load).transpose()?;
-        let config = config::experiment::resolve(args, file, cpus)?;
-        init_tracing(config.verbose)?;
-        return build_runtime(Some(config.worker_threads))?.block_on(run_local_experiment(config));
-    }
-    // A node's config file can set its runtime size too.
-    if let Command::Node(args) = &cli.command {
-        let file = args.config.as_deref().map(config::load).transpose()?;
-        let config = config::node::resolve(args, file)?;
-        init_tracing(false)?;
-        return build_runtime(Some(config.runtime_workers(cpus)))?
-            .block_on(run_node(config, args.stop_response_delay_ms));
+    // A long-running command's config file can set its runtime size, so its
+    // settings are resolved before the runtime is built.
+    match &cli.command {
+        Command::Experiment(args) => {
+            let file = args.config.as_deref().map(config::load).transpose()?;
+            let config = config::experiment::resolve(args, file, cpus)?;
+            init_tracing(config.verbose)?;
+            return build_runtime(Some(config.worker_threads))?
+                .block_on(run_local_experiment(config));
+        }
+        Command::Node(args) => {
+            let file = args.config.as_deref().map(config::load).transpose()?;
+            let config = config::node::resolve(args, file)?;
+            init_tracing(false)?;
+            return build_runtime(Some(config.runtime_workers(cpus)))?
+                .block_on(run_node(config, args.stop_response_delay_ms));
+        }
+        Command::Coordinator(args) => {
+            let file = args.config.as_deref().map(config::load).transpose()?;
+            let settings = config::coordinator::resolve(args, file)?;
+            init_tracing(false)?;
+            return build_runtime(Some(settings.runtime_workers(cpus)))?.block_on(run_coordinator(
+                settings,
+                args.pre_publish_delay_ms,
+                args.post_publish_delay_ms,
+            ));
+        }
+        _ => {}
     }
     init_tracing(false)?;
-    build_runtime(runtime_threads(&cli.command, cpus))?.block_on(run(cli.command))
+    // One-shot client and admin commands issue a few RPCs and need no worker pool.
+    build_runtime(None)?.block_on(run(cli.command))
 }
 
 /// Built explicitly rather than via #[tokio::main] so each role can size its
-/// own runtime; see docs/optimizations/worker-pool-sizing.md. `None` builds a
-/// single-threaded runtime.
+/// own runtime; see docs/optimizations/worker-pool-sizing.md. Servers default
+/// to one worker per available CPU because in a deployment they own their
+/// machine. `None` builds a single-threaded runtime.
 fn build_runtime(worker_threads: Option<usize>) -> Result<tokio::runtime::Runtime> {
     let mut builder = match worker_threads {
         Some(workers) => {
@@ -411,18 +449,6 @@ fn build_runtime(worker_threads: Option<usize>) -> Result<tokio::runtime::Runtim
         None => tokio::runtime::Builder::new_current_thread(),
     };
     Ok(builder.enable_all().build()?)
-}
-
-/// Worker threads for the process's runtime, or `None` for a single-threaded
-/// runtime. Servers take one worker per available CPU because in a deployment
-/// they own their machine. One-shot client and admin commands issue a few RPCs
-/// and need no worker pool. The node and experiment commands size their
-/// runtimes from their resolved settings, which a config file can set.
-fn runtime_threads(command: &Command, cpus: usize) -> Option<usize> {
-    match command {
-        Command::Coordinator(_) => Some(cpus),
-        _ => None,
-    }
 }
 
 fn init_tracing(verbose_experiment: bool) -> Result<()> {
@@ -436,7 +462,6 @@ fn init_tracing(verbose_experiment: bool) -> Result<()> {
 
 async fn run(command: Command) -> Result<()> {
     match command {
-        Command::Coordinator(args) => run_coordinator(args).await,
         Command::Put(args) => run_put(args).await,
         Command::Get(args) => run_get(args).await,
         Command::Delete(args) => run_delete(args).await,
@@ -447,8 +472,8 @@ async fn run(command: Command) -> Result<()> {
         Command::ChangeStatus(args) => run_change_status(args).await,
         Command::ReplicaStatus(args) => run_replica_status(args).await,
         Command::ExecuteChange(args) => run_execute_change(args).await,
-        Command::Node(_) | Command::Experiment(_) => {
-            unreachable!("main runs the node and experiment commands")
+        Command::Coordinator(_) | Command::Node(_) | Command::Experiment(_) => {
+            unreachable!("main runs the long-running commands")
         }
     }
 }
@@ -459,13 +484,11 @@ async fn run_local_experiment(config: ExperimentConfig) -> Result<()> {
     Ok(())
 }
 
-async fn run_coordinator(args: CoordinatorArgs) -> Result<()> {
-    let file = args
-        .config
-        .as_deref()
-        .map(config::load::<CoordinatorFile>)
-        .transpose()?;
-    let settings = config::coordinator::resolve(&args, file)?;
+async fn run_coordinator(
+    settings: CoordinatorSettings,
+    pre_publish_delay_ms: u64,
+    post_publish_delay_ms: u64,
+) -> Result<()> {
     let repository = Arc::new(
         RedbTopologyRepository::open(&settings.state)
             .with_context(|| format!("opening {}", settings.state.display()))?,
@@ -479,6 +502,7 @@ async fn run_coordinator(args: CoordinatorArgs) -> Result<()> {
         members = state.committed.members.len(),
         active_change = state.active_change.is_some(),
         range_move_concurrency = settings.range_move_concurrency.get(),
+        replica_repair_concurrency = settings.replica_repair_concurrency.get(),
         "coordinator ready"
     );
     let service = CoordinatorService::new(
@@ -487,8 +511,12 @@ async fn run_coordinator(args: CoordinatorArgs) -> Result<()> {
         Duration::from_millis(settings.migration_timeout_ms),
     )
     .with_range_move_concurrency(settings.range_move_concurrency.get())
-    .with_pre_publish_delay(Duration::from_millis(args.pre_publish_delay_ms))
-    .with_post_publish_delay(Duration::from_millis(args.post_publish_delay_ms));
+    .with_replica_repair_concurrency(settings.replica_repair_concurrency.get())
+    .with_prepublication_failure_grace(Duration::from_millis(
+        settings.prepublication_failure_grace_ms,
+    ))
+    .with_pre_publish_delay(Duration::from_millis(pre_publish_delay_ms))
+    .with_post_publish_delay(Duration::from_millis(post_publish_delay_ms));
     let recovery_service = service.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -816,22 +844,6 @@ async fn shutdown_signal() {
 mod worker_thread_tests {
     use super::*;
 
-    fn command(argv: &[&str]) -> Command {
-        Cli::try_parse_from(argv).unwrap().command
-    }
-
-    #[test]
-    fn each_role_sizes_its_own_runtime() {
-        assert_eq!(
-            runtime_threads(&command(&["hashring-rs", "coordinator"]), 24),
-            Some(24)
-        );
-        assert_eq!(
-            runtime_threads(&command(&["hashring-rs", "topology"]), 24),
-            None
-        );
-    }
-
     #[test]
     fn worker_thread_overrides_must_be_positive() {
         let node = [
@@ -843,17 +855,16 @@ mod worker_thread_tests {
             "127.0.0.1:1",
         ];
         assert!(Cli::try_parse_from(node.iter().chain(&["--worker-threads", "0"])).is_err());
+        let coordinator = ["hashring-rs", "coordinator"];
+        assert!(Cli::try_parse_from(coordinator.iter().chain(&["--worker-threads", "0"])).is_err());
         let experiment = ["hashring-rs", "experiment", "--output", "unused"];
         assert!(Cli::try_parse_from(experiment.iter().chain(&["--worker-threads", "0"])).is_err());
     }
 
     #[test]
-    fn worker_threads_is_not_a_client_or_coordinator_flag() {
+    fn worker_threads_is_not_a_client_flag() {
         assert!(Cli::try_parse_from(["hashring-rs", "--worker-threads", "2", "topology"]).is_err());
         assert!(Cli::try_parse_from(["hashring-rs", "topology", "--worker-threads", "2"]).is_err());
-        assert!(
-            Cli::try_parse_from(["hashring-rs", "coordinator", "--worker-threads", "2"]).is_err()
-        );
     }
 }
 

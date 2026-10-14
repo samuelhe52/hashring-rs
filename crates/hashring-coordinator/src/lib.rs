@@ -52,7 +52,12 @@ fn unix_millis_now() -> u64 {
 pub const DEFAULT_RANGE_MOVE_CONCURRENCY: usize = 16;
 const MAX_REPAIR_GROUPS_PER_PASS: usize = 32;
 const MAX_PENDING_PROBES_PER_PASS: usize = 32;
-const PREPUBLICATION_FAILURE_GRACE: Duration = Duration::from_secs(30);
+/// How long a migration participant may stay unreachable before publication
+/// before the coordinator treats it as failed and recovers the change.
+pub const DEFAULT_PREPUBLICATION_FAILURE_GRACE: Duration = Duration::from_secs(30);
+/// Follower groups seeded, merged, or repaired at once, and ranges copied at
+/// once within one group.
+pub const DEFAULT_REPLICA_REPAIR_CONCURRENCY: usize = 4;
 pub const NODE_LEASE_DURATION: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -499,6 +504,8 @@ pub struct CoordinatorService {
     execution_lock: Arc<Mutex<()>>,
     migration_timeout: Duration,
     range_move_concurrency: usize,
+    replica_repair_concurrency: usize,
+    prepublication_failure_grace: Duration,
     pre_publish_delay: Duration,
     post_publish_delay: Duration,
     lease_grants: Arc<Mutex<BTreeMap<String, NodeLeaseGrant>>>,

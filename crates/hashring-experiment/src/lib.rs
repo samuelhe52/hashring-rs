@@ -47,15 +47,20 @@ pub struct ExperimentConfig {
     pub operation_timeout_ms: u64,
     pub migration_timeout_ms: u64,
     pub range_move_concurrency: usize,
+    pub replica_repair_concurrency: usize,
+    pub prepublication_failure_grace_ms: u64,
     pub pre_publish_delay_ms: u64,
     pub require_clean_source: bool,
     pub verbose: bool,
-    /// Tokio worker threads for the driver and every data node. The coordinator
-    /// keeps its own default; it is not on the data path.
+    /// Tokio worker threads for the driver and every data node.
     pub worker_threads: usize,
+    /// `None` keeps the coordinator's default of one worker per CPU; it is not
+    /// on the data path.
+    pub coordinator_worker_threads: Option<usize>,
     pub desired_replication_factor: u32,
     pub minimum_admitted_copies: u32,
     pub minimum_healthy_followers: u32,
+    pub max_replica_lag_ms: u64,
     pub write_ack_policy: WriteAckPolicy,
     /// Forwarded to every data node the run starts.
     pub node: NodeOptions,
@@ -490,7 +495,16 @@ async fn run_cluster(
         config.migration_timeout_ms.to_string(),
         "--range-move-concurrency".into(),
         config.range_move_concurrency.to_string(),
+        "--replica-repair-concurrency".into(),
+        config.replica_repair_concurrency.to_string(),
+        "--prepublication-failure-grace-ms".into(),
+        config.prepublication_failure_grace_ms.to_string(),
+        "--max-replica-lag-ms".into(),
+        config.max_replica_lag_ms.to_string(),
     ];
+    if let Some(workers) = config.coordinator_worker_threads {
+        coordinator_args.extend(["--worker-threads".into(), workers.to_string()]);
+    }
     coordinator_args.extend([
         "--pre-publish-delay-ms".into(),
         config.pre_publish_delay_ms.to_string(),
@@ -1668,8 +1682,8 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
     );
     ensure!(config.concurrency > 0, "concurrency must be positive");
     ensure!(
-        config.range_move_concurrency > 0,
-        "range_move_concurrency must be positive"
+        config.range_move_concurrency > 0 && config.replica_repair_concurrency > 0,
+        "range_move_concurrency and replica_repair_concurrency must be positive"
     );
     ensure!(config.value_bytes > 0, "value_bytes must be positive");
     ensure!(

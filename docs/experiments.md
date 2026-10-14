@@ -30,7 +30,8 @@ configuration, so a run is reproducible without the file.
 All processes run on one host, so the driver and each data node get an equal
 share of the CPUs: `cpus / (peak_nodes + 2)` tokio workers, at least 2. Override
 it with `experiment --worker-threads N`. The coordinator keeps one worker per
-CPU, since it is not on the data path. See
+CPU, since it is not on the data path (`--coordinator-worker-threads N`
+overrides it). See
 [worker-pool-sizing.md](optimizations/worker-pool-sizing.md) for the evidence.
 
 ## Output
