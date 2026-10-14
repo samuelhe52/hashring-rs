@@ -886,8 +886,9 @@ async fn snapshot_and_changelog_preserve_a_deleted_key_tombstone() {
 async fn deletion_replay_and_commit_remove_stale_destination_data() {
     let mut destination = service();
     destination.node_id = "node-2".into();
-    destination.state.write().await.records.insert(
-        b"key".to_vec(),
+    seed_record(
+        &mut *destination.state.write().await,
+        b"key",
         Record {
             value: Arc::from(b"stale".as_slice()),
             version: RecordVersion {

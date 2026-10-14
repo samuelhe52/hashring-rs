@@ -1,6 +1,13 @@
 use super::*;
 use hashring_core::topology::{Member, TopologyConfig, WriteAvailabilityGuard};
 
+/// Seeds a record into the live map through the same helper the service uses,
+/// so tests that build state by hand also maintain the token index.
+fn seed_record(state: &mut NodeState, key: &[u8], record: Record) {
+    let token = state.token_of(key);
+    state.insert_record(Arc::from(key), token, record);
+}
+
 fn service() -> DataNodeService {
     let topology = TopologySnapshot::new_with_config(
         1,
@@ -30,6 +37,7 @@ fn service_for(node_id: &str, topology: TopologySnapshot) -> DataNodeService {
     let state = Arc::new(RwLock::new(NodeState {
         topology,
         records: HashMap::new(),
+        records_by_token: TokenIndex::default(),
         next_sequence: 0,
         owner_stream_sequences: HashMap::new(),
         owner_stream_unacked: HashMap::new(),
@@ -46,6 +54,7 @@ fn service_for(node_id: &str, topology: TopologySnapshot) -> DataNodeService {
         )),
         policy_write_fence: None,
         dedup: HashMap::new(),
+        dedup_by_token: TokenIndex::default(),
         dedup_expirations: BinaryHeap::new(),
         dedup_bytes: 0,
         dedup_peak_bytes: 0,
@@ -176,5 +185,6 @@ fn range(end_inclusive: u64) -> proto::RangeSpec {
     }
 }
 
+mod index;
 mod migration;
 mod replication;

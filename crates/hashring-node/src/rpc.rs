@@ -119,10 +119,11 @@ fn apply_replication_entry(
     }
     let mutation_id = entry.mutation_id.clone();
     let dedup_key: Arc<[u8]> = Arc::from(entry.key.as_slice());
+    let token = state.token_of(&entry.key);
 
-    apply_internal_record(
-        &mut state.records,
-        entry.key,
+    state.apply_record(
+        dedup_key.clone(),
+        token,
         Record {
             value: entry.value.into(),
             version: version.clone(),
@@ -177,7 +178,7 @@ impl DataNode for DataNodeService {
         }
         let Some(record) = state
             .records
-            .get(&request.key)
+            .get(request.key.as_slice())
             .filter(|record| !record.deleted)
         else {
             return Ok(Response::new(GetResponse {
@@ -480,7 +481,8 @@ impl DataNode for DataNodeService {
             version: version.clone(),
             deleted: false,
         };
-        state.records.insert(request.key.clone(), record.clone());
+        let record_key: Arc<[u8]> = Arc::from(request.key.as_slice());
+        state.insert_record(record_key.clone(), token, record.clone());
         for source in state
             .sources
             .values_mut()
@@ -504,7 +506,7 @@ impl DataNode for DataNodeService {
         insert_dedup(
             &mut state,
             mutation_id.clone(),
-            Arc::from(request.key.as_slice()),
+            record_key,
             fingerprint,
             version.clone(),
             false,
@@ -786,9 +788,9 @@ impl DataNode for DataNodeService {
                 .or_default()
                 .push_back((entry.stream_sequence, now));
         }
-        apply_internal_record(
-            &mut state.records,
-            request.key.clone(),
+        state.apply_record(
+            Arc::from(request.key.as_slice()),
+            token,
             Record {
                 value: Arc::from([]),
                 version: version.clone(),
@@ -1058,7 +1060,7 @@ impl DataNode for DataNodeService {
             ));
         }
         let key = range.key();
-        let (all_keys, dedup_keys, topology, ready) = {
+        {
             let mut state = self.state.write().await;
             if let Some(existing) = state.sources.get(&key) {
                 if existing.range != range {
@@ -1077,20 +1079,21 @@ impl DataNode for DataNodeService {
                     process_instance_id: self.process_instance_id.clone(),
                 }));
             }
-            let all_keys = state.records.keys().cloned().collect::<Vec<_>>();
-            let dedup_keys = state
-                .dedup
-                .iter()
-                .map(|(id, entry)| (id.clone(), entry.key.clone()))
-                .collect::<Vec<_>>();
-            let topology = state.topology.clone();
+            // The token indices answer "which of my keys and receipts are in this
+            // range" without hashing the whole key set, so the write lock is held
+            // for the size of the range rather than the size of the node. Values
+            // are materialized later, one bounded page at a time, by
+            // `read_snapshot_page`.
+            let snapshot_keys = state.record_keys_in_range(&range);
+            let snapshot_dedup_ids = state.dedup_ids_in_range(&range);
+            state.debug_assert_index();
             let (ready, _) = watch::channel(false);
             state.sources.insert(
                 key.clone(),
                 SourceMigration {
                     range: range.clone(),
-                    snapshot_keys: None,
-                    snapshot_dedup_ids: Vec::new(),
+                    snapshot_keys: Some(snapshot_keys),
+                    snapshot_dedup_ids,
                     snapshot_ready: ready.clone(),
                     journal: Vec::new(),
                     journal_bytes: 0,
@@ -1098,41 +1101,8 @@ impl DataNode for DataNodeService {
                     writes_paused: false,
                 },
             );
-            (all_keys, dedup_keys, topology, ready)
-        };
-        let mut preparation = SnapshotPreparationGuard {
-            state: self.state.clone(),
-            key: Some(key.clone()),
-        };
-
-        // Only keys are captured while traffic is locked. Filtering and sorting
-        // happen outside the lock, and values are materialized one bounded page
-        // at a time by `read_snapshot_page`.
-        let mut snapshot_keys: Vec<_> = all_keys
-            .into_iter()
-            .filter(|record_key| range.contains(topology.key_token(record_key)))
-            .collect();
-        snapshot_keys.sort();
-        let mut snapshot_dedup_ids: Vec<_> = dedup_keys
-            .into_iter()
-            .filter(|(_, record_key)| range.contains(topology.key_token(record_key)))
-            .map(|(id, _)| id)
-            .collect();
-        snapshot_dedup_ids.sort();
-        let mut state = self.state.write().await;
-        let source = state
-            .sources
-            .get_mut(&key)
-            .ok_or_else(|| Status::aborted("source migration was reset during preparation"))?;
-        if source.range != range {
-            return Err(Status::failed_precondition(
-                "source range changed during preparation",
-            ));
+            ready.send_replace(true);
         }
-        source.snapshot_keys = Some(snapshot_keys);
-        source.snapshot_dedup_ids = snapshot_dedup_ids;
-        ready.send_replace(true);
-        preparation.disarm();
         Ok(Response::new(PrepareSourceRangeResponse {
             process_instance_id: self.process_instance_id.clone(),
         }))
@@ -1243,12 +1213,12 @@ impl DataNode for DataNodeService {
         let mut records = Vec::new();
         let mut next_cursor = start;
         for key in &snapshot_keys[start..] {
-            let Some(record) = state.records.get(key) else {
+            let Some(record) = state.records.get(key.as_ref()) else {
                 next_cursor += 1;
                 continue;
             };
             let record = MigrationRecord {
-                key: key.clone(),
+                key: key.to_vec(),
                 value: record.value.to_vec(),
                 version: Some(record.version.clone()),
                 deleted: record.deleted,
@@ -1494,11 +1464,17 @@ impl DataNode for DataNodeService {
             .get(&(request.change_id, request.range_id))
             .ok_or_else(|| Status::not_found("source migration not prepared"))?;
         let watermark = source.watermark;
+        // Only the range's own records, taken from the token index rather than
+        // by hashing every key on this node.
         let records: HashMap<_, _> = state
-            .records
-            .iter()
-            .filter(|(key, _)| source.range.contains(state.topology.key_token(key)))
-            .map(|(key, record)| (key.clone(), record.clone()))
+            .record_keys_in_range(&source.range)
+            .into_iter()
+            .filter_map(|key| {
+                state
+                    .records
+                    .get(&key)
+                    .map(|record| (key.to_vec(), record.clone()))
+            })
             .collect();
         drop(state);
         Ok(Response::new(range_digest(&records, watermark)))
@@ -1576,12 +1552,15 @@ impl DataNode for DataNodeService {
                 "destination deduplication receipt store is full",
             ));
         }
-        let topology = state.topology.clone();
-        state
-            .records
-            .retain(|record_key, _| !range.contains(topology.key_token(record_key)));
+        // Only the range's own records leave this node, taken from the token
+        // index. The previous `records.retain` hashed every key on the node while
+        // holding this write lock.
+        for record_key in state.record_keys_in_range(&range) {
+            state.remove_record(&record_key);
+        }
         for (key, record) in records {
-            apply_internal_record(&mut state.records, key, record);
+            let token = state.token_of(&key);
+            state.apply_record(Arc::from(key.as_slice()), token, record);
         }
         for (id, staged) in dedup {
             if state.dedup.contains_key(id.as_str()) {
@@ -1639,21 +1618,22 @@ impl DataNode for DataNodeService {
             return Ok(Response::new(proto::Empty {}));
         };
         let topology = state.topology.clone();
+        // The replica check now runs on the range's keys instead of on every
+        // key this node holds.
         let keys: Vec<_> = state
-            .records
-            .keys()
+            .record_keys_in_range(&range)
+            .into_iter()
             .filter(|record_key| {
                 let token = topology.key_token(record_key);
-                range.contains(token)
-                    && topology
-                        .replica_node_ids_for_token(token)
-                        .is_ok_and(|replicas| !replicas.contains(&self.node_id.as_str()))
+                topology
+                    .replica_node_ids_for_token(token)
+                    .is_ok_and(|replicas| !replicas.contains(&self.node_id.as_str()))
             })
-            .cloned()
             .collect();
         for record_key in keys {
-            state.records.remove(&record_key);
+            state.remove_record(&record_key);
         }
+        state.debug_assert_index();
         if let Some(source) = state.sources.remove(&key) {
             state.journal_bytes_total = state
                 .journal_bytes_total

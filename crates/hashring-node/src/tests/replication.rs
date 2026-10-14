@@ -53,7 +53,9 @@ async fn follower_applies_only_contiguous_authorized_replication() {
         .into_inner();
     assert_eq!(applied.applied_stream_sequence, 1);
     assert_eq!(
-        service.state.read().await.records[&key].value.as_ref(),
+        service.state.read().await.records[key.as_slice()]
+            .value
+            .as_ref(),
         b"value"
     );
     let client_read = service
@@ -110,7 +112,7 @@ async fn follower_applies_only_contiguous_authorized_replication() {
         .unwrap()
         .into_inner();
     assert_eq!(applied.applied_stream_sequence, 2);
-    assert!(service.state.read().await.records[&key].deleted);
+    assert!(service.state.read().await.records[key.as_slice()].deleted);
 }
 
 #[tokio::test]
@@ -131,7 +133,7 @@ async fn follower_applies_a_replication_batch_in_order() {
     assert_eq!(applied.applied_stream_sequence, 3);
     let owner_node_id = topology.owner(&key).unwrap().node_id.clone();
     let state = service.state.read().await;
-    assert!(state.records[&key].deleted);
+    assert!(state.records[key.as_slice()].deleted);
     assert_eq!(
         state
             .follower_streams
@@ -160,7 +162,9 @@ async fn replication_batch_acknowledges_prefix_before_a_gap() {
             .into_inner();
         assert_eq!(response.applied_stream_sequence, 1);
         assert_eq!(
-            service.state.read().await.records[&key].value.as_ref(),
+            service.state.read().await.records[key.as_slice()]
+                .value
+                .as_ref(),
             b"one"
         );
     }
@@ -258,7 +262,14 @@ async fn full_stream_checkpoint_repairs_a_gap_without_replaying_old_entries() {
             .applied_stream_sequence,
         5
     );
-    assert!(!follower.state.read().await.records.contains_key(&key));
+    assert!(
+        !follower
+            .state
+            .read()
+            .await
+            .records
+            .contains_key(key.as_slice())
+    );
     let gap = replication_entry(&topology, key.clone(), 7, 7, b"gap", false);
     assert_eq!(
         follower
@@ -274,7 +285,9 @@ async fn full_stream_checkpoint_repairs_a_gap_without_replaying_old_entries() {
         .await
         .unwrap();
     assert_eq!(
-        follower.state.read().await.records[&key].value.as_ref(),
+        follower.state.read().await.records[key.as_slice()]
+            .value
+            .as_ref(),
         b"current"
     );
 }
@@ -498,6 +511,7 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
     let mut state = NodeState {
         topology,
         records: HashMap::new(),
+        records_by_token: TokenIndex::default(),
         next_sequence: 0,
         owner_stream_sequences: HashMap::new(),
         owner_stream_unacked: HashMap::new(),
@@ -511,6 +525,7 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
         lease: Some((1, Instant::now() + std::time::Duration::from_secs(3600))),
         policy_write_fence: None,
         dedup: HashMap::new(),
+        dedup_by_token: TokenIndex::default(),
         dedup_expirations: BinaryHeap::new(),
         dedup_bytes: 0,
         dedup_peak_bytes: 0,
@@ -616,7 +631,7 @@ async fn owner_only_delivers_put_and_delete_to_follower_in_order() {
                 .read()
                 .await
                 .records
-                .get(&key)
+                .get(key.as_slice())
                 .is_some_and(|record| record.value.as_ref() == b"replicated")
             {
                 break;
@@ -646,7 +661,10 @@ async fn owner_only_delivers_put_and_delete_to_follower_in_order() {
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             let state = follower_state.read().await;
-            if state.records.get(&key).is_some_and(|record| record.deleted)
+            if state
+                .records
+                .get(key.as_slice())
+                .is_some_and(|record| record.deleted)
                 && state
                     .follower_streams
                     .values()
@@ -688,7 +706,7 @@ async fn owner_only_delivers_put_and_delete_to_follower_in_order() {
                 .follower_streams
                 .values()
                 .any(|stream| stream.applied_sequence == 8)
-                && state.records[&key].version.owner_sequence == 8
+                && state.records[key.as_slice()].version.owner_sequence == 8
             {
                 break;
             }
@@ -819,7 +837,7 @@ async fn dispatcher_resumes_after_a_verified_gap_checkpoint() {
         let records = source_records
             .iter()
             .filter(|(key, _)| spec.contains(topology.key_token(key)))
-            .map(|(key, record)| (key.clone(), record.clone()))
+            .map(|(key, record)| (key.to_vec(), record.clone()))
             .collect();
         follower_state.write().await.destinations.insert(
             spec.key(),
@@ -881,7 +899,7 @@ async fn dispatcher_resumes_after_a_verified_gap_checkpoint() {
                 .follower_streams
                 .values()
                 .any(|stream| stream.applied_sequence == 3)
-                && state.records[&key].value.as_ref() == b"three"
+                && state.records[key.as_slice()].value.as_ref() == b"three"
             {
                 break;
             }
@@ -959,7 +977,7 @@ async fn unavailable_follower_backpressures_before_unbounded_queue_growth() {
     let state = owner.state.read().await;
     assert_eq!(state.next_sequence, successful as u64);
     assert_eq!(
-        state.records[&key].version.owner_sequence,
+        state.records[key.as_slice()].version.owner_sequence,
         successful as u64
     );
     assert_eq!(
@@ -974,8 +992,9 @@ async fn older_replicated_delete_cannot_erase_newer_seeded_value() {
     let key = key_with_placement(&topology, |replicas| replicas[1..].contains(&"node-2"));
     let service = service_for("node-2", topology.clone());
     let owner_node_id = topology.owner(&key).unwrap().node_id.clone();
-    service.state.write().await.records.insert(
-        key.clone(),
+    seed_record(
+        &mut *service.state.write().await,
+        key.as_slice(),
         Record {
             value: Arc::from(b"newer".as_slice()),
             version: RecordVersion {
@@ -993,8 +1012,8 @@ async fn older_replicated_delete_cannot_erase_newer_seeded_value() {
         .await
         .unwrap();
     let state = service.state.read().await;
-    assert_eq!(state.records[&key].value.as_ref(), b"newer");
-    assert!(!state.records[&key].deleted);
+    assert_eq!(state.records[key.as_slice()].value.as_ref(), b"newer");
+    assert!(!state.records[key.as_slice()].deleted);
 }
 
 #[tokio::test]
@@ -1026,8 +1045,9 @@ async fn source_cleanup_retains_records_needed_as_follower_copies() {
     let (snapshot_ready, _) = watch::channel(true);
     {
         let mut state = service.state.write().await;
-        state.records.insert(
-            key.clone(),
+        seed_record(
+            &mut state,
+            key.as_slice(),
             Record {
                 value: Arc::from(b"replica".as_slice()),
                 version: RecordVersion {
@@ -1067,7 +1087,14 @@ async fn source_cleanup_retains_records_needed_as_follower_copies() {
         }))
         .await
         .unwrap();
-    assert!(service.state.read().await.records.contains_key(&key));
+    assert!(
+        service
+            .state
+            .read()
+            .await
+            .records
+            .contains_key(key.as_slice())
+    );
 }
 
 #[tokio::test]
@@ -1596,7 +1623,9 @@ async fn delivery_publishes_partial_ack_and_retries_suffix_after_capacity_return
         2
     );
     assert_eq!(
-        follower_state.read().await.records[&key].value.as_ref(),
+        follower_state.read().await.records[key.as_slice()]
+            .value
+            .as_ref(),
         &[1]
     );
     // Model receipt expiry freeing capacity while the failed suffix is pending.
@@ -1613,7 +1642,9 @@ async fn delivery_publishes_partial_ack_and_retries_suffix_after_capacity_return
     assert_eq!(*progress.borrow(), 2);
     assert!(owner.state.read().await.owner_stream_unacked[&stream].is_empty());
     assert_eq!(
-        follower_state.read().await.records[&key].value.as_ref(),
+        follower_state.read().await.records[key.as_slice()]
+            .value
+            .as_ref(),
         &[2]
     );
     assert!(failed.lock().unwrap().is_empty());
