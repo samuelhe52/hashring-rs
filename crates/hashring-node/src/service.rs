@@ -462,6 +462,14 @@ impl DataNodeService {
                 state.admitted_followers.clear();
                 clear_replica_repair_staging(&mut state);
             }
+            // Same seed invariant as the token indices: the coordinator never reseeds
+            // the ring (see `hashring_core::migration`), so a snapshot fetched
+            // here must hash keys exactly like the one the indices were built
+            // from.
+            debug_assert_eq!(
+                topology.hash_seed, state.topology.hash_seed,
+                "fetched topology reseeded the ring, so the token index is stale",
+            );
             state.topology = topology;
             state
                 .owner_stream_sequences

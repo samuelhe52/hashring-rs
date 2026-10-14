@@ -1697,6 +1697,15 @@ impl DataNode for DataNodeService {
             state.admitted_followers.clear();
             clear_replica_repair_staging(&mut state);
         }
+        // The token indices are keyed by `TopologySnapshot::key_token`, which
+        // is a function of the key bytes and the snapshot's hash seed. The
+        // coordinator builds every target topology with the committed seed, so
+        // that cannot change here; if it ever does, the indices answer range
+        // queries with stale positions and must be rebuilt.
+        debug_assert_eq!(
+            topology.hash_seed, state.topology.hash_seed,
+            "topology change reseeded the ring, so the token index is stale",
+        );
         state.topology = topology;
         state
             .owner_stream_sequences
