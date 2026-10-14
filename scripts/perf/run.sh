@@ -10,11 +10,14 @@ set -u
 root="$1"; name="$2"; rep="$3"; shift 3
 here="$(cd "$(dirname "$0")" && pwd)"
 bin="${BIN:-$here/../../target/release/hashring-rs}"
+# Absolute, so the sampler can match the driver and the children it spawns
+# from its own executable path whatever the binary is named.
+bin="$(cd "$(dirname "$bin")" && pwd -P)/$(basename "$bin")"
 dir="$root/$name/rep$rep"
 mkdir -p "$root/$name"
 if [ -e "$dir" ]; then echo "SKIP: $dir exists" >&2; exit 3; fi
 [ "${PROFILE_WRITES:-0}" = 1 ] && export HASHRING_PROFILE_WRITES=1
-"$here/cpu-sample.sh" "$dir.cpu.tsv" & sp=$!
+"$here/cpu-sample.sh" "$dir.cpu.tsv" "$bin" & sp=$!
 start=$(date +%s)
 "$bin" experiment --mode performance --nodes 6 --seed 1 "$@" --output "$dir" > "$dir.stdout" 2> "$dir.stderr"
 rc=$?
