@@ -119,11 +119,8 @@ fn apply_replication_entry(
     }
     let mutation_id = entry.mutation_id.clone();
     let dedup_key: Arc<[u8]> = Arc::from(entry.key.as_slice());
-    let token = state.token_of(&entry.key);
-
     state.apply_record(
         dedup_key.clone(),
-        token,
         Record {
             value: entry.value.into(),
             version: version.clone(),
@@ -227,14 +224,17 @@ impl DataNode for DataNodeService {
             }));
         }
         self.refresh_if_newer(request.topology_epoch).await?;
-        // The hash seed is invariant for the process lifetime, so the routing
-        // token and the mutation fingerprint can be computed once and reused by
-        // every check below instead of being recomputed under each lock.
+        // The routing token and the mutation fingerprint are computed once and
+        // reused by every check below instead of being recomputed under each
+        // lock. The token is only valid for the seed it was hashed with, which
+        // the write lock checks again.
         let token;
+        let token_seed;
         let fingerprint = mutation_fingerprint(&request.key, &request.value, false);
         {
             let state = self.state.read().await;
             token = state.topology.key_token(&request.key);
+            token_seed = state.topology.hash_seed;
             if let Some(error) = self.owner_error(&state, token)? {
                 return Ok(Response::new(PutResponse {
                     current_epoch: error.current_epoch,
@@ -291,7 +291,9 @@ impl DataNode for DataNodeService {
                 ..Default::default()
             }));
         }
-        if state.topology.epoch != readiness_epoch {
+        // A reseed at the same epoch moves every key, so the routing token,
+        // ownership and readiness above were computed for a different ring.
+        if state.topology.epoch != readiness_epoch || state.topology.hash_seed != token_seed {
             let error = temporarily_unavailable(
                 state.topology.epoch,
                 "topology changed while checking replica readiness",
@@ -483,7 +485,7 @@ impl DataNode for DataNodeService {
             deleted: false,
         };
         let record_key: Arc<[u8]> = Arc::from(request.key.as_slice());
-        state.insert_record(record_key.clone(), token, record.clone());
+        state.insert_record(record_key.clone(), record.clone());
         for source in state
             .sources
             .values_mut()
@@ -559,10 +561,12 @@ impl DataNode for DataNodeService {
         }
         self.refresh_if_newer(request.topology_epoch).await?;
         let token;
+        let token_seed;
         let fingerprint = mutation_fingerprint(&request.key, &[], true);
         {
             let state = self.state.read().await;
             token = state.topology.key_token(&request.key);
+            token_seed = state.topology.hash_seed;
             if let Some(error) = self.owner_error(&state, token)? {
                 return Ok(Response::new(DeleteResponse {
                     current_epoch: error.current_epoch,
@@ -614,7 +618,9 @@ impl DataNode for DataNodeService {
                 error: Some(error),
             }));
         }
-        if state.topology.epoch != readiness_epoch {
+        // A reseed at the same epoch moves every key, so the routing token,
+        // ownership and readiness above were computed for a different ring.
+        if state.topology.epoch != readiness_epoch || state.topology.hash_seed != token_seed {
             let error = temporarily_unavailable(
                 state.topology.epoch,
                 "topology changed while checking replica readiness",
@@ -794,7 +800,6 @@ impl DataNode for DataNodeService {
         let record_key: Arc<[u8]> = Arc::from(request.key.as_slice());
         state.apply_record(
             record_key.clone(),
-            token,
             Record {
                 value: Arc::from([]),
                 version: version.clone(),
@@ -1566,8 +1571,7 @@ impl DataNode for DataNodeService {
             state.remove_record_at(token, &record_key);
         }
         for (key, record) in records {
-            let token = state.token_of(&key);
-            state.apply_record(Arc::from(key.as_slice()), token, record);
+            state.apply_record(Arc::from(key.as_slice()), record);
         }
         for (id, staged) in dedup {
             if state.dedup.contains_key(id.as_str()) {
@@ -1702,16 +1706,7 @@ impl DataNode for DataNodeService {
             state.admitted_followers.clear();
             clear_replica_repair_staging(&mut state);
         }
-        // The token indices are keyed by `TopologySnapshot::key_token`, which
-        // is a function of the key bytes and the snapshot's hash seed. The
-        // coordinator builds every target topology with the committed seed, so
-        // that cannot change here; if it ever does, the indices answer range
-        // queries with stale positions and must be rebuilt.
-        debug_assert_eq!(
-            topology.hash_seed, state.topology.hash_seed,
-            "topology change reseeded the ring, so the token index is stale",
-        );
-        state.topology = topology;
+        state.set_topology(topology);
         state
             .owner_stream_sequences
             .retain(|(stream_epoch, _), _| *stream_epoch == epoch);

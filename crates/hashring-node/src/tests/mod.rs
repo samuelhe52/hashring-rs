@@ -4,8 +4,7 @@ use hashring_core::topology::{Member, TopologyConfig, WriteAvailabilityGuard};
 /// Seeds a record into the live map through the same helper the service uses,
 /// so tests that build state by hand also maintain the token index.
 fn seed_record(state: &mut NodeState, key: &[u8], record: Record) {
-    let token = state.token_of(key);
-    state.insert_record(Arc::from(key), token, record);
+    state.insert_record(Arc::from(key), record);
 }
 
 fn service() -> DataNodeService {

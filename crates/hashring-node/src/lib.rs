@@ -377,9 +377,9 @@ struct NodeState {
     records: HashMap<Arc<[u8]>, Record>,
     /// The same `Arc` keys as `records`, ordered by
     /// `TopologySnapshot::key_token`. A key's token depends only on its bytes
-    /// and the snapshot's hash seed, and a topology change reuses the committed
-    /// seed (see `hashring_core::migration`), so this index stays correct across
-    /// epochs, members and virtual-node changes without being rebuilt.
+    /// and the snapshot's hash seed, so this index stays correct across epochs,
+    /// members and virtual-node changes; only a reseed rebuilds it (see
+    /// `set_topology`).
     records_by_token: TokenIndex<Arc<[u8]>>,
     next_sequence: u64,
     owner_stream_sequences: HashMap<(u64, String), u64>,
@@ -414,24 +414,52 @@ impl NodeState {
         self.topology.key_token(key)
     }
 
-    fn insert_record(&mut self, key: Arc<[u8]>, token: u64, record: Record) {
+    /// Swaps in a new topology snapshot. The token indices are keyed by
+    /// `TopologySnapshot::key_token`, a function of the key bytes and the hash
+    /// seed. The coordinator reuses the committed seed for every target
+    /// topology (see `hashring_core::migration`), but a recreated coordinator
+    /// picks a fresh one, so a reseed rebuilds both indices rather than leaving
+    /// range queries answering from stale positions.
+    fn set_topology(&mut self, topology: TopologySnapshot) {
+        let reseeded = topology.hash_seed != self.topology.hash_seed;
+        self.topology = topology;
+        if !reseeded {
+            return;
+        }
+        let mut records_by_token = TokenIndex::default();
+        for key in self.records.keys() {
+            records_by_token.insert(self.topology.key_token(key), key.clone());
+        }
+        let mut dedup_by_token = TokenIndex::default();
+        for (id, entry) in &self.dedup {
+            dedup_by_token.insert(self.topology.key_token(&entry.key), id.clone());
+        }
+        self.records_by_token = records_by_token;
+        self.dedup_by_token = dedup_by_token;
+    }
+
+    /// Hashes the key itself rather than trusting a caller's token: a write
+    /// computes its routing token before the write lock, and a reseed in
+    /// between would index the key where no range query looks for it.
+    fn insert_record(&mut self, key: Arc<[u8]>, record: Record) {
         // Replacing an existing key keeps the map's original `Arc`, which the
         // index already holds, so only a new key is indexed. Indexing the new
         // `Arc` instead would leave the map and index with separate copies.
         if self.records.insert(key.clone(), record).is_none() {
+            let token = self.token_of(&key);
             self.records_by_token.insert(token, key);
         }
     }
 
     /// Applies a record only when it is newer than the stored one, matching
     /// [`apply_internal_record`]'s version rule.
-    fn apply_record(&mut self, key: Arc<[u8]>, token: u64, record: Record) -> bool {
+    fn apply_record(&mut self, key: Arc<[u8]>, record: Record) -> bool {
         if self.records.get(&key).is_some_and(|current| {
             crate::migration::compare_versions(&record.version, &current.version).is_le()
         }) {
             return false;
         }
-        self.insert_record(key, token, record);
+        self.insert_record(key, record);
         true
     }
 
@@ -441,8 +469,8 @@ impl NodeState {
         self.remove_record_at(token, key)
     }
 
-    /// [`remove_record`] for a caller that already has the key's token, such
-    /// as one walking [`record_keys_in_range`].
+    /// [`remove_record`] for a caller that already has the key's token from
+    /// [`record_keys_in_range`] under the same lock, so it matches the index.
     fn remove_record_at(&mut self, token: u64, key: &[u8]) -> Option<Record> {
         let removed = self.records.remove(key);
         if removed.is_some() {

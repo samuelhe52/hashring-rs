@@ -102,8 +102,7 @@ async fn record_index_tracks_insert_replace_apply_and_remove() {
     state.debug_assert_index();
 
     // Replacing a key must not leave its old index entry behind.
-    let token = state.token_of(&owned[0]);
-    state.insert_record(Arc::from(owned[0].as_slice()), token, record(9));
+    state.insert_record(Arc::from(owned[0].as_slice()), record(9));
     state.debug_assert_index();
     assert_eq!(state.records_by_token.len(), 32);
     assert_eq!(
@@ -112,9 +111,8 @@ async fn record_index_tracks_insert_replace_apply_and_remove() {
     );
 
     // A stale version is ignored, and must not index the key twice.
-    let token = state.token_of(&owned[1]);
     assert!(
-        !state.apply_record(Arc::from(owned[1].as_slice()), token, record(1)),
+        !state.apply_record(Arc::from(owned[1].as_slice()), record(1)),
         "an older version must not overwrite the stored record",
     );
     state.debug_assert_index();
@@ -132,24 +130,10 @@ async fn record_index_tracks_insert_replace_apply_and_remove() {
     state.debug_assert_index();
 }
 
-#[tokio::test]
-async fn record_index_survives_a_topology_change() {
-    let service = service();
-    let mut state = service.state.write().await;
-    for (index, key) in keys(48).into_iter().enumerate() {
-        seed_record(&mut state, key.as_slice(), record(index as u64 + 1));
-    }
-    let before: Vec<Vec<Vec<u8>>> = ranges()
-        .iter()
-        .map(|range| indexed(&state, range))
-        .collect();
-
-    // A topology change carries the committed hash seed forward, so no key
-    // moves: the index must keep answering the same ranges without a rebuild.
-    let seed = state.topology.hash_seed;
-    let topology = TopologySnapshot::new_with_config(
+fn epoch_two(hash_seed: u64) -> TopologySnapshot {
+    TopologySnapshot::new_with_config(
         2,
-        seed,
+        hash_seed,
         16,
         (0..4)
             .map(|index| Member {
@@ -167,8 +151,25 @@ async fn record_index_survives_a_topology_change() {
             ..TopologyConfig::default()
         },
     )
-    .unwrap();
-    state.topology = topology;
+    .unwrap()
+}
+
+#[tokio::test]
+async fn record_index_survives_a_topology_change() {
+    let service = service();
+    let mut state = service.state.write().await;
+    for (index, key) in keys(48).into_iter().enumerate() {
+        seed_record(&mut state, key.as_slice(), record(index as u64 + 1));
+    }
+    let before: Vec<Vec<Vec<u8>>> = ranges()
+        .iter()
+        .map(|range| indexed(&state, range))
+        .collect();
+
+    // A topology change carries the committed hash seed forward, so no key
+    // moves: the index must keep answering the same ranges without a rebuild.
+    let seed = state.topology.hash_seed;
+    state.set_topology(epoch_two(seed));
     state.debug_assert_index();
 
     for (index, range) in ranges().iter().enumerate() {
@@ -188,6 +189,56 @@ async fn record_index_survives_a_topology_change() {
     assert_eq!(at_epoch_two.len(), 49);
     at_epoch_two.sort();
     assert_eq!(indexed(&state, &spec(0, u64::MAX)), at_epoch_two);
+}
+
+#[tokio::test]
+async fn reseeded_topology_rebuilds_both_indices() {
+    let service = service();
+    let mut state = service.state.write().await;
+    let now = Instant::now();
+    for (index, key) in keys(48).into_iter().enumerate() {
+        seed_record(&mut state, key.as_slice(), record(index as u64 + 1));
+        insert_dedup(
+            &mut state,
+            format!("mutation-{index}"),
+            Arc::from(key.as_slice()),
+            [index as u8; 32],
+            record(index as u64 + 1).version,
+            false,
+            now,
+        );
+    }
+
+    // A recreated coordinator picks a fresh seed, which moves every key.
+    let seed = state.topology.hash_seed.wrapping_add(1);
+    state.set_topology(epoch_two(seed));
+    state.debug_assert_index();
+    for range in ranges() {
+        assert_eq!(indexed(&state, &range), brute_force(&state, &range));
+        let mut brute: Vec<String> = state
+            .dedup
+            .iter()
+            .filter(|(_, entry)| range.contains(state.topology.key_token(&entry.key)))
+            .map(|(id, _)| id.to_string())
+            .collect();
+        brute.sort();
+        let mut indexed: Vec<String> = state
+            .dedup_ids_in_range(&range)
+            .into_iter()
+            .map(|id| id.to_string())
+            .collect();
+        indexed.sort();
+        assert_eq!(indexed, brute, "receipt index kept the old seed's tokens");
+    }
+
+    // A write after the reseed is indexed under the new seed, whatever token
+    // the write path hashed before it took the lock.
+    seed_record(&mut state, b"after-reseed", record(100));
+    state.debug_assert_index();
+    assert_eq!(
+        indexed(&state, &spec(0, 0)),
+        brute_force(&state, &spec(0, 0))
+    );
 }
 
 #[tokio::test]
@@ -276,9 +327,8 @@ async fn overwriting_a_record_keeps_one_copy_of_its_key() {
     let service = service();
     let mut state = service.state.write().await;
     let first: Arc<[u8]> = Arc::from(&b"key"[..]);
-    let token = state.token_of(&first);
-    state.insert_record(first.clone(), token, record(1));
-    state.insert_record(Arc::from(&b"key"[..]), token, record(2));
+    state.insert_record(first.clone(), record(1));
+    state.insert_record(Arc::from(&b"key"[..]), record(2));
     state.debug_assert_index();
 
     let (stored, _) = state.records.get_key_value(&b"key"[..]).unwrap();
