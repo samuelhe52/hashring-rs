@@ -336,3 +336,24 @@ async fn overwriting_a_record_keeps_one_copy_of_its_key() {
     assert!(Arc::ptr_eq(stored, &first));
     assert!(Arc::ptr_eq(&indexed[0].1, &first));
 }
+
+#[tokio::test]
+async fn replacing_a_receipt_releases_its_bytes() {
+    let service = service();
+    let mut state = service.state.write().await;
+    let now = Instant::now();
+    for _ in 0..3 {
+        insert_dedup(
+            &mut state,
+            "mutation-1".into(),
+            Arc::from(&b"key"[..]),
+            [1; 32],
+            record(1).version,
+            false,
+            now,
+        );
+    }
+    assert_eq!(state.dedup.len(), 1);
+    assert_eq!(state.dedup_bytes, state.dedup["mutation-1"].retained_bytes);
+    state.debug_assert_index();
+}
