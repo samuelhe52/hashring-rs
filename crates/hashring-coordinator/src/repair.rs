@@ -674,16 +674,12 @@ impl CoordinatorService {
         final_watermark: u64,
         deadline: Instant,
     ) -> Result<PreparedReplicaSeed, Status> {
-        let verified = self
+        // `finalize_range` has already fetched the source digest and compared it
+        // against the destination's over the same frozen range, so it is handed
+        // back here instead of being fetched a second time.
+        let (verified, digest) = self
             .finalize_range(&copied.change, &copied.range, final_watermark, deadline)
             .await?;
-        let mut source = self
-            .connect_node(&copied.range.source_endpoint, deadline)
-            .await?;
-        let digest = rpc_before(deadline, source.source_range_digest(copied.control.clone()))
-            .await?
-            .into_inner()
-            .digest;
         Ok(PreparedReplicaSeed {
             task: copied.task.clone(),
             control: copied.control,

@@ -156,7 +156,7 @@ impl CoordinatorService {
             self.range_move_concurrency,
             |range| async move {
                 let final_watermark = final_watermarks[&range.range_id];
-                let progress = self
+                let (progress, _source_digest) = self
                     .finalize_range(change_ref, &range, final_watermark, deadline)
                     .await?;
                 self.store_range_progress(&progress).await?;
@@ -739,13 +739,20 @@ impl CoordinatorService {
         .final_watermark)
     }
 
+    /// Returns the range's committed progress and the source digest that was
+    /// just verified against the destination's.
+    ///
+    /// The digest is returned rather than left to be fetched again because it
+    /// was already computed and compared here, and `finish_replica` used to
+    /// issue a second `source_range_digest` round trip immediately afterwards
+    /// purely to read back the same value from the same frozen range.
     pub(super) async fn finalize_range(
         &self,
         change: &TopologyChange,
         range: &RangeMigration,
         final_watermark: u64,
         deadline: Instant,
-    ) -> Result<RangeMigration, Status> {
+    ) -> Result<(RangeMigration, String), Status> {
         let mut source = self.connect_node(&range.source_endpoint, deadline).await?;
         let mut destination = self
             .connect_node(&range.destination_endpoint, deadline)
@@ -789,7 +796,7 @@ impl CoordinatorService {
         let mut progress = range.clone();
         progress.changelog_watermark = final_watermark;
         progress.verified = true;
-        Ok(progress)
+        Ok((progress, source_digest.digest))
     }
 
     pub(super) async fn finish_published_change(

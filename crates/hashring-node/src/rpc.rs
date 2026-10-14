@@ -1471,25 +1471,35 @@ impl DataNode for DataNodeService {
     ) -> Result<Response<RangeDigestResponse>, Status> {
         let request = request.into_inner();
         let state = self.state.read().await;
-        let source = state
-            .sources
-            .get(&(request.change_id, request.range_id))
-            .ok_or_else(|| Status::not_found("source migration not prepared"))?;
-        let watermark = source.watermark;
-        // Only the range's own records, taken from the token index rather than
-        // by hashing every key on this node.
-        let records: HashMap<_, _> = state
-            .record_keys_in_range(&source.range)
+        let (range, watermark) = {
+            let source = state
+                .sources
+                .get(&(request.change_id, request.range_id))
+                .ok_or_else(|| Status::not_found("source migration not prepared"))?;
+            (source.range.clone(), source.watermark)
+        };
+        // `record_keys_in_range` is already in token order, which is the order
+        // `range_digest` requires, so the records are hashed straight out of the
+        // index. This used to collect a `HashMap` of cloned keys and records
+        // first, copying every key of the range before anything was hashed; the
+        // only allocation left is the vector of index handles below, which
+        // shares each key's `Arc` rather than copying its bytes. The read lock
+        // is held across the hashing, which the old code avoided by cloning: the
+        // source range is frozen (`writes_paused`) for the life of the
+        // migration, and nothing else on this node contends for that lock
+        // during the digest.
+        let in_token_order: Vec<_> = state
+            .record_keys_in_range(&range)
             .into_iter()
-            .filter_map(|(_, key)| {
-                state
-                    .records
-                    .get(&key)
-                    .map(|record| (key.to_vec(), record.clone()))
-            })
+            .filter_map(|(_, key)| state.records.get(&key).map(|record| (key, record)))
             .collect();
-        drop(state);
-        Ok(Response::new(range_digest(&records, watermark)))
+        let response = range_digest(
+            in_token_order
+                .iter()
+                .map(|(key, record)| (key.as_ref(), *record)),
+            watermark,
+        );
+        Ok(Response::new(response))
     }
 
     async fn destination_range_digest(
@@ -1502,10 +1512,24 @@ impl DataNode for DataNodeService {
             .destinations
             .get(&(request.change_id, request.range_id))
             .ok_or_else(|| Status::not_found("destination migration not prepared"))?;
-        let records = destination.records.clone();
         let watermark = destination.watermark;
-        drop(state);
-        Ok(Response::new(range_digest(&records, watermark)))
+        // `DestinationMigration::records` is a plain map, so token order has to
+        // be established here rather than read off an index. Sorting by the u64
+        // token compares integers where the old path compared key byte slices,
+        // and it drops the clone of the whole map.
+        let mut by_token: Vec<_> = destination
+            .records
+            .iter()
+            .map(|(key, record)| (state.topology.key_token(key), key, record))
+            .collect();
+        by_token.sort_unstable_by_key(|(token, _, _)| *token);
+        let response = range_digest(
+            by_token
+                .iter()
+                .map(|(_, key, record)| (key.as_slice(), *record)),
+            watermark,
+        );
+        Ok(Response::new(response))
     }
 
     async fn commit_destination_range(

@@ -186,6 +186,7 @@ fn range(end_inclusive: u64) -> proto::RangeSpec {
     }
 }
 
+mod digest_bench;
 mod index;
 mod migration;
 mod replication;
