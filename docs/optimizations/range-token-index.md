@@ -298,6 +298,107 @@ across the mutations they apply, and they only ever read it —
 `Arc<TopologySnapshot>` in `NodeState` would turn those three deep clones into
 reference-count bumps.
 
+### On an 8-core Mac
+
+A second, independent run on different hardware: an Apple M1 Pro (6
+performance and 2 efficiency cores, 16 GB), macOS, release builds without frame
+pointers. `perf` does not exist there, so this run has no cycle shares; it
+checks the externally visible rows. The before binary is `main` at `394b975`,
+the after binary is this branch at `c120f33`, which includes the review fixes
+(bucketed index, reseed handling, write-path seed check). The runs were
+interleaved as above, in two sizes, and all 20 runs passed. The machine was
+shared with other work: the 1-minute load average was between 4.2 and 15.1
+when runs started.
+
+Memory, not cores, sets the size limit. The largest run here used 2.7 GB across
+all its processes for 1M keys, so 10M keys (about 3M records per node) would
+not fit in 16 GB, and the before binary's per-range key copies rule out
+correctness mode at 1M keys.
+
+**Small: 5 and 8 nodes.** The first size keeps records per node close to the
+Linux runs: correctness with 5 nodes (4 → 5 → 4) and 50,000 keys, about
+37k records per node against about 43k; performance with 8 nodes and 250,000
+keys, about 94k records per node against 150k. Both use concurrency 32 and
+otherwise `experiments/experiment_cmach.yaml`'s settings. Peak RSS is the
+largest `ps` sample of any node process, taken every 0.5 s, so short spikes can
+be missed.
+
+Correctness, median (range) of three runs:
+
+| | before | after | after / before |
+| --- | ---: | ---: | ---: |
+| mutations during scale-out | 832 ops/s (821–836) | 1,457 ops/s (1,453–1,483) | **1.75x** |
+| scale-out transition to full RF | 7.61 s (7.57–7.71) | 4.35 s (4.27–4.36) | 0.57x |
+| scale-in transition to full RF | 6.56 s (6.44–6.84) | 2.36 s (2.34–2.39) | 0.36x |
+| whole experiment | 24.4 s (24.4–24.7) | 16.8 s (16.7–16.8) | 0.69x |
+| peak per-node RSS | 718 MiB (674–733) | 76.3 MiB (76.2–76.6) | 0.11x |
+| initial put | 36,290 ops/s (36,127–36,310) | 35,412 ops/s (34,073–35,883) | 0.98x |
+| scale-in mutations | 12,172 ops/s (10,152–12,190) | 11,833 ops/s (11,024–11,858) | 0.97x |
+
+Performance, median (range) of two runs:
+
+| | before | after | after / before |
+| --- | ---: | ---: | ---: |
+| initial put | 27,551 ops/s (27,219–27,884) | 27,022 ops/s (26,761–27,284) | 0.98x |
+| get verify | 68,291 ops/s (67,936–68,646) | 67,993 ops/s (67,871–68,115) | 1.00x |
+| time to full RF after the put | 10.82 s | 10.83 s | 1.00x |
+| peak per-node RSS | 109.0 MiB (108.7–109.3) | 119.8 MiB (118.1–121.6) | 1.10x |
+
+What carries over, and what does not:
+
+**Large: 10 nodes.** Correctness at 10 nodes (9 → 10 → 9) and 100,000 keys,
+the Linux key count; performance at 10 nodes and 1,000,000 keys. Concurrency
+64, as in `experiment_cmach.yaml`.
+
+Correctness, median (range) of three runs:
+
+| | before | after | after / before |
+| --- | ---: | ---: | ---: |
+| mutations during scale-out | 505 ops/s (497–511) | 858 ops/s (857–863) | **1.70x** |
+| scale-out transition to full RF | 12.81 s (12.67–13.02) | 7.55 s (7.50–7.56) | 0.59x |
+| scale-in transition to full RF | 11.69 s (11.55–16.18) | 11.33 s (11.25–11.38) | 0.97x |
+| whole experiment | 47.8 s (47.7–52.8) | 41.9 s (41.7–41.9) | 0.88x |
+| peak per-node RSS | 375 MiB (374–417) | 63.5 MiB (61.6–72.6) | 0.17x |
+| initial put | 31,574 ops/s (31,175–31,687) | 31,185 ops/s (30,806–31,411) | 0.99x |
+| scale-in mutations | 9,885 ops/s (6,586–10,762) | 10,572 ops/s (10,561–10,840) | 1.07x |
+
+Performance, median (range) of two runs:
+
+| | before | after | after / before |
+| --- | ---: | ---: | ---: |
+| initial put | 29,365 ops/s (29,132–29,598) | 28,559 ops/s (28,465–28,652) | 0.97x |
+| get verify | 77,258 ops/s (75,871–78,644) | 79,046 ops/s (78,669–79,423) | 1.02x |
+| time to full RF after the put | 15.94 s | 15.88 s | 1.00x |
+| peak per-node RSS | 289.9 MiB (286.0–293.8) | 310.9 MiB (309.8–312.0) | 1.07x |
+
+What carries over, and what does not:
+
+- **The migration win reproduces in direction, at a smaller size.** Scale-out
+  mutations are 1.75x faster at 5 nodes and 1.70x at 10, rather than 9.8x,
+  with no overlap between the two sides' ranges in either size. With a quarter as many ranges and fewer keys per node, each
+  scan was shorter to begin with, so there was less to remove.
+- **Scale-in's convergence gets faster at 5 nodes (0.36x) but not at 10
+  (0.97x).** At 5 nodes it is the replica repair after the direct merge, which
+  runs the same handlers, as described under Evidence. At 10 nodes the wait is
+  about 11.3 s on both sides, close to two 5 s repair ticks, and 9 members give
+  up to 72 repair groups against a cap of 32 per pass. That points at the
+  pass timing in
+  [replica-repair-convergence-latency.md](replica-repair-convergence-latency.md)
+  rather than the scans, but these runs did not record per-group timings to
+  confirm it. Scale-in's own mutations do not move, as on Linux.
+- **The migration memory peak falls 9x at 5 nodes and 6x at 10**, in line
+  with Linux's 7x.
+- **The steady-state cost reproduces: +10% and +7% peak RSS** in the two
+  performance runs, about 11 MiB per node at 250k keys and 21 MiB at 1M,
+  against +23% on Linux.
+- **The put speed-up does not reproduce.** Initial put is 0.97x–0.99x in all
+  four comparisons here, against 1.18x on Linux. The weaker claim above, that the index insert
+  costs nothing measurable, holds; the stronger one, that the put got faster,
+  is not supported by this run.
+
+Configs, logs, RSS samples and the runner are in
+`results/macos-bench-20261014/` (ignored by Git).
+
 ### Reproducing both sides
 
 Each side is the same script pointed at a different binary. Build the tree under
