@@ -319,7 +319,8 @@ correctness mode at 1M keys.
 Linux runs: correctness with 5 nodes (4 → 5 → 4) and 50,000 keys, about
 37k records per node against about 43k; performance with 8 nodes and 250,000
 keys, about 94k records per node against 150k. Both use concurrency 32 and
-otherwise `experiments/experiment_cmach.yaml`'s settings. Peak RSS is the
+otherwise the settings listed under
+[Reproducing both sides](#reproducing-both-sides). Peak RSS is the
 largest `ps` sample of any node process, taken every 0.5 s, so short spikes can
 be missed.
 
@@ -348,7 +349,7 @@ What carries over, and what does not:
 
 **Large: 10 nodes.** Correctness at 10 nodes (9 → 10 → 9) and 100,000 keys,
 the Linux key count; performance at 10 nodes and 1,000,000 keys. Concurrency
-64, as in `experiment_cmach.yaml`.
+64, as in the settings under [Reproducing both sides](#reproducing-both-sides).
 
 Correctness, median (range) of three runs:
 
@@ -406,9 +407,29 @@ test with `RUSTFLAGS='-C force-frame-pointers=yes' cargo build --release
 --target-dir target/fp`, then:
 
 ```bash
+mkdir -p experiments
+cat > experiments/range-token-index.yaml <<'YAML'
+mode: correctness
+nodes: 8
+keys: 100000
+value_bytes: 128
+concurrency: 64
+seed: 114514
+virtual_nodes: 128
+operation_timeout_ms: 30000
+migration_timeout_ms: 600000
+range_move_concurrency: 16
+pre_publish_delay_ms: 250
+desired_replication_factor: 3
+minimum_admitted_copies: 1
+minimum_healthy_followers: 0
+policy: first-successor
+YAML
 BINARY=$PWD/target/fp/release/hashring-rs BUILD=0 \
-  CONFIG=experiments/experiment_cmach.yaml ./scripts/flamegraph.sh
+  CONFIG=experiments/range-token-index.yaml ./scripts/flamegraph.sh
 ```
+
+`experiments/` is ignored by Git; this file is the settings the captures used.
 
 The second table needs a copy of that config with `mode: performance`,
 `nodes: 20` and `keys: 1000000`, passed the same way through `CONFIG`, plus the

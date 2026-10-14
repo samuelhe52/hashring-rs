@@ -1,8 +1,9 @@
 # Rust build artifacts
 /target/
 
-# Local experiment output
+# Local experiment output and configs
 /results/
+/experiments/
 
 # Local environment and secrets
 .env
