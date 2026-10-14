@@ -857,8 +857,13 @@ async fn interrupted_membership_retries_after_destination_returns() {
     coordinator.stop();
     execution.abort();
     node_2.stop();
+    // The deadline bounds a whole retry of the change, and one retry takes
+    // about 0.6 s on a loaded 8-core laptop. At 500 ms every 5 s recovery tick
+    // reset the change at Verifying and it never completed. The outage itself
+    // does not need a short deadline: with node-2 down, the retry fails at once
+    // on a refused connection.
     let mut recovery_args = coordinator_arguments(ports[0], &state, &[]);
-    recovery_args.extend(["--migration-timeout-ms".into(), "500".into()]);
+    recovery_args.extend(["--migration-timeout-ms".into(), "4000".into()]);
     coordinator = spawn_process(&recovery_args);
     wait_for_listener(ports[0]);
     tokio::time::timeout(Duration::from_secs(5), async {
