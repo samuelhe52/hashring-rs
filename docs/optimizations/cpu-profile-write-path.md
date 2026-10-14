@@ -108,8 +108,8 @@ CONFIG=/tmp/experiment_cpu_profile.yaml ./scripts/flamegraph.sh
 ```
 
 The script profiles whatever `experiment` runs, so it needs a settings file;
-`experiments/experiment_cmach.yaml` is its default. This capture predates that
-default and used the flag defaults listed above, so it needs its own file. The
+`examples/experiment.yaml` is its default. This capture used the flag defaults
+listed above, so it needs its own file. The
 manifest in `<out>/run/` records what was actually resolved.
 
 The script runs `cargo build` for its own frame-pointer `target/fp` binary on
