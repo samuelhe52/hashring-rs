@@ -9,7 +9,7 @@
 #
 # Usage
 # -----
-#   ./scripts/flamegraph.sh                      # examples/experiment_cmach.yaml
+#   ./scripts/flamegraph.sh                      # experiments/experiment_cmach.yaml
 #   ./scripts/flamegraph.sh performance           # same file, mode from the argument
 #
 #   env CONFIG=examples/experiment.yaml ./scripts/flamegraph.sh
@@ -83,7 +83,7 @@ set -euo pipefail
 # Empty unless the caller pins a mode; otherwise the config file's `mode:` key
 # applies, and this only names the output directory and the graph title.
 MODE="${1:-}"
-CONFIG="${CONFIG:-examples/experiment_cmach.yaml}"
+CONFIG="${CONFIG:-experiments/experiment_cmach.yaml}"
 # Separate target directory: frame pointers are a profiling build, not the one to
 # benchmark or ship. TARGET_DIR only matters when building, and must match BINARY.
 TARGET_DIR="${TARGET_DIR:-target/fp}"

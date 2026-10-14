@@ -285,7 +285,7 @@ test with `RUSTFLAGS='-C force-frame-pointers=yes' cargo build --release
 
 ```bash
 BINARY=$PWD/target/fp/release/hashring-rs BUILD=0 \
-  CONFIG=examples/experiment_cmach.yaml ./scripts/flamegraph.sh
+  CONFIG=experiments/experiment_cmach.yaml ./scripts/flamegraph.sh
 ```
 
 The second table needs a copy of that config with `mode: performance`,

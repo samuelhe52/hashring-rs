@@ -108,7 +108,7 @@ CONFIG=/tmp/experiment_cpu_profile.yaml ./scripts/flamegraph.sh
 ```
 
 The script profiles whatever `experiment` runs, so it needs a settings file;
-`examples/experiment_cmach.yaml` is its default. This capture predates that
+`experiments/experiment_cmach.yaml` is its default. This capture predates that
 default and used the flag defaults listed above, so it needs its own file. The
 manifest in `<out>/run/` records what was actually resolved.
 
