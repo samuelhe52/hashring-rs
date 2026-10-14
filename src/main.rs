@@ -2,7 +2,10 @@ use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf, sync::Arc, time::Du
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use config::coordinator::{CoordinatorFile, CoordinatorSettings, MemberSource};
+use config::{
+    coordinator::{CoordinatorFile, CoordinatorSettings, MemberSource},
+    node::NodeConfig,
+};
 use hashring_client::HashringClient;
 use hashring_coordinator::{
     CoordinatorRepository, CoordinatorService, RedbTopologyRepository, load_or_initialize,
@@ -109,19 +112,58 @@ struct CoordinatorArgs {
 
 #[derive(Args)]
 struct NodeArgs {
+    /// YAML file with node settings. Keys use the flag names with `_` for `-`.
+    /// A flag on the command line wins over the file.
     #[arg(long)]
-    id: String,
+    config: Option<PathBuf>,
+    /// Required here or as `id` in the config file.
     #[arg(long)]
-    listen: SocketAddr,
-    #[arg(long, default_value = "http://127.0.0.1:50050")]
-    coordinator: String,
+    id: Option<String>,
+    /// Required here or as `listen` in the config file.
+    #[arg(long)]
+    listen: Option<SocketAddr>,
+    /// [default: http://127.0.0.1:50050]
+    #[arg(long)]
+    coordinator: Option<String>,
     /// Tokio worker threads. Defaults to one per CPU available to the process
     /// (affinity and cgroup limits included); set it lower when the node shares
     /// its host with other busy processes.
     #[arg(long)]
     worker_threads: Option<NonZeroUsize>,
+    #[command(flatten)]
+    tuning: NodeTuningArgs,
     #[arg(long, default_value_t = 0, hide = true)]
     stop_response_delay_ms: u64,
+}
+
+/// Per-node budgets and timeouts, shared by `node` and `experiment`. Nodes in
+/// one cluster may use different values.
+#[derive(Args, Clone, Debug, Default)]
+struct NodeTuningArgs {
+    /// Bytes of deduplication receipts a node retains, and separately the bytes
+    /// each migration destination stages. A full store rejects writes before
+    /// applying them, with a retryable error. [default: 134217728 (128 MiB)]
+    #[arg(long)]
+    max_dedup_bytes: Option<usize>,
+    /// Bytes of mutations queued for followers, and separately the bytes held
+    /// by in-flight replication RPCs. [default: 67108864 (64 MiB)]
+    #[arg(long)]
+    max_pending_replication_bytes: Option<usize>,
+    /// Bytes of writes journaled across a node's active migrations. When it is
+    /// full, writes to moving ranges get a retryable rejection.
+    /// [default: 16777216 (16 MiB)]
+    #[arg(long)]
+    max_migration_journal_bytes: Option<usize>,
+    /// Mutations queued per follower stream, whatever their size. [default: 32]
+    #[arg(long)]
+    replication_stream_queue_capacity: Option<NonZeroUsize>,
+    /// How long a write waits for its required follower ACKs before reporting
+    /// an unknown outcome. [default: 2000]
+    #[arg(long)]
+    required_ack_timeout_ms: Option<u64>,
+    /// Bounds each replication connect and batch RPC. [default: 2000]
+    #[arg(long)]
+    replication_rpc_timeout_ms: Option<u64>,
 }
 
 #[derive(Args, Clone)]
@@ -328,6 +370,9 @@ struct ExperimentArgs {
     /// [default: the CPU count divided by peak nodes + 2, at least 2]
     #[arg(long)]
     worker_threads: Option<NonZeroUsize>,
+    /// Forwarded to every data node the run starts.
+    #[command(flatten)]
+    node_tuning: NodeTuningArgs,
 }
 
 fn main() -> Result<()> {
@@ -340,6 +385,14 @@ fn main() -> Result<()> {
         let config = config::experiment::resolve(args, file, cpus)?;
         init_tracing(config.verbose)?;
         return build_runtime(Some(config.worker_threads))?.block_on(run_local_experiment(config));
+    }
+    // A node's config file can set its runtime size too.
+    if let Command::Node(args) = &cli.command {
+        let file = args.config.as_deref().map(config::load).transpose()?;
+        let config = config::node::resolve(args, file)?;
+        init_tracing(false)?;
+        return build_runtime(Some(config.runtime_workers(cpus)))?
+            .block_on(run_node(config, args.stop_response_delay_ms));
     }
     init_tracing(false)?;
     build_runtime(runtime_threads(&cli.command, cpus))?.block_on(run(cli.command))
@@ -363,11 +416,10 @@ fn build_runtime(worker_threads: Option<usize>) -> Result<tokio::runtime::Runtim
 /// Worker threads for the process's runtime, or `None` for a single-threaded
 /// runtime. Servers take one worker per available CPU because in a deployment
 /// they own their machine. One-shot client and admin commands issue a few RPCs
-/// and need no worker pool. The experiment command sizes its runtime in
-/// [`config::experiment::resolve`].
+/// and need no worker pool. The node and experiment commands size their
+/// runtimes from their resolved settings, which a config file can set.
 fn runtime_threads(command: &Command, cpus: usize) -> Option<usize> {
     match command {
-        Command::Node(args) => Some(args.worker_threads.map_or(cpus, NonZeroUsize::get)),
         Command::Coordinator(_) => Some(cpus),
         _ => None,
     }
@@ -385,7 +437,6 @@ fn init_tracing(verbose_experiment: bool) -> Result<()> {
 async fn run(command: Command) -> Result<()> {
     match command {
         Command::Coordinator(args) => run_coordinator(args).await,
-        Command::Node(args) => run_node(args).await,
         Command::Put(args) => run_put(args).await,
         Command::Get(args) => run_get(args).await,
         Command::Delete(args) => run_delete(args).await,
@@ -396,7 +447,9 @@ async fn run(command: Command) -> Result<()> {
         Command::ChangeStatus(args) => run_change_status(args).await,
         Command::ReplicaStatus(args) => run_replica_status(args).await,
         Command::ExecuteChange(args) => run_execute_change(args).await,
-        Command::Experiment(_) => unreachable!("main runs the experiment command"),
+        Command::Node(_) | Command::Experiment(_) => {
+            unreachable!("main runs the node and experiment commands")
+        }
     }
 }
 
@@ -512,15 +565,15 @@ fn coordinator_bootstrap(
     )?))
 }
 
-async fn run_node(args: NodeArgs) -> Result<()> {
-    let service = DataNodeService::connect(args.id.clone(), args.coordinator)
+async fn run_node(config: NodeConfig, stop_response_delay_ms: u64) -> Result<()> {
+    let service = DataNodeService::connect(config.id.clone(), config.coordinator, config.settings)
         .await?
-        .with_stop_response_delay(Duration::from_millis(args.stop_response_delay_ms));
+        .with_stop_response_delay(Duration::from_millis(stop_response_delay_ms));
     let mut remote_shutdown = service.shutdown_receiver();
     info!(
-        node_id = %args.id,
+        node_id = %config.id,
         process_instance_id = service.process_instance_id(),
-        listen = %args.listen,
+        listen = %config.listen,
         "data node ready"
     );
     Server::builder()
@@ -529,7 +582,7 @@ async fn run_node(args: NodeArgs) -> Result<()> {
                 .max_decoding_message_size(MAX_CONTROL_MESSAGE_BYTES)
                 .max_encoding_message_size(MAX_CONTROL_MESSAGE_BYTES),
         )
-        .serve_with_shutdown(args.listen, async move {
+        .serve_with_shutdown(config.listen, async move {
             tokio::select! {
                 () = shutdown_signal() => {}
                 result = remote_shutdown.changed() => {
@@ -769,15 +822,6 @@ mod worker_thread_tests {
 
     #[test]
     fn each_role_sizes_its_own_runtime() {
-        let node = command(&[
-            "hashring-rs",
-            "node",
-            "--id",
-            "n",
-            "--listen",
-            "127.0.0.1:1",
-        ]);
-        assert_eq!(runtime_threads(&node, 24), Some(24));
         assert_eq!(
             runtime_threads(&command(&["hashring-rs", "coordinator"]), 24),
             Some(24)
@@ -799,8 +843,6 @@ mod worker_thread_tests {
             "127.0.0.1:1",
         ];
         assert!(Cli::try_parse_from(node.iter().chain(&["--worker-threads", "0"])).is_err());
-        let cli = Cli::try_parse_from(node.iter().chain(&["--worker-threads", "3"])).unwrap();
-        assert_eq!(runtime_threads(&cli.command, 24), Some(3));
         let experiment = ["hashring-rs", "experiment", "--output", "unused"];
         assert!(Cli::try_parse_from(experiment.iter().chain(&["--worker-threads", "0"])).is_err());
     }

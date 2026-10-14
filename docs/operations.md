@@ -98,6 +98,10 @@ treated as healthy.
 
 ## Timers and budgets
 
+These values are fixed in the code. The configurable ones, such as the node
+budgets and worker threads, are listed with their defaults in
+[configuration.md](configuration.md).
+
 | Setting | Value |
 | --- | --- |
 | Lease duration / renewal interval | 5 s / 1 s |
@@ -105,13 +109,10 @@ treated as healthy.
 | Repair and recovery interval | 5 s |
 | Repair groups per pass / concurrently | 32 / 4 |
 | Repair retry backoff cap | 60 s (exponential, per group) |
-| Pending replication buffer per node | 64 MiB |
-| Deduplication receipt store per node | 128 MiB |
 | Deduplication receipt retention | 60 s |
 | Migration snapshot page | 8 MiB |
-| Migration journal per node (default) | 16 MiB |
 | Control-plane message limit | 64 MiB |
-| Tokio workers: `node`, `coordinator` | one per available CPU (`node --worker-threads N` overrides) |
+| Tokio workers: `coordinator` | one per available CPU |
 | Tokio workers: client and admin commands | single-threaded |
 
 The cluster-size limits in the README (1,024 members, 4,096 virtual nodes per

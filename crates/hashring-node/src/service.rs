@@ -107,7 +107,7 @@ impl DataNodeService {
         let topology = topology.clone();
         drop(state);
         let status = if needs_status {
-            let result = tokio::time::timeout(REPLICATION_RPC_TIMEOUT, async {
+            let result = tokio::time::timeout(COORDINATOR_RPC_TIMEOUT, async {
                 let mut client = configure_coordinator_client(CoordinatorClient::new(
                     self.coordinator_channel.clone(),
                 ));
@@ -168,7 +168,7 @@ impl DataNodeService {
                 }
                 Ok(())
             };
-            tokio::time::timeout(REQUIRED_ACK_TIMEOUT, wait)
+            tokio::time::timeout(self.required_ack_timeout, wait)
                 .await
                 .unwrap_or_else(|_| Err(outcome_unknown(epoch)))?;
         }
@@ -206,7 +206,12 @@ impl DataNodeService {
         Ok(())
     }
 
-    pub async fn connect(node_id: String, coordinator_endpoint: String) -> anyhow::Result<Self> {
+    pub async fn connect(
+        node_id: String,
+        coordinator_endpoint: String,
+        settings: NodeSettings,
+    ) -> anyhow::Result<Self> {
+        settings.validate()?;
         let process_instance_id = uuid::Uuid::new_v4().to_string();
         let topology = fetch_topology(&coordinator_endpoint).await?;
         let is_committed_member = topology
@@ -263,7 +268,8 @@ impl DataNodeService {
             cleanup_timing: proto::ReceiptCleanupTiming::default(),
         }));
         let pressure = Arc::new(NodePressureStats::default());
-        let replication_dispatch = start_replication_dispatch(state.clone(), pressure.clone());
+        let replication_dispatch =
+            start_replication_dispatch(state.clone(), pressure.clone(), &settings);
         let service = Self {
             node_id,
             process_instance_id,
@@ -275,8 +281,9 @@ impl DataNodeService {
             refresh_lock: Arc::new(Mutex::new(())),
             max_key_bytes: DEFAULT_MAX_KEY_BYTES,
             max_value_bytes: DEFAULT_MAX_VALUE_BYTES,
-            max_journal_bytes: DEFAULT_MAX_MIGRATION_JOURNAL_BYTES,
-            max_dedup_bytes: MAX_DEDUP_BYTES,
+            max_journal_bytes: settings.max_migration_journal_bytes,
+            max_dedup_bytes: settings.max_dedup_bytes,
+            required_ack_timeout: settings.required_ack_timeout,
             stop_response_delay: std::time::Duration::ZERO,
             stop_prepared: Arc::new(AtomicBool::new(false)),
             shutdown,
@@ -294,7 +301,7 @@ impl DataNodeService {
         // Discount the entire RPC round trip from the granted lifetime. This
         // makes local authority expire no later than the coordinator's grant.
         let sent_at = Instant::now();
-        let response = tokio::time::timeout(REPLICATION_RPC_TIMEOUT, async {
+        let response = tokio::time::timeout(COORDINATOR_RPC_TIMEOUT, async {
             let mut client = configure_coordinator_client(CoordinatorClient::new(
                 self.coordinator_channel.clone(),
             ));

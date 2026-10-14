@@ -431,6 +431,7 @@ impl DataNode for DataNodeService {
             &version,
             request.request_id,
             token,
+            self.replication_dispatch.max_pending_bytes(),
         ) {
             Ok(replications) => replications,
             Err(()) => {
@@ -744,6 +745,7 @@ impl DataNode for DataNodeService {
             &version,
             request.request_id,
             token,
+            self.replication_dispatch.max_pending_bytes(),
         ) {
             Ok(replications) => replications,
             Err(()) => {

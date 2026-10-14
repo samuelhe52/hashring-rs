@@ -57,6 +57,50 @@ pub struct ExperimentConfig {
     pub minimum_admitted_copies: u32,
     pub minimum_healthy_followers: u32,
     pub write_ack_policy: WriteAckPolicy,
+    /// Forwarded to every data node the run starts.
+    pub node: NodeOptions,
+}
+
+/// The `node` command's tuning flags, in their flag units.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct NodeOptions {
+    pub max_dedup_bytes: usize,
+    pub max_pending_replication_bytes: usize,
+    pub max_migration_journal_bytes: usize,
+    pub replication_stream_queue_capacity: usize,
+    pub required_ack_timeout_ms: u64,
+    pub replication_rpc_timeout_ms: u64,
+}
+
+impl NodeOptions {
+    fn arguments(&self) -> Vec<String> {
+        [
+            ("--max-dedup-bytes", self.max_dedup_bytes.to_string()),
+            (
+                "--max-pending-replication-bytes",
+                self.max_pending_replication_bytes.to_string(),
+            ),
+            (
+                "--max-migration-journal-bytes",
+                self.max_migration_journal_bytes.to_string(),
+            ),
+            (
+                "--replication-stream-queue-capacity",
+                self.replication_stream_queue_capacity.to_string(),
+            ),
+            (
+                "--required-ack-timeout-ms",
+                self.required_ack_timeout_ms.to_string(),
+            ),
+            (
+                "--replication-rpc-timeout-ms",
+                self.replication_rpc_timeout_ms.to_string(),
+            ),
+        ]
+        .into_iter()
+        .flat_map(|(flag, value)| [flag.to_owned(), value])
+        .collect()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -174,9 +218,9 @@ struct ProcessGroup {
     executable: PathBuf,
     log_dir: PathBuf,
     verbose: bool,
-    /// Passed to every data node so the nodes share the host budget with the
-    /// driver.
-    node_worker_threads: usize,
+    /// Passed to every data node: its share of the host's worker threads and
+    /// the run's node tuning.
+    node_arguments: Vec<String>,
     processes: Vec<ManagedProcess>,
 }
 
@@ -185,13 +229,13 @@ impl ProcessGroup {
         executable: PathBuf,
         log_dir: PathBuf,
         verbose: bool,
-        node_worker_threads: usize,
+        node_arguments: Vec<String>,
     ) -> Self {
         Self {
             executable,
             log_dir,
             verbose,
-            node_worker_threads,
+            node_arguments,
             processes: Vec::new(),
         }
     }
@@ -301,7 +345,7 @@ pub async fn run_experiment(
         runtime_tree_hash.as_deref(),
     );
     let manifest = ExperimentManifest {
-        schema_version: 4,
+        schema_version: 5,
         started_unix_ms: unix_ms(),
         executable_path: executable.display().to_string(),
         executable_blake3: file_digest(&executable)?,
@@ -424,7 +468,7 @@ async fn run_cluster(
     };
     let initial_members = &members[..initial_count];
     let mut processes =
-        ProcessGroup::new(executable, log_dir, config.verbose, config.worker_threads);
+        ProcessGroup::new(executable, log_dir, config.verbose, node_arguments(config));
     let state_path = config.output_dir.join("coordinator.redb");
     let mut coordinator_args = vec![
         "coordinator".into(),
@@ -1520,21 +1564,23 @@ fn spawn_node(
     port: u16,
     coordinator_endpoint: &str,
 ) -> Result<()> {
-    let worker_threads = processes.node_worker_threads.to_string();
-    processes.spawn(
+    let mut arguments = vec![
+        "node".into(),
+        "--id".into(),
         node_id.clone(),
-        &[
-            "node".into(),
-            "--id".into(),
-            node_id,
-            "--listen".into(),
-            format!("127.0.0.1:{port}"),
-            "--coordinator".into(),
-            coordinator_endpoint.into(),
-            "--worker-threads".into(),
-            worker_threads,
-        ],
-    )
+        "--listen".into(),
+        format!("127.0.0.1:{port}"),
+        "--coordinator".into(),
+        coordinator_endpoint.into(),
+    ];
+    arguments.extend(processes.node_arguments.iter().cloned());
+    processes.spawn(node_id, &arguments)
+}
+
+fn node_arguments(config: &ExperimentConfig) -> Vec<String> {
+    let mut arguments = vec!["--worker-threads".into(), config.worker_threads.to_string()];
+    arguments.extend(config.node.arguments());
+    arguments
 }
 
 async fn connect_eventually(

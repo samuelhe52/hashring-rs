@@ -11,8 +11,8 @@ use hashring_core::topology::{
 use hashring_experiment::{ExperimentConfig, ExperimentMode};
 use serde::Deserialize;
 
-use super::LoadedFile;
-use crate::{ExperimentArgs, ExperimentModeArg, PolicyArg};
+use super::{LoadedFile, node};
+use crate::{ExperimentArgs, ExperimentModeArg, NodeTuningArgs, PolicyArg};
 
 pub const DEFAULT_VALUE_BYTES: usize = 128;
 pub const DEFAULT_CONCURRENCY: usize = 64;
@@ -45,6 +45,12 @@ pub struct ExperimentFile {
     pub minimum_healthy_followers: Option<u32>,
     pub policy: Option<PolicyArg>,
     pub worker_threads: Option<NonZeroUsize>,
+    pub max_dedup_bytes: Option<usize>,
+    pub max_pending_replication_bytes: Option<usize>,
+    pub max_migration_journal_bytes: Option<usize>,
+    pub replication_stream_queue_capacity: Option<NonZeroUsize>,
+    pub required_ack_timeout_ms: Option<u64>,
+    pub replication_rpc_timeout_ms: Option<u64>,
 }
 
 /// Resolves the run's configuration. Boolean flags can only turn a setting on,
@@ -59,6 +65,18 @@ pub fn resolve(
         .map(|loaded| loaded.dir().to_owned())
         .unwrap_or_default();
     let file = file.map(|loaded| loaded.body).unwrap_or_default();
+    let node_settings = node::settings(
+        &args.node_tuning,
+        &NodeTuningArgs {
+            max_dedup_bytes: file.max_dedup_bytes,
+            max_pending_replication_bytes: file.max_pending_replication_bytes,
+            max_migration_journal_bytes: file.max_migration_journal_bytes,
+            replication_stream_queue_capacity: file.replication_stream_queue_capacity,
+            required_ack_timeout_ms: file.required_ack_timeout_ms,
+            replication_rpc_timeout_ms: file.replication_rpc_timeout_ms,
+        },
+    );
+    node_settings.validate()?;
 
     let Some(output_dir) = args
         .output
@@ -140,6 +158,7 @@ pub fn resolve(
             .or(file.minimum_healthy_followers)
             .unwrap_or(DEFAULT_MINIMUM_HEALTHY_FOLLOWERS),
         write_ack_policy: policy.into(),
+        node: node::options(&node_settings),
     })
 }
 
@@ -255,6 +274,27 @@ mod tests {
 
         let zero = write(dir.path(), "worker_threads: 0\n");
         assert!(load::<ExperimentFile>(&zero).is_err());
+    }
+
+    #[test]
+    fn node_tuning_is_resolved_for_every_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "max_dedup_bytes: 4096\nreplication_stream_queue_capacity: 8\n",
+        );
+        let args = experiment_args(&["--output", "out", "--max-dedup-bytes", "8192"]);
+        let config = resolve(&args, Some(load(&path).unwrap()), 24).unwrap();
+        assert_eq!(config.node.max_dedup_bytes, 8192);
+        assert_eq!(config.node.replication_stream_queue_capacity, 8);
+        assert_eq!(
+            config.node.max_pending_replication_bytes,
+            hashring_node::DEFAULT_MAX_PENDING_REPLICATION_BYTES
+        );
+        assert_eq!(config.node.required_ack_timeout_ms, 2_000);
+
+        let args = experiment_args(&["--output", "out", "--required-ack-timeout-ms", "0"]);
+        assert!(resolve(&args, None, 24).is_err());
     }
 
     #[test]

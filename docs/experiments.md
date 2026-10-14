@@ -18,7 +18,9 @@ nodes, and a 30-second operation deadline. The default ACK policy is
 `hashring-rs experiment --help` for every flag.
 
 `experiment --config <file>` reads the same settings from YAML; see
-[`examples/experiment.yaml`](../examples/experiment.yaml). Keys are the flag
+[`examples/experiment.yaml`](../examples/experiment.yaml) and every setting's
+default and scope in [configuration.md](configuration.md). The node tuning
+settings, such as `--max-dedup-bytes`, are passed to every node of the run. Keys are the flag
 names with `_` for `-` and take the flag values. A flag on the command line wins
 over the file, except that `--verbose` and `--require-clean-source` can only
 turn a setting on. Unknown keys are an error, and a relative `output` in the

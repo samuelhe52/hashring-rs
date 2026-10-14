@@ -74,6 +74,10 @@ ignores the bootstrap keys in the config file (`members`, `seed`,
 for every restart. Explicit `--member` flags must still match the stored
 topology.
 
+Nodes take a config file too (see [`examples/node.yaml`](examples/node.yaml)).
+[docs/configuration.md](docs/configuration.md) lists every flag and key with
+its default and scope.
+
 ## Commands
 
 | Command | Purpose |
@@ -265,6 +269,7 @@ profiling, and how to compare runs.
 | `crates/hashring-node` | In-memory storage, replication, and the data-node service |
 | `crates/hashring-experiment` | Multi-process experiment runner |
 | `docs/report/` | [Preliminary report](docs/report/preliminary-report.md) on the design and results |
+| `docs/configuration.md` | Every flag and config key, with defaults and scopes |
 | `docs/rfcs/` | Design RFCs |
 | `docs/optimizations/` | Performance work, with measurements |
 

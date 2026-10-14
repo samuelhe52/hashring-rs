@@ -24,3 +24,11 @@ minimum_admitted_copies: 1
 minimum_healthy_followers: 0
 policy: first-successor
 # worker_threads: 2   # default: CPUs / (nodes + 2), at least 2
+
+# Forwarded to every data node the run starts; see the node flags.
+max_dedup_bytes: 134217728              # 128 MiB
+max_pending_replication_bytes: 67108864 # 64 MiB
+max_migration_journal_bytes: 16777216   # 16 MiB
+replication_stream_queue_capacity: 32
+required_ack_timeout_ms: 2000
+replication_rpc_timeout_ms: 2000

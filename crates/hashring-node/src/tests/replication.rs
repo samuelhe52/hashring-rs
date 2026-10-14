@@ -532,6 +532,7 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
         &version,
         "mutation-1".into(),
         token,
+        DEFAULT_MAX_PENDING_REPLICATION_BYTES,
     )
     .unwrap();
     let second = prepare_replication_entries(
@@ -545,6 +546,7 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
         },
         "mutation-2".into(),
         token,
+        DEFAULT_MAX_PENDING_REPLICATION_BYTES,
     )
     .unwrap();
 
@@ -942,7 +944,9 @@ async fn unavailable_follower_backpressures_before_unbounded_queue_growth() {
         // Backpressure is bounded by the per-stream channel plus at most one
         // in-flight replication batch that the delivery task drained before
         // blocking on the unavailable follower.
-        assert!(successful <= REPLICATION_STREAM_QUEUE_CAPACITY + REPLICATION_BATCH_MAX_ENTRIES);
+        assert!(
+            successful <= DEFAULT_REPLICATION_STREAM_QUEUE_CAPACITY + REPLICATION_BATCH_MAX_ENTRIES
+        );
     };
 
     assert_eq!(rejected.code, ErrorCode::ResourceExhausted as i32);
@@ -954,7 +958,7 @@ async fn unavailable_follower_backpressures_before_unbounded_queue_growth() {
     assert_eq!(pressure.replication_reservation_rejections, 1);
     assert_eq!(
         pressure.replication_stream_peak_pending,
-        REPLICATION_STREAM_QUEUE_CAPACITY as u64
+        DEFAULT_REPLICATION_STREAM_QUEUE_CAPACITY as u64
     );
     let state = owner.state.read().await;
     assert_eq!(state.next_sequence, successful as u64);
@@ -1441,7 +1445,7 @@ async fn unreachable_streams_do_not_copy_unbudgeted_payloads() {
         mutation_id: "memory-reproduction".into(),
     });
     let bytes = replication_mutation_bytes(&mutation);
-    let retained = Arc::new(Semaphore::new(MAX_PENDING_REPLICATION_BYTES));
+    let retained = Arc::new(Semaphore::new(DEFAULT_MAX_PENDING_REPLICATION_BYTES));
     let budget = Arc::new(ReplicationBudget(
         retained
             .clone()
@@ -1449,7 +1453,7 @@ async fn unreachable_streams_do_not_copy_unbudgeted_payloads() {
             .await
             .unwrap(),
     ));
-    let active = Arc::new(Semaphore::new(MAX_PENDING_REPLICATION_BYTES));
+    let active = Arc::new(Semaphore::new(DEFAULT_MAX_PENDING_REPLICATION_BYTES));
     let failed = Arc::new(StdMutex::new(HashSet::new()));
     let before = rss_kib();
     let mut tasks = Vec::new();
@@ -1472,6 +1476,7 @@ async fn unreachable_streams_do_not_copy_unbudgeted_payloads() {
             service.state.clone(),
             failed.clone(),
             active.clone(),
+            DEFAULT_REPLICATION_RPC_TIMEOUT,
             service.pressure.clone(),
             (1, "node-1".into(), follower),
             receiver,
@@ -1487,9 +1492,12 @@ async fn unreachable_streams_do_not_copy_unbudgeted_payloads() {
         task.abort();
         let _ = task.await;
     }
-    assert_eq!(active.available_permits(), MAX_PENDING_REPLICATION_BYTES);
+    assert_eq!(
+        active.available_permits(),
+        DEFAULT_MAX_PENDING_REPLICATION_BYTES
+    );
     assert!(
-        growth < MAX_PENDING_REPLICATION_BYTES / 1024,
+        growth < DEFAULT_MAX_PENDING_REPLICATION_BYTES / 1024,
         "unbudgeted payload growth: {growth} KiB"
     );
 }
@@ -1517,7 +1525,7 @@ async fn delivery_publishes_partial_ack_and_retries_suffix_after_capacity_return
     );
     let owner = service_for("node-1", topology.clone());
     let (sender, receiver) = mpsc::channel(2);
-    let retained = Arc::new(Semaphore::new(MAX_PENDING_REPLICATION_BYTES));
+    let retained = Arc::new(Semaphore::new(DEFAULT_MAX_PENDING_REPLICATION_BYTES));
     let mut state = owner.state.write().await;
     for sequence in 1..=2 {
         let version = RecordVersion {
@@ -1534,6 +1542,7 @@ async fn delivery_publishes_partial_ack_and_retries_suffix_after_capacity_return
             &version,
             format!("mutation-{sequence}"),
             token,
+            DEFAULT_MAX_PENDING_REPLICATION_BYTES,
         )
         .unwrap()
         .pop()
@@ -1561,11 +1570,12 @@ async fn delivery_publishes_partial_ack_and_retries_suffix_after_capacity_return
     drop(state);
     drop(sender);
     let failed = Arc::new(StdMutex::new(HashSet::new()));
-    let active = Arc::new(Semaphore::new(MAX_PENDING_REPLICATION_BYTES));
+    let active = Arc::new(Semaphore::new(DEFAULT_MAX_PENDING_REPLICATION_BYTES));
     let delivery = tokio::spawn(deliver_replication_stream(
         owner.state.clone(),
         failed.clone(),
         active.clone(),
+        DEFAULT_REPLICATION_RPC_TIMEOUT,
         owner.pressure.clone(),
         (topology.epoch, "node-1".into(), "node-2".into()),
         receiver,
@@ -1617,7 +1627,13 @@ async fn delivery_publishes_partial_ack_and_retries_suffix_after_capacity_return
         &[2]
     );
     assert!(failed.lock().unwrap().is_empty());
-    assert_eq!(active.available_permits(), MAX_PENDING_REPLICATION_BYTES);
-    assert_eq!(retained.available_permits(), MAX_PENDING_REPLICATION_BYTES);
+    assert_eq!(
+        active.available_permits(),
+        DEFAULT_MAX_PENDING_REPLICATION_BYTES
+    );
+    assert_eq!(
+        retained.available_permits(),
+        DEFAULT_MAX_PENDING_REPLICATION_BYTES
+    );
     server.abort();
 }
