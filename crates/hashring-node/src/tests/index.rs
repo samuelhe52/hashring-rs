@@ -232,10 +232,9 @@ async fn dedup_index_matches_hashing_every_receipt_key() {
     }
 
     // Expiration must drop the index entry as well as the receipt.
-    purge_expired_dedup(
-        &mut state,
-        now + RECEIPT_RETENTION_PERIOD + std::time::Duration::from_secs(1),
-    );
+    let past_retention =
+        now + state.topology.timings.receipt_retention() + std::time::Duration::from_secs(1);
+    purge_expired_dedup(&mut state, past_retention);
     state.debug_assert_index();
     assert!(state.dedup.is_empty());
     assert_eq!(state.dedup_by_token.len(), 0);
