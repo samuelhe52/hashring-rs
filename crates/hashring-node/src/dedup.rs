@@ -92,7 +92,11 @@ pub(super) fn stage_dedup(
         return Err(Status::invalid_argument("invalid deduplication record"));
     }
     let expires_at = Instant::now()
-        + std::time::Duration::from_millis(record.remaining_retention_millis.min(60_000));
+        + std::time::Duration::from_millis(
+            record
+                .remaining_retention_millis
+                .min(RECEIPT_RETENTION_MILLIS),
+        );
     if let Some(existing) = destination.dedup.get_mut(&record.mutation_id) {
         let same = existing.record.key == record.key
             && existing.record.fingerprint == record.fingerprint
@@ -145,7 +149,7 @@ pub(super) fn remaining_retention_millis(expires_at: Instant, now: Instant) -> u
     }
     u64::try_from(remaining.as_nanos().div_ceil(1_000_000))
         .unwrap_or(u64::MAX)
-        .min(60_000)
+        .min(RECEIPT_RETENTION_MILLIS)
 }
 
 pub(super) fn purge_expired_dedup(state: &mut NodeState, now: Instant) {

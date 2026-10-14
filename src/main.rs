@@ -128,6 +128,8 @@ struct NodeArgs {
 struct ClientArgs {
     #[arg(long, default_value = "http://127.0.0.1:50050")]
     coordinator: String,
+    /// `put` and `delete` stop retrying after the 60 s receipt retention
+    /// period even when this is longer.
     #[arg(long, default_value_t = 2_000)]
     deadline_ms: u64,
 }
@@ -289,6 +291,7 @@ struct ExperimentArgs {
     /// [default: 128]
     #[arg(long)]
     virtual_nodes: Option<u32>,
+    /// At most the 60 s receipt retention period, which caps mutation retries.
     /// [default: 30000]
     #[arg(long)]
     operation_timeout_ms: Option<u64>,

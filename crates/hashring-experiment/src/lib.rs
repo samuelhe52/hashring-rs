@@ -16,7 +16,7 @@ use anyhow::{Context, Result, bail, ensure};
 use futures::{StreamExt, TryStreamExt, stream};
 use hashring_client::{ClientError, HashringClient};
 use hashring_core::{
-    limits::DEFAULT_MAX_VALUE_BYTES,
+    limits::{DEFAULT_MAX_VALUE_BYTES, RECEIPT_RETENTION_MILLIS},
     migration::{MigrationPhase, TopologyChange},
     proto::{ErrorCode, PutRequest, data_node_client::DataNodeClient},
     topology::{Member, WriteAckPolicy},
@@ -1634,6 +1634,11 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
     ensure!(
         config.operation_timeout_ms > 0 && config.migration_timeout_ms > 0,
         "timeouts must be positive"
+    );
+    ensure!(
+        config.operation_timeout_ms <= RECEIPT_RETENTION_MILLIS,
+        "operation_timeout_ms exceeds the {RECEIPT_RETENTION_MILLIS} ms receipt retention \
+         period, which caps every mutation's retries"
     );
     Ok(())
 }
