@@ -789,7 +789,7 @@ async fn dispatcher_resumes_after_a_verified_gap_checkpoint() {
     {
         let mut state = follower_state.write().await;
         state.follower_streams.clear();
-        state.records.clear();
+        state.clear_records();
     }
     let result = owner
         .put(Request::new(PutRequest {
@@ -1631,7 +1631,7 @@ async fn delivery_publishes_partial_ack_and_retries_suffix_after_capacity_return
     // Model receipt expiry freeing capacity while the failed suffix is pending.
     {
         let mut state = follower_state.write().await;
-        state.dedup.clear();
+        state.clear_dedup();
         state.dedup_expirations.clear();
         state.dedup_bytes = 0;
     }

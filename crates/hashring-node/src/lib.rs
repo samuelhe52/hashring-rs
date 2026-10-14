@@ -419,6 +419,20 @@ impl NodeState {
         self.dedup_by_token.ids_in_range(range)
     }
 
+    /// Test-only reset. The indices cannot be cleared through `records.clear`,
+    /// so the whole reset lives here where the invariant is kept in one place.
+    #[cfg(test)]
+    fn clear_records(&mut self) {
+        self.records.clear();
+        self.records_by_token = TokenIndex::default();
+    }
+
+    #[cfg(test)]
+    fn clear_dedup(&mut self) {
+        self.dedup.clear();
+        self.dedup_by_token = TokenIndex::default();
+    }
+
     fn insert_dedup_index(&mut self, id: &Arc<str>, key: &[u8]) {
         let token = self.token_of(key);
         self.dedup_by_token.insert(token, id.clone());

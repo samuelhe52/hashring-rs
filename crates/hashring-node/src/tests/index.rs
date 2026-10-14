@@ -30,7 +30,9 @@ fn spec(start_exclusive: u64, end_inclusive: u64) -> RangeSpec {
 }
 
 fn keys(count: u32) -> Vec<Vec<u8>> {
-    (0..count).map(|index| format!("key-{index:04}").into_bytes()).collect()
+    (0..count)
+        .map(|index| format!("key-{index:04}").into_bytes())
+        .collect()
 }
 
 fn record(owner_sequence: u64) -> Record {
@@ -73,7 +75,7 @@ async fn record_index_matches_hashing_every_key() {
     let service = service();
     let mut state = service.state.write().await;
     for (index, key) in keys(64).into_iter().enumerate() {
-        seed_record(&mut *state, key.as_slice(), record(index as u64 + 1));
+        seed_record(&mut state, key.as_slice(), record(index as u64 + 1));
     }
     state.debug_assert_index();
     assert_eq!(state.records_by_token.len(), 64);
@@ -95,7 +97,7 @@ async fn record_index_tracks_insert_replace_apply_and_remove() {
     let owned = keys(32);
 
     for key in &owned {
-        seed_record(&mut *state, key.as_slice(), record(1));
+        seed_record(&mut state, key.as_slice(), record(1));
     }
     state.debug_assert_index();
 
@@ -104,7 +106,10 @@ async fn record_index_tracks_insert_replace_apply_and_remove() {
     state.insert_record(Arc::from(owned[0].as_slice()), token, record(9));
     state.debug_assert_index();
     assert_eq!(state.records_by_token.len(), 32);
-    assert_eq!(state.records[owned[0].as_slice()].value.as_ref(), b"value-9");
+    assert_eq!(
+        state.records[owned[0].as_slice()].value.as_ref(),
+        b"value-9"
+    );
 
     // A stale version is ignored, and must not index the key twice.
     let token = state.token_of(&owned[1]);
@@ -132,7 +137,7 @@ async fn record_index_survives_a_topology_change() {
     let service = service();
     let mut state = service.state.write().await;
     for (index, key) in keys(48).into_iter().enumerate() {
-        seed_record(&mut *state, key.as_slice(), record(index as u64 + 1));
+        seed_record(&mut state, key.as_slice(), record(index as u64 + 1));
     }
     let before: Vec<Vec<Vec<u8>>> = ranges()
         .iter()
@@ -177,7 +182,7 @@ async fn record_index_survives_a_topology_change() {
     }
 
     // Writes at the new epoch still index correctly.
-    seed_record(&mut *state, b"at-epoch-2", record(100));
+    seed_record(&mut state, b"at-epoch-2", record(100));
     state.debug_assert_index();
     let mut at_epoch_two = brute_force(&state, &spec(0, u64::MAX));
     assert_eq!(at_epoch_two.len(), 49);
@@ -193,7 +198,7 @@ async fn dedup_index_matches_hashing_every_receipt_key() {
     let owned = keys(48);
     for (index, key) in owned.iter().enumerate() {
         insert_dedup(
-            &mut *state,
+            &mut state,
             format!("mutation-{index}"),
             Arc::from(key.as_slice()),
             [index as u8; 32],
@@ -227,7 +232,10 @@ async fn dedup_index_matches_hashing_every_receipt_key() {
     }
 
     // Expiration must drop the index entry as well as the receipt.
-    purge_expired_dedup(&mut *state, now + RECEIPT_RETENTION_PERIOD + std::time::Duration::from_secs(1));
+    purge_expired_dedup(
+        &mut state,
+        now + RECEIPT_RETENTION_PERIOD + std::time::Duration::from_secs(1),
+    );
     state.debug_assert_index();
     assert!(state.dedup.is_empty());
     assert_eq!(state.dedup_by_token.len(), 0);
