@@ -7,7 +7,7 @@ mode: correctness
 # Usually given per run with --output, since the directory must be new or
 # empty. A relative path here is resolved against this file's directory.
 # output: ../results/availability
-nodes: 4
+nodes: 8
 keys: 100000
 value_bytes: 128
 concurrency: 64
