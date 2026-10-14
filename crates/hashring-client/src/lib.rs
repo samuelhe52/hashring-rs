@@ -397,7 +397,7 @@ impl HashringClient {
     pub async fn get(&self, key: Vec<u8>) -> Result<GetOutput, ClientError> {
         validate_key_size(&key)?;
         let deadline = Instant::now() + self.inner.operation_timeout;
-        let request_id = uuid::Uuid::new_v4().to_string();
+        let request_id = new_request_id();
         let mut attempt = 0_u32;
 
         loop {
@@ -470,7 +470,7 @@ impl HashringClient {
             )));
         }
         let deadline = self.mutation_deadline();
-        let request_id = uuid::Uuid::new_v4().to_string();
+        let request_id = new_request_id();
         let mut attempt = 0_u32;
         let mut unknown_write_outcome = false;
 
@@ -559,7 +559,7 @@ impl HashringClient {
     pub async fn delete(&self, key: Vec<u8>) -> Result<DeleteOutput, ClientError> {
         validate_key_size(&key)?;
         let deadline = self.mutation_deadline();
-        let request_id = uuid::Uuid::new_v4().to_string();
+        let request_id = new_request_id();
         let mut attempt = 0_u32;
         let mut unknown_write_outcome = false;
 
@@ -936,6 +936,14 @@ async fn retry_delay_with_hint(
     }
     tokio::time::sleep(delay).await;
     Ok(())
+}
+
+/// A random 128-bit operation id, as unique as a v4 UUID. `rand`'s thread-local
+/// generator is seeded from the OS once and reseeds only after 64 KiB of output,
+/// where `Uuid::new_v4` makes a `getentropy` syscall per call, which cost 4.5-7%
+/// of a load driver's CPU.
+fn new_request_id() -> String {
+    format!("{:032x}", rand::random::<u128>())
 }
 
 fn configure_data_client(

@@ -134,7 +134,8 @@ Two smaller findings:
   vs 29.7k with the pool alone; 34.2k vs 29.7k combined with spawned driver
   tasks). The pool and a spawned-task driver were therefore not kept.
 - **UUID generation.** The client generates a v4 UUID per operation, and the
-  resulting `getentropy` syscall is 4.5-7% of driver CPU time.
+  resulting `getentropy` syscall is 4.5-7% of driver CPU time. Fixed in
+  [request-id-generation.md](request-id-generation.md).
 
 ## What this rules out
 
