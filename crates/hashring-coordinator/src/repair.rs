@@ -245,23 +245,24 @@ impl CoordinatorService {
             if tasks.is_empty() {
                 return Ok(seeded);
             }
-            let work = try_map_bounded(tasks, self.replica_repair_concurrency, |tasks| async move {
-                // Keep other ranges available if one destination is down. Failed
-                // tasks retain durable Pending state for the next retry.
-                match self.seed_replica_group(&tasks).await {
-                    Ok(()) => Ok::<_, Status>(tasks.len()),
-                    Err(error) => {
-                        self.record_repair_failure(&tasks, &error).await?;
-                        tracing::warn!(
-                            owner = %tasks[0].owner_node_id,
-                            follower = %tasks[0].node_id,
-                            %error,
-                            "replica seed remains pending"
-                        );
-                        Ok(0)
+            let work =
+                try_map_bounded(tasks, self.replica_repair_concurrency, |tasks| async move {
+                    // Keep other ranges available if one destination is down. Failed
+                    // tasks retain durable Pending state for the next retry.
+                    match self.seed_replica_group(&tasks).await {
+                        Ok(()) => Ok::<_, Status>(tasks.len()),
+                        Err(error) => {
+                            self.record_repair_failure(&tasks, &error).await?;
+                            tracing::warn!(
+                                owner = %tasks[0].owner_node_id,
+                                follower = %tasks[0].node_id,
+                                %error,
+                                "replica seed remains pending"
+                            );
+                            Ok(0)
+                        }
                     }
-                }
-            });
+                });
             let results = tokio::select! {
                 results = work => results?,
                 changed = interrupt.changed() => {
