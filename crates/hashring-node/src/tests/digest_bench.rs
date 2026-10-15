@@ -1,14 +1,37 @@
+//! Timing for the migration range digest, old paths versus new ones.
+//!
+//! The end-to-end experiment cannot resolve this change. Four repetitions of one
+//! unchanged binary spanned 79s to 109s in a single session, and the negative
+//! control makes the reason plain: `initial_put` moved 75.7% between runs even
+//! though `range_digest` never executes during the put phase. Against that, the
+//! digest is at most ~3% of a run, so only a measurement of the operation itself
+//! says anything.
+//!
+//! Four paths are timed over one set of records, because the change did not only
+//! remove work:
+//!
+//! | | before | now |
+//! |---|---|---|
+//! | source | copy the range into a `HashMap`, sort key bytes, hash | walk the token index, hash |
+//! | destination | clone the map, sort key bytes, hash | token every key, sort `u64`s, hash |
+//!
+//! The destination gained a pass of `xxh3`, so timing it separately is the only
+//! way to see whether the bytes sorted as integers give back more than that pass
+//! costs.
+//!
+//! ```sh
+//! cargo test --release -p hashring-node range_digest -- --ignored --nocapture
+//! ```
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::*;
 
-/// The previous implementation, kept here so the change is measured rather than
-/// asserted: collect the map, sort it by key bytes, hash the result.
-fn range_digest_sorted_by_key(
-    records: &HashMap<Vec<u8>, Record>,
-    watermark: u64,
-) -> RangeDigestResponse {
+/// What both sides did before: order the records by key byte and hash. Kept
+/// verbatim so the comparison measures the code it replaced rather than a
+/// paraphrase of it.
+fn sorted_by_key(records: &HashMap<Vec<u8>, Record>, watermark: u64) -> RangeDigestResponse {
     let mut ordered: Vec<_> = records.iter().collect();
     ordered.sort_by_key(|(key, _)| *key);
     let mut digest = blake3::Hasher::new();
@@ -31,98 +54,201 @@ fn range_digest_sorted_by_key(
     }
 }
 
-/// Records whose token order is not their key-byte order, which is the case
-/// where the removed sort was real work rather than a no-op. `xxh3` of a counter
-/// is not monotonic, so the two orders genuinely differ.
-fn bench_records(count: usize, seed: u64) -> (HashMap<Vec<u8>, Record>, Vec<(Vec<u8>, Record)>) {
-    let mut map = HashMap::with_capacity(count);
-    let mut by_token = Vec::with_capacity(count);
-    for index in 0..count {
-        let key = index.to_be_bytes().to_vec();
-        let value = Record {
-            value: Arc::from(format!("value-{index}").as_bytes()),
-            version: RecordVersion {
-                topology_epoch: 1,
-                owner_sequence: index as u64,
-                owner_node_id: format!("node-{}", index % 4),
-            },
-            deleted: index % 17 == 0,
-        };
-        map.insert(key.clone(), value.clone());
-        by_token.push((key, value));
-    }
-    by_token.sort_by_key(|(key, _)| seed ^ token_of(key, seed));
-    (map, by_token)
+/// The source path before: copy every key and record of the range into a fresh
+/// map, then sort it, then hash.
+fn source_before(index: &[Arc<[u8]>], records: &HashMap<Vec<u8>, Record>) -> RangeDigestResponse {
+    let copied: HashMap<Vec<u8>, Record> = index
+        .iter()
+        .filter_map(|key| {
+            records
+                .get(key.as_ref())
+                .map(|record| (key.to_vec(), record.clone()))
+        })
+        .collect();
+    sorted_by_key(&copied, 0)
 }
 
-fn token_of(key: &[u8], seed: u64) -> u64 {
+/// The source path now: `record_keys_in_range` already yields token order, so
+/// records are hashed straight off the index.
+fn source_now(index: &[Arc<[u8]>], records: &HashMap<Vec<u8>, Record>) -> RangeDigestResponse {
+    let collected: Vec<_> = index
+        .iter()
+        .filter_map(|key| records.get(key.as_ref()).map(|record| (key, record)))
+        .collect();
+    range_digest(
+        collected
+            .iter()
+            .map(|(key, record)| (key.as_ref(), *record)),
+        0,
+    )
+}
+
+/// The destination path before: clone the map and sort the copy by key byte.
+fn destination_before(records: &HashMap<Vec<u8>, Record>) -> RangeDigestResponse {
+    sorted_by_key(&records.clone(), 0)
+}
+
+/// The destination path now: the records live in a plain map, so token order has
+/// to be established here — one `xxh3` per key, then sort `u64`s.
+fn destination_now(
+    records: &HashMap<Vec<u8>, Record>,
+    topology: &TopologySnapshot,
+) -> RangeDigestResponse {
+    let mut by_token: Vec<_> = records
+        .iter()
+        .map(|(key, record)| (topology.key_token(key), key, record))
+        .collect();
+    by_token.sort_unstable_by_key(|(token, _, _)| *token);
+    range_digest(
+        by_token
+            .iter()
+            .map(|(_, key, record)| (key.as_slice(), *record)),
+        0,
+    )
+}
+
+/// Same shape as the test helper in `mod.rs`: one member, replication factor 1,
+/// so the seed is the only thing that distinguishes tokens from key bytes.
+fn bench_topology() -> TopologySnapshot {
     TopologySnapshot::new_with_config(
         1,
-        seed,
-        16,
+        0x5e3d_1234,
+        8,
         vec![Member {
             node_id: "node-1".into(),
             endpoint: "http://127.0.0.1:5001".into(),
         }],
-        TopologyConfig::default(),
+        TopologyConfig {
+            desired_replication_factor: 1,
+            write_availability_guard: WriteAvailabilityGuard {
+                minimum_admitted_copies: 1,
+                minimum_healthy_followers: 0,
+                ..WriteAvailabilityGuard::default()
+            },
+            ..TopologyConfig::default()
+        },
     )
-    .map(|topology| topology.key_token(key))
-    .expect("single-member topology builds")
+    .unwrap()
 }
 
-fn time(rounds: u32, mut body: impl FnMut()) -> Duration {
+/// Counter keys, whose byte order is their numeric order, plus their token
+/// order. `xxh3` is not monotonic, so the two are genuinely different
+/// permutations — without that the sort being removed would not have been work.
+fn bench_records(
+    count: usize,
+    topology: &TopologySnapshot,
+) -> (Vec<Arc<[u8]>>, HashMap<Vec<u8>, Record>) {
+    let mut records = HashMap::with_capacity(count);
+    let mut index = Vec::with_capacity(count);
+    for counter in 0..count {
+        let key: Arc<[u8]> = counter.to_be_bytes().to_vec().into();
+        let deleted = counter % 17 == 0;
+        records.insert(
+            key.to_vec(),
+            Record {
+                value: if deleted {
+                    Vec::new().into()
+                } else {
+                    format!("value-{counter}").into_bytes().into()
+                },
+                version: RecordVersion {
+                    topology_epoch: 1,
+                    owner_sequence: counter as u64,
+                    owner_node_id: format!("node-{}", counter % 4),
+                },
+                deleted,
+            },
+        );
+        index.push(key);
+    }
+    // `records_by_token` is a `BTreeMap`, so the source's view of a range is
+    // already in token order. Leaving `index` in key order would have made
+    // `source_now` hash the wrong stream and quietly measured the old path.
+    index.sort_by_key(|key| topology.key_token(key));
+    (index, records)
+}
+
+/// Generic over the closure's return so the `black_box` value stays live through
+/// the call instead of being discarded before it is produced.
+fn time<T>(rounds: u32, mut body: impl FnMut() -> T) -> Duration {
     body();
     let started = Instant::now();
     for _ in 0..rounds {
-        body();
+        drop(body());
     }
     started.elapsed() / rounds
 }
 
-/// The digest has to stop paying for a sort and a clone.
-///
-/// The end-to-end experiment cannot resolve this: four repetitions of one
-/// unchanged binary spanned 79s to 109s in a single session, and
-/// `source_range_digest` was 21.3% of the migration phase in
-/// `results/flamegraph-correctness-20261015-005607`. So the change is measured
-/// on the operation itself, where the removed work is not competing with noise.
+fn milliseconds(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1e3
+}
+
 #[test]
 #[ignore = "micro-benchmark; run with --ignored --nocapture"]
-fn range_digest_orders_by_token_without_sorting_or_cloning() {
+fn range_digest_pays_for_the_order_it_is_given() {
     const RECORDS: usize = 20_000;
     const ROUNDS: u32 = 30;
-    let seed = 0x5eed_u64;
 
-    let (by_key, by_token) = bench_records(RECORDS, seed);
+    let topology = bench_topology();
+    let (index, records) = bench_records(RECORDS, &topology);
 
-    // The two must agree, or this is a behaviour change rather than a refactor.
-    let sorted = range_digest_sorted_by_key(&by_key, 7);
-    let streamed = range_digest(
-        by_token.iter().map(|(key, record)| (key.as_slice(), record)),
-        7,
+    // The setup has to be non-trivial, or a timing result proves nothing about
+    // the sort that was removed.
+    let mut by_key = index.clone();
+    by_key.sort();
+    let mut by_token = index.clone();
+    by_token.sort_by_key(|key| topology.key_token(key));
+    assert_ne!(
+        by_key, by_token,
+        "test keys are already in token order, so no sort was ever needed"
     );
-    assert_eq!(sorted.record_count, streamed.record_count);
+
+    let old_src = source_before(&index, &records);
+    let old_dst = destination_before(&records);
+    let new_src = source_now(&index, &records);
+    let new_dst = destination_now(&records, &topology);
+
+    for response in [&old_src, &old_dst, &new_src, &new_dst] {
+        assert_eq!(response.record_count as usize, RECORDS);
+    }
+    // Both contracts, each over the order its side is supposed to use.
     assert_eq!(
-        sorted.digest, streamed.digest,
-        "token order and key-byte order must digest the same records identically"
+        old_src.digest, old_dst.digest,
+        "key-byte order agreed on both sides before"
     );
-    assert_eq!(streamed.record_count as usize, RECORDS);
+    assert_eq!(
+        new_src.digest, new_dst.digest,
+        "token order must agree on both sides now, or a range would fail verification"
+    );
+    assert_ne!(
+        new_src.digest, old_src.digest,
+        "the orders differ, so the inputs really did exercise the removed sort"
+    );
 
-    let old = time(ROUNDS, || {
-        std::hint::black_box(range_digest_sorted_by_key(&by_key, 7));
+    let old_source = time(ROUNDS, || {
+        std::hint::black_box(source_before(&index, &records))
     });
-    let new = time(ROUNDS, || {
-        std::hint::black_box(range_digest(
-            by_token.iter().map(|(key, record)| (key.as_slice(), record)),
-            7,
-        ));
+    let new_source = time(ROUNDS, || {
+        std::hint::black_box(source_now(&index, &records))
+    });
+    let old_dest = time(ROUNDS, || {
+        std::hint::black_box(destination_before(&records))
+    });
+    let new_dest = time(ROUNDS, || {
+        std::hint::black_box(destination_now(&records, &topology))
     });
 
-    println!("range_digest over {RECORDS} records, {ROUNDS} rounds:");
-    println!("  sort by key bytes (old): {:.3} ms", old.as_secs_f64() * 1e3);
-    println!("  token order       (new): {:.3} ms", new.as_secs_f64() * 1e3);
+    println!("range_digest over {RECORDS} records, {ROUNDS} rounds each:");
     println!(
-        "  speedup: {:.2}x",
-        old.as_secs_f64() / new.as_secs_f64().max(f64::MIN_POSITIVE)
+        "  source      before {ms1:.3} ms   now {ms2:.3} ms   ({speed:.2}x)",
+        ms1 = milliseconds(old_source),
+        ms2 = milliseconds(new_source),
+        speed = old_source.as_secs_f64() / new_source.as_secs_f64()
+    );
+    println!(
+        "  destination before {ms1:.3} ms   now {ms2:.3} ms   ({speed:.2}x)",
+        ms1 = milliseconds(old_dest),
+        ms2 = milliseconds(new_dest),
+        speed = old_dest.as_secs_f64() / new_dest.as_secs_f64()
     );
 }
