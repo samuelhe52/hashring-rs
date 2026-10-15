@@ -1,5 +1,30 @@
 use super::*;
 
+/// An expiry-only write replaces the deadline of a record it does not carry a
+/// value for, so it needs both an empty value and a deadline to set, while an
+/// ordinary write may carry either.
+fn validate_expiry_request(
+    preserve_value: bool,
+    has_value: bool,
+    expires_at_unix_millis: Option<u64>,
+) -> Option<OperationError> {
+    if preserve_value && has_value {
+        return Some(operation_error(
+            ErrorCode::InvalidArgument,
+            "an expiry-only write must not carry a value",
+            false,
+        ));
+    }
+    if preserve_value && expires_at_unix_millis.is_none_or(|at| at == 0) {
+        return Some(operation_error(
+            ErrorCode::InvalidArgument,
+            "an expiry-only write must set a non-zero expiry",
+            false,
+        ));
+    }
+    None
+}
+
 fn apply_replication_entry(
     node: &DataNodeService,
     state: &mut NodeState,
@@ -100,7 +125,19 @@ fn apply_replication_entry(
 
     let dedup_now = Instant::now();
     purge_expired_dedup(state, dedup_now);
-    let mutation_fingerprint = mutation_fingerprint(&entry.key, &entry.value, entry.deleted);
+    let mutation_fingerprint = mutation_fingerprint(
+        &entry.key,
+        MutationShape {
+            value: if entry.preserve_value {
+                &[]
+            } else {
+                entry.value.as_slice()
+            },
+            deleted: entry.deleted,
+            preserve_value: entry.preserve_value,
+            expires_at_unix_millis: entry.expires_at_unix_millis,
+        },
+    );
     if state.dedup.contains_key(entry.mutation_id.as_str()) {
         return Err(Status::already_exists(
             "replication stream reused a live mutation ID",
@@ -125,6 +162,7 @@ fn apply_replication_entry(
             value: entry.value.into(),
             version: version.clone(),
             deleted: entry.deleted,
+            expires_at_unix_millis: stored_deadline(entry.expires_at_unix_millis),
         },
     );
     let stream = state
@@ -176,7 +214,7 @@ impl DataNode for DataNodeService {
         let Some(record) = state
             .records
             .get(request.key.as_slice())
-            .filter(|record| !record.deleted)
+            .filter(|record| !record.deleted && !record.is_expired(now_unix_millis()))
         else {
             return Ok(Response::new(GetResponse {
                 current_epoch: state.topology.epoch,
@@ -192,6 +230,7 @@ impl DataNode for DataNodeService {
             version: Some(record.version.clone()),
             current_epoch: state.topology.epoch,
             error: None,
+            expires_at_unix_millis: record.expires_at_unix_millis,
         }))
     }
 
@@ -223,6 +262,16 @@ impl DataNode for DataNodeService {
                 ..Default::default()
             }));
         }
+        if let Some(error) = validate_expiry_request(
+            request.preserve_value,
+            !request.value.is_empty(),
+            request.expires_at_unix_millis,
+        ) {
+            return Ok(Response::new(PutResponse {
+                error: Some(error),
+                ..Default::default()
+            }));
+        }
         self.refresh_if_newer(request.topology_epoch).await?;
         // The routing token and the mutation fingerprint are computed once and
         // reused by every check below instead of being recomputed under each
@@ -230,7 +279,19 @@ impl DataNode for DataNodeService {
         // the write lock checks again.
         let token;
         let token_seed;
-        let fingerprint = mutation_fingerprint(&request.key, &request.value, false);
+        // The shape is what the mutation does, not what it leaves behind, so it
+        // is computable before the record is read. That is what lets a retried
+        // expiry-only write be recognized as the same operation without first
+        // loading the value it keeps.
+        let shape = match request.preserve_value {
+            true => MutationShape::expiry_only(
+                request
+                    .expires_at_unix_millis
+                    .expect("an expiry-only write's expiry was validated"),
+            ),
+            false => MutationShape::value(&request.value, false, request.expires_at_unix_millis),
+        };
+        let fingerprint = mutation_fingerprint(&request.key, shape);
         {
             let state = self.state.read().await;
             token = state.topology.key_token(&request.key);
@@ -270,6 +331,7 @@ impl DataNode for DataNodeService {
                     version: error.is_none().then_some(version),
                     current_epoch: epoch,
                     error,
+                    key_missing: false,
                 }));
             }
         }
@@ -320,6 +382,7 @@ impl DataNode for DataNodeService {
                     version: error.is_none().then_some(version),
                     current_epoch: epoch,
                     error,
+                    key_missing: false,
                 }));
             }
             return Ok(Response::new(PutResponse {
@@ -332,6 +395,47 @@ impl DataNode for DataNodeService {
                 ..Default::default()
             }));
         }
+        // An expiry-only write replaces the deadline of a record it never
+        // received, so the value it keeps is read here, under the same write
+        // lock that applies it, and reported as missing rather than stored.
+        let kept = if request.preserve_value {
+            let now_unix_millis = now_unix_millis();
+            match state
+                .records
+                .get(request.key.as_slice())
+                .filter(|record| !record.deleted && !record.is_expired(now_unix_millis))
+            {
+                Some(record) => record.clone(),
+                None => {
+                    return Ok(Response::new(PutResponse {
+                        current_epoch: state.topology.epoch,
+                        key_missing: true,
+                        ..Default::default()
+                    }));
+                }
+            }
+        } else {
+            Record {
+                value: request.value.clone().into(),
+                version: RecordVersion::default(),
+                deleted: false,
+                expires_at_unix_millis: None,
+            }
+        };
+        // A write that does not mention a deadline keeps the one it finds,
+        // which is what a caller's `KEEPTTL` asks for; one that sets a deadline
+        // of zero clears it.
+        let expires_at_unix_millis = if request.preserve_value {
+            shape.expires_at_unix_millis
+        } else {
+            match request.expires_at_unix_millis {
+                Some(expires_at) => Some(expires_at),
+                None => state
+                    .records
+                    .get(request.key.as_slice())
+                    .and_then(|record| record.expires_at_unix_millis),
+            }
+        };
         let ack_cost = required_ack_retained_bytes(&ready_followers);
         let dedup_cost =
             dedup_retained_bytes(&request.request_id, request.key.len(), self.node_id.len())
@@ -359,7 +463,7 @@ impl DataNode for DataNodeService {
             }));
         }
         let journal_record_bytes =
-            request.key.len() + request.value.len() + request.request_id.len() + 128;
+            request.key.len() + kept.value.len() + request.request_id.len() + 128;
         let matching_sources = state
             .sources
             .values()
@@ -429,8 +533,8 @@ impl DataNode for DataNodeService {
         let replications = match prepare_replication_entries(
             &mut state,
             &request.key,
-            &request.value,
-            false,
+            &kept.value,
+            shape,
             &version,
             request.request_id,
             token,
@@ -480,9 +584,10 @@ impl DataNode for DataNodeService {
                 .push_back((entry.stream_sequence, now));
         }
         let record = Record {
-            value: request.value.into(),
+            value: kept.value.clone(),
             version: version.clone(),
             deleted: false,
+            expires_at_unix_millis: stored_deadline(expires_at_unix_millis),
         };
         let record_key: Arc<[u8]> = Arc::from(request.key.as_slice());
         state.insert_record(record_key.clone(), record.clone());
@@ -502,6 +607,8 @@ impl DataNode for DataNodeService {
                     deleted: false,
                     mutation_id: mutation_id.clone(),
                     remaining_retention_millis: 0,
+                    expires_at_unix_millis: shape.expires_at_unix_millis,
+                    preserve_value: request.preserve_value,
                 }),
             });
         }
@@ -535,6 +642,7 @@ impl DataNode for DataNodeService {
             version: error.is_none().then_some(version),
             current_epoch,
             error,
+            key_missing: false,
         }))
     }
 
@@ -562,7 +670,7 @@ impl DataNode for DataNodeService {
         self.refresh_if_newer(request.topology_epoch).await?;
         let token;
         let token_seed;
-        let fingerprint = mutation_fingerprint(&request.key, &[], true);
+        let fingerprint = mutation_fingerprint(&request.key, MutationShape::value(&[], true, None));
         {
             let state = self.state.read().await;
             token = state.topology.key_token(&request.key);
@@ -749,7 +857,7 @@ impl DataNode for DataNodeService {
             &mut state,
             &request.key,
             &[],
-            true,
+            MutationShape::value(&[], true, None),
             &version,
             request.request_id,
             token,
@@ -804,6 +912,7 @@ impl DataNode for DataNodeService {
                 value: Arc::from([]),
                 version: version.clone(),
                 deleted: true,
+                expires_at_unix_millis: None,
             },
         );
         for source in state
@@ -822,6 +931,8 @@ impl DataNode for DataNodeService {
                     deleted: true,
                     mutation_id: mutation_id.clone(),
                     remaining_retention_millis: 0,
+                    expires_at_unix_millis: None,
+                    preserve_value: false,
                 }),
             });
         }
@@ -1223,6 +1334,11 @@ impl DataNode for DataNodeService {
                 deleted: record.deleted,
                 mutation_id: String::new(),
                 remaining_retention_millis: 0,
+                // An expired record is carried across like any other: the
+                // destination enforces the same absolute deadline, and skipping
+                // it here would make the two sides disagree about the range.
+                expires_at_unix_millis: record.expires_at_unix_millis,
+                preserve_value: false,
             };
             let size = migration_record_size(&record);
             if !records.is_empty() && bytes + size > max_bytes {
@@ -1330,7 +1446,7 @@ impl DataNode for DataNodeService {
                     .get(record.mutation_id.as_str())
                     .filter(|dedup| {
                         dedup.fingerprint
-                            == mutation_fingerprint(&record.key, &record.value, record.deleted)
+                            == mutation_fingerprint(&record.key, migration_record_shape(record))
                             && Some(&dedup.version) == record.version.as_ref()
                     })
                     .map_or(0, |dedup| {
@@ -1394,11 +1510,12 @@ impl DataNode for DataNodeService {
                 ));
             }
             if !record.mutation_id.is_empty() {
+                let fingerprint =
+                    mutation_fingerprint(&record.key, migration_record_shape(&record));
                 let dedup = DeduplicationRecord {
                     mutation_id: record.mutation_id.clone(),
                     key: record.key.clone(),
-                    fingerprint: mutation_fingerprint(&record.key, &record.value, record.deleted)
-                        .to_vec(),
+                    fingerprint: fingerprint.to_vec(),
                     version: record.version.clone(),
                     deleted: record.deleted,
                     remaining_retention_millis: record.remaining_retention_millis,

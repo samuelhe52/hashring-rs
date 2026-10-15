@@ -157,6 +157,7 @@ fn bench_records(
                     owner_node_id: format!("node-{}", counter % 4),
                 },
                 deleted,
+                expires_at_unix_millis: None,
             },
         );
         index.push(key);

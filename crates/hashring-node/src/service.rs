@@ -248,6 +248,7 @@ impl DataNodeService {
             topology,
             records: HashMap::new(),
             records_by_token: TokenIndex::default(),
+            record_expirations: BinaryHeap::new(),
             next_sequence: 0,
             owner_stream_sequences: HashMap::new(),
             owner_stream_unacked: HashMap::new(),
@@ -272,6 +273,7 @@ impl DataNodeService {
         let pressure = Arc::new(NodePressureStats::default());
         let replication_dispatch =
             start_replication_dispatch(state.clone(), pressure.clone(), &settings);
+        start_expiry_sweep(state.clone());
         let service = Self {
             node_id,
             process_instance_id,

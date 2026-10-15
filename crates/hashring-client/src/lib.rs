@@ -32,12 +32,43 @@ pub struct GetOutput {
     pub value: Vec<u8>,
     pub version: RecordVersion,
     pub topology_epoch: u64,
+    /// Absolute Unix milliseconds at which the record stops being readable, or
+    /// `None` when it never expires. Always `None` for a key that was not
+    /// found, so a miss never looks like an expired hit.
+    pub expires_at_unix_millis: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
 pub struct PutOutput {
     pub version: RecordVersion,
     pub topology_epoch: u64,
+    /// An expiry-only write to a key that does not exist. The record was not
+    /// touched and no receipt was kept, so a retry re-reads the key.
+    pub key_missing: bool,
+}
+
+/// What a write does to the record's deadline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Expiry {
+    /// Leave the record's current deadline alone.
+    Keep,
+    /// Store this absolute Unix millisecond deadline.
+    At(u64),
+    /// Remove the record's deadline.
+    Clear,
+}
+
+/// On the wire an unset field means "keep what is there" and zero means "no
+/// deadline", which is the same convention Redis uses for `KEEPTTL` against a
+/// plain write.
+impl From<Expiry> for Option<u64> {
+    fn from(expiry: Expiry) -> Self {
+        match expiry {
+            Expiry::Keep => None,
+            Expiry::At(at) => Some(at),
+            Expiry::Clear => Some(0),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -454,6 +485,7 @@ impl HashringClient {
                 value: response.value,
                 version: response.version.ok_or(ClientError::MissingVersion)?,
                 topology_epoch: response.current_epoch,
+                expires_at_unix_millis: response.expires_at_unix_millis,
             };
             if response.current_epoch > epoch {
                 self.trigger_background_refresh(response.current_epoch);
@@ -463,6 +495,44 @@ impl HashringClient {
     }
 
     pub async fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<PutOutput, ClientError> {
+        self.put_record(key, value, Expiry::Keep, false).await
+    }
+
+    /// Stores `value` and sets the record's deadline.
+    ///
+    /// The deadline is absolute and is fixed when this is called, so every
+    /// retry of one logical write carries the deadline it was first sent with.
+    /// A caller that wants a deadline relative to the moment the write is
+    /// accepted computes it from its own clock.
+    pub async fn put_with_expiry(
+        &self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        expiry: Expiry,
+    ) -> Result<PutOutput, ClientError> {
+        self.put_record(key, value, expiry, false).await
+    }
+
+    /// Replaces the deadline of an existing record, keeping its value.
+    ///
+    /// Returns `key_missing` rather than an error when the key is absent, and
+    /// writes nothing in that case: no record, no sequence and no receipt.
+    pub async fn set_expiry(
+        &self,
+        key: Vec<u8>,
+        expires_at_unix_millis: u64,
+    ) -> Result<PutOutput, ClientError> {
+        self.put_record(key, Vec::new(), Expiry::At(expires_at_unix_millis), true)
+            .await
+    }
+
+    async fn put_record(
+        &self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        expiry: Expiry,
+        preserve_value: bool,
+    ) -> Result<PutOutput, ClientError> {
         validate_key_size(&key)?;
         if value.len() > DEFAULT_MAX_VALUE_BYTES {
             return Err(size_failure(format!(
@@ -495,6 +565,8 @@ impl HashringClient {
                 value: value.clone(),
                 topology_epoch: epoch,
                 request_id: request_id.clone(),
+                expires_at_unix_millis: expiry.into(),
+                preserve_value,
             };
             let response = match tokio::time::timeout(
                 remaining(deadline, unknown_write_outcome)?,
@@ -546,6 +618,7 @@ impl HashringClient {
             let output = PutOutput {
                 version: response.version.ok_or(ClientError::MissingVersion)?,
                 topology_epoch: response.current_epoch,
+                key_missing: response.key_missing,
             };
             if response.current_epoch > epoch {
                 self.trigger_background_refresh(response.current_epoch);

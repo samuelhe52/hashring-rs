@@ -7,14 +7,15 @@ listed under [timers and budgets](operations.md#timers-and-budgets).
 
 ## How settings resolve
 
-`coordinator`, `node` and `experiment` take `--config <file>`, a YAML file whose
-keys are the flag names with `_` for `-`. For each setting, a flag on the
-command line wins over the file, and the file wins over the default. Unknown
-keys are an error. A relative path in a file is resolved against the file's
-directory. Boolean experiment flags can turn a setting on but not off.
+`coordinator`, `node`, `redis-gateway` and `experiment` take `--config <file>`, a
+YAML file whose keys are the flag names with `_` for `-`. For each setting, a flag
+on the command line wins over the file, and the file wins over the default.
+Unknown keys are an error. A relative path in a file is resolved against the
+file's directory. Boolean experiment flags can turn a setting on but not off.
 
 The examples list every key: [`coordinator.yaml`](../examples/coordinator.yaml),
-[`node.yaml`](../examples/node.yaml) and
+[`node.yaml`](../examples/node.yaml),
+[`redis-gateway.yaml`](../examples/redis-gateway.yaml) and
 [`experiment.yaml`](../examples/experiment.yaml).
 
 ## Scopes
@@ -64,6 +65,22 @@ The examples list every key: [`coordinator.yaml`](../examples/coordinator.yaml),
 | `--replication-stream-queue-capacity` | `replication_stream_queue_capacity` | 32 | per node | Mutations queued per follower stream, whatever their size, so it limits small writes before the byte budget does. |
 | `--required-ack-timeout-ms` | `required_ack_timeout_ms` | 2000 | per node | How long a write waits for its required follower ACKs before reporting an unknown outcome. |
 | `--replication-rpc-timeout-ms` | `replication_rpc_timeout_ms` | 2000 | per node | Bounds each replication connect and batch RPC; a timed-out batch is retried. |
+
+## `redis-gateway`
+
+Serves the Redis protocol on `--listen` and reaches the cluster through
+`--coordinator`. The port may be fronted by any number of gateway processes;
+see [Redis compatibility](redis-compatibility.md) for what that does and does
+not guarantee.
+
+| Flag | YAML key | Default | Scope | Notes |
+| --- | --- | --- | --- | --- |
+| `--config` | — | none | process | |
+| `--listen` | `listen` | `127.0.0.1:6379` | process | |
+| `--coordinator` | `coordinator` | `http://127.0.0.1:50050` | process | Contacted on the first command, so the gateway may start before the coordinator. |
+| `--deadline-ms` | `deadline_ms` | 5000 | process | How long one command may take against the cluster. Redis has no such deadline; a proxy in front of a migrating cluster needs one. |
+| `--requirepass` | `requirepass` | none | process | Falls back to the `HASHRING_GATEWAY_PASSWORD` environment variable, which keeps the secret out of both the file and the process list. |
+| `--worker-threads` | `worker_threads` | one per available CPU | process | |
 
 ## `experiment`
 

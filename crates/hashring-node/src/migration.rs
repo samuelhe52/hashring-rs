@@ -10,6 +10,27 @@ pub(super) fn migration_record_size(record: &MigrationRecord) -> usize {
     record.key.len() + record.value.len() + record.mutation_id.len() + 128
 }
 
+/// The shape whose fingerprint the owner stored in the deduplication receipt of
+/// the mutation that produced this record. Reconstructing it from the record is
+/// what lets a destination, a follower and a retried client agree on the same
+/// receipt without the node ever keeping the request itself.
+///
+/// An expiry-only write carries the value it kept rather than an empty one,
+/// because a follower has to store it; `preserve_value` is what says that value
+/// was not the one the client sent, so the request value was empty.
+pub(super) fn migration_record_shape(record: &MigrationRecord) -> MutationShape<'_> {
+    MutationShape {
+        value: if record.preserve_value {
+            &[]
+        } else {
+            record.value.as_slice()
+        },
+        deleted: record.deleted,
+        preserve_value: record.preserve_value,
+        expires_at_unix_millis: record.expires_at_unix_millis,
+    }
+}
+
 pub(super) fn apply_record(
     records: &mut HashMap<Vec<u8>, Record>,
     record: MigrationRecord,
@@ -29,6 +50,7 @@ pub(super) fn apply_record(
             value: record.value.into(),
             version,
             deleted: record.deleted,
+            expires_at_unix_millis: stored_deadline(record.expires_at_unix_millis),
         },
     );
     Ok(())
@@ -77,15 +99,16 @@ pub(super) fn compare_versions(left: &RecordVersion, right: &RecordVersion) -> O
 /// `destination_range_digest` (21.3% and 8.2% of the migration phase in
 /// results/flamegraph-correctness-20261015-005607).
 ///
-/// The digest bytes differ from v2 because the order differs, so the domain
-/// separator is bumped: a digest from a node running the old code must never be
-/// compared against one from a node running this.
+/// Records now carry an expiry, so the digest covers it as well: a source and a
+/// destination that disagreed about a deadline would hand over keys that stop
+/// being readable at different times. The digest bytes change again, hence the
+/// new domain separator.
 pub(super) fn range_digest<'a>(
     records: impl IntoIterator<Item = (&'a [u8], &'a Record)>,
     watermark: u64,
 ) -> RangeDigestResponse {
     let mut digest = blake3::Hasher::new();
-    digest.update(b"hashring-rs:records:v3\0");
+    digest.update(b"hashring-rs:records:v4\0");
     let mut count = 0u64;
     for (key, record) in records {
         count += 1;
@@ -98,6 +121,16 @@ pub(super) fn range_digest<'a>(
         digest.update(&(record.value.len() as u64).to_be_bytes());
         digest.update(record.value.as_ref());
         digest.update(&[u8::from(record.deleted)]);
+        match record.expires_at_unix_millis {
+            Some(expires_at) => {
+                digest.update(&[1]);
+                let deadline = expires_at.to_be_bytes();
+                digest.update(&deadline);
+            }
+            None => {
+                digest.update(&[0]);
+            }
+        }
     }
     RangeDigestResponse {
         record_count: count,

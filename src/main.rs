@@ -65,6 +65,8 @@ enum Command {
     ReplicaStatus(ClientArgs),
     /// Execute the active migration through publication and cleanup.
     ExecuteChange(ExecuteChangeArgs),
+    /// Serve the Redis protocol on a port, over this cluster.
+    RedisGateway(GatewayArgs),
     /// Run a reproducible separate-process correctness or performance experiment.
     Experiment(ExperimentArgs),
 }
@@ -295,6 +297,33 @@ struct ConfigChangeArgs {
 }
 
 #[derive(Args)]
+struct GatewayArgs {
+    /// YAML file with gateway settings. Keys use the flag names with `_` for
+    /// `-`. A flag on the command line wins over the file.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// [default: 127.0.0.1:6379]
+    #[arg(long)]
+    listen: Option<SocketAddr>,
+    /// [default: http://127.0.0.1:50050]
+    #[arg(long)]
+    coordinator: Option<String>,
+    /// How long one command may take against the cluster before it is reported
+    /// as not finished. [default: 5000]
+    #[arg(long)]
+    deadline_ms: Option<u64>,
+    /// Require this password in AUTH before a connection may read or write.
+    /// Falls back to the HASHRING_GATEWAY_PASSWORD environment variable, so a
+    /// secret need not appear in the process list.
+    #[arg(long)]
+    requirepass: Option<String>,
+    /// Tokio worker threads. Defaults to one per CPU available to the process
+    /// (affinity and cgroup limits included).
+    #[arg(long)]
+    worker_threads: Option<NonZeroUsize>,
+}
+
+#[derive(Args, Clone)]
 struct ExecuteChangeArgs {
     #[arg(long, default_value = "http://127.0.0.1:50050")]
     coordinator: String,
@@ -451,6 +480,13 @@ fn main() -> Result<()> {
                 args.post_publish_delay_ms,
             ));
         }
+        Command::RedisGateway(args) => {
+            let file = args.config.as_deref().map(config::load).transpose()?;
+            let settings = config::gateway::resolve(args, file)?;
+            init_tracing(false)?;
+            return build_runtime(Some(settings.runtime_workers(cpus)))?
+                .block_on(run_redis_gateway(settings));
+        }
         _ => {}
     }
     init_tracing(false)?;
@@ -495,10 +531,36 @@ async fn run(command: Command) -> Result<()> {
         Command::ChangeStatus(args) => run_change_status(args).await,
         Command::ReplicaStatus(args) => run_replica_status(args).await,
         Command::ExecuteChange(args) => run_execute_change(args).await,
-        Command::Coordinator(_) | Command::Node(_) | Command::Experiment(_) => {
+        Command::Coordinator(_)
+        | Command::Node(_)
+        | Command::Experiment(_)
+        | Command::RedisGateway(_) => {
             unreachable!("main runs the long-running commands")
         }
     }
+}
+
+/// Serves the Redis protocol until the process is asked to stop.
+///
+/// The coordinator is contacted when the first command arrives rather than
+/// before the port opens, so the gateway may be started before, with, or
+/// instead of the coordinator: clients get `-TRYAGAIN` until it answers.
+async fn run_redis_gateway(settings: config::gateway::GatewaySettings) -> Result<()> {
+    let (shutdown, mut stopped) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown.send(true);
+    });
+    let config = hashring_redis::GatewayConfig {
+        coordinator: settings.coordinator,
+        listen: settings.listen,
+        operation_timeout: settings.operation_timeout,
+        password: settings.password,
+        ..Default::default()
+    };
+    hashring_redis::serve(config, stopped.clone()).await?;
+    stopped.changed().await.ok();
+    Ok(())
 }
 
 async fn run_local_experiment(config: ExperimentConfig) -> Result<()> {
