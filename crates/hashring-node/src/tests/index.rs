@@ -37,6 +37,7 @@ fn keys(count: u32) -> Vec<Vec<u8>> {
 
 fn record(owner_sequence: u64) -> Record {
     Record {
+        expires_at_unix_millis: None,
         value: Arc::from(format!("value-{owner_sequence}").as_bytes()),
         version: RecordVersion {
             topology_epoch: 1,

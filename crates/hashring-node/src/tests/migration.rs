@@ -27,6 +27,8 @@ async fn paused_source_range_keeps_reads_available_and_blocks_writes() {
             value: b"value".to_vec(),
             topology_epoch: 1,
             request_id: "put-1".into(),
+            expires_at_unix_millis: None,
+            preserve_value: false,
         }))
         .await
         .unwrap();
@@ -61,6 +63,8 @@ async fn paused_source_range_keeps_reads_available_and_blocks_writes() {
             value: b"replacement".to_vec(),
             topology_epoch: 1,
             request_id: "put-2".into(),
+            expires_at_unix_millis: None,
+            preserve_value: false,
         }))
         .await
         .unwrap()
@@ -89,6 +93,8 @@ async fn paused_source_range_keeps_reads_available_and_blocks_writes() {
             value: b"replacement".to_vec(),
             topology_epoch: 1,
             request_id: "put-3".into(),
+            expires_at_unix_millis: None,
+            preserve_value: false,
         }))
         .await
         .unwrap()
@@ -121,6 +127,8 @@ async fn interrupted_repair_cleanup_unpauses_only_repair_ranges() {
             value: b"value".to_vec(),
             topology_epoch: 1,
             request_id: "before-cleanup".into(),
+            expires_at_unix_millis: None,
+            preserve_value: false,
         }))
         .await
         .unwrap()
@@ -139,6 +147,8 @@ async fn interrupted_repair_cleanup_unpauses_only_repair_ranges() {
             value: b"value".to_vec(),
             topology_epoch: 1,
             request_id: "after-cleanup".into(),
+            expires_at_unix_millis: None,
+            preserve_value: false,
         }))
         .await
         .unwrap()
@@ -171,6 +181,8 @@ async fn committed_destination_fences_writes_until_idempotent_activation() {
                 deleted: false,
                 mutation_id: String::new(),
                 remaining_retention_millis: 0,
+                expires_at_unix_millis: None,
+                preserve_value: false,
             }],
             journal_records: Vec::new(),
         }))
@@ -248,6 +260,8 @@ async fn committed_destination_fences_writes_until_idempotent_activation() {
             value: b"new".to_vec(),
             topology_epoch: 2,
             request_id: "put-1".into(),
+            expires_at_unix_millis: None,
+            preserve_value: false,
         }))
         .await
         .unwrap()
@@ -281,6 +295,8 @@ async fn committed_destination_fences_writes_until_idempotent_activation() {
             value: b"new".to_vec(),
             topology_epoch: 2,
             request_id: "put-2".into(),
+            expires_at_unix_millis: None,
+            preserve_value: false,
         }))
         .await
         .unwrap();
@@ -318,6 +334,8 @@ async fn owner_retries_reuse_original_result_and_reject_mutation_id_conflicts() 
         value: b"original".to_vec(),
         topology_epoch: 1,
         request_id: "same-id".into(),
+        expires_at_unix_millis: None,
+        preserve_value: false,
     };
     let original = service
         .put(Request::new(first.clone()))
@@ -400,6 +418,8 @@ async fn dedup_budget_rejects_before_apply_and_expired_records_free_capacity() {
         value: b"one".to_vec(),
         topology_epoch: 1,
         request_id: "first".into(),
+        expires_at_unix_millis: None,
+        preserve_value: false,
     };
     assert!(
         service
@@ -415,6 +435,8 @@ async fn dedup_budget_rejects_before_apply_and_expired_records_free_capacity() {
         value: b"two".to_vec(),
         topology_epoch: 1,
         request_id: "other".into(),
+        expires_at_unix_millis: None,
+        preserve_value: false,
     };
     let rejected = service
         .put(Request::new(second.clone()))
@@ -473,6 +495,8 @@ async fn migration_carries_snapshot_and_journal_mutation_ids() {
         value: b"one".to_vec(),
         topology_epoch: 1,
         request_id: "before-id".into(),
+        expires_at_unix_millis: None,
+        preserve_value: false,
     };
     let first_version = source
         .put(Request::new(before.clone()))
@@ -492,6 +516,8 @@ async fn migration_carries_snapshot_and_journal_mutation_ids() {
         value: b"two".to_vec(),
         topology_epoch: 1,
         request_id: "after-id".into(),
+        expires_at_unix_millis: None,
+        preserve_value: false,
     };
     let second_version = source
         .put(Request::new(after.clone()))
@@ -612,7 +638,8 @@ async fn expired_staged_ids_free_migration_budget_before_commit() {
     let make_record = |id: &str, key: &[u8]| DeduplicationRecord {
         mutation_id: id.into(),
         key: key.to_vec(),
-        fingerprint: mutation_fingerprint(key, b"value", false).to_vec(),
+        fingerprint: mutation_fingerprint(key, MutationShape::value(b"value", false, None))
+            .to_vec(),
         version: Some(RecordVersion {
             topology_epoch: 1,
             owner_sequence: 1,
@@ -678,6 +705,8 @@ async fn delete_is_idempotent_and_put_restores_an_empty_value() {
             value: Vec::new(),
             topology_epoch: 1,
             request_id: "put-1".into(),
+            expires_at_unix_millis: None,
+            preserve_value: false,
         }))
         .await
         .unwrap();
@@ -713,6 +742,8 @@ async fn delete_is_idempotent_and_put_restores_an_empty_value() {
             value: b"restored".to_vec(),
             topology_epoch: 1,
             request_id: "put-2".into(),
+            expires_at_unix_millis: None,
+            preserve_value: false,
         }))
         .await
         .unwrap();
@@ -779,6 +810,8 @@ async fn snapshot_and_changelog_preserve_a_deleted_key_tombstone() {
             value: b"value".to_vec(),
             topology_epoch: 1,
             request_id: "put-1".into(),
+            expires_at_unix_millis: None,
+            preserve_value: false,
         }))
         .await
         .unwrap();
@@ -896,6 +929,7 @@ async fn deletion_replay_and_commit_remove_stale_destination_data() {
                 owner_sequence: 1,
                 owner_node_id: "node-2".into(),
             },
+            expires_at_unix_millis: None,
             deleted: false,
         },
     );
@@ -918,6 +952,8 @@ async fn deletion_replay_and_commit_remove_stale_destination_data() {
             deleted: true,
             mutation_id: String::new(),
             remaining_retention_millis: 0,
+            expires_at_unix_millis: None,
+            preserve_value: false,
         }),
     };
     let batch = ApplyMigrationBatchRequest {
@@ -971,6 +1007,8 @@ async fn migration_replay_preserves_delete_and_put_order() {
             deleted: true,
             mutation_id: String::new(),
             remaining_retention_millis: 0,
+            expires_at_unix_millis: None,
+            preserve_value: false,
         }),
     };
     let put = |watermark, owner_sequence, value: &[u8]| JournalRecord {
@@ -982,6 +1020,8 @@ async fn migration_replay_preserves_delete_and_put_order() {
             deleted: false,
             mutation_id: String::new(),
             remaining_retention_millis: 0,
+            expires_at_unix_millis: None,
+            preserve_value: false,
         }),
     };
 
@@ -1089,6 +1129,8 @@ async fn journal_budget_is_aggregate_across_ranges() {
             value: b"value".to_vec(),
             topology_epoch: 1,
             request_id: "put-1".into(),
+            expires_at_unix_millis: None,
+            preserve_value: false,
         }))
         .await
         .unwrap()
@@ -1109,6 +1151,8 @@ async fn delete_leaves_the_value_when_the_journal_budget_is_full() {
             value: b"value".to_vec(),
             topology_epoch: 1,
             request_id: "put-1".into(),
+            expires_at_unix_millis: None,
+            preserve_value: false,
         }))
         .await
         .unwrap();
@@ -1198,6 +1242,8 @@ async fn range_digest_agrees_when_keys_share_a_token() {
                     value: format!("value-{index}-{side}").into_bytes(),
                     topology_epoch: 1,
                     request_id: format!("put-{index}-{side}"),
+                    expires_at_unix_millis: None,
+                    preserve_value: false,
                 }))
                 .await
                 .unwrap();
@@ -1255,4 +1301,129 @@ async fn range_digest_agrees_when_keys_share_a_token() {
         .into_inner();
     assert_eq!(destination_digest.record_count, source_digest.record_count);
     assert_eq!(destination_digest.digest, source_digest.digest);
+}
+
+/// Source and destination must digest a range to the same value.
+///
+/// The earlier test compared digests over a single record, where both sides
+/// agree whichever order they walk in, so it could not catch one side walking
+/// key bytes while the other walked tokens. That is now the whole risk:
+/// `range_digest` takes records in the order its caller supplies, the source
+/// reads that order off the token index, and the destination sorts by token.
+/// Here the range is large enough that token order and key-byte order are
+/// different permutations, so a side using the wrong one cannot match by luck.
+#[tokio::test]
+async fn source_and_destination_digest_a_range_whose_orders_differ() {
+    const RECORDS: usize = 256;
+
+    let source = service();
+
+    // Records first: `prepare_source_range` captures the range's keys into
+    // `snapshot_keys`, so seeding afterwards would leave an empty snapshot even
+    // though the token index already has them.
+    let keys: Vec<Vec<u8>> = (0..RECORDS)
+        .map(|index| format!("key-{index:04}").into_bytes())
+        .collect();
+    {
+        let mut state = source.state.write().await;
+        for (index, key) in keys.iter().enumerate() {
+            let deleted = index % 7 == 0;
+            let value: Arc<[u8]> = if deleted {
+                Vec::new().into()
+            } else {
+                format!("value-{index}").into_bytes().into()
+            };
+            seed_record(
+                &mut state,
+                key.as_slice(),
+                Record {
+                    value,
+                    version: RecordVersion {
+                        topology_epoch: 1,
+                        owner_sequence: index as u64 + 1,
+                        owner_node_id: "node-1".into(),
+                    },
+                    deleted,
+                    expires_at_unix_millis: None,
+                },
+            );
+        }
+        // The setup has to genuinely differ, or the comparison below proves
+        // nothing: if these keys were already in token order, a destination
+        // walking key bytes would match by accident.
+        let mut by_key = keys.clone();
+        by_key.sort();
+        let mut by_token = keys.clone();
+        by_token.sort_by_key(|key| state.topology.key_token(key));
+        assert_ne!(
+            by_key, by_token,
+            "test keys are already in token order, so the test cannot distinguish the two"
+        );
+    }
+
+    source
+        .prepare_source_range(Request::new(PrepareRangeRequest {
+            range: Some(range(0)),
+        }))
+        .await
+        .unwrap();
+
+    let digest = source
+        .source_range_digest(Request::new(RangeControlRequest {
+            change_id: "change-1".into(),
+            range_id: "range-1".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(digest.record_count, RECORDS as u64);
+
+    let snapshot = source
+        .read_snapshot_page(Request::new(SnapshotPageRequest {
+            change_id: "change-1".into(),
+            range_id: "range-1".into(),
+            cursor: 0,
+            max_bytes: MAX_MIGRATION_PAGE_BYTES as u64,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        snapshot.done,
+        "the whole range must fit one page for this comparison"
+    );
+    assert_eq!(snapshot.records.len(), RECORDS);
+
+    let mut destination = service();
+    destination.node_id = "node-2".into();
+    destination
+        .prepare_destination_range(Request::new(PrepareRangeRequest {
+            range: Some(range(0)),
+        }))
+        .await
+        .unwrap();
+    destination
+        .apply_migration_batch(Request::new(ApplyMigrationBatchRequest {
+            change_id: "change-1".into(),
+            range_id: "range-1".into(),
+            snapshot_records: snapshot.records,
+            journal_records: Vec::new(),
+        }))
+        .await
+        .unwrap();
+    let destination_digest = destination
+        .destination_range_digest(Request::new(RangeControlRequest {
+            change_id: "change-1".into(),
+            range_id: "range-1".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(destination_digest.record_count, RECORDS as u64);
+    assert_eq!(
+        destination_digest.digest, digest.digest,
+        "the source walks its token index and the destination sorts by token; \
+         both must hash the same bytes in the same order"
+    );
 }

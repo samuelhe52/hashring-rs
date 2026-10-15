@@ -1,13 +1,64 @@
 use super::*;
 
-pub(super) fn mutation_fingerprint(key: &[u8], value: &[u8], deleted: bool) -> [u8; 32] {
+/// What a mutation does to a record, hashed into its deduplication receipt so
+/// one mutation ID is only ever deduplicated against an identical operation: a
+/// retried write carries the same shape, while a different payload, a different
+/// expiry, or a delete is rejected instead of being taken for the same write.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct MutationShape<'a> {
+    /// The value the request carried. An expiry-only write carries none, which
+    /// is why the shape also records `preserve_value`.
+    pub(super) value: &'a [u8],
+    pub(super) deleted: bool,
+    pub(super) preserve_value: bool,
+    pub(super) expires_at_unix_millis: Option<u64>,
+}
+
+impl<'a> MutationShape<'a> {
+    pub(super) fn value(
+        value: &'a [u8],
+        deleted: bool,
+        expires_at_unix_millis: Option<u64>,
+    ) -> Self {
+        Self {
+            value,
+            deleted,
+            preserve_value: false,
+            expires_at_unix_millis,
+        }
+    }
+
+    pub(super) fn expiry_only(expires_at_unix_millis: u64) -> Self {
+        Self {
+            value: &[],
+            deleted: false,
+            preserve_value: true,
+            expires_at_unix_millis: Some(expires_at_unix_millis),
+        }
+    }
+}
+
+/// The digest is versioned because an expiry-only write carries a shape the
+/// earlier form could not express, so a receipt from a node running the old
+/// code must never be compared against one from a node running this.
+pub(super) fn mutation_fingerprint(key: &[u8], shape: MutationShape<'_>) -> [u8; 32] {
     let mut digest = blake3::Hasher::new();
-    digest.update(b"hashring-rs:mutation:v1\0");
+    digest.update(b"hashring-rs:mutation:v2\0");
     digest.update(&(key.len() as u64).to_be_bytes());
     digest.update(key);
-    digest.update(&[u8::from(deleted)]);
-    digest.update(&(value.len() as u64).to_be_bytes());
-    digest.update(value);
+    digest.update(&[u8::from(shape.deleted), u8::from(shape.preserve_value)]);
+    digest.update(&(shape.value.len() as u64).to_be_bytes());
+    digest.update(shape.value);
+    match shape.expires_at_unix_millis {
+        Some(expires_at) => {
+            digest.update(&[1]);
+            let deadline = expires_at.to_be_bytes();
+            digest.update(&deadline);
+        }
+        None => {
+            digest.update(&[0]);
+        }
+    }
     *digest.finalize().as_bytes()
 }
 

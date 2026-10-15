@@ -92,7 +92,7 @@ pub(super) fn prepare_replication_entries(
     state: &mut NodeState,
     key: &[u8],
     value: &[u8],
-    deleted: bool,
+    shape: MutationShape<'_>,
     version: &RecordVersion,
     mutation_id: String,
     token: u64,
@@ -137,9 +137,11 @@ pub(super) fn prepare_replication_entries(
         owner_node_id: version.owner_node_id.clone(),
         key: Arc::from(key),
         value: Arc::from(value),
-        deleted,
+        deleted: shape.deleted,
         version: version.clone(),
         mutation_id,
+        expires_at_unix_millis: shape.expires_at_unix_millis,
+        preserve_value: shape.preserve_value,
     });
 
     Ok(followers
@@ -199,7 +201,7 @@ pub(super) fn replication_backpressure_error(epoch: u64) -> OperationError {
 
 pub(super) fn replication_fingerprint(entry: &ReplicationEntry) -> String {
     let mut digest = blake3::Hasher::new();
-    digest.update(b"hashring-rs:replication-entry:v1\0");
+    digest.update(b"hashring-rs:replication-entry:v2\0");
     digest.update(&entry.topology_epoch.to_be_bytes());
     digest.update(&(entry.owner_node_id.len() as u64).to_be_bytes());
     digest.update(entry.owner_node_id.as_bytes());
@@ -208,7 +210,17 @@ pub(super) fn replication_fingerprint(entry: &ReplicationEntry) -> String {
     digest.update(&entry.key);
     digest.update(&(entry.value.len() as u64).to_be_bytes());
     digest.update(&entry.value);
-    digest.update(&[u8::from(entry.deleted)]);
+    digest.update(&[u8::from(entry.deleted), u8::from(entry.preserve_value)]);
+    match entry.expires_at_unix_millis {
+        Some(expires_at) => {
+            digest.update(&[1]);
+            let deadline = expires_at.to_be_bytes();
+            digest.update(&deadline);
+        }
+        None => {
+            digest.update(&[0]);
+        }
+    }
     if let Some(version) = &entry.version {
         digest.update(&version.topology_epoch.to_be_bytes());
         digest.update(&version.owner_sequence.to_be_bytes());

@@ -17,6 +17,7 @@ use tonic::{
     transport::{Channel, Endpoint},
 };
 
+pub use expiry::{EXPIRY_SWEEP_INTERVAL, EXPIRY_SWEEP_LIMIT};
 pub use hashring_core::limits::{
     DEFAULT_MAX_KEY_BYTES, DEFAULT_MAX_VALUE_BYTES, MAX_CONTROL_MESSAGE_BYTES,
     MAX_DATA_MESSAGE_BYTES, MAX_MIGRATION_PAGE_BYTES, MAX_MUTATION_ID_BYTES,
@@ -197,6 +198,27 @@ struct Record {
     value: Arc<[u8]>,
     version: RecordVersion,
     deleted: bool,
+    /// Absolute Unix milliseconds at which the record stops being readable, or
+    /// `None` when it never expires. Absolute rather than a duration because
+    /// every replica enforces it with its own clock and a follower promoted
+    /// months later must agree with the record it already holds.
+    expires_at_unix_millis: Option<u64>,
+}
+
+impl Record {
+    /// A record past its deadline is absent, whichever replica is asked, so
+    /// the expiry is enforced on every read rather than only on the owner.
+    fn is_expired(&self, now_unix_millis: u64) -> bool {
+        self.expires_at_unix_millis
+            .is_some_and(|expires_at| now_unix_millis >= expires_at)
+    }
+}
+
+/// The deadline a stored record carries. Zero is how a write says "no deadline"
+/// on the wire, and a record never holds it, because a deadline of zero would
+/// read as already expired.
+fn stored_deadline(expires_at_unix_millis: Option<u64>) -> Option<u64> {
+    expires_at_unix_millis.filter(|expires_at| *expires_at != 0)
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -320,6 +342,8 @@ struct ReplicationMutation {
     deleted: bool,
     version: RecordVersion,
     mutation_id: String,
+    expires_at_unix_millis: Option<u64>,
+    preserve_value: bool,
 }
 
 impl PreparedReplication {
@@ -333,6 +357,8 @@ impl PreparedReplication {
             deleted: self.mutation.deleted,
             version: Some(self.mutation.version.clone()),
             mutation_id: self.mutation.mutation_id.clone(),
+            expires_at_unix_millis: self.mutation.expires_at_unix_millis,
+            preserve_value: self.mutation.preserve_value,
         }
     }
 }
@@ -386,6 +412,12 @@ struct NodeState {
     /// members and virtual-node changes; only a reseed rebuilds it (see
     /// `set_topology`).
     records_by_token: TokenIndex<Arc<[u8]>>,
+    /// The same `Arc` keys as `records`, ordered by their expiry deadline.
+    /// Reads hide an expired record, so this heap exists only to find those
+    /// records again without scanning every key on the node. Entries left
+    /// behind by a later write to the same key are dropped when popped, since
+    /// the map holds the only current deadline.
+    record_expirations: BinaryHeap<Reverse<(Instant, Arc<[u8]>)>>,
     next_sequence: u64,
     owner_stream_sequences: HashMap<(u64, String), u64>,
     owner_stream_unacked: HashMap<(u64, String), VecDeque<(u64, u64)>>,
@@ -447,6 +479,12 @@ impl NodeState {
     /// computes its routing token before the write lock, and a reseed in
     /// between would index the key where no range query looks for it.
     fn insert_record(&mut self, key: Arc<[u8]>, record: Record) {
+        if let Some(expires_at_unix_millis) = record.expires_at_unix_millis {
+            self.record_expirations.push(Reverse((
+                deadline_instant(expires_at_unix_millis),
+                key.clone(),
+            )));
+        }
         // Replacing an existing key keeps the map's original `Arc`, which the
         // index already holds, so only a new key is indexed. Indexing the new
         // `Arc` instead would leave the map and index with separate copies.
@@ -640,12 +678,14 @@ pub struct DataNodeService {
 
 mod dedup;
 mod diagnostics;
+mod expiry;
 mod migration;
 mod replication;
 mod rpc;
 mod service;
 
 use dedup::*;
+use expiry::*;
 use migration::*;
 use replication::*;
 

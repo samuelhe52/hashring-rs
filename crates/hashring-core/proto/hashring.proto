@@ -248,6 +248,12 @@ message MigrationRecord {
   bool deleted = 4;
   string mutation_id = 5;
   uint64 remaining_retention_millis = 6;
+  // The expiry the record carries once this record is applied.
+  optional uint64 expires_at_unix_millis = 7;
+  // Set when the mutation that produced this record changed only the expiry.
+  // `value` then holds the value the record kept, not one the client sent, so
+  // a rebuilt deduplication fingerprint uses an empty request value.
+  bool preserve_value = 8;
 }
 
 message DeduplicationRecord {
@@ -401,6 +407,10 @@ message ReplicationEntry {
   bool deleted = 6;
   RecordVersion version = 7;
   string mutation_id = 8;
+  // The expiry the follower stores with the record. See PutRequest.
+  optional uint64 expires_at_unix_millis = 9;
+  // Set when the mutation changed only the expiry; see MigrationRecord.
+  bool preserve_value = 10;
 }
 
 message ReplicateMutationResponse {
@@ -477,6 +487,10 @@ message GetResponse {
   RecordVersion version = 2;
   uint64 current_epoch = 3;
   OperationError error = 4;
+  // Absolute Unix milliseconds at which the record stops being readable, unset
+  // when it has no expiry. Set only when the record was found, so a miss never
+  // carries a deadline.
+  optional uint64 expires_at_unix_millis = 5;
 }
 
 message PutRequest {
@@ -484,12 +498,24 @@ message PutRequest {
   bytes value = 2;
   uint64 topology_epoch = 3;
   string request_id = 4;
+  // Absolute Unix milliseconds at which the record stops being readable. Unset
+  // keeps the expiry the record already has; 0 clears it. An absolute deadline
+  // rather than a duration, so every replica of the record agrees on when it
+  // expires and a retried mutation carries the deadline it was first sent with.
+  optional uint64 expires_at_unix_millis = 5;
+  // Replace only the expiry and keep the stored value. `value` must then be
+  // empty and `expires_at_unix_millis` must be set and non-zero; a key that
+  // does not exist is reported through PutResponse.key_missing.
+  bool preserve_value = 6;
 }
 
 message PutResponse {
   RecordVersion version = 1;
   uint64 current_epoch = 2;
   OperationError error = 3;
+  // A `preserve_value` write whose key does not exist. Reported apart from an
+  // error so the caller can tell "no such key" from a write that failed.
+  bool key_missing = 4;
 }
 
 message DeleteRequest {

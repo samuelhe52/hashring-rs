@@ -673,6 +673,8 @@ async fn run_cluster(
                 value: deterministic_value(key, 0, config.value_bytes),
                 topology_epoch: sample_topology.epoch,
                 request_id: format!("experiment-owner-rpc-{}-{key}", std::process::id()),
+                expires_at_unix_millis: None,
+                preserve_value: false,
             }),
         )
         .await
