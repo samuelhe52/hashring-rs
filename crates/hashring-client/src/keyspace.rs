@@ -1,11 +1,16 @@
 //! Walking the keyspace: every live key, from every owner.
 //!
-//! Each owner pages through the keys it owns, all owners at once. Every page
-//! names the epoch the walk started from, and a node at a newer epoch refuses
-//! it: a range that changed hands mid-walk may hold keys the walk already
-//! passed over at its old owner. The walk then catches up with the topology
-//! and starts over, within the operation deadline, so a finished walk saw
-//! every key that was live throughout it exactly once.
+//! A whole walk (`keys`, `key_count`) pages through every owner at once.
+//! Every page names the epoch the walk started from, and a node at a newer
+//! epoch refuses it: a range that changed hands mid-walk may hold keys the
+//! walk already passed over at its old owner. The walk then catches up with
+//! the topology and starts over, within the operation deadline, so a finished
+//! walk saw every key that was live throughout it exactly once.
+//!
+//! A scan (`scan`) instead goes round the ring in token order, a stretch at a
+//! time, each stretch from whichever node owns it when asked. Its cursor is a
+//! token, which means the same thing in every epoch, so a scan can span
+//! topology changes, and calls on different clients, without starting over.
 
 use futures::future::try_join_all;
 use hashring_core::proto::{ListKeysRequest, ListKeysResponse};
@@ -21,6 +26,10 @@ const KEY_BYTES_PER_PAGE: u64 = 1 << 20;
 /// any of its keys are kept, so without this a walk over a thousand owners
 /// could hold a gigabyte of pages that its result never needed.
 const PAGES_IN_FLIGHT: usize = 16;
+/// Pages one `scan` call reads, across however many owners' stretches it
+/// crosses. A call ends sooner once it has seen its `count` of keys; this
+/// bounds a call over a sparse stretch of the ring, which may see none.
+const SCAN_PAGES_PER_CALL: usize = 64;
 /// What holding one key costs beyond its bytes: its allocation, and the
 /// framing a reply wraps it in. Charged against `keys`' budget so that many
 /// tiny keys cannot pass a budget meant to bound memory.
@@ -90,6 +99,81 @@ impl HashringClient {
         }
     }
 
+    /// One step of a scan round the ring: the live keys at or after token
+    /// `cursor` for which `keep` holds, in token order, and the token to
+    /// continue from, or `None` once the scan has reached the end of the ring.
+    /// Start a scan at token 0.
+    ///
+    /// A step stops once it has seen about `count` live keys, kept or not, so
+    /// a selective `keep` can return fewer, or none, before the scan is done.
+    /// A key that was live for the whole scan is returned exactly once,
+    /// however the topology changed between steps: every key sits at one
+    /// token, and the scan passes each token once, asking whichever node owns
+    /// it at the time. A key written or deleted during the scan may or may not
+    /// be returned. Fails with `TooLarge` once the kept keys, each charged its
+    /// length plus [`PER_KEY_OVERHEAD_BYTES`], add up to more than
+    /// `max_bytes`.
+    pub async fn scan(
+        &self,
+        cursor: u64,
+        count: usize,
+        keep: impl Fn(&[u8]) -> bool,
+        max_bytes: usize,
+    ) -> Result<(Vec<Vec<u8>>, Option<u64>), ClientError> {
+        let count = count.max(1);
+        let deadline = Instant::now() + self.inner.operation_timeout;
+        let mut attempt = 0;
+        let mut position = cursor;
+        let mut keys = Vec::new();
+        let (mut pages, mut seen, mut kept_bytes) = (0, 0, 0);
+        while pages < SCAN_PAGES_PER_CALL && seen < count {
+            let (epoch, endpoint) = {
+                let topology = self.inner.topology.read().await;
+                let owner = topology
+                    .owner_for_token(position)
+                    .map_err(anyhow::Error::from)?;
+                (topology.epoch, owner.endpoint.clone())
+            };
+            let request = ListKeysRequest {
+                topology_epoch: epoch,
+                start_token: position,
+                max_keys: u32::try_from(count - seen).unwrap_or(u32::MAX),
+                max_bytes: KEY_BYTES_PER_PAGE,
+                one_stretch: true,
+                ..Default::default()
+            };
+            // A retry asks the same token again, of its owner as the client
+            // now knows it, so nothing is skipped or seen twice.
+            let page = match self.list_page(&endpoint, request, deadline).await {
+                Ok(page) => page,
+                Err(Interrupted::Failed(error)) => return Err(error),
+                Err(Interrupted::Retry(error)) => {
+                    self.recover(error, epoch, deadline, &mut attempt).await?;
+                    continue;
+                }
+            };
+            pages += 1;
+            seen += usize::try_from(page.count).unwrap_or(usize::MAX);
+            for key in page.keys.into_iter().filter(|key| keep(key)) {
+                kept_bytes += key.len() + PER_KEY_OVERHEAD_BYTES;
+                if kept_bytes > max_bytes {
+                    return Err(size_failure(format!(
+                        "the matching keys exceed {max_bytes} bytes"
+                    )));
+                }
+                keys.push(key);
+            }
+            if page.done {
+                return Ok((keys, None));
+            }
+            position = page.next_token;
+        }
+        // Every page ends past the token it started at, so a scan that has
+        // read one is past token 0, which a caller may use to mean "done".
+        debug_assert!(position > cursor || pages == 0);
+        Ok((keys, Some(position)))
+    }
+
     async fn walk(
         &self,
         count_only: bool,
@@ -157,7 +241,7 @@ impl HashringClient {
                 .acquire()
                 .await
                 .expect("the walk's page semaphore is never closed");
-            let page = self.list_page(endpoint, request.clone(), deadline).await?;
+            let page = self.list_page(endpoint, request, deadline).await?;
             count += page.count;
             for key in page.keys.into_iter().filter(|key| keep(key)) {
                 let cost = key.len() + PER_KEY_OVERHEAD_BYTES;
@@ -174,7 +258,6 @@ impl HashringClient {
                 return Ok((keys, count));
             }
             request.start_token = page.next_token;
-            request.after_key = page.next_after_key;
         }
     }
 
@@ -197,7 +280,7 @@ impl HashringClient {
                     ..Default::default()
                 };
                 loop {
-                    let page = self.list_page(endpoint, request.clone(), deadline).await?;
+                    let page = self.list_page(endpoint, request, deadline).await?;
                     if let Some(key) = page.keys.into_iter().next() {
                         return Ok(Some(key));
                     }
@@ -205,7 +288,6 @@ impl HashringClient {
                         break;
                     }
                     request.start_token = page.next_token;
-                    request.after_key = page.next_after_key;
                 }
             }
         }

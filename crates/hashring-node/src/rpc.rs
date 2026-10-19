@@ -242,34 +242,44 @@ impl DataNode for DataNodeService {
                 ..Default::default()
             }))
         };
-        // A walk is only complete if every page came from the same epoch: a
-        // range that changed hands since the caller's first page may hold keys
-        // it already passed over at the old owner.
-        // A node still behind the caller is mid-install of the newer
-        // topology; it will catch up, so the walk only has to wait.
-        if epoch < request.topology_epoch {
-            return refuse(temporarily_unavailable(
-                epoch,
-                "this node has not installed the walk's topology yet",
-            ));
-        }
-        if epoch > request.topology_epoch {
-            return refuse(OperationError {
-                current_epoch: epoch,
-                ..operation_error(
-                    ErrorCode::Moved,
-                    "the topology changed during the key walk",
-                    true,
-                )
-            });
-        }
-        let owns_any = state
-            .topology
-            .assignments
-            .iter()
-            .any(|assignment| assignment.node_id == self.node_id);
-        if owns_any && let Some(error) = lease_error(&state) {
-            return refuse(error);
+        if request.one_stretch {
+            // Only ownership matters here. A source keeps a range's keys until
+            // every node has the topology that moved it, and a destination
+            // holds all of them before it owns the range, so whichever node
+            // owns a token now can answer for it.
+            if let Some(error) = self.owner_error(&state, request.start_token)? {
+                return refuse(error);
+            }
+        } else {
+            // A node still behind the caller is mid-install of the newer
+            // topology; it will catch up, so the walk only has to wait.
+            if epoch < request.topology_epoch {
+                return refuse(temporarily_unavailable(
+                    epoch,
+                    "this node has not installed the walk's topology yet",
+                ));
+            }
+            // A walk is only complete if every page came from the same epoch:
+            // a range that changed hands since the caller's first page may
+            // hold keys it already passed over at the old owner.
+            if epoch > request.topology_epoch {
+                return refuse(OperationError {
+                    current_epoch: epoch,
+                    ..operation_error(
+                        ErrorCode::Moved,
+                        "the topology changed during the key walk",
+                        true,
+                    )
+                });
+            }
+            let owns_any = state
+                .topology
+                .assignments
+                .iter()
+                .any(|assignment| assignment.node_id == self.node_id);
+            if owns_any && let Some(error) = lease_error(&state) {
+                return refuse(error);
+            }
         }
         let limits = keyspace::PageLimits {
             max_keys: (request.max_keys as usize).clamp(1, keyspace::MAX_KEYS_PER_PAGE),
@@ -278,26 +288,19 @@ impl DataNode for DataNodeService {
                 .clamp(1, keyspace::MAX_KEY_BYTES_PER_PAGE),
             max_examined: keyspace::MAX_EXAMINED_PER_PAGE,
             count_only: request.count_only,
+            one_stretch: request.one_stretch,
         };
         let page = state.owned_keys_page(
             &self.node_id,
-            keyspace::KeyCursor {
-                token: request.start_token,
-                after_key: request.after_key,
-            },
+            request.start_token,
             now_unix_millis(),
             &limits,
         );
-        let (done, next_token, next_after_key) = match page.next {
-            Some(next) => (false, next.token, next.after_key),
-            None => (true, 0, None),
-        };
         Ok(Response::new(ListKeysResponse {
             keys: page.keys,
             count: page.count,
-            done,
-            next_token,
-            next_after_key,
+            done: page.next.is_none(),
+            next_token: page.next.unwrap_or(0),
             current_epoch: epoch,
             error: None,
         }))
@@ -486,6 +489,26 @@ impl DataNode for DataNodeService {
             return Ok(Response::new(PutResponse {
                 current_epoch: state.topology.epoch,
                 condition_failed: true,
+                ..Default::default()
+            }));
+        }
+        // A key-listing page ends only between tokens, so a token shared by
+        // too many keys would be a page no budget bounds. Only a new key can
+        // grow a token's bucket; rewriting one already there never does.
+        if !state.records.contains_key(request.key.as_slice())
+            && state.records_by_token.len_at(state.token_of(&request.key))
+                >= keyspace::MAX_KEYS_PER_TOKEN
+        {
+            return Ok(Response::new(PutResponse {
+                current_epoch: state.topology.epoch,
+                error: Some(operation_error(
+                    ErrorCode::ResourceExhausted,
+                    format!(
+                        "{} keys already share this key's position on the ring",
+                        keyspace::MAX_KEYS_PER_TOKEN
+                    ),
+                    false,
+                )),
                 ..Default::default()
             }));
         }

@@ -140,6 +140,15 @@ impl<T: Ord + Clone> TokenIndex<T> {
         true
     }
 
+    /// How many values share `token`.
+    fn len_at(&self, token: u64) -> usize {
+        match self.by_token.get(&token) {
+            None => 0,
+            Some(TokenBucket::One(_)) => 1,
+            Some(TokenBucket::Many(values)) => values.len(),
+        }
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.by_token

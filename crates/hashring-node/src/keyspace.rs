@@ -1,10 +1,19 @@
 //! Paging through the keys a node owns, for callers that need the keyspace
-//! rather than one key: `KEYS`, `DBSIZE` and `RANDOMKEY` at the Redis gateway.
+//! rather than one key: `KEYS`, `SCAN`, `DBSIZE` and `RANDOMKEY` at the Redis
+//! gateway.
 //!
 //! A node also holds follower copies of other owners' ranges, so a page walks
 //! only the token segments this node owns in its current topology and jumps
 //! over the rest. A segment is `(previous assignment, assignment]`, plus the
 //! wrap-around tail past the last assignment, which belongs to the first.
+//!
+//! A page ends only between tokens, never inside one, so where the next page
+//! starts is a token alone. That is what lets `SCAN` hand its cursor to a
+//! Redis client as a plain integer. A token holds more than one key only when
+//! keys' 64-bit hashes collide, which by chance is all but unheard of, but
+//! keys can be built to collide by anyone who knows the hash seed. So an owner
+//! refuses to put more than [`MAX_KEYS_PER_TOKEN`] keys on one token, which
+//! bounds what finishing a token can add to a page.
 
 use super::*;
 
@@ -13,38 +22,38 @@ use super::*;
 pub(super) const MAX_EXAMINED_PER_PAGE: usize = 10_000;
 pub(super) const MAX_KEYS_PER_PAGE: usize = 10_000;
 pub(super) const MAX_KEY_BYTES_PER_PAGE: usize = 4 * 1024 * 1024;
-
-/// Where a page starts: keys at or after `token`, and when `after_key` is set,
-/// only the keys at `token` that sort after it.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(super) struct KeyCursor {
-    pub token: u64,
-    pub after_key: Option<Vec<u8>>,
-}
+/// The most keys one token may hold, deleted or not. Even at the largest key
+/// size, a full token adds a megabyte to a page, which keeps every page well
+/// inside one data message.
+pub(super) const MAX_KEYS_PER_TOKEN: usize = 16;
 
 pub(super) struct PageLimits {
     pub max_keys: usize,
     pub max_bytes: usize,
     pub max_examined: usize,
     pub count_only: bool,
+    /// Stop at the first segment another node owns, rather than jump over it:
+    /// the page then covers one contiguous stretch of the ring, which is what
+    /// a `SCAN` cursor walks.
+    pub one_stretch: bool,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct KeyPage {
     pub keys: Vec<Vec<u8>>,
     pub count: u64,
-    /// `None` when no owned key remains.
-    pub next: Option<KeyCursor>,
+    /// The token the next page starts at, or `None` at the end of the ring.
+    pub next: Option<u64>,
 }
 
 impl NodeState {
     /// One page of the live keys `node_id` owns in this state's topology, from
-    /// `cursor` on, in token order. Deleted records and records past their
-    /// deadline are not keys.
+    /// token `start` on, in token order. Deleted records and records past
+    /// their deadline are not keys.
     pub(super) fn owned_keys_page(
         &self,
         node_id: &str,
-        cursor: KeyCursor,
+        start: u64,
         now_unix_millis: u64,
         limits: &PageLimits,
     ) -> KeyPage {
@@ -55,8 +64,7 @@ impl NodeState {
         }
         let mut examined = 0;
         let mut bytes = 0;
-        let mut position = cursor.token;
-        let mut after_key = cursor.after_key;
+        let mut position = start;
         loop {
             let index = assignments.partition_point(|assignment| assignment.token < position);
             let (segment_end, owner) = match assignments.get(index) {
@@ -64,30 +72,25 @@ impl NodeState {
                 None => (u64::MAX, &assignments[0].node_id),
             };
             examined += 1;
+            if owner != node_id && limits.one_stretch {
+                page.next = Some(position);
+                return page;
+            }
             if owner == node_id {
                 for (&token, bucket) in self.records_by_token.by_token.range(position..=segment_end)
                 {
-                    // Only the bucket the cursor points into is resumed part
-                    // way, and it is entered just past the cursor's key rather
-                    // than walked from its start.
-                    let resume = match token == position {
-                        true => after_key.clone(),
-                        false => None,
-                    };
-                    for key in bucket.keys_after(resume.as_deref()) {
-                        if examined >= limits.max_examined
-                            || page.count as usize >= limits.max_keys
-                            || bytes >= limits.max_bytes
-                        {
-                            page.next = Some(KeyCursor {
-                                token: position,
-                                after_key,
-                            });
-                            return page;
-                        }
+                    // Checked before a token, never inside one, so a page
+                    // always ends on a token boundary. The first token is
+                    // always taken, which is what keeps every page moving.
+                    if examined >= limits.max_examined
+                        || page.count as usize >= limits.max_keys
+                        || bytes >= limits.max_bytes
+                    {
+                        page.next = Some(token);
+                        return page;
+                    }
+                    for key in bucket.values() {
                         examined += 1;
-                        position = token;
-                        after_key = Some(key.to_vec());
                         let live = self.records.get(key).is_some_and(|record| {
                             !record.deleted && !record.is_expired(now_unix_millis)
                         });
@@ -106,33 +109,19 @@ impl NodeState {
                 return page;
             }
             position = segment_end + 1;
-            after_key = None;
             if examined >= limits.max_examined {
-                page.next = Some(KeyCursor {
-                    token: position,
-                    after_key: None,
-                });
+                page.next = Some(position);
                 return page;
             }
         }
     }
 }
 
-impl TokenBucket<Arc<[u8]>> {
-    /// The bucket's keys in order, starting just after `after` when given.
-    fn keys_after<'a>(&'a self, after: Option<&'a [u8]>) -> impl Iterator<Item = &'a Arc<[u8]>> {
-        use std::ops::Bound;
+impl<T> TokenBucket<T> {
+    fn values(&self) -> impl Iterator<Item = &T> {
         let (one, many) = match self {
-            TokenBucket::One(key) => (
-                after
-                    .is_none_or(|after| key.as_ref() > after)
-                    .then_some(key),
-                None,
-            ),
-            TokenBucket::Many(keys) => {
-                let start = after.map_or(Bound::Unbounded, Bound::Excluded);
-                (None, Some(keys.range::<[u8], _>((start, Bound::Unbounded))))
-            }
+            TokenBucket::One(value) => (Some(value), None),
+            TokenBucket::Many(values) => (None, Some(values)),
         };
         one.into_iter().chain(many.into_iter().flatten())
     }
