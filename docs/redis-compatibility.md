@@ -23,7 +23,7 @@ redis-cli -p 6379 get greeting
 The coordinator is contacted on the **first command**, not at startup, so a
 gateway may be started before, alongside, or instead of the coordinator.
 Clients get `-TRYAGAIN` until the cluster answers. Several gateways may be run
-at once; see [the atomicity limit](#read-modify-write-is-atomic-only-within-one-gateway).
+at once; see [how read-modify-write stays atomic](#read-modify-write-is-a-conditional-write).
 
 Settings are in [configuration.md](configuration.md#redis-gateway), and the
 gateway itself lives in [`crates/hashring-redis`](../crates/hashring-redis).
@@ -54,10 +54,10 @@ supports sees what is actually implemented.
 | Command | Notes |
 | --- | --- |
 | `PING`, `ECHO` | |
-| `HELLO` | RESP2 and RESP3. The reply is a map under RESP3 and a flat array under RESP2. `HELLO <ver> AUTH <user> <pass>` and `SETNAME` are accepted. |
+| `HELLO` | RESP2 and RESP3. The reply is a map under RESP3 and a flat array under RESP2. `HELLO <ver> AUTH <user> <pass>` and `SETNAME` are accepted; the request is checked whole before any of it applies, so a wrong password changes neither the protocol nor the name. |
 | `AUTH` | Only when `--requirepass` is set. Otherwise it answers the error Redis gives when no password is configured. |
 | `SELECT` | Accepts database 0 only; one flat namespace, so any other index is refused. |
-| `CLIENT` | `ID`, `SETNAME`, `GETNAME`, `SETINFO`, `INFO`, `LIST`, `NO-EVICT`, `NO-TOUCH`, `UNPAUSE`, `GETREDIR`, and `REPLY ON\|OFF\|SKIP`. |
+| `CLIENT` | `ID`, `SETNAME`, `GETNAME`, `SETINFO`, `INFO`, `LIST`, `NO-EVICT`, `NO-TOUCH`, `UNPAUSE`, `GETREDIR`, and `REPLY ON\|OFF\|SKIP`. As in Redis, `REPLY ON` answers `OK` and `OFF` and `SKIP` answer nothing. |
 | `RESET` | Returns `+RESET` and restores RESP2, even on a RESP2 connection where Redis errors. Being liberal here is what keeps clients that send it on reconnect working. |
 | `QUIT` | Answers, then closes. |
 | `COMMAND` | `COMMAND`, `COMMAND COUNT`, `COMMAND INFO`, `COMMAND DOCS`. `GETKEYS` is declined. |
@@ -86,24 +86,24 @@ parameter it has no other value for; any other parameter is an error.
 | Command | Notes |
 | --- | --- |
 | `GET`, `GETDEL` | |
-| `GETEX` | Takes `EX`, `PX`, `EXAT`, `PXAT`, `PERSIST`. Without an option it keeps the deadline. |
+| `GETEX` | Takes `EX`, `PX`, `EXAT`, `PXAT`, `PERSIST`. Without an option it keeps the deadline. Changing the deadline does not rewrite the value. |
 | `GETRANGE` | Redis' index rules, including negative indices. |
 | `SET` | `NX`, `XX`, `GET`, `EX`, `PX`, `EXAT`, `PXAT`, `KEEPTTL`. |
 | `SETEX`, `PSETEX` | |
 | `SETNX`, `GETSET` | |
-| `SETRANGE` | Pads with zero bytes. |
+| `SETRANGE` | Pads with zero bytes. An empty patch reports the length and creates nothing. |
 | `APPEND`, `STRLEN` | |
-| `MSET`, `MSETNX`, `MGET` | Not atomic across owners. See [limits](#limits-here). |
-| `INCR`, `DECR`, `INCRBY`, `DECRBY` | Atomic within one gateway. A value that is not an integer is an error and the value is left alone. |
-| `INCRBYFLOAT` | Atomic within one gateway. The result is printed in the shortest form that reads back as the same double. |
+| `MSET`, `MSETNX`, `MGET` | Not atomic across owners. A key named twice takes its later value. See [cross-key atomicity](#cross-key-atomicity-is-not-available-at-all). |
+| `INCR`, `DECR`, `INCRBY`, `DECRBY` | Atomic against every writer. A value that is not an integer is an error and the value is left alone. |
+| `INCRBYFLOAT` | Atomic against every writer. The result is printed in the shortest form that reads back as the same double. |
 
 ### Expiry
 
 | Command | Notes |
 | --- | --- |
 | `TTL`, `PTTL` | `-1` is a key with no deadline, `-2` no key at all. `TTL` rounds up to whole seconds. |
-| `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT` | Accepts `NX`, `XX`, `GT`, `LT`. |
-| `PERSIST` | |
+| `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT` | Accepts one of `NX`, `XX`, `GT`, `LT`. A key with no deadline counts as never expiring, so `LT` sets one and `GT` does not. A deadline that is not in the future, including a negative timeout, deletes the key. |
+| `PERSIST` | Clears the deadline without rewriting the value. |
 
 ## Declined commands
 
@@ -132,22 +132,27 @@ If a workload needs any of those, this is not a Redis substitute.
 These are the places where an application that works against Redis would notice
 a difference.
 
-### Read-modify-write is atomic only within one gateway
+### Read-modify-write is a conditional write
 
 Redis makes `INCR` atomic because one thread owns the key. A gateway has no such
-owner: the key lives on a data node, and the node offers only get, put and
-delete. So `INCR`, `APPEND`, `SETRANGE`, `SETNX`, `GETSET`, `GETDEL`, `SET ... GET`,
-`INCRBYFLOAT`, `MSETNX`, `RENAME`, `EXPIRE` and `PERSIST` are read-modify-write
-operations here too.
+owner: the key lives on a data node. So `INCR`, `APPEND`, `SETRANGE`, `SETNX`,
+`GETSET`, `GETDEL`, `GETEX`, `SET ... NX|XX|GET`, `INCRBYFLOAT`, `DEL`, `EXPIRE`
+and `PERSIST` read the key, compute, and write.
 
-The gateway serializes them with striped per-key locks, which makes them atomic
-**between clients of one gateway process**. This does **not** hold when:
+The write carries a precondition: the version the read returned, or that the key
+was absent. The owning node checks it under the same lock that applies the
+write, and refuses the write if anything else wrote the key in between. The
+gateway then reads again and recomputes. So these commands are atomic against
+**every** writer: clients of the same gateway, clients of other gateways behind
+the same load balancer, and programs using `hashring-client` directly.
 
-- more than one gateway is running behind a load balancer;
-- a client bypasses the gateway and talks to the cluster with `hashring-client`.
+The costs are a read before every such write, as before, and a retry when two
+writers collide on one key. Within one gateway, a striped per-key lock makes its
+own clients take turns, so collisions are with writers elsewhere. A command that
+keeps colliding is bounded by the [command deadline](#limits-here).
 
-Run one gateway if the guarantee matters, and understand that you now have a
-process that must not be restarted carelessly.
+A plain `SET`, `SETEX`, `PSETEX` or `MSET` has nothing to compute and is one
+unconditional write. A read-modify-write that raced it simply reads again.
 
 ### Cross-key atomicity is not available at all
 
@@ -155,6 +160,23 @@ process that must not be restarted carelessly.
 owners hold their keys, and each key is applied on its own. There is no
 operation that spans two nodes atomically, and none can be added at this layer:
 the keys are on different machines.
+
+If any key fails, the whole command answers with an error rather than a count
+or a list built from the keys that happened to answer. When a writing command
+such as `DEL` or `MSET` failed on one key after writing another, that error is
+`ERR` and says its writes may have been applied, never `TRYAGAIN`: sending the
+command again could undo someone else's write in between.
+
+Two commands make the best of it and report what they could not do:
+
+- `MSETNX` checks every key, then writes each one on condition that it is still
+  absent, so it never overwrites a value. A key created by someone else between
+  the check and the writes leaves the others written; that is answered with an
+  error, not with `0` or `1`.
+- `RENAME` writes the destination, then deletes the source on condition that it
+  is still the version it copied. A source rewritten in between is left in place
+  and the command answers with an error, since the destination holds the
+  earlier value.
 
 This is the same trade Redis Cluster makes, where such commands fail with
 `CROSSSLOT`. Here they succeed but are not atomic. The honest comparison for
@@ -166,15 +188,10 @@ If a write must not be observed half-applied, it must be one key.
 
 Redis counts the keys that existed and were removed. This cluster's delete is
 idempotent and reports success whether or not the key was there, so the gateway
-reads each key first and counts that. The cost is one extra request per key,
-issued concurrently. `DEL` of a large keyspace is therefore roughly twice the
-requests of a Redis `DEL`.
-
-### `PERSIST` rewrites the value
-
-The cluster has no "clear this field" operation, so `PERSIST` reads the value
-back and writes it without a deadline. That is a new record version and the
-usual write path, where Redis just clears the TTL in place.
+reads each key first and deletes it on condition that it is still the version
+read, which keeps the count exact. The cost is one extra request per key, issued
+concurrently. `DEL` of a large keyspace is therefore roughly twice the requests
+of a Redis `DEL`.
 
 ### `EXPIRE` with a past deadline deletes the key
 
@@ -211,7 +228,9 @@ gateway-local expiry could not:
 
 Records past their deadline are hidden on read and reclaimed by a sweep every
 500 ms, bounded per pass so the sweep cannot stall writers. A key nobody asks
-about stays resident until its next sweep.
+about stays resident until its next sweep. While a range is migrating off a
+node, its expired records wait for the migration to end before they are
+reclaimed, because both sides of the migration verify the same records.
 
 Two consequences worth knowing:
 
@@ -231,10 +250,11 @@ Two consequences worth knowing:
 | --- | --- |
 | Key or value too large | `OOM` |
 | Bad argument, syntax, unknown command | `ERR` |
-| Retryable cluster condition: a range is moving, a follower is not ready, replication is backed up, the coordinator is unreachable, the command passed its deadline | `TRYAGAIN` |
+| Retryable cluster condition: a range is moving, a follower is not ready, replication is backed up, the coordinator is unreachable, a read passed its deadline | `TRYAGAIN` |
 | Command sent before `AUTH` | `NOAUTH` |
 | Wrong password | `WRONGPASS` |
-| A write whose outcome is unknown | `ERR`, because the value may well be stored |
+| A write whose outcome is unknown, including a write command that passed its deadline | `ERR`, saying the writes may or may not have been applied |
+| More than `--maxclients` connections | `ERR max number of clients reached`, and the connection is closed |
 
 `TRYAGAIN` is the code clients already back off on, so a client that honours it
 behaves sensibly across a migration. A missing key is never an error: `GET`
@@ -253,21 +273,27 @@ returns nil, `EXISTS` returns 0, `TTL` returns -2.
 - The connection is not closed for a bad command, a declined command, or a
   protocol error in a command; only an unparseable frame ends it, because the
   stream cannot be resynchronized.
+- Before a connection authenticates it may send at most 10 arguments of at most
+  16 KiB each, as in Redis, so a client without the password cannot make the
+  gateway hold memory for it. Any connection may have at most 1 GiB received
+  and not yet run, and a line without a newline (an inline command, or a RESP
+  header) may be at most 64 KiB.
 
 ## Limits here
 
 - One process, one extra hop. See [what it is not](#what-it-is-not).
-- Read-modify-write is atomic only within one gateway process.
 - No atomicity across keys, ever.
 - No keyspace enumeration, so no `SCAN`, `KEYS`, `DBSIZE` or `FLUSHALL`.
 - No data structures, transactions, scripting or Pub/Sub.
 - The gateway keeps nothing, so it holds no expiry state, no keys and no
   replication state. Losing it loses no data; losing the *cluster* loses every
   value on every node, as the cluster's own guarantees describe.
-- Command deadlines come from `--deadline-ms`, default 5 s. Redis has no such
-  deadline; a proxy in front of a migrating cluster needs one. A command that
-  passes it answers `TRYAGAIN`, so a long migration turns into client retries
-  rather than silent timeouts.
+- Command deadlines come from `--deadline-ms`, default 5 s, and cover the whole
+  command: lock waits, every request it makes, and the retries of a conditional
+  write. Redis has no such deadline; a proxy in front of a migrating cluster
+  needs one. A read that passes it answers `TRYAGAIN`, so a long migration turns
+  into client retries rather than silent timeouts. A write that passes it
+  answers `ERR` instead, because it may already have been applied.
 
 ## Not attempted
 

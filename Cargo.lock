@@ -618,6 +618,7 @@ dependencies = [
 name = "hashring-redis"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "hashring-client",
  "hashring-core",
  "redis",

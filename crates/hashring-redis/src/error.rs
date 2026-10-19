@@ -1,6 +1,6 @@
 //! Errors as a Redis client sees them.
 
-use hashring_client::{ClientError, OperationFailure};
+use hashring_client::{ClientError, MutationOutcome, OperationFailure};
 use hashring_core::proto::ErrorCode;
 
 /// A failure with the error code in front of the message, which is the part
@@ -10,6 +10,9 @@ use hashring_core::proto::ErrorCode;
 pub struct RedisError {
     pub code: &'static str,
     pub message: String,
+    /// A write may have been applied before this was returned, so the command
+    /// is not safe to send again as if nothing happened.
+    pub may_have_applied: bool,
 }
 
 pub type RedisResult<T> = Result<T, RedisError>;
@@ -19,6 +22,7 @@ impl RedisError {
         Self {
             code,
             message: message.into(),
+            may_have_applied: false,
         }
     }
 
@@ -91,6 +95,26 @@ impl RedisError {
         )
     }
 
+    /// A command that ran out of time. A read can simply be sent again; a
+    /// write may have been applied before the deadline cut it off, which
+    /// `TRYAGAIN` would hide.
+    pub fn deadline(writes: bool) -> Self {
+        match writes {
+            false => Self::new("TRYAGAIN", "the command did not finish before its deadline"),
+            true => Self::outcome_unknown("the command did not finish before its deadline"),
+        }
+    }
+
+    pub fn outcome_unknown(detail: &str) -> Self {
+        Self {
+            may_have_applied: true,
+            ..Self::new(
+                "ERR",
+                format!("{detail}; its writes may or may not have been applied"),
+            )
+        }
+    }
+
     pub fn protocol(message: impl Into<String>) -> Self {
         Self::new("ERR", message)
     }
@@ -103,9 +127,21 @@ impl RedisError {
 impl From<ClientError> for RedisError {
     /// A retryable cluster condition becomes `TRYAGAIN`, which is the code
     /// clients already treat as "back off and send it again". A permanent
-    /// condition becomes `ERR`.
+    /// condition becomes `ERR`, and so does any failure after which a write
+    /// may have been applied: retrying that blindly is not safe.
     fn from(error: ClientError) -> Self {
         match error {
+            ClientError::DeadlineExceeded {
+                outcome: MutationOutcome::MayHaveApplied,
+            }
+            | ClientError::TopologyRefresh {
+                outcome: MutationOutcome::MayHaveApplied,
+                ..
+            }
+            | ClientError::Rpc {
+                outcome: MutationOutcome::MayHaveApplied,
+                ..
+            } => Self::outcome_unknown(&error.to_string()),
             ClientError::Operation(failure) => Self::from(failure),
             ClientError::TopologyRefresh { source, .. } => Self::new(
                 "TRYAGAIN",
@@ -139,6 +175,9 @@ impl From<ClientError> for RedisError {
 impl From<OperationFailure> for RedisError {
     fn from(failure: OperationFailure) -> Self {
         let message = failure.message.trim().to_owned();
+        if failure.outcome == MutationOutcome::MayHaveApplied {
+            return Self::outcome_unknown(&message);
+        }
         match failure.code {
             ErrorCode::NotFound => Self::new(
                 "ERR",
@@ -167,9 +206,24 @@ impl From<OperationFailure> for RedisError {
 
 #[cfg(test)]
 mod tests {
-    use hashring_client::MutationOutcome;
-
     use super::*;
+
+    #[test]
+    fn a_write_that_may_have_landed_is_never_a_plain_retry() {
+        let mut busy = failure(ErrorCode::RangeBusy, true);
+        busy.outcome = MutationOutcome::MayHaveApplied;
+        assert_eq!(RedisError::from(busy).code, "ERR");
+        let timed_out = ClientError::DeadlineExceeded {
+            outcome: MutationOutcome::MayHaveApplied,
+        };
+        assert_eq!(RedisError::from(timed_out).code, "ERR");
+        let unsent = ClientError::DeadlineExceeded {
+            outcome: MutationOutcome::KnownNotApplied,
+        };
+        assert_eq!(RedisError::from(unsent).code, "TRYAGAIN");
+        assert_eq!(RedisError::deadline(false).code, "TRYAGAIN");
+        assert_eq!(RedisError::deadline(true).code, "ERR");
+    }
 
     fn failure(code: ErrorCode, retryable: bool) -> OperationFailure {
         OperationFailure {

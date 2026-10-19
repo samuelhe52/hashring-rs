@@ -321,6 +321,10 @@ struct GatewayArgs {
     /// secret need not appear in the process list.
     #[arg(long)]
     requirepass: Option<String>,
+    /// Connections open at once before a new one is refused, as Redis's
+    /// `maxclients`. [default: 10000]
+    #[arg(long)]
+    maxclients: Option<NonZeroUsize>,
     /// Tokio worker threads. Defaults to one per CPU available to the process
     /// (affinity and cgroup limits included).
     #[arg(long)]
@@ -562,6 +566,7 @@ async fn run_redis_gateway(settings: config::gateway::GatewaySettings) -> Result
         listen: settings.listen,
         operation_timeout: settings.operation_timeout,
         password: settings.password,
+        max_connections: settings.max_connections.get(),
         ..Default::default()
     };
     hashring_redis::serve(config, stopped.clone()).await?;

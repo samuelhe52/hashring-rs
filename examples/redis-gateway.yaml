@@ -7,6 +7,8 @@ coordinator: http://127.0.0.1:50050
 # not finished. Redis has no such deadline; a proxy in front of a migrating
 # cluster does.
 deadline_ms: 5000
+# Connections open at once before a new one is refused, as Redis's maxclients.
+# maxclients: 10000
 # worker_threads: 4   # default: one per available CPU
 
 # Require AUTH before a connection may read or write. Leave it unset here and

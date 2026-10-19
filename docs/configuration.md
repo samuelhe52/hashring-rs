@@ -81,6 +81,7 @@ not guarantee.
 | `--coordinator` | `coordinator` | `http://127.0.0.1:50050` | process | Contacted on the first command, so the gateway may start before the coordinator. |
 | `--deadline-ms` | `deadline_ms` | 5000 | process | How long one command may take against the cluster. Redis has no such deadline; a proxy in front of a migrating cluster needs one. |
 | `--requirepass` | `requirepass` | none | process | Falls back to the `HASHRING_GATEWAY_PASSWORD` environment variable, which keeps the secret out of both the file and the process list. |
+| `--maxclients` | `maxclients` | 10000 | process | Connections open at once. One more is answered `-ERR max number of clients reached` and closed, as Redis does. |
 | `--worker-threads` | `worker_threads` | one per available CPU | process | |
 
 ## `experiment`

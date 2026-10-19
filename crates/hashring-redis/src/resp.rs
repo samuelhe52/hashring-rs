@@ -24,14 +24,21 @@ impl Protocol {
     }
 }
 
-/// Bounds on one request, so a client cannot make the gateway allocate without
-/// limit before a single command runs.
+/// Bounds on what a connection may send, so a client cannot make the gateway
+/// allocate without limit before a single command runs.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     /// Largest accepted bulk string. The largest value a node accepts is 8
     /// MiB, and a key is 64 KiB, so nothing a node would store is refused here.
     pub max_bulk_bytes: usize,
     pub max_arguments: usize,
+    /// Longest line without a newline: an inline command, or a `*` or `$`
+    /// header. Redis's own bound, so a stream of bytes that never ends a line
+    /// is refused instead of buffered.
+    pub max_line_bytes: usize,
+    /// Bytes a connection may have received and not yet run, across however
+    /// many requests they hold. Redis's `client-query-buffer-limit`.
+    pub max_query_buffer_bytes: usize,
 }
 
 impl Default for Limits {
@@ -39,6 +46,22 @@ impl Default for Limits {
         Self {
             max_bulk_bytes: 16 * 1024 * 1024,
             max_arguments: 1 << 17,
+            max_line_bytes: 64 * 1024,
+            max_query_buffer_bytes: 1024 * 1024 * 1024,
+        }
+    }
+}
+
+impl Limits {
+    /// What a connection that has not authenticated may send. The handshake
+    /// needs a handful of short arguments; anything larger is someone without
+    /// the password asking the gateway to hold memory for them. Redis uses the
+    /// same two numbers.
+    pub fn unauthenticated(self) -> Self {
+        Self {
+            max_bulk_bytes: self.max_bulk_bytes.min(16 * 1024),
+            max_arguments: self.max_arguments.min(10),
+            ..self
         }
     }
 }
@@ -79,7 +102,7 @@ pub fn parse(buffer: &[u8], limits: &Limits) -> Frame {
 
 /// `*<count>\r\n` followed by that many `$<length>\r\n<bytes>\r\n` elements.
 fn parse_multibulk(buffer: &[u8], limits: &Limits) -> Frame {
-    let count = match read_header(buffer, 0, b'*') {
+    let count = match read_header(buffer, 0, b'*', limits) {
         Header::Incomplete => return Frame::Incomplete,
         Header::Invalid(error) => return Frame::Invalid(error),
         Header::Found { value, next } => (value, next),
@@ -93,7 +116,7 @@ fn parse_multibulk(buffer: &[u8], limits: &Limits) -> Frame {
     let mut args = Vec::with_capacity(count.0.min(1024));
     let mut cursor = count.1;
     for _ in 0..count.0 {
-        let (length, start) = match read_header(buffer, cursor, b'$') {
+        let (length, start) = match read_header(buffer, cursor, b'$', limits) {
             Header::Incomplete => return Frame::Incomplete,
             Header::Invalid(error) => return Frame::Invalid(error),
             Header::Found { value, next } => (value, next),
@@ -132,7 +155,7 @@ enum Header {
     Invalid(String),
 }
 
-fn read_header(buffer: &[u8], index: usize, expected: u8) -> Header {
+fn read_header(buffer: &[u8], index: usize, expected: u8, limits: &Limits) -> Header {
     let Some(byte) = buffer.get(index) else {
         return Header::Incomplete;
     };
@@ -144,6 +167,12 @@ fn read_header(buffer: &[u8], index: usize, expected: u8) -> Header {
     }
     let digits_start = index + 1;
     let Some(end) = find_line_end(buffer, digits_start) else {
+        if buffer.len() - index > limits.max_line_bytes {
+            return Header::Invalid(match expected {
+                b'*' => "too big mbulk count string".into(),
+                _ => "too big bulk count string".into(),
+            });
+        }
         return Header::Incomplete;
     };
     // `end` is past the line ending, so drop the LF and a CR if the client sent
@@ -168,6 +197,9 @@ fn read_header(buffer: &[u8], index: usize, expected: u8) -> Header {
 /// The `PING\r\n` form, with arguments separated by spaces.
 fn parse_inline(buffer: &[u8], limits: &Limits) -> Frame {
     let Some(end) = find_line_end(buffer, 0) else {
+        if buffer.len() > limits.max_line_bytes {
+            return Frame::Invalid("too big inline request".into());
+        }
         return Frame::Incomplete;
     };
     let line = &buffer[..end];
@@ -183,6 +215,12 @@ fn parse_inline(buffer: &[u8], limits: &Limits) -> Frame {
             ));
         }
         args.push(argument.to_vec());
+    }
+    if args.len() > limits.max_arguments {
+        return Frame::Invalid(format!(
+            "invalid multibulk length, the command has too many arguments (at most {})",
+            limits.max_arguments
+        ));
     }
     Frame::Command { args, length: end }
 }
@@ -408,6 +446,36 @@ mod tests {
         };
         let request = b"*2\r\n$3\r\nGET\r\n$9\r\nkeykeykey\r\n";
         assert!(matches!(parse(request, &limits), Frame::Invalid(_)));
+    }
+
+    #[test]
+    fn a_line_that_never_ends_is_refused_instead_of_buffered() {
+        let limits = Limits {
+            max_line_bytes: 16,
+            ..limits()
+        };
+        assert!(matches!(parse(&[b'x'; 17], &limits), Frame::Invalid(_)));
+        assert!(matches!(parse(&[b'x'; 16], &limits), Frame::Incomplete));
+        let mut header = b"*".to_vec();
+        header.extend([b'1'; 17]);
+        assert!(matches!(parse(&header, &limits), Frame::Invalid(_)));
+        let mut bulk = b"*1\r\n$".to_vec();
+        bulk.extend([b'1'; 17]);
+        assert!(matches!(parse(&bulk, &limits), Frame::Invalid(_)));
+    }
+
+    #[test]
+    fn an_unauthenticated_connection_may_send_only_a_handshake() {
+        let limits = Limits::default().unauthenticated();
+        assert!(matches!(parse(b"*11\r\n", &limits), Frame::Invalid(_)));
+        assert!(matches!(
+            parse(b"*1\r\n$16385\r\n", &limits),
+            Frame::Invalid(_)
+        ));
+        assert!(matches!(
+            parse(b"*2\r\n$4\r\nAUTH\r\n$6\r\nsecret\r\n", &limits),
+            Frame::Command { .. }
+        ));
     }
 
     #[test]

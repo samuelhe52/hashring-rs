@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+futures = "0.3"
 hashring-client = { version = "0.1.0", path = "../hashring-client" }
 hashring-core = { version = "0.1.0", path = "../hashring-core" }
 thiserror = "2"
