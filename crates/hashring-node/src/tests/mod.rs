@@ -162,9 +162,11 @@ fn replication_entry(
     expires_at_unix_millis: Option<u64>,
 ) -> ReplicationEntry {
     let owner = topology.owner(&key).unwrap();
-    let request_fingerprint =
-        mutation_fingerprint(&key, MutationShape::value(value, deleted, expires_at_unix_millis))
-            .to_vec();
+    let request_fingerprint = mutation_fingerprint(
+        &key,
+        MutationShape::value(value, deleted, expires_at_unix_millis),
+    )
+    .to_vec();
     ReplicationEntry {
         topology_epoch: topology.epoch,
         owner_node_id: owner.node_id.clone(),
@@ -194,6 +196,7 @@ fn range(end_inclusive: u64) -> proto::RangeSpec {
     }
 }
 
+mod conditional;
 mod digest_bench;
 mod digest_stall_bench;
 mod expiry;

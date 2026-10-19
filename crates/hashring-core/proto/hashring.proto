@@ -497,6 +497,20 @@ message GetResponse {
   optional uint64 expires_at_unix_millis = 5;
 }
 
+// A condition the owner checks against the key's live record, under the same
+// lock that applies the mutation, so nothing can change the record between the
+// check and the write. A record that is deleted or past its deadline is not
+// live. A failed condition is a definite outcome: nothing was written and no
+// deduplication receipt was kept.
+message Precondition {
+  oneof expect {
+    // The key has no live record.
+    Empty absent = 1;
+    // The key's live record carries exactly this version.
+    RecordVersion version = 2;
+  }
+}
+
 message PutRequest {
   bytes key = 1;
   bytes value = 2;
@@ -511,6 +525,8 @@ message PutRequest {
   // empty and `expires_at_unix_millis` must be set and non-zero; a key that
   // does not exist is reported through PutResponse.key_missing.
   bool preserve_value = 6;
+  // Apply the write only if this holds; see PutResponse.condition_failed.
+  Precondition precondition = 7;
 }
 
 message PutResponse {
@@ -520,17 +536,23 @@ message PutResponse {
   // A `preserve_value` write whose key does not exist. Reported apart from an
   // error so the caller can tell "no such key" from a write that failed.
   bool key_missing = 4;
+  // The request's precondition did not hold, so nothing was written.
+  bool condition_failed = 5;
 }
 
 message DeleteRequest {
   bytes key = 1;
   uint64 topology_epoch = 2;
   string request_id = 3;
+  // Delete only if this holds; see DeleteResponse.condition_failed.
+  Precondition precondition = 4;
 }
 
 message DeleteResponse {
   uint64 current_epoch = 1;
   OperationError error = 2;
+  // The request's precondition did not hold, so nothing was written.
+  bool condition_failed = 3;
 }
 
 service DataNode {

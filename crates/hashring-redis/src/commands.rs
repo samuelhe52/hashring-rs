@@ -965,7 +965,7 @@ impl Dispatcher {
             return Ok(Reply::Integer(1));
         }
         let applied = client.set_expiry(rest[0].clone(), expires_at).await?;
-        Ok(Reply::Integer(i64::from(!applied.key_missing)))
+        Ok(Reply::Integer(i64::from(applied.is_some())))
     }
 
     async fn persist(&self, args: &[Vec<u8>]) -> RedisResult<Reply> {

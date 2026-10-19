@@ -266,6 +266,15 @@ impl DataNode for DataNodeService {
                 ..Default::default()
             }));
         }
+        let condition = match Condition::from_proto(request.precondition.as_ref()) {
+            Ok(condition) => condition,
+            Err(error) => {
+                return Ok(Response::new(PutResponse {
+                    error: Some(error),
+                    ..Default::default()
+                }));
+            }
+        };
         self.refresh_if_newer(request.topology_epoch).await?;
         // The routing token and the mutation fingerprint are computed once and
         // reused by every check below instead of being recomputed under each
@@ -284,7 +293,8 @@ impl DataNode for DataNodeService {
                     .expect("an expiry-only write's expiry was validated"),
             ),
             false => MutationShape::value(&request.value, false, request.expires_at_unix_millis),
-        };
+        }
+        .with_condition(condition);
         let fingerprint = mutation_fingerprint(&request.key, shape);
         {
             let state = self.state.read().await;
@@ -326,6 +336,7 @@ impl DataNode for DataNodeService {
                     current_epoch: epoch,
                     error,
                     key_missing: false,
+                    ..Default::default()
                 }));
             }
         }
@@ -377,6 +388,7 @@ impl DataNode for DataNodeService {
                     current_epoch: epoch,
                     error,
                     key_missing: false,
+                    ..Default::default()
                 }));
             }
             return Ok(Response::new(PutResponse {
@@ -389,16 +401,23 @@ impl DataNode for DataNodeService {
                 ..Default::default()
             }));
         }
+        let now_millis = now_unix_millis();
+        let live = state
+            .records
+            .get(request.key.as_slice())
+            .filter(|record| !record.deleted && !record.is_expired(now_millis));
+        if !condition.holds(live) {
+            return Ok(Response::new(PutResponse {
+                current_epoch: state.topology.epoch,
+                condition_failed: true,
+                ..Default::default()
+            }));
+        }
         // An expiry-only write replaces the deadline of a record it never
         // received, so the value it keeps is read here, under the same write
         // lock that applies it, and reported as missing rather than stored.
         let kept = if request.preserve_value {
-            let now_unix_millis = now_unix_millis();
-            match state
-                .records
-                .get(request.key.as_slice())
-                .filter(|record| !record.deleted && !record.is_expired(now_unix_millis))
-            {
+            match live {
                 Some(record) => record.clone(),
                 None => {
                     return Ok(Response::new(PutResponse {
@@ -426,16 +445,7 @@ impl DataNode for DataNodeService {
         } else {
             match request.expires_at_unix_millis {
                 Some(expires_at) => Some(expires_at),
-                None => {
-                    let now_unix_millis = now_unix_millis();
-                    state
-                        .records
-                        .get(request.key.as_slice())
-                        .filter(|record| {
-                            !record.deleted && !record.is_expired(now_unix_millis)
-                        })
-                        .and_then(|record| record.expires_at_unix_millis)
-                }
+                None => live.and_then(|record| record.expires_at_unix_millis),
             }
         };
         let ack_cost = required_ack_retained_bytes(&ready_followers);
@@ -648,6 +658,7 @@ impl DataNode for DataNodeService {
             current_epoch,
             error,
             key_missing: false,
+            ..Default::default()
         }))
     }
 
@@ -672,10 +683,22 @@ impl DataNode for DataNodeService {
                 ..Default::default()
             }));
         }
+        let condition = match Condition::from_proto(request.precondition.as_ref()) {
+            Ok(condition) => condition,
+            Err(error) => {
+                return Ok(Response::new(DeleteResponse {
+                    error: Some(error),
+                    ..Default::default()
+                }));
+            }
+        };
         self.refresh_if_newer(request.topology_epoch).await?;
         let token;
         let token_seed;
-        let fingerprint = mutation_fingerprint(&request.key, MutationShape::value(&[], true, None));
+        let fingerprint = mutation_fingerprint(
+            &request.key,
+            MutationShape::value(&[], true, None).with_condition(condition),
+        );
         {
             let state = self.state.read().await;
             token = state.topology.key_token(&request.key);
@@ -684,6 +707,7 @@ impl DataNode for DataNodeService {
                 return Ok(Response::new(DeleteResponse {
                     current_epoch: error.current_epoch,
                     error: Some(error),
+                    ..Default::default()
                 }));
             }
             if let Some(existing) = state
@@ -699,6 +723,7 @@ impl DataNode for DataNodeService {
                             "mutation ID was reused with a different operation or payload",
                             false,
                         )),
+                        ..Default::default()
                     }));
                 }
                 let version = existing.version.clone();
@@ -712,6 +737,7 @@ impl DataNode for DataNodeService {
                 return Ok(Response::new(DeleteResponse {
                     current_epoch: epoch,
                     error,
+                    ..Default::default()
                 }));
             }
         }
@@ -721,6 +747,7 @@ impl DataNode for DataNodeService {
                 return Ok(Response::new(DeleteResponse {
                     current_epoch: error.current_epoch,
                     error: Some(error),
+                    ..Default::default()
                 }));
             }
         };
@@ -729,6 +756,7 @@ impl DataNode for DataNodeService {
             return Ok(Response::new(DeleteResponse {
                 current_epoch: error.current_epoch,
                 error: Some(error),
+                ..Default::default()
             }));
         }
         // A reseed at the same epoch moves every key, so the routing token,
@@ -741,6 +769,7 @@ impl DataNode for DataNodeService {
             return Ok(Response::new(DeleteResponse {
                 current_epoch: error.current_epoch,
                 error: Some(error),
+                ..Default::default()
             }));
         }
         let dedup_now = Instant::now();
@@ -758,6 +787,7 @@ impl DataNode for DataNodeService {
                 return Ok(Response::new(DeleteResponse {
                     current_epoch: epoch,
                     error,
+                    ..Default::default()
                 }));
             }
             return Ok(Response::new(DeleteResponse {
@@ -767,6 +797,19 @@ impl DataNode for DataNodeService {
                     "mutation ID was reused with a different operation or payload",
                     false,
                 )),
+                ..Default::default()
+            }));
+        }
+        let now_millis = now_unix_millis();
+        let live = state
+            .records
+            .get(request.key.as_slice())
+            .filter(|record| !record.deleted && !record.is_expired(now_millis));
+        if !condition.holds(live) {
+            return Ok(Response::new(DeleteResponse {
+                current_epoch: state.topology.epoch,
+                condition_failed: true,
+                ..Default::default()
             }));
         }
         let ack_cost = required_ack_retained_bytes(&ready_followers);
@@ -777,6 +820,7 @@ impl DataNode for DataNodeService {
             return Ok(Response::new(DeleteResponse {
                 current_epoch: state.topology.epoch,
                 error: Some(self.owner_dedup_full_error(&state)),
+                ..Default::default()
             }));
         }
 
@@ -791,6 +835,7 @@ impl DataNode for DataNodeService {
                         true,
                     )
                 }),
+                ..Default::default()
             }));
         }
         for source in state
@@ -809,6 +854,7 @@ impl DataNode for DataNodeService {
                             true,
                         )
                     }),
+                    ..Default::default()
                 }));
             }
         }
@@ -827,6 +873,7 @@ impl DataNode for DataNodeService {
                         true,
                     )
                 }),
+                ..Default::default()
             }));
         }
 
@@ -848,6 +895,7 @@ impl DataNode for DataNodeService {
                         true,
                     )
                 }),
+                ..Default::default()
             }));
         }
 
@@ -879,6 +927,7 @@ impl DataNode for DataNodeService {
                 return Ok(Response::new(DeleteResponse {
                     current_epoch: state.topology.epoch,
                     error: Some(replication_backpressure_error(state.topology.epoch)),
+                    ..Default::default()
                 }));
             }
         };
@@ -900,6 +949,7 @@ impl DataNode for DataNodeService {
                 return Ok(Response::new(DeleteResponse {
                     current_epoch: state.topology.epoch,
                     error: Some(replication_backpressure_error(state.topology.epoch)),
+                    ..Default::default()
                 }));
             }
         };
@@ -968,6 +1018,7 @@ impl DataNode for DataNodeService {
         Ok(Response::new(DeleteResponse {
             current_epoch,
             error,
+            ..Default::default()
         }))
     }
 

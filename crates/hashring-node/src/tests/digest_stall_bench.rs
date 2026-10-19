@@ -93,6 +93,7 @@ fn spawn_writer(
                     request_id: format!("writer-{sequence}"),
                     expires_at_unix_millis: None,
                     preserve_value: false,
+                    ..Default::default()
                 }))
                 .await
                 .unwrap()

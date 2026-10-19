@@ -679,6 +679,7 @@ async fn lost_first_successor_blocks_raw_writes_until_replacement_is_ready() {
             request_id: "lost-first-successor-blocked".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }),
     )
     .await
@@ -745,6 +746,7 @@ async fn lost_first_successor_blocks_raw_writes_until_replacement_is_ready() {
                     request_id: format!("lost-first-successor-recovered-{attempt}"),
                     expires_at_unix_millis: None,
                     preserve_value: false,
+                    ..Default::default()
                 })
                 .await
                 .unwrap()
@@ -1244,6 +1246,7 @@ async fn node_self_fences_client_operations_when_coordinator_lease_expires() {
             request_id: "expired-put".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         })
         .await
         .unwrap()

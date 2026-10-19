@@ -42,9 +42,38 @@ pub struct GetOutput {
 pub struct PutOutput {
     pub version: RecordVersion,
     pub topology_epoch: u64,
-    /// An expiry-only write to a key that does not exist. The record was not
-    /// touched and no receipt was kept, so a retry re-reads the key.
-    pub key_missing: bool,
+}
+
+/// What a conditional write expects of the key's live record, checked by the
+/// owner under the same lock that applies the write. A record that is deleted
+/// or past its deadline is not live.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Precondition {
+    /// The key has no live record.
+    Absent,
+    /// The key's live record carries exactly this version, as returned by
+    /// [`HashringClient::get`].
+    Version(RecordVersion),
+}
+
+impl From<Precondition> for proto::Precondition {
+    fn from(precondition: Precondition) -> Self {
+        use proto::precondition::Expect;
+        Self {
+            expect: Some(match precondition {
+                Precondition::Absent => Expect::Absent(proto::Empty {}),
+                Precondition::Version(version) => Expect::Version(version),
+            }),
+        }
+    }
+}
+
+/// The definite outcomes of one put: written, or not written for a reason the
+/// node reported. Neither "not written" case keeps a receipt.
+enum PutResult {
+    Applied(PutOutput),
+    KeyMissing,
+    ConditionFailed,
 }
 
 /// What a write does to the record's deadline.
@@ -74,6 +103,19 @@ impl From<Expiry> for Option<u64> {
 #[derive(Clone, Debug)]
 pub struct DeleteOutput {
     pub topology_epoch: u64,
+}
+
+/// A conditional write rejected on a retry whose earlier attempt's outcome
+/// is unknown. The rejection rules out the retry, not that earlier attempt.
+fn rejected_after_ambiguity() -> ClientError {
+    OperationFailure {
+        code: ErrorCode::OutcomeUnknown,
+        message: "a retried conditional write was rejected, but an earlier attempt may still apply"
+            .into(),
+        retryable: false,
+        outcome: MutationOutcome::MayHaveApplied,
+    }
+    .into()
 }
 
 /// Whether a mutation can be ruled out after an unsuccessful attempt.
@@ -494,7 +536,7 @@ impl HashringClient {
     }
 
     pub async fn put(&self, key: Vec<u8>, value: Vec<u8>) -> Result<PutOutput, ClientError> {
-        self.put_record(key, value, Expiry::Keep, false).await
+        self.put_with_expiry(key, value, Expiry::Keep).await
     }
 
     /// Stores `value` and sets the record's deadline.
@@ -509,20 +551,60 @@ impl HashringClient {
         value: Vec<u8>,
         expiry: Expiry,
     ) -> Result<PutOutput, ClientError> {
-        self.put_record(key, value, expiry, false).await
+        match self.put_record(key, value, expiry, false, None).await? {
+            PutResult::Applied(output) => Ok(output),
+            // Only a conditional or expiry-only write is answered this way.
+            PutResult::KeyMissing | PutResult::ConditionFailed => Err(ClientError::MissingVersion),
+        }
+    }
+
+    /// Stores `value` only if `precondition` holds for the key's live record
+    /// when the owner applies the write. `None` means it did not hold and
+    /// nothing was written.
+    ///
+    /// A retry inside this call reuses the mutation ID, and the owner answers
+    /// it from the first attempt's receipt before checking the condition
+    /// again, so a write that was applied is never reported as failed.
+    pub async fn put_if(
+        &self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        expiry: Expiry,
+        precondition: Precondition,
+    ) -> Result<Option<PutOutput>, ClientError> {
+        match self
+            .put_record(key, value, expiry, false, Some(precondition))
+            .await?
+        {
+            PutResult::Applied(output) => Ok(Some(output)),
+            PutResult::ConditionFailed => Ok(None),
+            PutResult::KeyMissing => Err(ClientError::MissingVersion),
+        }
     }
 
     /// Replaces the deadline of an existing record, keeping its value.
     ///
-    /// Returns `key_missing` rather than an error when the key is absent, and
-    /// writes nothing in that case: no record, no sequence and no receipt.
+    /// Returns `None` rather than an error when the key is absent, and writes
+    /// nothing in that case: no record, no sequence and no receipt.
     pub async fn set_expiry(
         &self,
         key: Vec<u8>,
         expires_at_unix_millis: u64,
-    ) -> Result<PutOutput, ClientError> {
-        self.put_record(key, Vec::new(), Expiry::At(expires_at_unix_millis), true)
-            .await
+    ) -> Result<Option<PutOutput>, ClientError> {
+        match self
+            .put_record(
+                key,
+                Vec::new(),
+                Expiry::At(expires_at_unix_millis),
+                true,
+                None,
+            )
+            .await?
+        {
+            PutResult::Applied(output) => Ok(Some(output)),
+            PutResult::KeyMissing => Ok(None),
+            PutResult::ConditionFailed => Err(ClientError::MissingVersion),
+        }
     }
 
     async fn put_record(
@@ -531,7 +613,8 @@ impl HashringClient {
         value: Vec<u8>,
         expiry: Expiry,
         preserve_value: bool,
-    ) -> Result<PutOutput, ClientError> {
+        precondition: Option<Precondition>,
+    ) -> Result<PutResult, ClientError> {
         let _operation_timer = hashring_core::rpc_profile::CLIENT_PUT_OPERATION.start();
         validate_key_size(&key)?;
         if value.len() > DEFAULT_MAX_VALUE_BYTES {
@@ -567,6 +650,7 @@ impl HashringClient {
                 request_id: request_id.clone(),
                 expires_at_unix_millis: expiry.into(),
                 preserve_value,
+                precondition: precondition.clone().map(Into::into),
             };
             let rpc_timer = hashring_core::rpc_profile::CLIENT_PUT_RPC.start();
             let response = tokio::time::timeout(
@@ -598,6 +682,9 @@ impl HashringClient {
             if let Some(error) = response.error {
                 let error_unknown_write_outcome =
                     unknown_write_outcome || operation_may_have_applied(&error);
+                // Kept for later attempts: a retry the owner then rejects, or
+                // fails permanently, still follows this ambiguous one.
+                unknown_write_outcome = error_unknown_write_outcome;
                 if error.retryable {
                     tracing::debug!(operation = "put", request_id, attempt, epoch = epoch, code = ?ErrorCode::try_from(error.code).unwrap_or(ErrorCode::Unspecified), message = error.message, "retrying operation response");
                 }
@@ -617,19 +704,50 @@ impl HashringClient {
                 failure.outcome = error_unknown_write_outcome.into();
                 return Err(failure.into());
             }
-            let output = PutOutput {
-                version: response.version.ok_or(ClientError::MissingVersion)?,
-                topology_epoch: response.current_epoch,
-                key_missing: response.key_missing,
-            };
             if response.current_epoch > epoch {
                 self.trigger_background_refresh(response.current_epoch);
             }
-            return Ok(output);
+            if response.condition_failed || response.key_missing {
+                // A rejection answers for this attempt only, and keeps no
+                // receipt. An earlier attempt whose outcome is unknown may
+                // still be on its way to the owner and apply afterwards.
+                if unknown_write_outcome {
+                    return Err(rejected_after_ambiguity());
+                }
+                return Ok(match response.condition_failed {
+                    true => PutResult::ConditionFailed,
+                    false => PutResult::KeyMissing,
+                });
+            }
+            return Ok(PutResult::Applied(PutOutput {
+                version: response.version.ok_or(ClientError::MissingVersion)?,
+                topology_epoch: response.current_epoch,
+            }));
         }
     }
 
     pub async fn delete(&self, key: Vec<u8>) -> Result<DeleteOutput, ClientError> {
+        self.delete_record(key, None)
+            .await?
+            .ok_or(ClientError::MissingVersion)
+    }
+
+    /// Deletes the key only if `precondition` holds for its live record when
+    /// the owner applies the delete. `None` means it did not hold and nothing
+    /// was written. See [`HashringClient::put_if`] for how retries behave.
+    pub async fn delete_if(
+        &self,
+        key: Vec<u8>,
+        precondition: Precondition,
+    ) -> Result<Option<DeleteOutput>, ClientError> {
+        self.delete_record(key, Some(precondition)).await
+    }
+
+    async fn delete_record(
+        &self,
+        key: Vec<u8>,
+        precondition: Option<Precondition>,
+    ) -> Result<Option<DeleteOutput>, ClientError> {
         validate_key_size(&key)?;
         let deadline = self.mutation_deadline();
         let request_id = new_request_id();
@@ -656,6 +774,7 @@ impl HashringClient {
                 key: key.clone(),
                 topology_epoch: epoch,
                 request_id: request_id.clone(),
+                precondition: precondition.clone().map(Into::into),
             };
             let response = match tokio::time::timeout(
                 remaining(deadline, unknown_write_outcome)?,
@@ -685,6 +804,9 @@ impl HashringClient {
             if let Some(error) = response.error {
                 let error_unknown_write_outcome =
                     unknown_write_outcome || operation_may_have_applied(&error);
+                // Kept for later attempts: a retry the owner then rejects, or
+                // fails permanently, still follows this ambiguous one.
+                unknown_write_outcome = error_unknown_write_outcome;
                 if error.retryable {
                     tracing::debug!(operation = "delete", request_id, attempt, epoch = epoch, code = ?ErrorCode::try_from(error.code).unwrap_or(ErrorCode::Unspecified), message = error.message, "retrying operation response");
                 }
@@ -704,13 +826,20 @@ impl HashringClient {
                 failure.outcome = error_unknown_write_outcome.into();
                 return Err(failure.into());
             }
-            let output = DeleteOutput {
-                topology_epoch: response.current_epoch,
-            };
             if response.current_epoch > epoch {
                 self.trigger_background_refresh(response.current_epoch);
             }
-            return Ok(output);
+            if response.condition_failed {
+                // See `put_record`: an earlier ambiguous attempt may still
+                // apply after this one was rejected.
+                if unknown_write_outcome {
+                    return Err(rejected_after_ambiguity());
+                }
+                return Ok(None);
+            }
+            return Ok(Some(DeleteOutput {
+                topology_epoch: response.current_epoch,
+            }));
         }
     }
 

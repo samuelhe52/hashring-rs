@@ -32,6 +32,7 @@ fn put(key: &[u8], value: &[u8], request_id: &str) -> PutRequest {
         request_id: request_id.into(),
         expires_at_unix_millis: None,
         preserve_value: false,
+        ..Default::default()
     }
 }
 
@@ -144,6 +145,7 @@ async fn an_expiry_only_write_keeps_the_value_and_reports_a_missing_key() {
             request_id: "extend".into(),
             expires_at_unix_millis: Some(expires_at),
             preserve_value: true,
+            ..Default::default()
         },
     )
     .await;
@@ -168,6 +170,7 @@ async fn an_expiry_only_write_keeps_the_value_and_reports_a_missing_key() {
             request_id: "extend-absent".into(),
             expires_at_unix_millis: Some(expires_at),
             preserve_value: true,
+            ..Default::default()
         },
     )
     .await;
@@ -202,6 +205,7 @@ async fn an_expiry_only_write_keeps_the_value_and_reports_a_missing_key() {
             request_id: "extend-gone".into(),
             expires_at_unix_millis: Some(expires_at),
             preserve_value: true,
+            ..Default::default()
         },
     )
     .await;
@@ -220,6 +224,7 @@ async fn an_expiry_only_write_needs_a_deadline_and_no_value() {
             request_id: "bad".into(),
             expires_at_unix_millis: Some(deadline_in(60)),
             preserve_value: true,
+            ..Default::default()
         },
     )
     .await;
@@ -239,6 +244,7 @@ async fn an_expiry_only_write_needs_a_deadline_and_no_value() {
             request_id: "bad".into(),
             expires_at_unix_millis: None,
             preserve_value: true,
+            ..Default::default()
         },
     )
     .await;
@@ -262,6 +268,7 @@ async fn a_retried_expiry_only_write_returns_the_first_answer() {
         request_id: "extend".into(),
         expires_at_unix_millis: Some(expires_at),
         preserve_value: true,
+        ..Default::default()
     };
     let first = write(&service, request.clone()).await;
     let sequence_after_first = service.state.read().await.next_sequence;
@@ -287,6 +294,7 @@ async fn a_retried_expiry_only_write_returns_the_first_answer() {
             request_id: "extend".into(),
             expires_at_unix_millis: Some(deadline_in(900)),
             preserve_value: true,
+            ..Default::default()
         },
     )
     .await;
@@ -632,7 +640,10 @@ async fn rewriting_a_key_keeps_one_expiry_entry_for_it() {
     let state = service.state.read().await;
     assert_eq!(state.record_expirations.len(), 1);
     assert_eq!(
-        state.record_expirations.first().map(|(deadline, _)| *deadline),
+        state
+            .record_expirations
+            .first()
+            .map(|(deadline, _)| *deadline),
         state.records[b"hot".as_slice()].expires_at_unix_millis
     );
     state.debug_assert_index();
@@ -718,7 +729,10 @@ async fn an_expired_record_outlives_the_migration_that_copied_it() {
     let later = deadline_in(601);
     {
         let mut state = source.state.write().await;
-        assert_eq!(sweep_expired_records(&mut state, later, EXPIRY_SWEEP_LIMIT), 0);
+        assert_eq!(
+            sweep_expired_records(&mut state, later, EXPIRY_SWEEP_LIMIT),
+            0
+        );
         assert!(state.records.contains_key(key.as_slice()));
         state.debug_assert_index();
     }
@@ -745,7 +759,10 @@ async fn an_expired_record_outlives_the_migration_that_copied_it() {
         .await
         .unwrap();
     let mut state = source.state.write().await;
-    assert_eq!(sweep_expired_records(&mut state, later, EXPIRY_SWEEP_LIMIT), 1);
+    assert_eq!(
+        sweep_expired_records(&mut state, later, EXPIRY_SWEEP_LIMIT),
+        1
+    );
     assert!(!state.records.contains_key(key.as_slice()));
     state.debug_assert_index();
 }

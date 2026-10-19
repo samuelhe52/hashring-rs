@@ -675,6 +675,7 @@ async fn run_cluster(
                 request_id: format!("experiment-owner-rpc-{}-{key}", std::process::id()),
                 expires_at_unix_millis: None,
                 preserve_value: false,
+                ..Default::default()
             }),
         )
         .await

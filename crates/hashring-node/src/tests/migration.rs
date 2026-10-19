@@ -29,6 +29,7 @@ async fn paused_source_range_keeps_reads_available_and_blocks_writes() {
             request_id: "put-1".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -65,6 +66,7 @@ async fn paused_source_range_keeps_reads_available_and_blocks_writes() {
             request_id: "put-2".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -75,6 +77,7 @@ async fn paused_source_range_keeps_reads_available_and_blocks_writes() {
             key: b"key".to_vec(),
             topology_epoch: 1,
             request_id: "delete-1".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -95,6 +98,7 @@ async fn paused_source_range_keeps_reads_available_and_blocks_writes() {
             request_id: "put-3".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -129,6 +133,7 @@ async fn interrupted_repair_cleanup_unpauses_only_repair_ranges() {
             request_id: "before-cleanup".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -149,6 +154,7 @@ async fn interrupted_repair_cleanup_unpauses_only_repair_ranges() {
             request_id: "after-cleanup".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -262,6 +268,7 @@ async fn committed_destination_fences_writes_until_idempotent_activation() {
             request_id: "put-1".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -272,6 +279,7 @@ async fn committed_destination_fences_writes_until_idempotent_activation() {
             key: b"key".to_vec(),
             topology_epoch: 2,
             request_id: "delete-1".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -297,6 +305,7 @@ async fn committed_destination_fences_writes_until_idempotent_activation() {
             request_id: "put-2".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -319,6 +328,7 @@ async fn committed_destination_fences_writes_until_idempotent_activation() {
             key: b"key".to_vec(),
             topology_epoch: 2,
             request_id: "delete-2".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -336,6 +346,7 @@ async fn owner_retries_reuse_original_result_and_reject_mutation_id_conflicts() 
         request_id: "same-id".into(),
         expires_at_unix_millis: None,
         preserve_value: false,
+        ..Default::default()
     };
     let original = service
         .put(Request::new(first.clone()))
@@ -367,6 +378,7 @@ async fn owner_retries_reuse_original_result_and_reject_mutation_id_conflicts() 
             key: b"key".to_vec(),
             topology_epoch: 1,
             request_id: "same-id".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -387,6 +399,7 @@ async fn owner_retries_reuse_original_result_and_reject_mutation_id_conflicts() 
         key: b"key".to_vec(),
         topology_epoch: 1,
         request_id: "delete-id".into(),
+        ..Default::default()
     };
     assert!(
         service
@@ -420,6 +433,7 @@ async fn dedup_budget_rejects_before_apply_and_expired_records_free_capacity() {
         request_id: "first".into(),
         expires_at_unix_millis: None,
         preserve_value: false,
+        ..Default::default()
     };
     assert!(
         service
@@ -437,6 +451,7 @@ async fn dedup_budget_rejects_before_apply_and_expired_records_free_capacity() {
         request_id: "other".into(),
         expires_at_unix_millis: None,
         preserve_value: false,
+        ..Default::default()
     };
     let rejected = service
         .put(Request::new(second.clone()))
@@ -497,6 +512,7 @@ async fn migration_carries_snapshot_and_journal_mutation_ids() {
         request_id: "before-id".into(),
         expires_at_unix_millis: None,
         preserve_value: false,
+        ..Default::default()
     };
     let first_version = source
         .put(Request::new(before.clone()))
@@ -518,6 +534,7 @@ async fn migration_carries_snapshot_and_journal_mutation_ids() {
         request_id: "after-id".into(),
         expires_at_unix_millis: None,
         preserve_value: false,
+        ..Default::default()
     };
     let second_version = source
         .put(Request::new(after.clone()))
@@ -707,6 +724,7 @@ async fn delete_is_idempotent_and_put_restores_an_empty_value() {
             request_id: "put-1".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -716,6 +734,7 @@ async fn delete_is_idempotent_and_put_restores_an_empty_value() {
             key: b"key".to_vec(),
             topology_epoch: 1,
             request_id: "delete-1".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -729,6 +748,7 @@ async fn delete_is_idempotent_and_put_restores_an_empty_value() {
             key: b"key".to_vec(),
             topology_epoch: 1,
             request_id: "delete-2".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -744,6 +764,7 @@ async fn delete_is_idempotent_and_put_restores_an_empty_value() {
             request_id: "put-2".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -768,6 +789,7 @@ async fn delete_validates_empty_and_oversized_keys() {
             key: Vec::new(),
             topology_epoch: 1,
             request_id: "delete-empty".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -779,6 +801,7 @@ async fn delete_validates_empty_and_oversized_keys() {
             key: vec![0; DEFAULT_MAX_KEY_BYTES + 1],
             topology_epoch: 1,
             request_id: "delete-oversized".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -790,6 +813,7 @@ async fn delete_validates_empty_and_oversized_keys() {
             key: b"key".to_vec(),
             topology_epoch: 1,
             request_id: "x".repeat(MAX_MUTATION_ID_BYTES + 1),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -812,6 +836,7 @@ async fn snapshot_and_changelog_preserve_a_deleted_key_tombstone() {
             request_id: "put-1".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -826,6 +851,7 @@ async fn snapshot_and_changelog_preserve_a_deleted_key_tombstone() {
             key: b"key".to_vec(),
             topology_epoch: 1,
             request_id: "delete-1".into(),
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1131,6 +1157,7 @@ async fn journal_budget_is_aggregate_across_ranges() {
             request_id: "put-1".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -1153,6 +1180,7 @@ async fn delete_leaves_the_value_when_the_journal_budget_is_full() {
             request_id: "put-1".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1168,6 +1196,7 @@ async fn delete_leaves_the_value_when_the_journal_budget_is_full() {
             key: b"key".to_vec(),
             topology_epoch: 1,
             request_id: "delete-1".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -1244,6 +1273,7 @@ async fn range_digest_agrees_when_keys_share_a_token() {
                     request_id: format!("put-{index}-{side}"),
                     expires_at_unix_millis: None,
                     preserve_value: false,
+                    ..Default::default()
                 }))
                 .await
                 .unwrap();

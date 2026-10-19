@@ -629,6 +629,7 @@ async fn owner_only_delivers_put_and_delete_to_follower_in_order() {
             request_id: "put-1".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -662,6 +663,7 @@ async fn owner_only_delivers_put_and_delete_to_follower_in_order() {
             key: key.clone(),
             topology_epoch: 1,
             request_id: "delete-1".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -701,6 +703,7 @@ async fn owner_only_delivers_put_and_delete_to_follower_in_order() {
                     request_id: format!("concurrent-{index}"),
                     expires_at_unix_millis: None,
                     preserve_value: false,
+                    ..Default::default()
                 }))
                 .await
                 .unwrap()
@@ -777,6 +780,7 @@ async fn dispatcher_resumes_after_a_verified_gap_checkpoint() {
                 request_id: id.into(),
                 expires_at_unix_millis: None,
                 preserve_value: false,
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -812,6 +816,7 @@ async fn dispatcher_resumes_after_a_verified_gap_checkpoint() {
             request_id: "second".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -904,6 +909,7 @@ async fn dispatcher_resumes_after_a_verified_gap_checkpoint() {
             request_id: "third".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -968,6 +974,7 @@ async fn unavailable_follower_backpressures_before_unbounded_queue_growth() {
                 request_id: format!("put-{successful}"),
                 expires_at_unix_millis: None,
                 preserve_value: false,
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -1155,6 +1162,7 @@ async fn strong_ack_policies_fail_writes_closed_until_replication_is_active() {
                 request_id: "put".into(),
                 expires_at_unix_millis: None,
                 preserve_value: false,
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -1168,6 +1176,7 @@ async fn strong_ack_policies_fail_writes_closed_until_replication_is_active() {
                 key: b"key".to_vec(),
                 topology_epoch: 2,
                 request_id: "delete".into(),
+                ..Default::default()
             }))
             .await
             .unwrap()
