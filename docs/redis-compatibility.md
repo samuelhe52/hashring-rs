@@ -339,6 +339,34 @@ returns nil, `EXISTS` returns 0, `TTL` returns -2.
   into client retries rather than silent timeouts. A write that passes it
   answers `ERR` instead, because it may already have been applied.
 
+## Planned: parity against a real Redis
+
+- [ ] **Differential test against `redis-server`.** `tests/redis_gateway.rs`
+  drives the gateway with a real client, but every expected reply in it is
+  written by hand from what Redis is believed to do, so a wrong belief passes.
+  Add `tests/redis_parity.rs`, which sends the same command sequences to a real
+  Redis (a local `redis-server`, else a pinned `redis:7` container; the test is
+  skipped when neither is available) and to the gateway, and compares the
+  replies as `redis::Value` under RESP2 and RESP3.
+  - Move the `Cluster` harness out of `redis_gateway.rs` into a shared test
+    module rather than copying it.
+  - Isolate cases by flushing the reference and giving each case its own key
+    prefix on the gateway, since `FLUSHALL` is declined there.
+  - Compare error codes (`ERR`, `WRONGTYPE`, …) rather than whole messages.
+  - Normalize what is not deterministic: compare `KEYS` and a full `SCAN` as
+    sets, check `RANDOMKEY` only for membership, allow ±1 on `TTL` and `PTTL`,
+    and skip `INFO`, `CLIENT ID`/`LIST`, the server fields of `HELLO`, and
+    `COMMAND`.
+  - List each difference this page documents as an expected divergence that
+    links its section, so that only a difference not recorded here fails.
+  - Start with a fixed script covering every supported command and its options.
+    Then add a seeded random replay over a small pool of keys and values, which
+    finds edge cases such as `SETRANGE` padding, `INCRBYFLOAT` formatting,
+    negative offsets and `GETEX` option combinations. Print the seed on failure.
+  - Out of scope: concurrency and cross-key behaviour during migration. Parity
+    checks what one sequential client sees on the wire, and the existing tests
+    keep covering the rest.
+
 ## Not attempted
 
 Recorded so the gap is deliberate rather than an oversight. In rough order of
