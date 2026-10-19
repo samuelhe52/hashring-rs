@@ -258,9 +258,15 @@ format.
 
 Items 1-4 are implemented. `MAX_REPAIR_GROUPS_PER_PASS` is gone: `resume_replica_repairs`
 now drains every due group instead of truncating to a batch and leaving the
-remainder for the next tick, bounded by the same `migration_timeout` every other
-operation in that file uses. The ordering gained three keys so `retry_count`
-cannot degenerate into node-name order. `register_node` wakes the recovery loop,
+remainder for the next tick. The pass holds `execution_lock`, so it stops
+launching groups once `migration_timeout` has elapsed or a topology change has
+been planned, and drains only the groups already in flight; the rest stay
+`Pending` for the next pass. The lock is then held for the budget plus whatever
+the at most `replica_repair_concurrency` in-flight groups still need, where the
+truncation used to bound it to 32 groups.
+With no truncation, the order only decides which groups a pass that runs out of
+time leaves behind: groups with the fewest failures go first, so a flapping
+follower cannot hold back healthy ones. `register_node` wakes the recovery loop,
 so a pass starts when its registrations land instead of on the next tick.
 
 Paired A/B on this host, 24-core AMD Ryzen 9 7845HX, the capture's own config
@@ -311,7 +317,8 @@ the lease duration a committed-topology setting (`self.lease_duration`, read at
 `NODE_LEASE_DURATION` constant. The default is still 5 s, so the 5 s quantisation
 analysis is unaffected — only the line references moved.
 
-Everything the analysis rests on is unchanged:
+Neither commit touched what the analysis rests on. At capture time, before
+[Result](#result):
 
 - `MAX_REPAIR_GROUPS_PER_PASS = 32` (`lib.rs:53`) against 42 groups.
 - The degenerate `sort_by_key` and the `node-7` tail.
@@ -319,6 +326,9 @@ Everything the analysis rests on is unchanged:
 - `reconcile_replica_repairs` creating `Pending` tasks without seeding
   (`lib.rs:497`).
 - The t=0 tick being a guaranteed no-op (`repair.rs:256-257`).
+
+The first two and the last are gone now; the interval remains as a ceiling, and
+`reconcile_replica_repairs` still only reconciles.
 
 **Item 1 was the one that mattered and it is closed** — see
 [Result](#result): `initial_full_rf_seconds` fell from 10.37 s to 1.58 s.

@@ -988,3 +988,61 @@ async fn leases_use_the_stored_cluster_lease_duration_across_restarts() {
     let restarted = CoordinatorService::new(restored, repository, Duration::from_secs(1));
     assert_eq!(restarted.lease_duration, Duration::from_millis(3_000));
 }
+
+#[tokio::test]
+async fn repair_pass_stops_launching_groups_at_its_deadline() {
+    // Listeners that complete the TCP handshake and never answer, so every
+    // group runs until its own RPC deadline instead of failing fast.
+    let listeners: Vec<_> = (0..8)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let members = listeners
+        .iter()
+        .enumerate()
+        .map(|(index, listener)| Member {
+            node_id: format!("n{index}"),
+            endpoint: format!("http://{}", listener.local_addr().unwrap()),
+        })
+        .collect();
+    let topology = TopologySnapshot::new(1, 7, 8, members).unwrap();
+    let repository = Arc::new(MemoryRepository::default());
+    let mut state = load_or_initialize(repository.as_ref(), Some(topology.clone())).unwrap();
+    for member in &topology.members {
+        state.process_instances.insert(
+            member.node_id.clone(),
+            format!("{}-process", member.node_id),
+        );
+    }
+    let groups: BTreeSet<_> = state
+        .replica_repairs
+        .iter()
+        .map(|repair| (repair.owner_node_id.clone(), repair.node_id.clone()))
+        .collect();
+    let width = DEFAULT_REPLICA_REPAIR_CONCURRENCY;
+    assert!(
+        groups.len() > 4 * width,
+        "{} groups would fit in a few launches, so the deadline is never tested",
+        groups.len()
+    );
+    let service = CoordinatorService::new(state, repository, Duration::from_millis(100));
+
+    assert_eq!(service.resume_replica_repairs().await.unwrap(), 0);
+
+    // Each launched group times out and records a failure; a group the pass
+    // never launched keeps retry_count 0. Without the launch check the pass
+    // works through every group, one width at a time.
+    let state = service.state.read().await;
+    let attempted: BTreeSet<_> = state
+        .replica_repairs
+        .iter()
+        .filter(|repair| repair.retry_count > 0)
+        .map(|repair| (repair.owner_node_id.clone(), repair.node_id.clone()))
+        .collect();
+    assert!(!attempted.is_empty(), "no group was attempted at all");
+    assert!(
+        attempted.len() <= 2 * width,
+        "{} of {} groups launched after a 100 ms budget at width {width}",
+        attempted.len(),
+        groups.len()
+    );
+}
