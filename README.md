@@ -58,6 +58,28 @@ cargo run -- replica-status  # per-range owner, followers, lag, and repair state
 `--member` is only read when the state file is first created. To restart the
 coordinator, pass just `--state`. Everything else is loaded from the file.
 
+## Redis clients
+
+`redis-gateway` serves the Redis protocol on a port over this cluster, so
+`redis-cli`, redis-py, Jedis, Lettuce and go-redis can drive it unmodified:
+
+```sh
+cargo run -- redis-gateway --listen 127.0.0.1:6379 \
+  --coordinator http://127.0.0.1:50050
+```
+
+It answers the string and key commands, the connection handshake, and the
+expiry commands, and declines the rest with a clear error rather than a wrong
+answer. It is **not** Redis and not Redis Cluster: there are no data structures,
+no transactions or scripting, no keyspace enumeration, no atomicity across
+keys, and read-modify-write commands are atomic only within a single gateway
+process. [docs/redis-compatibility.md](docs/redis-compatibility.md) documents
+every command, every difference, and what each limitation would cost to close.
+
+Expiry itself belongs to the cluster, not the gateway: a deadline is a field on
+the record, so it survives failover, migration and restart. `SET key value EX
+60` and `EXPIRE` work the same way whether or not a gateway is in front.
+
 The same settings can live in a YAML file instead. Keys use the flag names with
 `_` for `-`, except that `--member` becomes a `members` list of
 `{node_id, endpoint}`. A flag on the command line wins over the file (see
@@ -92,6 +114,7 @@ its default and scope.
 | `begin-config-change` | Stage a new replication factor or write guard |
 | `execute-change` | Run the staged change through to publication |
 | `change-status` | Show the active change, if any |
+| `redis-gateway` | Serve the Redis protocol on a port, over this cluster |
 | `experiment` | Run a reproducible multi-process experiment |
 
 Run `cargo run -- <command> --help` for each command's flags.
@@ -268,9 +291,11 @@ profiling, and how to compare runs.
 | `crates/hashring-client` | Routing, deadlines, retries, client errors |
 | `crates/hashring-coordinator` | Durable cluster state and migration orchestration |
 | `crates/hashring-node` | In-memory storage, replication, and the data-node service |
+| `crates/hashring-redis` | The Redis-protocol gateway over the cluster |
 | `crates/hashring-experiment` | Multi-process experiment runner |
 | `docs/report/` | [Preliminary report](docs/report/preliminary-report.md) on the design and results |
 | `docs/configuration.md` | Every flag and config key, with defaults and scopes |
+| `docs/redis-compatibility.md` | What the Redis gateway answers, and where it differs |
 | `docs/rfcs/` | Design RFCs |
 | `docs/optimizations/` | Performance work, with measurements |
 
