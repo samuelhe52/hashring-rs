@@ -1479,24 +1479,24 @@ impl DataNode for DataNodeService {
             (source.range.clone(), source.watermark)
         };
         // `record_keys_in_range` is already in token order, which is the order
-        // `range_digest` requires, so the records are hashed straight out of the
-        // index. This used to collect a `HashMap` of cloned keys and records
-        // first, copying every key of the range before anything was hashed; the
-        // only allocation left is the vector of index handles below, which
-        // shares each key's `Arc` rather than copying its bytes. The read lock
-        // is held across the hashing, so writers to every range on this node
-        // wait for it. That is still shorter than the copy it replaces, which
-        // also ran under the lock: over 200,000 records, 79 ms for this whole
-        // path against 106 ms for the old copy alone (`tests/digest_bench.rs`).
+        // `range_digest` requires, so no sort is needed. Only handles are taken
+        // under the read lock -- each key's `Arc` and a record whose value is an
+        // `Arc` too -- and the hashing, which reads every value byte, runs after
+        // the lock is released. Hashing under the lock stalled writers to every
+        // range on this node for time proportional to the range's bytes.
         let in_token_order: Vec<_> = state
             .record_keys_in_range(&range)
             .into_iter()
-            .filter_map(|(_, key)| state.records.get(&key).map(|record| (key, record)))
+            .filter_map(|(_, key)| {
+                let record = state.records.get(&key)?.clone();
+                Some((key, record))
+            })
             .collect();
+        drop(state);
         let response = range_digest(
             in_token_order
                 .iter()
-                .map(|(key, record)| (key.as_ref(), *record)),
+                .map(|(key, record)| (key.as_ref(), record)),
             watermark,
         );
         Ok(Response::new(response))
@@ -1514,17 +1514,21 @@ impl DataNode for DataNodeService {
             .ok_or_else(|| Status::not_found("destination migration not prepared"))?;
         let watermark = destination.watermark;
         // `DestinationMigration::records` is a plain map, so token order has to
-        // be established here rather than read off an index. Sorting by the u64
-        // token compares integers where the old path compared key byte slices,
-        // and it drops the clone of the whole map. The price is that computing
-        // tokens, sorting and hashing all run under the read lock, where the old
-        // path held it only for the clone: 61 ms against 24 ms over 200,000
-        // records. A range is one of hundreds per ring, so in practice this is
-        // short.
-        let mut by_token: Vec<_> = destination
+        // be established here rather than read off an index. The read lock is
+        // held only to copy the records out; tokens, the sort and the hash all
+        // run after it is released, so writers to other ranges wait for the
+        // copy and not for a pass over every value byte. Sorting by the u64
+        // token still compares integers where the old path compared key bytes.
+        let hash_seed = state.topology.hash_seed;
+        let records: Vec<_> = destination
             .records
             .iter()
-            .map(|(key, record)| (state.topology.key_token(key), key.as_slice(), record))
+            .map(|(key, record)| (key.clone(), record.clone()))
+            .collect();
+        drop(state);
+        let mut by_token: Vec<_> = records
+            .iter()
+            .map(|(key, record)| (key_token(key, hash_seed), key.as_slice(), record))
             .collect();
         sort_into_token_order(&mut by_token);
         let response = range_digest(

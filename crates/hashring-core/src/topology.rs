@@ -5,6 +5,12 @@ use thiserror::Error;
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 pub const HASH_ALGORITHM: &str = "xxh3-64";
+
+/// A key's ring token under `hash_seed`, for callers that hold the seed but not
+/// a whole topology. [`TopologySnapshot::key_token`] is this with its own seed.
+pub fn key_token(key: &[u8], hash_seed: u64) -> u64 {
+    xxh3_64_with_seed(key, hash_seed)
+}
 pub const ENCODING_VERSION: u32 = 2;
 pub const MAX_MEMBERS: usize = 1_024;
 pub const MAX_VIRTUAL_NODES: u32 = 4_096;
@@ -337,7 +343,7 @@ impl TopologySnapshot {
     }
 
     pub fn key_token(&self, key: &[u8]) -> u64 {
-        xxh3_64_with_seed(key, self.hash_seed)
+        key_token(key, self.hash_seed)
     }
 
     pub fn owner(&self, key: &[u8]) -> Result<&Member, TopologyError> {

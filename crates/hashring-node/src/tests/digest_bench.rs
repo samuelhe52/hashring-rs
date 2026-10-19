@@ -12,12 +12,13 @@
 //!
 //! | | before | now |
 //! |---|---|---|
-//! | source | copy the range into a `HashMap`, sort key bytes, hash | walk the token index, hash |
-//! | destination | clone the map, sort key bytes, hash | token every key, sort `u64`s, hash |
+//! | source | copy the range into a `HashMap`, sort key bytes, hash | copy handles off the token index, hash |
+//! | destination | clone the map, sort key bytes, hash | copy the records, token every key, sort `u64`s, hash |
 //!
 //! The destination gained a pass of `xxh3`, so timing it separately is the only
 //! way to see whether the bytes sorted as integers give back more than that pass
-//! costs.
+//! costs. The copies on both sides are what the handlers take under the state
+//! lock before releasing it; `digest_stall_bench.rs` measures that lock hold.
 //!
 //! ```sh
 //! cargo test --release -p hashring-node range_digest -- --ignored --nocapture
@@ -70,16 +71,18 @@ fn source_before(index: &[Arc<[u8]>], records: &HashMap<Vec<u8>, Record>) -> Ran
 }
 
 /// The source path now: `record_keys_in_range` already yields token order, so
-/// records are hashed straight off the index.
+/// the handler copies `Arc` handles off the index under the lock and hashes them
+/// after releasing it.
 fn source_now(index: &[Arc<[u8]>], records: &HashMap<Vec<u8>, Record>) -> RangeDigestResponse {
     let collected: Vec<_> = index
         .iter()
-        .filter_map(|key| records.get(key.as_ref()).map(|record| (key, record)))
+        .filter_map(|key| {
+            let record = records.get(key.as_ref())?.clone();
+            Some((key.clone(), record))
+        })
         .collect();
     range_digest(
-        collected
-            .iter()
-            .map(|(key, record)| (key.as_ref(), *record)),
+        collected.iter().map(|(key, record)| (key.as_ref(), record)),
         0,
     )
 }
@@ -89,13 +92,18 @@ fn destination_before(records: &HashMap<Vec<u8>, Record>) -> RangeDigestResponse
     sorted_by_key(&records.clone(), 0)
 }
 
-/// The destination path now: the records live in a plain map, so token order has
-/// to be established here — one `xxh3` per key, then sort `u64`s.
+/// The destination path now: the records live in a plain map, so the handler
+/// copies them under the lock, then outside it computes one `xxh3` per key and
+/// sorts `u64`s.
 fn destination_now(
     records: &HashMap<Vec<u8>, Record>,
     topology: &TopologySnapshot,
 ) -> RangeDigestResponse {
-    let mut by_token: Vec<_> = records
+    let copied: Vec<_> = records
+        .iter()
+        .map(|(key, record)| (key.clone(), record.clone()))
+        .collect();
+    let mut by_token: Vec<_> = copied
         .iter()
         .map(|(key, record)| (topology.key_token(key), key.as_slice(), record))
         .collect();
