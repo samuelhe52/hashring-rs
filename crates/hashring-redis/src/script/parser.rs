@@ -184,27 +184,33 @@ impl Parser<'_> {
                 Token::If => self.if_statement()?,
                 Token::While => self.while_statement()?,
                 Token::For => self.for_statement()?,
+                // `return`, `break` and `do` end a block, so they end it
+                // with whatever the block already collected rather than with
+                // a list of their own.
                 Token::Return => {
                     self.at += 1;
-                    // `return` ends the block even with nothing after it, so
+                    // `return` ends a block even with nothing after it, so
                     // the values are only read when one can be.
                     let values = if self.peek_is_stop(&[]) || self.peek() == &Token::Semi {
                         Vec::new()
                     } else {
                         self.expression_list()?
                     };
-                    return Ok(vec![Statement::Return(values)]);
+                    statements.push(Statement::Return(values));
+                    return Ok(statements);
                 }
                 Token::Break => {
                     self.at += 1;
                     self.accept(&Token::Semi);
-                    return Ok(vec![Statement::Break]);
+                    statements.push(Statement::Break);
+                    return Ok(statements);
                 }
                 Token::Do => {
                     self.at += 1;
                     let body = self.block(&[])?;
                     self.expect(Token::End)?;
-                    return Ok(body);
+                    statements.extend(body);
+                    return Ok(statements);
                 }
                 Token::Repeat => {
                     return Err("'repeat ... until' is not supported in this gateway".into());
@@ -242,6 +248,9 @@ impl Parser<'_> {
                 Token::Else => {
                     self.at += 1;
                     otherwise = Some(self.block(&[])?);
+                    // The `end` that follows the else block closes this `if`,
+                    // and the arm below would have consumed it.
+                    self.expect(Token::End)?;
                     break;
                 }
                 Token::End => {
@@ -307,14 +316,17 @@ impl Parser<'_> {
             }
             return Ok(Statement::Local { names, values });
         }
-        let first = self.suffixed_expression()?;
-        if self.accept(&Token::Assign) || self.accept(&Token::Comma) {
+        let first = self.primary()?;
+        if matches!(self.peek(), Token::Assign | Token::Comma) {
             let mut targets = vec![first];
             while self.accept(&Token::Comma) {
-                targets.push(self.suffixed_expression()?);
+                targets.push(self.primary()?);
             }
             for target in &targets {
-                if !matches!(target, Expression::Name(_) | Expression::Index(..)) {
+                if !matches!(
+                    target,
+                    Expression::Name(_) | Expression::Index(..) | Expression::Field(..)
+                ) {
                     return Err("cannot assign to this expression".into());
                 }
             }
@@ -393,11 +405,7 @@ impl Parser<'_> {
         let mut left = self.additive()?;
         while self.accept(&Token::Concat) {
             let right = self.additive()?;
-            left = Expression::Binary(
-                Operator::Concat,
-                Box::new(left),
-                Box::new(right),
-            );
+            left = Expression::Binary(Operator::Concat, Box::new(left), Box::new(right));
         }
         Ok(left)
     }
@@ -440,22 +448,16 @@ impl Parser<'_> {
             return Ok(Expression::Unary(Operator::Not, Box::new(self.unary()?)));
         }
         if self.accept(&Token::Minus) {
-            return Ok(Expression::Unary(
-                Operator::Negate,
-                Box::new(self.unary()?),
-            ));
+            return Ok(Expression::Unary(Operator::Negate, Box::new(self.unary()?)));
         }
         if self.accept(&Token::Hash) {
-            return Ok(Expression::Unary(
-                Operator::Length,
-                Box::new(self.unary()?),
-            ));
+            return Ok(Expression::Unary(Operator::Length, Box::new(self.unary()?)));
         }
         self.power()
     }
 
     fn power(&mut self) -> Result<Expression, String> {
-        let base = self.suffixed_expression()?;
+        let base = self.primary()?;
         if self.accept(&Token::Caret) {
             let exponent = self.unary()?;
             return Ok(Expression::Binary(
@@ -467,11 +469,24 @@ impl Parser<'_> {
         Ok(base)
     }
 
-    /// A name and everything that can follow it: indexing, field access and
-    /// calls. A literal on its own is not one of these, which is why
-    /// `("x"):upper()` would be refused and `x.y` is not.
-    fn suffixed_expression(&mut self) -> Result<Expression, String> {
-        let mut expression = Expression::Name(self.name()?);
+    /// An expression that is not made of operators: a name or a literal, with
+    /// everything that can follow either of them.
+    fn primary(&mut self) -> Result<Expression, String> {
+        let expression = match self.peek() {
+            Token::Name(_) => Expression::Name(self.name()?),
+            Token::Nil
+            | Token::True
+            | Token::False
+            | Token::Number(_)
+            | Token::Str(_)
+            | Token::LBrace => self.simple_expression()?,
+            other => return Err(format!("name expected near {}", other.describe())),
+        };
+        self.suffixes(expression)
+    }
+
+    /// Indexing, field access and calls, in any order and any number of times.
+    fn suffixes(&mut self, mut expression: Expression) -> Result<Expression, String> {
         loop {
             match self.peek() {
                 Token::LBracket => {
@@ -544,7 +559,7 @@ impl Parser<'_> {
             }
             // `{name = value}` and `{[key] = value}` name a field; anything
             // else is the next value of the array part.
-            if self.peek_is_named_field() {
+            if self.peek() == &Token::LBracket || self.peek_is_named_field() {
                 let key = if self.accept(&Token::LBracket) {
                     let key = self.expression()?;
                     self.expect(Token::RBracket)?;
@@ -614,12 +629,13 @@ mod tests {
               return {consumed, ttl}",
         )
         .unwrap();
-        assert_eq!(body.len(), 6);
+        assert_eq!(body.len(), 5);
         assert_eq!(
-            body[5],
-            Statement::Return(vec![Expression::Table(vec![TableField::Positional(
-                Expression::Name(b"consumed".to_vec())
-            ), TableField::Positional(Expression::Name(b"ttl".to_vec())])])
+            body[4],
+            Statement::Return(vec![Expression::Table(vec![
+                TableField::Positional(Expression::Name(b"consumed".to_vec())),
+                TableField::Positional(Expression::Name(b"ttl".to_vec())),
+            ])])
         );
     }
 
@@ -671,7 +687,7 @@ mod tests {
         // `and` binds tighter than `or`.
         assert!(matches!(
             parse_one("return a and b or c"),
-            Statement::Return(vec![Expression::Or(..)])
+            Statement::Return(values) if matches!(values[0], Expression::Or(..))
         ));
         assert_eq!(
             parse_one("return -x"),
@@ -696,7 +712,8 @@ mod tests {
         );
         assert!(matches!(
             parse_one("return 2 ^ 3 ^ 2"),
-            Statement::Return(vec![Expression::Binary(Operator::Power, ..)])
+            Statement::Return(values)
+                if matches!(values[0], Expression::Binary(Operator::Power, ..))
         ));
     }
 
@@ -729,7 +746,10 @@ mod tests {
 
     #[test]
     fn loops_parse_into_their_own_statements() {
-        assert!(matches!(parse_one("while true do end"), Statement::While { .. }));
+        assert!(matches!(
+            parse_one("while true do end"),
+            Statement::While { .. }
+        ));
         assert!(matches!(
             parse_one("for i = 1, 10 do local x = i end"),
             Statement::For { .. }
@@ -762,7 +782,10 @@ mod tests {
         assert!(parse(b"if x then").is_err());
         assert!(parse(b"return 1 +").is_err());
         assert!(parse(b"local a = {1").is_err());
-        assert!(parse(b"x == 1").is_err(), "an expression is not a statement");
+        assert!(
+            parse(b"x == 1").is_err(),
+            "an expression is not a statement"
+        );
     }
 
     #[test]

@@ -150,6 +150,14 @@ the gateway before the reply is sent, hence its limit.
 | `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT` | Accepts one of `NX`, `XX`, `GT`, `LT`. A key with no deadline counts as never expiring, so `LT` sets one and `GT` does not. A deadline that is not in the future, including a negative timeout, deletes the key. |
 | `PERSIST` | Clears the deadline without rewriting the value. |
 
+### Scripting
+
+| Command | Notes |
+| --- | --- |
+| `EVAL` | See [scripts](#scripts). |
+| `EVALSHA` | Answers `NOSCRIPT` for a script the gateway does not have, which is the code a client watches for to send `EVAL` instead. |
+| `SCRIPT LOAD`, `SCRIPT EXISTS`, `SCRIPT FLUSH` | |
+
 ## Declined commands
 
 These are answered with a clear error rather than a wrong answer:
@@ -168,7 +176,7 @@ Anything not in this document is answered with Redis' own unknown-command error.
 A data structure command (`HSET`, `ZADD`, `LPUSH`, …) is unknown here, because
 this gateway stores byte strings and nothing else, and will go on doing so; see
 [out of scope](#out-of-scope-data-structures). So are `MULTI`, `EXEC`,
-`WATCH`, `EVAL`, `SCRIPT`, and the `SUBSCRIBE` family.
+`WATCH`, and the `SUBSCRIBE` family.
 
 If a workload needs any of those, this is not a Redis substitute.
 
@@ -198,6 +206,67 @@ keeps colliding is bounded by the [command deadline](#limits-here).
 
 A plain `SET`, `SETEX`, `PSETEX` or `MSET` has nothing to compute and is one
 unconditional write. A read-modify-write that raced it simply reads again.
+
+### Scripts
+
+`EVAL` runs a script on the gateway. It is here because clients do not have an
+alternative: a cache client claims a key with a read and a write that must not
+interleave, a rate limiter adds one to a counter and reads its deadline, and
+neither can say that in plain commands. Both send a script, and both work
+against this gateway unmodified.
+
+The grammar is Lua's for the statements and expressions a client library writes,
+which is `local`, assignment, `if`/`elseif`/`else`, `while`, the numeric `for`,
+`return`, `break`, tables, indexing, field access, calls, and the operators. A
+script is given `KEYS`, `ARGV`, `redis.call`, `redis.pcall`,
+`redis.error_reply`, `redis.status_reply`, `redis.sha1hex`, `redis.log`, and
+the base functions `type`, `tonumber`, `tostring`, `error` and `assert`.
+`function`, `repeat`, the generic `for ... in`, and the `string`, `table`,
+`math` and `cjson` libraries are refused **by name**, so a script that needs one
+is told what it asked for rather than misread:
+
+```
+127.0.0.1:6379> eval "for k, v in pairs(t) do end" 0
+(error) ERR user_script: 'for ... in' is not supported in this gateway; only the numeric form is
+```
+
+What differs from Redis:
+
+- **A script may only touch the keys it declared in `KEYS`.** A single-threaded
+  Redis lets a script reach any key in its process. This cluster cannot know
+  where a key lives without the client saying so, and a script free to touch
+  undeclared keys would hold no lock on them. The check reads the same command
+  table `COMMAND` answers with, so it is the key positions a client already
+  knows, and a script naming a key it did not declare is refused by name.
+- **A script is atomic against every writer, not just one gateway's clients.**
+  The commands a script runs are the gateway's own, so each carries a
+  precondition to the node that owns the key. A write the script makes is
+  conditional on what the script read: a script that reads a key and then
+  writes it cannot overwrite a write that arrived in between, whichever gateway
+  or client made it.
+- **A conflict runs the script again, or fails it.** When a conditional write
+  finds the key changed underneath the script, the script is run again from the
+  start, which is what Redis' single thread gets by never letting anyone in.
+  A script that has already changed something a second run would change twice
+  cannot be run again, and is failed with `ERR` instead — its answer would
+  otherwise be a number no run of it produced. This is the one place where a
+  script and Redis differ in outcome rather than in reporting.
+- **One script at a time per gateway.** A script holds its declared keys for its
+  whole run, so no client of that gateway takes one of them between two of the
+  script's commands. Another gateway is serialized only by the conditional
+  writes above, which is the same guarantee `INCR` already has.
+- **A script may not change the connection.** `AUTH`, `HELLO`, `RESET`,
+  `SELECT`, `CLIENT`, `QUIT`, `EVAL`, `EVALSHA` and `SCRIPT` are refused from a
+  script, as in Redis.
+
+The budgets are the [command deadline](#limits-here) and a step count of
+100 000, whichever runs out first. A runaway script is reported as `BUSY` on the
+deadline, which is the code Redis uses for a script that outstayed `lua-time-limit`.
+
+`MULTI`, `EXEC` and `WATCH` are still unknown here: see
+[cross-key atomicity](#cross-key-atomicity-is-not-available-at-all). A script
+does not provide them either — it is one operation on one gateway, not a
+transaction spanning clients.
 
 ### Cross-key atomicity is not available at all
 
@@ -330,8 +399,11 @@ returns nil, `EXISTS` returns 0, `TTL` returns -2.
 - No `FLUSHALL`. `KEYS` and `DBSIZE` walk every key on every owner,
   so they cost as much as the keyspace is large.
 - No data structures, by decision; see
-  [out of scope](#out-of-scope-data-structures). No transactions, scripting or
-  Pub/Sub.
+  [out of scope](#out-of-scope-data-structures). No transactions or Pub/Sub.
+- Scripting is Lua's grammar for what a client library writes, not all of Lua:
+  no functions, no `repeat`, no generic `for`, and no `string`, `table`, `math`
+  or `cjson` library. See [scripts](#scripts). A script is bounded by the
+  command deadline and 100 000 steps, and one runs at a time per gateway.
 - The gateway keeps nothing, so it holds no expiry state, no keys and no
   replication state. Losing it loses no data; losing the *cluster* loses every
   value on every node, as the cluster's own guarantees describe.
@@ -392,8 +464,8 @@ linearizability, but:
   holds depends on their size: about 50 000 of 150 bytes each, about 8 000 of
   1 KiB. The rewrite cost bites well before that.
 - **It would not buy the libraries that need structures.** Job queues and locks
-  such as Sidekiq, Celery, BullMQ and Redlock also need blocking pops and Lua,
-  and honest scripting needs atomicity across keys, which is
+  such as Sidekiq, Celery, BullMQ and Redlock also need blocking pops and Lua.
+  Lua is here; blocking pops are not, and cross-key atomicity is
   [not available](#cross-key-atomicity-is-not-available-at-all).
 
 Lists and streams fit worst of all: `LPOP` and consumer groups want element
@@ -412,4 +484,6 @@ how much each would cost:
 | | What it would take |
 | --- | --- |
 | `MULTI`, `EXEC`, `WATCH` | Would need server-side execution, and cross-key atomicity is unavailable underneath, so `EXEC` could not honestly promise atomicity across keys. |
+| Functions, `repeat`, generic `for`, the `string`, `table`, `math`, `cjson` and `bit` libraries | More of Lua in [`script`](../crates/hashring-redis/src/script), and the `bit` library needs 64-bit integers Lua numbers cannot hold. What is refused today is refused by name, so a script that needs one fails with a message naming it. |
+| `SCRIPT DEBUG`, `FUNCTION` | The scripting debugger works against Redis' own interpreter state, which this gateway does not have. |
 | Durability | The cluster is in-memory by design; the gateway adds no storage. |

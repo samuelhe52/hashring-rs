@@ -9,16 +9,20 @@
 //!
 //! What a script gets here, and what it does not:
 //!
-//! - A script runs as one operation against the keys it declares, under the
-//!   same lock read-modify-write commands take, so two clients of one gateway
-//!   never interleave inside a script. It is the same single-gateway
-//!   guarantee the rest of the gateway gives, and it reaches no further.
-//! - A script may only touch keys it declared in `KEYS`. A single-threaded
+//! - A script may only touch the keys it declared in `KEYS`. A single-threaded
 //!   Redis lets a script reach any key in its process; this cluster cannot
 //!   know where a key lives without the client saying so, and a script free to
 //!   touch undeclared keys would hold no lock on them.
-//! - One script at a time, as Redis runs them, bounded by a step count and a
-//!   wall-clock deadline so a runaway script cannot hold the gateway.
+//! - The commands a script runs are the gateway's own commands, each atomic in
+//!   the way the gateway already makes them: a read-modify-write command
+//!   carries a precondition to the node that owns the key, so it is atomic
+//!   against every other writer, whichever gateway or client it came through.
+//! - A write the script makes is conditional on what the script read, so a
+//!   script that reads a key and then writes it cannot overwrite a write that
+//!   arrived in between. The script is then run again, which is what Redis'
+//!   single thread does by never letting anyone in.
+//! - One script at a time, as Redis runs them, bounded by a step count and by
+//!   the command's own deadline, so a runaway script cannot hold the gateway.
 //! - The grammar is Lua's for the statements and expressions a client library
 //!   writes. Functions, `repeat` and the generic `for` loop are refused by
 //!   name. See [`parser`] for the shape of it, and [`run`] for what a script
@@ -31,7 +35,11 @@ pub mod parser;
 pub mod sha1;
 pub mod value;
 
-use std::time::{Duration, Instant};
+use std::{
+    future::Future,
+    pin::Pin,
+    time::{Duration, Instant},
+};
 
 use crate::{
     error::{RedisError, RedisResult},
@@ -43,9 +51,9 @@ pub use value::{Table, Value};
 /// What a script may spend, and how long it may take.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
-    /// Statement evaluations and `redis.call` invocations together. This is
-    /// the deterministic half of the budget: a script that computes rather
-    /// than calls is stopped at exactly this many steps, on any machine.
+    /// Statement evaluations and calls together. This is the deterministic half
+    /// of the budget: a script that computes rather than calls is stopped at
+    /// exactly this many steps, on any machine.
     pub max_steps: usize,
     /// Wall-clock time, checked whenever the step count is. Redis' equivalent
     /// is `lua-time-limit`; the gateway has no background thread watching for
@@ -71,7 +79,7 @@ impl Default for Limits {
 /// The commands go through the same dispatcher a client connection uses, so a
 /// script sees the answer a client would, errors included.
 pub trait Host {
-    async fn call(&mut self, command: &[Vec<u8>]) -> RedisResult<Reply>;
+    fn call(&mut self, command: &[Vec<u8>]) -> impl Future<Output = RedisResult<Reply>> + Send;
 }
 
 /// Runs `source` once, against `keys` and `argv`, and answers with whatever the
@@ -81,8 +89,8 @@ pub trait Host {
 /// pays for its parse, which Redis does not: keeping the source is a cache of
 /// a client's own text, and one round trip to a cluster is the larger cost in
 /// every case that matters here.
-pub async fn run(
-    host: &mut impl Host,
+pub async fn run<H: Host + Send>(
+    host: &mut H,
     source: &[u8],
     keys: Vec<Vec<u8>>,
     argv: Vec<Vec<u8>>,
@@ -91,20 +99,24 @@ pub async fn run(
     let program = parser::parse(source).map_err(script_error)?;
     let mut interpreter = Interpreter {
         host,
-        keys,
-        argv,
+        keys: keys.clone(),
         scopes: Vec::new(),
         steps: 0,
         deadline: Instant::now() + limits.timeout,
         limits,
     };
     interpreter.push_scope(builtins());
+    interpreter.push_scope(vec![
+        (b"KEYS".to_vec(), strings(&keys)),
+        (b"ARGV".to_vec(), strings(&argv)),
+    ]);
     match interpreter.block(&program).await? {
         Control::Returned(values) => Ok(match values.into_iter().next() {
             Some(value) => value::to_reply(&value).map_err(script_error)?,
             None => Reply::Nil,
         }),
         Control::Done => Ok(Reply::Nil),
+        Control::Break => Err(script_error("'break' outside a loop")),
     }
 }
 
@@ -118,17 +130,26 @@ fn script_error(message: impl AsRef<str>) -> RedisError {
 /// in the interpreter so that `local call = redis.call` works the way Lua says
 /// it should, and so a call is an expression like any other.
 fn builtins() -> Vec<(Vec<u8>, Value)> {
-    [
-        (b"redis", Value::Native("redis")),
-        (b"type", Value::Native("type")),
-        (b"tonumber", Value::Native("tonumber")),
-        (b"tostring", Value::Native("tostring")),
-        (b"error", Value::Native("error")),
-        (b"assert", Value::Native("assert")),
-    ]
-    .into_iter()
-    .map(|(name, value)| (name.to_vec(), value))
-    .collect()
+    let names: [(&[u8], &str); 6] = [
+        (b"redis", "redis"),
+        (b"type", "type"),
+        (b"tonumber", "tonumber"),
+        (b"tostring", "tostring"),
+        (b"error", "error"),
+        (b"assert", "assert"),
+    ];
+    names
+        .into_iter()
+        .map(|(name, value)| (name.to_vec(), Value::Native(value)))
+        .collect()
+}
+
+/// The `KEYS` and `ARGV` tables, which are byte strings in the order the
+/// command named them. Lua tables start at one, so `KEYS[1]` is the first.
+fn strings(values: &[Vec<u8>]) -> Value {
+    Value::Table(Table::array(
+        values.iter().cloned().map(Value::String).collect(),
+    ))
 }
 
 /// The members of the `redis` table, as the name they are reached by.
@@ -156,10 +177,19 @@ enum Control {
     Returned(Vec<Value>),
 }
 
-struct Interpreter<'a> {
-    host: &'a mut dyn Host,
+/// A block's future, boxed because a block and the statements in it call each
+/// other: without the box the two futures would each contain the other.
+type BlockFuture<'a> = Pin<Box<dyn Future<Output = RedisResult<Control>> + Send + 'a>>;
+
+/// An assignment target's future, for the same reason: `t.a.b = 1` walks an
+/// expression that holds itself.
+type LValueFuture<'a> =
+    Pin<Box<dyn Future<Output = RedisResult<(Vec<u8>, Vec<Value>)>> + Send + 'a>>;
+
+struct Interpreter<'a, H: Host> {
+    host: &'a mut H,
+    /// The keys the script declared, which is every key it is allowed to touch.
     keys: Vec<Vec<u8>>,
-    argv: Vec<Vec<u8>>,
     /// The block stack, innermost last. One script never shares a scope with
     /// another, so a plain vector is enough and nothing is ref-counted.
     scopes: Vec<Vec<(Vec<u8>, Value)>>,
@@ -168,7 +198,7 @@ struct Interpreter<'a> {
     limits: Limits,
 }
 
-impl Interpreter<'_> {
+impl<H: Host + Send> Interpreter<'_, H> {
     fn push_scope(&mut self, variables: Vec<(Vec<u8>, Value)>) {
         self.scopes.push(variables);
     }
@@ -182,14 +212,12 @@ impl Interpreter<'_> {
     fn account(&mut self) -> RedisResult<()> {
         self.steps += 1;
         if self.steps > self.limits.max_steps {
-            return Err(script_error(
-                "script exceeded its maximum number of steps",
-            ));
+            return Err(script_error("script exceeded its maximum number of steps"));
         }
         // Reading the clock on every statement costs more than it saves, so it
         // is read once every 256 steps: a runaway loop still stops within a
         // fraction of a millisecond of its budget.
-        if self.steps % 256 == 0 && Instant::now() > self.deadline {
+        if self.steps.is_multiple_of(256) && Instant::now() > self.deadline {
             return Err(RedisError::new(
                 "BUSY",
                 "script exceeded its execution deadline",
@@ -199,21 +227,25 @@ impl Interpreter<'_> {
     }
 
     /// Runs a block in a scope of its own.
-    async fn block(&mut self, statements: &[parser::Statement]) -> RedisResult<Control> {
-        self.push_scope(Vec::new());
-        let outcome = self.block_unscoped(statements).await;
-        self.pop_scope();
-        outcome
+    fn block<'b>(&'b mut self, statements: &'b [parser::Statement]) -> BlockFuture<'b> {
+        Box::pin(async move {
+            self.push_scope(Vec::new());
+            let outcome = self.block_unscoped(statements).await;
+            self.pop_scope();
+            outcome
+        })
     }
 
-    async fn block_unscoped(&mut self, statements: &[parser::Statement]) -> RedisResult<Control> {
-        for statement in statements {
-            match self.statement(statement).await? {
-                Control::Done => {}
-                flow => return Ok(flow),
+    fn block_unscoped<'b>(&'b mut self, statements: &'b [parser::Statement]) -> BlockFuture<'b> {
+        Box::pin(async move {
+            for statement in statements {
+                match self.statement(statement).await? {
+                    Control::Done => {}
+                    flow => return Ok(flow),
+                }
             }
-        }
-        Ok(Control::Done)
+            Ok(Control::Done)
+        })
     }
 
     async fn statement(&mut self, statement: &parser::Statement) -> RedisResult<Control> {
@@ -262,6 +294,9 @@ impl Interpreter<'_> {
             }
             parser::Statement::While { condition, body } => {
                 while self.condition(condition).await? {
+                    // A loop that runs forever spends nothing else, so the
+                    // budget is charged per turn round it as well.
+                    self.account()?;
                     match self.block(body).await? {
                         Control::Done => {}
                         Control::Break => break,
@@ -279,12 +314,17 @@ impl Interpreter<'_> {
             } => {
                 // The bounds and the step are evaluated once, as Lua does, so
                 // a loop over an expression with a side effect runs it once.
-                let from = self.single(from).await?.to_number().map_err(script_error)?;
-                let to = self.single(to).await?.to_number().map_err(script_error)?;
+                let from = first(self.evaluate(from).await?)
+                    .to_number()
+                    .map_err(script_error)?;
+                let to = first(self.evaluate(to).await?)
+                    .to_number()
+                    .map_err(script_error)?;
                 let step = match step {
                     Some(expression) => {
-                        let value =
-                            self.single(expression).await?.to_number().map_err(script_error)?;
+                        let value = first(self.evaluate(expression).await?)
+                            .to_number()
+                            .map_err(script_error)?;
                         if value == 0.0 {
                             return Err(script_error("'for' step is zero"));
                         }
@@ -294,6 +334,7 @@ impl Interpreter<'_> {
                 };
                 let mut current = from;
                 while (step > 0.0 && current <= to) || (step < 0.0 && current >= to) {
+                    self.account()?;
                     self.push_scope(vec![(name.clone(), Value::Number(current))]);
                     let outcome = self.block_unscoped(body).await;
                     self.pop_scope();
@@ -313,121 +354,124 @@ impl Interpreter<'_> {
 
     /// The values of an expression list, where the last expression may be a
     /// call that produced several: `local a, b = redis.call(...)` is how a
-    /// script reads a two-part reply.
-    async fn values(&mut self, expressions: &[parser::Expression]) -> RedisResult<Vec<Value>> {
-        let mut values = Vec::new();
-        for (position, expression) in expressions.iter().enumerate() {
-            let mut produced = self.evaluate(expression).await?;
-            if position + 1 == expressions.len() {
-                values.append(&mut produced);
-            } else {
-                values.push(produced.into_iter().next().unwrap_or(Value::Nil));
+    /// script reads a two-part reply. Boxed for the same reason a block is:
+    /// an expression and the list it sits in evaluate each other.
+    fn values<'b>(
+        &'b mut self,
+        expressions: &'b [parser::Expression],
+    ) -> Pin<Box<dyn Future<Output = RedisResult<Vec<Value>>> + Send + 'b>> {
+        Box::pin(async move {
+            let mut values = Vec::new();
+            for (position, expression) in expressions.iter().enumerate() {
+                let mut produced = self.evaluate(expression).await?;
+                if position + 1 == expressions.len() {
+                    values.append(&mut produced);
+                } else {
+                    values.push(produced.into_iter().next().unwrap_or(Value::Nil));
+                }
             }
-        }
-        Ok(values)
+            Ok(values)
+        })
     }
 
     async fn condition(&mut self, expression: &parser::Expression) -> RedisResult<bool> {
-        Ok(self.single(expression).await?.truthy())
+        Ok(first(self.evaluate(expression).await?).truthy())
     }
 
-    /// The first value of an expression, which is the value an expression has
-    /// when it is not the last in a list of more than one.
-    async fn single(&mut self, expression: &parser::Expression) -> RedisResult<Value> {
-        Ok(self
-            .evaluate(expression)
-            .await?
-            .into_iter()
-            .next()
-            .unwrap_or(Value::Nil))
-    }
-
-    async fn evaluate(&mut self, expression: &parser::Expression) -> RedisResult<Vec<Value>> {
-        Ok(match expression {
-            parser::Expression::Nil => vec![Value::Nil],
-            parser::Expression::Boolean(value) => vec![Value::Boolean(*value)],
-            parser::Expression::Number(value) => vec![Value::Number(*value)],
-            parser::Expression::Str(value) => vec![Value::String(value.clone())],
-            parser::Expression::Name(name) => vec![self.lookup(name)?],
-            parser::Expression::Index(table, key) => {
-                let table = self.single(table).await?;
-                let key = self.single(key).await?;
-                vec![self.index(table, key)?]
-            }
-            parser::Expression::Field(table, field) => {
-                let table = self.single(table).await?;
-                vec![self.index(table, Value::String(field.clone()))?]
-            }
-            parser::Expression::Call(callee, arguments) => {
-                let callee = self.single(callee).await?;
-                let arguments = self.values(arguments).await?;
-                self.invoke(callee, arguments).await?
-            }
-            parser::Expression::Method(callee, method, arguments) => {
-                // Lua passes the receiver as the first argument, which is why
-                // `redis:call('GET', k)` is not how a script calls `call`:
-                // `redis` would arrive where the command name belongs.
-                let receiver = self.single(callee).await?;
-                let member = self.index(receiver.clone(), Value::String(method.clone()))?;
-                let mut arguments = vec![receiver];
-                arguments.extend(self.values(arguments).await?);
-                self.invoke(member, arguments).await?
-            }
-            parser::Expression::Table(fields) => {
-                let mut table = Table::new();
-                for (position, field) in fields.iter().enumerate() {
-                    match field {
-                        parser::TableField::Positional(expression) => {
-                            // Only the last value of an expression list
-                            // expands, which is how `{a, b, unpack(list)}` is
-                            // written and how `{redis.call(...)}` is read.
-                            let mut produced = self.evaluate(expression).await?;
-                            if position + 1 == fields.len() {
-                                for value in produced {
+    /// One expression, as the values it produced. Boxed for the same reason a
+    /// block is: an expression can hold itself, as `KEYS[1]` does, and the two
+    /// futures would otherwise each contain the other.
+    fn evaluate<'b>(
+        &'b mut self,
+        expression: &'b parser::Expression,
+    ) -> Pin<Box<dyn Future<Output = RedisResult<Vec<Value>>> + Send + 'b>> {
+        Box::pin(async move {
+            Ok(match expression {
+                parser::Expression::Nil => vec![Value::Nil],
+                parser::Expression::Boolean(value) => vec![Value::Boolean(*value)],
+                parser::Expression::Number(value) => vec![Value::Number(*value)],
+                parser::Expression::Str(value) => vec![Value::String(value.clone())],
+                parser::Expression::Name(name) => vec![self.lookup(name)?],
+                parser::Expression::Index(table, key) => {
+                    let table = first(self.evaluate(table).await?);
+                    let key = first(self.evaluate(key).await?);
+                    vec![self.index(table, key)?]
+                }
+                parser::Expression::Field(table, field) => {
+                    let table = first(self.evaluate(table).await?);
+                    vec![self.index(table, Value::String(field.clone()))?]
+                }
+                parser::Expression::Call(callee, arguments) => {
+                    let callee = first(self.evaluate(callee).await?);
+                    let arguments = self.values(arguments).await?;
+                    self.invoke(callee, arguments).await?
+                }
+                parser::Expression::Method(callee, method, arguments) => {
+                    // Lua passes the receiver as the first argument, which is why
+                    // `redis:call('GET', k)` is not how a script calls `call`:
+                    // `redis` would arrive where the command name belongs.
+                    let receiver = first(self.evaluate(callee).await?);
+                    let member = self.index(receiver.clone(), Value::String(method.clone()))?;
+                    let mut all = vec![receiver];
+                    all.extend(self.values(arguments).await?);
+                    self.invoke(member, all).await?
+                }
+                parser::Expression::Table(fields) => {
+                    let mut table = Table::new();
+                    for (position, field) in fields.iter().enumerate() {
+                        match field {
+                            parser::TableField::Positional(expression) => {
+                                // Only the last value of an expression list
+                                // expands, which is how `{a, b, unpack(list)}` is
+                                // written and how `{redis.call(...)}` is read.
+                                let produced = self.evaluate(expression).await?;
+                                if position + 1 == fields.len() {
+                                    for value in produced {
+                                        table.set(Value::Number(table.len() as f64 + 1.0), value);
+                                    }
+                                } else {
+                                    let value = produced.into_iter().next().unwrap_or(Value::Nil);
                                     table.set(Value::Number(table.len() as f64 + 1.0), value);
                                 }
-                            } else {
-                                let value = produced.into_iter().next().unwrap_or(Value::Nil);
-                                table.set(Value::Number(table.len() as f64 + 1.0), value);
+                            }
+                            parser::TableField::Named(key, value) => {
+                                let key = match key {
+                                    parser::Expression::Name(name) => Value::String(name.clone()),
+                                    other => first(self.evaluate(other).await?),
+                                };
+                                let value = first(self.evaluate(value).await?);
+                                table.set(key, value);
                             }
                         }
-                        parser::TableField::Named(key, value) => {
-                            let key = match key {
-                                parser::Expression::Name(name) => Value::String(name.clone()),
-                                other => self.single(other).await?,
-                            };
-                            let value = self.single(value).await?;
-                            table.set(key, value);
-                        }
+                    }
+                    vec![Value::Table(table)]
+                }
+                parser::Expression::And(left, right) => {
+                    let left = first(self.evaluate(left).await?);
+                    if left.truthy() {
+                        vec![first(self.evaluate(right).await?)]
+                    } else {
+                        vec![left]
                     }
                 }
-                vec![Value::Table(table)]
-            }
-            parser::Expression::And(left, right) => {
-                let left = self.single(left).await?;
-                if left.truthy() {
-                    vec![self.single(right).await?]
-                } else {
-                    vec![left]
+                parser::Expression::Or(left, right) => {
+                    let left = first(self.evaluate(left).await?);
+                    if left.truthy() {
+                        vec![left]
+                    } else {
+                        vec![first(self.evaluate(right).await?)]
+                    }
                 }
-            }
-            parser::Expression::Or(left, right) => {
-                let left = self.single(left).await?;
-                if left.truthy() {
-                    vec![left]
-                } else {
-                    vec![self.single(right).await?]
+                parser::Expression::Unary(operator, operand) => {
+                    let operand = first(self.evaluate(operand).await?);
+                    vec![self.unary(*operator, operand)?]
                 }
-            }
-            parser::Expression::Unary(operator, operand) => {
-                let operand = self.single(operand).await?;
-                vec![self.unary(*operator, operand)?]
-            }
-            parser::Expression::Binary(operator, left, right) => {
-                let left = self.single(left).await?;
-                let right = self.single(right).await?;
-                vec![self.binary(*operator, left, right)?]
-            }
+                parser::Expression::Binary(operator, left, right) => {
+                    let left = first(self.evaluate(left).await?);
+                    let right = first(self.evaluate(right).await?);
+                    vec![self.binary(*operator, left, right)?]
+                }
+            })
         })
     }
 
@@ -443,7 +487,7 @@ impl Interpreter<'_> {
                     return Err(script_error(format!(
                         "attempt to get length of a {} value",
                         other.type_name()
-                    )))
+                    )));
                 }
             },
             other => return Err(script_error(format!("'{other:?}' is not a unary operator"))),
@@ -475,7 +519,10 @@ impl Interpreter<'_> {
             }
             Equal | NotEqual => {
                 let equal = values_equal(&left, &right);
-                Ok(Value::Boolean(!equal == matches!(operator, NotEqual)))
+                Ok(Value::Boolean(match operator {
+                    Equal => equal,
+                    _ => !equal,
+                }))
             }
             Less | LessEqual | Greater | GreaterEqual => {
                 let ordering = compare(&left, &right).map_err(script_error)?;
@@ -487,9 +534,9 @@ impl Interpreter<'_> {
                     _ => unreachable!("an ordering operator"),
                 }))
             }
-            Not | Negate | Length => {
-                Err(script_error(format!("'{operator:?}' is not a binary operator")))
-            }
+            Not | Negate | Length => Err(script_error(format!(
+                "'{operator:?}' is not a binary operator"
+            ))),
         }
     }
 
@@ -518,19 +565,21 @@ impl Interpreter<'_> {
         // a table reaches the table the name refers to rather than a copy of
         // it: values are read out of a scope, so a copy written to would be
         // written nowhere.
-        let (root, keys) = match lvalue(target) {
-            Some(path) => path,
-            None => return Err(script_error("cannot assign to this expression")),
-        };
+        let (root, keys) = self.lvalue(target).await?;
         let mut holding = self.lookup(&root)?;
         let mut current = &mut holding;
         for key in &keys[..keys.len().saturating_sub(1)] {
-            let next = current
-                .get_mut(key)
-                .ok_or_else(|| script_error(format!("attempt to index a {}", type_of(current))))?;
+            // The name is read before the borrow, because naming the value that
+            // has no slot is the error this step can report.
+            let named = current.type_name();
+            let Some(next) = current.get_mut(key) else {
+                return Err(script_error(format!("attempt to index a {named} value")));
+            };
             current = next;
         }
         match keys.last() {
+            // No keys means the target is the name itself, so the value goes
+            // where the name's value is.
             None => *current = value,
             Some(key) => match current {
                 Value::Table(table) => table.set(key.clone(), value),
@@ -538,12 +587,11 @@ impl Interpreter<'_> {
                     return Err(script_error(format!(
                         "attempt to index a {} value",
                         other.type_name()
-                    )))
+                    )));
                 }
             },
         }
-        self.declare(&root, holding)?;
-        Ok(())
+        self.declare(&root, holding)
     }
 
     /// Puts a value back where the root name already lives, which is the only
@@ -563,56 +611,50 @@ impl Interpreter<'_> {
     }
 
     fn index(&self, table: Value, key: Value) -> RedisResult<Value> {
-        match table {
-            Value::Table(table) => Ok(table.get(&key)),
-            // `redis.call` is the member of the `redis` name, which is what
+        Ok(match table {
+            Value::Table(table) => table.get(&key),
+            // `redis.call` is a member of the `redis` name, which is what
             // makes `local call = redis.call` read the same as `redis.call`.
             Value::Native("redis") => match key {
-                Value::String(member) => Ok(match redis_member(&member) {
+                Value::String(member) => match redis_member(&member) {
                     Some(name) => Value::Native(name),
                     None => Value::Nil,
-                }),
-                _ => Value::Nil.into(),
+                },
+                _ => Value::Nil,
             },
-            Value::Nil => Ok(Value::Nil),
-            other => Err(script_error(format!(
-                "attempt to index a {} value",
-                other.type_name()
-            ))),
-        }
+            Value::Nil => Value::Nil,
+            other => {
+                return Err(script_error(format!(
+                    "attempt to index a {} value",
+                    other.type_name()
+                )));
+            }
+        })
     }
 
-    /// A value and a list of keys, or `None` when the expression cannot be
-    /// assigned to because it does not start at a name.
-    fn lvalue(target: &parser::Expression) -> Option<(Vec<u8>, Vec<Value>)> {
-        match target {
-            parser::Expression::Name(name) => Some((name.clone(), Vec::new())),
-            parser::Expression::Index(base, key) => {
-                let (root, mut keys) = lvalue(base)?;
-                keys.push(value_of(key)?);
-                Some((root, keys))
-            }
-            parser::Expression::Field(base, field) => {
-                let (root, mut keys) = lvalue(base)?;
-                keys.push(Value::String(field.clone()));
-                Some((root, keys))
-            }
-            _ => None,
-        }
-    }
-
-    /// A key expression that is a constant, which is every key an assignment
-    /// target needs: `t[1]`, `t[k]` where `k` is a declared name, and
-    /// `t.field`. A key computed by an expression has nowhere to be read at
-    /// this point, because the read would have to happen after the write.
-    fn value_of(expression: &parser::Expression) -> Option<Value> {
-        Some(match expression {
-            parser::Expression::Nil => Value::Nil,
-            parser::Expression::Boolean(value) => Value::Boolean(*value),
-            parser::Expression::Number(value) => Value::Number(*value),
-            parser::Expression::Str(value) => Value::String(value.clone()),
-            parser::Expression::Name(name) => Value::String(name.clone()),
-            _ => return None,
+    /// The name a value is written through, and the keys under it. Boxed
+    /// because it walks an expression that can hold another one, `t.a.b = 1`,
+    /// and a self-calling `async fn` would otherwise have no size.
+    fn lvalue<'b>(&'b mut self, target: &'b parser::Expression) -> LValueFuture<'b> {
+        Box::pin(async move {
+            Ok(match target {
+                parser::Expression::Name(name) => (name.clone(), Vec::new()),
+                parser::Expression::Index(base, key) => {
+                    let (root, mut keys) = self.lvalue(base).await?;
+                    keys.push(first(self.evaluate(key).await?));
+                    (root, keys)
+                }
+                parser::Expression::Field(base, field) => {
+                    let (root, mut keys) = self.lvalue(base).await?;
+                    keys.push(Value::String(field.clone()));
+                    (root, keys)
+                }
+                other => {
+                    return Err(script_error(format!(
+                        "cannot assign to this expression: {other:?}"
+                    )));
+                }
+            })
         })
     }
 
@@ -628,7 +670,9 @@ impl Interpreter<'_> {
         match name {
             "type" => {
                 require_arguments(name, &arguments, 1)?;
-                Ok(vec![Value::String(arguments[0].type_name().as_bytes().to_vec())])
+                Ok(vec![Value::String(
+                    arguments[0].type_name().as_bytes().to_vec(),
+                )])
             }
             "tonumber" => {
                 require_arguments(name, &arguments, 1)?;
@@ -640,8 +684,12 @@ impl Interpreter<'_> {
             "tostring" => {
                 require_arguments(name, &arguments, 1)?;
                 Ok(vec![match &arguments[0] {
-                    Value::Number(number) => Value::String(value::format_number(*number).into_bytes()),
-                    Value::Boolean(value) => Value::String(if *value { "true" } else { "false" }.into()),
+                    Value::Number(number) => {
+                        Value::String(value::format_number(*number).into_bytes())
+                    }
+                    Value::Boolean(value) => {
+                        Value::String(if *value { "true" } else { "false" }.into())
+                    }
                     Value::Nil => Value::String("nil".into()),
                     other => Value::String(other.to_string_value().map_err(script_error)?),
                 }])
@@ -679,7 +727,7 @@ impl Interpreter<'_> {
                     sha1::hex(&arguments[0].to_string_value().map_err(script_error)?).into_bytes(),
                 )])
             }
-            // Logging goes to the gateway's tracing rather than a log file
+            // Logging goes to the gateway's tracing rather than to a log file
             // Redis owns; a script that reaches for it still runs.
             "redis.log" => Ok(Vec::new()),
             // Redis' own debugging hooks, which do nothing in a client's
@@ -721,7 +769,12 @@ impl Interpreter<'_> {
                 }
             });
         }
-        self.check_declared(&command_line)?;
+        if let Err(error) = self.check_declared(&command_line) {
+            if !catches {
+                return Err(error);
+            }
+            return Ok(vec![reply_table("err", error.message)]);
+        }
         match self.host.call(&command_line).await {
             Ok(Reply::Error(message)) => {
                 if catches {
@@ -745,19 +798,17 @@ impl Interpreter<'_> {
         let Some(name) = command_line.first() else {
             return Ok(());
         };
-        let Some(info) = crate::table::lookup(&String::from_utf8_lossy(name)) else {
-            return Err(script_error(format!(
-                "unknown command '{}'",
-                String::from_utf8_lossy(name)
-            )));
+        let spelled = String::from_utf8_lossy(name);
+        let Some(info) = crate::table::lookup(&spelled.to_ascii_lowercase()) else {
+            return Err(script_error(format!("unknown command '{spelled}'")));
         };
+        let name = spelled.to_ascii_lowercase();
         for key in info.keys(command_line) {
             if !self.keys.iter().any(|declared| declared.as_slice() == key) {
                 return Err(script_error(format!(
-                    "the command '{}' touches '{}', which this script did not \
+                    "the command '{name}' touches '{}', which this script did not \
                      declare in KEYS; a script here may only touch the keys it \
                      declares",
-                    String::from_utf8_lossy(name),
                     String::from_utf8_lossy(key)
                 )));
             }
@@ -775,6 +826,12 @@ fn require_arguments(name: &str, arguments: &[Value], expected: usize) -> RedisR
     )))
 }
 
+/// The one value an expression has. A call that produced several is used for
+/// its first, which is what Lua does everywhere but the last slot of a list.
+fn first(values: Vec<Value>) -> Value {
+    values.into_iter().next().unwrap_or(Value::Nil)
+}
+
 fn message_of(value: &Value) -> RedisResult<String> {
     Ok(match value {
         Value::String(text) => String::from_utf8_lossy(text).into_owned(),
@@ -790,10 +847,6 @@ fn reply_table(field: &str, message: String) -> Value {
         Value::String(message.into_bytes()),
     );
     Value::Table(table)
-}
-
-fn type_of(value: &Value) -> &'static str {
-    value.type_name()
 }
 
 /// Whether two values are the same value. Lua compares tables by identity,
@@ -833,14 +886,14 @@ mod tests {
     struct Silent;
 
     impl Host for Silent {
-        async fn call(&mut self, command: &[Vec<u8>]) -> RedisResult<Reply> {
-            // The answer a script gets from a key that is not there, so a
-            // script written against a cache reads its branches the same way.
-            Ok(match command.first().map(|name| name.to_ascii_lowercase()) {
+        fn call(&mut self, command: &[Vec<u8>]) -> impl Future<Output = RedisResult<Reply>> + Send {
+            let answer = match command.first().map(|name| name.to_ascii_lowercase()) {
                 Some(name) if name == b"exists" => Reply::Integer(0),
                 Some(name) if name == b"incrby" => Reply::Integer(1),
+                Some(name) if name == b"pttl" => Reply::Integer(-1),
                 _ => Reply::bulk("value"),
-            })
+            };
+            async move { Ok(answer) }
         }
     }
 
@@ -849,7 +902,9 @@ mod tests {
             &mut Silent,
             source.as_bytes(),
             keys.iter().map(|key| key.as_bytes().to_vec()).collect(),
-            argv.iter().map(|argument| argument.as_bytes().to_vec()).collect(),
+            argv.iter()
+                .map(|argument| argument.as_bytes().to_vec())
+                .collect(),
             Limits::default(),
         )
         .await
@@ -881,10 +936,12 @@ mod tests {
         let source = "if redis.call('GET', KEYS[1]) == '1' then return 0 end \
                       redis.call('SET', KEYS[1], '1', 'EX', ARGV[1]) return 1";
         assert_eq!(reply(source).await, Reply::Integer(1));
-        assert_eq!(
-            run_script(source, &["k"], &[]).await.unwrap_err().message,
-            "user_script: Lua redis lib command arguments must be strings or integers \
-             (got nil)"
+        // A missing argument is not a command argument Redis would take.
+        let error = run_script(source, &["k"], &[]).await.unwrap_err();
+        assert!(
+            error.message.contains("must be strings or integers"),
+            "{}",
+            error.message
         );
     }
 
@@ -906,7 +963,10 @@ mod tests {
 
     #[tokio::test]
     async fn control_flow_works_the_way_the_script_expects() {
-        assert_eq!(reply("if 1 == 1 then return 'yes' else return 'no' end").await, Reply::bulk("yes"));
+        assert_eq!(
+            reply("if 1 == 1 then return 'yes' else return 'no' end").await,
+            Reply::bulk("yes")
+        );
         assert_eq!(
             reply("if 1 == 2 then return 'yes' else return 'no' end").await,
             Reply::bulk("no")
@@ -960,6 +1020,11 @@ mod tests {
             reply("local t = {1, 2} return t[1] + t[2]").await,
             Reply::Integer(3)
         );
+        // A key held in a name is the key's value, not its name.
+        assert_eq!(
+            reply("local t = {} local k = 'name' t[k] = 'v' return t.name").await,
+            Reply::bulk("v")
+        );
     }
 
     #[tokio::test]
@@ -968,13 +1033,19 @@ mod tests {
         assert_eq!(reply("return type('x')").await, Reply::bulk("string"));
         assert_eq!(reply("return tonumber('42')").await, Reply::Integer(42));
         assert_eq!(reply("return tonumber('x')").await, Reply::Nil);
-        assert_eq!(reply("return tostring(42) .. '!'").await, Reply::bulk("42!"));
+        assert_eq!(
+            reply("return tostring(42) .. '!'").await,
+            Reply::bulk("42!")
+        );
         assert_eq!(reply("return tostring(true)").await, Reply::bulk("true"));
         assert_eq!(reply("return assert(1)").await, Reply::Integer(1));
         assert!(run_script("assert(false)", &[], &[]).await.is_err());
         assert!(run_script("error('boom')", &[], &[]).await.is_err());
         // `redis` is a value, so a member of it can be carried around.
-        assert_eq!(reply("local c = redis.call return type(c)").await, Reply::bulk("function"));
+        assert_eq!(
+            reply("local c = redis.call return type(c)").await,
+            Reply::bulk("function")
+        );
     }
 
     #[tokio::test]
@@ -989,12 +1060,16 @@ mod tests {
         );
         // The same key, declared, is fine.
         assert_eq!(
-            run_script("return redis.call('GET', KEYS[1])", &["k"], &[]).await.unwrap(),
+            run_script("return redis.call('GET', KEYS[1])", &["k"], &[])
+                .await
+                .unwrap(),
             Reply::bulk("value")
         );
         // A command with no keys at all touches none.
         assert_eq!(
-            run_script("return redis.call('PING')", &[], &[]).await.unwrap(),
+            run_script("return redis.call('PING')", &[], &[])
+                .await
+                .unwrap(),
             Reply::bulk("value")
         );
     }
@@ -1004,18 +1079,18 @@ mod tests {
         let error = run_script("return redis.call('HSET', KEYS[1], 'f', 'v')", &["k"], &[])
             .await
             .unwrap_err();
-        assert!(error.message.contains("unknown command 'HSET'"), "{}", error.message);
+        assert!(
+            error.message.contains("unknown command 'HSET'"),
+            "{}",
+            error.message
+        );
     }
 
     #[tokio::test]
     async fn pcall_reports_a_failure_as_a_table_instead_of_stopping() {
         assert_eq!(
-            reply("return redis.pcall('SCAN', '0')").await,
-            Reply::Error(
-                "SCAN is not supported by the hashring-rs Redis gateway; \
-                 see docs/redis-compatibility.md"
-                    .into()
-            )
+            reply("return redis.pcall('NOSUCHCOMMAND', '0')").await,
+            Reply::Error("user_script: unknown command 'NOSUCHCOMMAND'".into())
         );
         assert_eq!(
             reply("return redis.error_reply('nope')").await,
@@ -1029,8 +1104,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_runaway_script_is_stopped_by_the_step_budget() {
-        let mut limits = Limits::default();
-        limits.max_steps = 500;
+        let limits = Limits {
+            max_steps: 500,
+            ..Limits::default()
+        };
         let error = run(
             &mut Silent,
             b"while true do end",
@@ -1040,20 +1117,35 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(error.message.contains("maximum number of steps"), "{}", error.message);
+        assert!(
+            error.message.contains("maximum number of steps"),
+            "{}",
+            error.message
+        );
     }
 
     #[tokio::test]
     async fn a_runaway_script_is_stopped_by_its_deadline() {
-        let mut limits = Limits::default();
-        limits.timeout = Duration::ZERO;
+        let limits = Limits {
+            timeout: Duration::ZERO,
+            ..Limits::default()
+        };
         let mut running = Silent;
         let started = Instant::now();
-        let error = run(&mut running, b"while true do local x = 1 end", Vec::new(), Vec::new(), limits)
-            .await
-            .unwrap_err();
-        assert!(error.code == "BUSY", "{}", error.message);
-        assert!(started.elapsed() < Duration::from_secs(5), "it ran too long");
+        let error = run(
+            &mut running,
+            b"while true do local x = 1 end",
+            Vec::new(),
+            Vec::new(),
+            limits,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "BUSY", "{}", error.message);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "it ran too long"
+        );
     }
 
     #[tokio::test]

@@ -50,6 +50,10 @@ pub enum Token {
     Do,
     For,
     In,
+    Repeat,
+    Until,
+    Function,
+    Local,
     Return,
     Break,
     Nil,
@@ -109,6 +113,10 @@ impl Token {
             Token::Do => "do",
             Token::For => "for",
             Token::In => "in",
+            Token::Repeat => "repeat",
+            Token::Until => "until",
+            Token::Function => "function",
+            Token::Local => "local",
             Token::Return => "return",
             Token::Break => "break",
             Token::Nil => "nil",
@@ -135,6 +143,10 @@ fn keyword(word: &[u8]) -> Option<Token> {
         b"do" => Token::Do,
         b"for" => Token::For,
         b"in" => Token::In,
+        b"repeat" => Token::Repeat,
+        b"until" => Token::Until,
+        b"function" => Token::Function,
+        b"local" => Token::Local,
         b"return" => Token::Return,
         b"break" => Token::Break,
         b"nil" => Token::Nil,
@@ -213,7 +225,7 @@ impl Lexer<'_> {
                         ahead += 1;
                     }
                     if self.peek_at(ahead) != Some(b'\n') {
-                        return;
+                        return Ok(());
                     }
                     self.at += ahead + 1;
                     self.line += 1;
@@ -240,11 +252,15 @@ impl Lexer<'_> {
     /// The `=` count of a long bracket opening at the cursor, which is how Lua
     /// writes `[[text]]` and `--[==[text]==]`.
     fn long_bracket_level(&self) -> Option<usize> {
-        let mut ahead = 0;
+        // The `=` count sits between the two brackets, as in `[==[`.
+        if self.peek() != Some(b'[') {
+            return None;
+        }
+        let mut ahead = 1;
         while self.peek_at(ahead) == Some(b'=') {
             ahead += 1;
         }
-        (self.peek_at(ahead) == Some(b'[')).then_some(ahead)
+        (self.peek_at(ahead) == Some(b'[')).then_some(ahead - 1)
     }
 
     fn read_long_bracket(&mut self, level: usize, what: &str) -> Result<Vec<u8>, String> {
@@ -257,7 +273,9 @@ impl Lexer<'_> {
             self.at += 1;
             self.line += 1;
         }
-        let closing: Vec<u8> = [b"]".to_vec(), vec![b'='; level], vec![b"]"].concat();
+        let mut closing = vec![b']'];
+        closing.extend(std::iter::repeat_n(b'=', level));
+        closing.push(b']');
         let Some(offset) = self.source[self.at..]
             .windows(closing.len())
             .position(|window| window == closing)
@@ -317,8 +335,15 @@ impl Lexer<'_> {
                 Token::RBrace
             }
             b'[' => {
-                self.at += 1;
-                Token::LBracket
+                // `[[text]]` and `[==[text]==]` are a string written without
+                // escapes; a lone `[` is the indexing operator.
+                match self.long_bracket_level() {
+                    Some(level) => Token::Str(self.read_long_bracket(level, "string")?),
+                    None => {
+                        self.at += 1;
+                        Token::LBracket
+                    }
+                }
             }
             b']' => {
                 self.at += 1;
@@ -367,19 +392,19 @@ impl Lexer<'_> {
                     Token::Greater
                 }
             }
-            b'.' => {
-                self.at += 1;
-                if self.eat(b'.') {
+            b'.' => match self.peek_at(1) {
+                // `.5` is a number, not a field access on nothing.
+                Some(byte) if byte.is_ascii_digit() => self.read_number()?,
+                Some(b'.') => {
+                    self.at += 2;
                     Token::Concat
-                } else if self.peek().is_some_and(u8::is_ascii_digit) {
-                    // `.5` is a number, not a field access on nothing.
-                    self.read_number()?
-                } else {
+                }
+                _ => {
+                    self.at += 1;
                     Token::Dot
                 }
-            }
+            },
             b'"' | b'\'' => self.read_string(byte)?,
-            b'[' => unreachable!("handled as punctuation above"),
             byte if byte.is_ascii_digit() => self.read_number()?,
             byte if byte == b'_' || byte.is_ascii_alphabetic() => self.read_name()?,
             byte => return Err(self.error(format!("unexpected character '{byte}'"))),
@@ -445,9 +470,6 @@ impl Lexer<'_> {
     }
 
     fn read_string(&mut self, quote: u8) -> Result<Token, String> {
-        if self.peek_at(1) == Some(quote) && self.peek_at(2) == Some(quote) {
-            return Ok(Token::Str(self.read_long_bracket(0, "string")?));
-        }
         self.at += 1;
         let mut text = Vec::new();
         loop {
@@ -575,8 +597,14 @@ mod tests {
 
     #[test]
     fn escapes_and_long_strings_read_the_way_lua_reads_them() {
-        assert_eq!(tokens(r#"'a\nb\065\x41'"#)[0], Token::Str(b"a\nbAA".to_vec()));
-        assert_eq!(tokens("[[plain\ntext]]")[0], Token::Str(b"plain\ntext".to_vec()));
+        assert_eq!(
+            tokens(r#"'a\nb\065\x41'"#)[0],
+            Token::Str(b"a\nbAA".to_vec())
+        );
+        assert_eq!(
+            tokens("[[plain\ntext]]")[0],
+            Token::Str(b"plain\ntext".to_vec())
+        );
         assert_eq!(tokens("[==[x]==]")[0], Token::Str(b"x".to_vec()));
         // A newline straight after the opening bracket is not part of the text.
         assert_eq!(tokens("[[\ntext]]")[0], Token::Str(b"text".to_vec()));

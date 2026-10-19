@@ -55,11 +55,24 @@ pub enum Change<T> {
 pub struct Store<'a> {
     client: &'a SharedClient,
     locks: &'a KeyLocks,
+    /// The script this command runs inside, when it runs inside one. A plain
+    /// write becomes conditional on what that script read, which is what makes
+    /// a script that reads a key and then writes it atomic against every other
+    /// writer rather than against one gateway's clients only.
+    script: Option<&'a super::script::State>,
 }
 
 impl<'a> Store<'a> {
-    pub fn new(client: &'a SharedClient, locks: &'a KeyLocks) -> Self {
-        Self { client, locks }
+    pub fn new(
+        client: &'a SharedClient,
+        locks: &'a KeyLocks,
+        script: Option<&'a super::script::State>,
+    ) -> Self {
+        Self {
+            client,
+            locks,
+            script,
+        }
     }
 
     pub async fn client(&self) -> RedisResult<HashringClient> {
@@ -67,17 +80,45 @@ impl<'a> Store<'a> {
     }
 
     pub async fn read(&self, key: &[u8]) -> RedisResult<Option<Current>> {
-        read_with(&self.client().await?, key).await
+        let current = read_with(&self.client().await?, key).await?;
+        if let Some(script) = self.script {
+            script.record(key, current.as_ref().map(|current| current.version.clone()));
+        }
+        Ok(current)
     }
 
     /// An unconditional write, for commands whose result does not depend on
     /// what the key held: `SET`, `SETEX`, `MSET`.
+    ///
+    /// Inside a script it is conditional on what the script read, and a key
+    /// that changed underneath the script makes the script fail rather than
+    /// overwrite the change.
     pub async fn put(&self, key: &[u8], value: Vec<u8>, expiry: Expiry) -> RedisResult<()> {
-        self.client()
+        let expected = match self.script {
+            Some(script) => script.version(key),
+            None => None,
+        };
+        let Some(expected) = expected else {
+            self.client()
+                .await?
+                .put_with_expiry(key.to_vec(), value, expiry)
+                .await?;
+            return Ok(());
+        };
+        let applied = self
+            .client()
             .await?
-            .put_with_expiry(key.to_vec(), value, expiry)
+            .put_if(key.to_vec(), value, expiry, precondition(expected))
             .await?;
-        Ok(())
+        match applied {
+            Some(output) => {
+                if let Some(script) = self.script {
+                    script.written(key, output.version);
+                }
+                Ok(())
+            }
+            None => Err(RedisError::conflict(key)),
+        }
     }
 
     /// Reads `key`, asks `decide` what to do, and applies that only if the key
@@ -91,39 +132,65 @@ impl<'a> Store<'a> {
         key: &[u8],
         mut decide: impl FnMut(Option<&Current>) -> RedisResult<Change<T>>,
     ) -> RedisResult<T> {
-        let _guard = self.locks.lock(&[key]).await;
+        // A script holds its declared keys for its whole run, so a command
+        // inside it must not wait for a lock the script itself took. The
+        // conditional write below is what keeps this correct, not the lock.
+        let held = self.script.is_some_and(|_| true);
+        let _guard = if held {
+            None
+        } else {
+            Some(self.locks.lock(&[key]).await)
+        };
         let client = self.client().await?;
         loop {
             let current = read_with(&client, key).await?;
+            if let Some(script) = self.script {
+                script.record(key, current.as_ref().map(|current| current.version.clone()));
+            }
             let expected = match &current {
                 Some(current) => Precondition::Version(current.version.clone()),
                 None => Precondition::Absent,
             };
             let key = key.to_vec();
-            let (applied, reply) = match decide(current.as_ref())? {
+            // The version the key carries after the write, if one landed.
+            let mut written: Option<Option<RecordVersion>> = None;
+            let reply = match decide(current.as_ref())? {
                 Change::Nothing(reply) => return Ok(reply),
                 Change::Put {
                     value,
                     deadline,
                     reply,
                 } => {
-                    let applied = client
-                        .put_if(key, value, expiry(deadline), expected)
-                        .await?;
-                    (applied.is_some(), reply)
+                    written = client
+                        .put_if(key.clone(), value, expiry(deadline), expected)
+                        .await?
+                        .as_ref()
+                        .map(|output| Some(output.version.clone()));
+                    reply
                 }
                 Change::Expire { deadline, reply } => {
                     debug_assert!(current.is_some(), "an expiry change needs a key");
-                    let applied = client.set_expiry_if(key, deadline, expected).await?;
-                    (applied.is_some(), reply)
+                    written = client
+                        .set_expiry_if(key.clone(), deadline, expected)
+                        .await?
+                        .as_ref()
+                        .map(|output| Some(output.version.clone()));
+                    reply
                 }
                 Change::Delete { reply } => {
                     debug_assert!(current.is_some(), "a delete change needs a key");
-                    let applied = client.delete_if(key, expected).await?;
-                    (applied.is_some(), reply)
+                    if client.delete_if(key.clone(), expected).await?.is_some() {
+                        // A delete leaves no record behind, so what a script
+                        // saw afterwards is that the key is not there.
+                        written = Some(None);
+                    }
+                    reply
                 }
             };
-            if applied {
+            if let Some(version) = written {
+                if let Some(script) = self.script {
+                    script.record(&key, version);
+                }
                 return Ok(reply);
             }
         }
@@ -212,6 +279,14 @@ async fn read_with(client: &HashringClient, key: &[u8]) -> RedisResult<Option<Cu
 /// the node never resolves "keep" against a record other than that one.
 pub fn expiry(deadline: Option<u64>) -> Expiry {
     deadline.map_or(Expiry::Clear, Expiry::At)
+}
+
+/// What a conditional write expects, given what the reader saw.
+fn precondition(expected: Option<RecordVersion>) -> Precondition {
+    match expected {
+        Some(version) => Precondition::Version(version),
+        None => Precondition::Absent,
+    }
 }
 
 /// The deadline a write that keeps the key's deadline stores.

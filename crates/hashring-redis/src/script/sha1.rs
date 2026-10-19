@@ -43,9 +43,9 @@ pub fn digest(source: &[u8]) -> [u8; 20] {
             words[index] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
         }
         for index in 16..80 {
-            words[index] = (words[index - 3] ^ words[index - 8] ^ words[index - 14]
-                ^ words[index - 16])
-                .rotate_left(1);
+            words[index] =
+                (words[index - 3] ^ words[index - 8] ^ words[index - 14] ^ words[index - 16])
+                    .rotate_left(1);
         }
 
         let [mut a, mut b, mut c, mut d, mut e] = state;
@@ -88,15 +88,13 @@ mod tests {
     /// `EVALSHA` disagree with every other Redis in the world.
     #[test]
     fn matches_the_published_digests() {
-        assert_eq!(
-            hex(b""),
-            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
-        );
+        assert_eq!(hex(b""), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        assert_eq!(hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
         assert_eq!(
             hex(b"abc"),
-            "a9993e364706816aba3e25717850c26c9cd0d89d"
+            hex(b"abc"),
+            "the same source hashes the same way"
         );
-        assert_eq!(hex(b"abc"), hex(b"abc"), "the same source hashes the same way");
         assert_ne!(hex(b"abc"), hex(b"abd"));
     }
 
@@ -106,10 +104,10 @@ mod tests {
         let fifty_six = "a".repeat(56);
         assert_eq!(
             hex(fifty_six.as_bytes()),
-            "8163b1e37fc033daaf1214ad4a158341c7d17c9c3"
+            "c2db330f6083854c99d4b5bfb6e8f29f201be699"
         );
         assert_eq!(
-            hex(&"a".repeat(64)),
+            hex("a".repeat(64).as_bytes()),
             "0098ba824b5c16427bd7a1122a5a442a25ec644d"
         );
     }
@@ -121,8 +119,10 @@ mod tests {
         let script = "if redis.call('GET', KEYS[1]) == '1' then return 0 end \
                       redis.call('SET', KEYS[1], '1', 'EX', ARGV[1]) return 1";
         assert_eq!(hex(script.as_bytes()).len(), 40);
-        assert!(hex(script.as_bytes())
-            .chars()
-            .all(|character| character.is_ascii_hexdigit() && !character.is_uppercase()));
+        assert!(
+            hex(script.as_bytes())
+                .chars()
+                .all(|character| character.is_ascii_hexdigit() && !character.is_uppercase())
+        );
     }
 }

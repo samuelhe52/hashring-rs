@@ -119,6 +119,34 @@ impl RedisError {
         Self::new("ERR", message)
     }
 
+    /// Redis' own answer to an `EVALSHA` for a script this gateway does not
+    /// have. A client watches for this code to decide whether to send the
+    /// script's source instead, so the wording is what it looks for.
+    pub fn no_such_script() -> Self {
+        Self::new("NOSCRIPT", "No matching script. Please use EVAL.")
+    }
+
+    /// A write inside a script found the key changed since the script read it.
+    /// The gateway's answer is to run the script again, which is what Redis'
+    /// single thread does by never letting anyone in; this is what a run that
+    /// cannot be repeated reports instead.
+    pub fn conflict(key: &[u8]) -> Self {
+        Self::new(
+            "ERR",
+            format!(
+                "user_script: the script cannot be run again because '{}' changed \
+                 while it ran",
+                String::from_utf8_lossy(key)
+            ),
+        )
+    }
+
+    /// Whether this failure is a script that has to be run again.
+    pub fn is_conflict(&self) -> bool {
+        self.message
+            .starts_with("user_script: the script cannot be run again")
+    }
+
     pub fn to_reply(&self) -> crate::resp::Reply {
         crate::resp::Reply::Error(format!("{} {}", self.code, self.message))
     }

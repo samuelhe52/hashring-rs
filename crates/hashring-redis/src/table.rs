@@ -138,6 +138,13 @@ pub const COMMANDS: &[CommandInfo] = &[
     // exist. See docs/redis-compatibility.md for why each one is absent.
     declined("flushdb", -1, WRITE),
     declined("flushall", -1, WRITE),
+    // Scripting. The keys come after the script and its key count rather than
+    // at fixed positions, so these report no keys; that is what Redis reports
+    // for them too, and it is why a client cannot split them across a cluster
+    // without asking first.
+    command("eval", -3, &["no_script", "movablekeys"]),
+    command("evalsha", -3, &["no_script", "movablekeys"]),
+    command("script", -2, ADMIN),
 ];
 
 pub fn lookup(name: &str) -> Option<&'static CommandInfo> {
@@ -175,6 +182,34 @@ impl CommandInfo {
     /// Reaches the cluster, rather than answering from the gateway.
     pub fn reaches_cluster(&self) -> bool {
         self.has_keys() || self.keyspace
+    }
+
+    /// The keys `args` names, read at the positions this command reports to
+    /// `COMMAND`. Those positions count the command name as zero, which is how
+    /// Redis numbers them: `GET key` has its key at 1.
+    ///
+    /// A script uses this to check the keys it touches against the ones it
+    /// declared, which is the same list a client reads to split a multi-key
+    /// command across a cluster.
+    pub fn keys<'a>(&self, args: &'a [Vec<u8>]) -> Vec<&'a [u8]> {
+        if !self.has_keys() {
+            return Vec::new();
+        }
+        let first = usize::try_from(self.first_key).unwrap_or(0);
+        if first >= args.len() {
+            return Vec::new();
+        }
+        // A negative `last_key` means "to the end", as it does for `del` and
+        // `mget`, where the keys run to the last argument.
+        let last = match self.last_key {
+            negative if negative < 0 => args.len(),
+            last => usize::try_from(last).unwrap_or(0).min(args.len()),
+        };
+        let step = usize::try_from(self.step).unwrap_or(1).max(1);
+        (first..last.max(first + 1).min(args.len()))
+            .step_by(step)
+            .map(|at| args[at].as_slice())
+            .collect()
     }
 
     pub fn to_reply(&self) -> Reply {

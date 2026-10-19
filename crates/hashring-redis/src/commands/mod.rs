@@ -17,6 +17,7 @@ mod connection;
 mod glob;
 mod keys;
 mod keyspace;
+mod script;
 mod store;
 mod strings;
 
@@ -41,6 +42,8 @@ pub struct Dispatcher {
     /// lock wait or request to its last.
     command_timeout: Duration,
     started_at: std::time::Instant,
+    /// The scripts clients have sent, and the lock that runs one at a time.
+    scripts: Arc<script::Scripts>,
 }
 
 /// What one command produced: the reply, and what it does to the connection
@@ -88,11 +91,35 @@ impl Dispatcher {
             limits,
             command_timeout,
             started_at: std::time::Instant::now(),
+            scripts: Arc::new(script::Scripts::default()),
         }
     }
 
     pub fn limits(&self) -> Limits {
         self.limits
+    }
+
+    /// How long one command that reaches the cluster may take. A script is one
+    /// command, so it has the same budget, however many steps it takes.
+    pub fn command_timeout(&self) -> Duration {
+        self.command_timeout
+    }
+
+    pub fn scripts(&self) -> &script::Scripts {
+        &self.scripts
+    }
+
+    /// Keeps a script's source under its own hash, as Redis does for `EVAL`.
+    /// Keeps a script's source under its own hash, as Redis does for `EVAL`.
+    pub fn remember(&self, source: &[u8]) -> std::sync::Arc<[u8]> {
+        self.scripts.remember(source)
+    }
+
+    /// The locks a script holds for its whole run, so that no other client of
+    /// this gateway takes a key between two of the script's commands.
+    pub async fn lock_declared(&self, keys: &[Vec<u8>]) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+        let keys: Vec<&[u8]> = keys.iter().map(|key| key.as_slice()).collect();
+        self.locks.lock(&keys).await
     }
 
     /// Whether a connection has to authenticate before it may read or write.
@@ -104,6 +131,19 @@ impl Dispatcher {
     /// socket: the negotiated protocol, the name the client gave itself, and
     /// whether it has authenticated.
     pub async fn execute(&self, connection: &mut Connection, args: &[Vec<u8>]) -> Response {
+        self.dispatch(connection, args, None).await
+    }
+
+    /// One command, with the script it runs inside when there is one. A
+    /// command a script runs is the gateway's own command with the script's
+    /// reads attached, which is what makes the script's writes conditional on
+    /// what it saw.
+    async fn dispatch(
+        &self,
+        connection: &mut Connection,
+        args: &[Vec<u8>],
+        script: Option<&script::State>,
+    ) -> Response {
         let Some((name, rest)) = args.split_first() else {
             return Response::error(RedisError::new("ERR", "empty multibulk"));
         };
@@ -126,17 +166,38 @@ impl Dispatcher {
             return Response::error(RedisError::unsupported(&command.name.to_ascii_uppercase()));
         }
         let args = args::Args::new(command.name, rest);
+        match command.name {
+            "eval" | "evalsha" => {
+                return match tokio::time::timeout(
+                    self.command_timeout,
+                    script::eval(self, connection, command, args),
+                )
+                .await
+                {
+                    Ok(reply) => Response::reply(reply),
+                    Err(_) => Response::error(RedisError::deadline(true)),
+                };
+            }
+            "script" => return Response::reply(script::script_command(self, args)),
+            _ => {}
+        }
         if !command.reaches_cluster() {
             return self.local(command, connection, args);
         }
-        match tokio::time::timeout(self.command_timeout, self.cluster(command, args)).await {
+        match tokio::time::timeout(self.command_timeout, self.cluster(command, args, script)).await
+        {
             Ok(reply) => Response::reply(reply),
             Err(_) => Response::error(RedisError::deadline(command.writes())),
         }
     }
 
-    async fn cluster(&self, command: &CommandInfo, args: args::Args<'_>) -> RedisResult<Reply> {
-        let store = store::Store::new(&self.client, &self.locks);
+    async fn cluster(
+        &self,
+        command: &CommandInfo,
+        args: args::Args<'_>,
+        script: Option<&script::State>,
+    ) -> RedisResult<Reply> {
+        let store = store::Store::new(&self.client, &self.locks, script);
         let max_value = self.limits.max_bulk_bytes;
         use args::{DeadlineMode::*, TimeUnit::*, TtlForm};
         match command.name {

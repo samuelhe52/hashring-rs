@@ -41,8 +41,12 @@ impl Value {
     pub fn to_number(&self) -> Result<f64, String> {
         match self {
             Self::Number(number) => Ok(*number),
-            Self::String(text) => parse_number(text)
-                .ok_or_else(|| format!("attempt to perform arithmetic on a string value: {}", String::from_utf8_lossy(text))),
+            Self::String(text) => parse_number(text).ok_or_else(|| {
+                format!(
+                    "attempt to perform arithmetic on a string value: {}",
+                    String::from_utf8_lossy(text)
+                )
+            }),
             other => Err(format!(
                 "attempt to perform arithmetic on a {} value",
                 other.type_name()
@@ -72,6 +76,15 @@ impl Value {
             Self::String(_) => "string",
             Self::Table(_) => "table",
             Self::Native(_) => "function",
+        }
+    }
+
+    /// The slot `key` names, when the value has one. An assignment through
+    /// this reaches the value a name holds rather than a copy of it.
+    pub fn get_mut(&mut self, key: &Value) -> Option<&mut Value> {
+        match self {
+            Self::Table(table) => table.get_mut(key),
+            _ => None,
         }
     }
 }
@@ -133,7 +146,7 @@ impl Table {
                 // back, so the named part holds it under its number's text.
                 Some(index) => self
                     .named
-                    .get(format_number(index).as_bytes())
+                    .get(index.to_string().as_bytes())
                     .cloned()
                     .unwrap_or(Value::Nil),
                 None => Value::Nil,
@@ -168,7 +181,7 @@ impl Table {
                     self.array[index as usize - 1] = value;
                 }
                 Some(index) if index >= 1 => {
-                    self.grow(index as usize - 1);
+                    self.grow(index as usize);
                     self.array[index as usize - 1] = value;
                 }
                 Some(_) => {}
@@ -225,13 +238,18 @@ pub fn from_reply(reply: &Reply) -> Value {
     match reply {
         Reply::Integer(value) => Value::Number(*value as f64),
         Reply::Double(value) => Value::Number(*value),
-        Reply::Bulk(Some(value)) | Reply::Simple(value.clone()) => Value::String(value.clone()),
+        Reply::Bulk(Some(value)) => Value::String(value.clone()),
+        Reply::Simple(value) => Value::String(value.clone().into_bytes()),
         // Redis hands a script `false` where a client would get a nil, because
         // that is what a Lua `if` can test.
         Reply::Bulk(None) | Reply::Nil => Value::Boolean(false),
         Reply::Boolean(value) => Value::Boolean(*value),
-        Reply::Array(items) | Reply::Set(items) => Value::Table(Table::array(
-            items.iter().map(from_reply).collect(),
+        Reply::Array(items) => Value::Table(Table::array(items.iter().map(from_reply).collect())),
+        Reply::Set(items) => Value::Table(Table::array(
+            items
+                .iter()
+                .map(|item| Value::String(item.clone()))
+                .collect(),
         )),
         Reply::Map(entries) => {
             let mut table = Table::new();
@@ -260,21 +278,21 @@ pub fn to_reply(value: &Value) -> Result<Reply, String> {
             None => Reply::bulk(format_number(*number)),
         },
         Value::String(text) => Reply::bulk(text.clone()),
-        Value::Table(table) if table.array_part().is_empty() => match table.get(&Value::String(
-            b"err".to_vec(),
-        )) {
-            Value::String(message) => Reply::Error(message_as_text(&message)),
-            _ => match table.get(&Value::String(b"ok".to_vec())) {
-                Value::String(status) => Reply::Simple(status_as_text(&status)),
-                _ => Reply::Map(
-                    table
-                        .named_part()
-                        .iter()
-                        .map(|(key, value)| Ok((key.clone(), to_reply(value)?)))
-                        .collect::<Result<Vec<_>, String>>()?,
-                ),
-            },
-        },
+        Value::Table(table) if table.array_part().is_empty() => {
+            match table.get(&Value::String(b"err".to_vec())) {
+                Value::String(message) => Reply::Error(message_as_text(&message)),
+                _ => match table.get(&Value::String(b"ok".to_vec())) {
+                    Value::String(status) => Reply::Simple(status_as_text(&status)),
+                    _ => Reply::Map(
+                        table
+                            .named_part()
+                            .iter()
+                            .map(|(key, value)| Ok((key.clone(), to_reply(value)?)))
+                            .collect::<Result<Vec<_>, String>>()?,
+                    ),
+                },
+            }
+        }
         Value::Table(table) if table.named_part().is_empty() => Reply::Array(
             table
                 .array_part()
@@ -283,9 +301,7 @@ pub fn to_reply(value: &Value) -> Result<Reply, String> {
                 .collect::<Result<Vec<_>, _>>()?,
         ),
         Value::Table(_) => {
-            return Err(
-                "Lua table with both array and named fields is not a valid reply".into(),
-            );
+            return Err("Lua table with both array and named fields is not a valid reply".into());
         }
         Value::Native(name) => {
             return Err(format!("{name} is a function and cannot be returned"));
@@ -413,7 +429,10 @@ mod tests {
             Reply::Error("boom".into())
         );
         let mut status = Table::new();
-        status.set(Value::String(b"ok".to_vec()), Value::String(b"PONG".to_vec()));
+        status.set(
+            Value::String(b"ok".to_vec()),
+            Value::String(b"PONG".to_vec()),
+        );
         assert_eq!(
             to_reply(&Value::Table(status)).unwrap(),
             Reply::Simple("PONG".into())

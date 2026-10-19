@@ -21,6 +21,7 @@ pub mod client;
 pub mod commands;
 pub mod error;
 pub mod resp;
+pub mod script;
 pub mod server;
 pub mod table;
 

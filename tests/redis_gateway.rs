@@ -1293,14 +1293,24 @@ async fn a_declined_command_says_so_instead_of_failing_obscurely() {
         error.to_string().contains("unknown command"),
         "unexpected error: {error}"
     );
+    // A script is answered, so the command a client reaches for when it cannot
+    // do something in one round trip is here; what the grammar does not have is
+    // refused by name rather than misread.
+    let value: i64 = redis::cmd("EVAL")
+        .arg("return 1 + 2 * 3")
+        .arg(0)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(value, 7);
     let error = redis::cmd("EVAL")
-        .arg("return 1")
+        .arg("for k, v in pairs(t) do end")
         .arg(0)
         .query_async::<i64>(&mut connection)
         .await
         .unwrap_err();
     assert!(
-        error.to_string().contains("unknown command"),
+        error.to_string().contains("for ... in"),
         "unexpected error: {error}"
     );
 
@@ -1375,6 +1385,260 @@ async fn concurrent_clients_on_one_gateway_do_not_lose_increments() {
         .await
         .unwrap();
     assert_eq!(total, "200", "an increment was lost");
+}
+
+#[tokio::test]
+async fn a_script_is_run_the_way_a_client_library_sends_it() {
+    let _guard = test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let cluster = Cluster::start(&directory.path().join("coordinator.redb"), None);
+    let mut connection = cluster.client().await;
+
+    // What a script returns, in the shapes a client library reads back.
+    let answer: i64 = redis::cmd("EVAL")
+        .arg("return 1 + 2 * 3")
+        .arg(0)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(answer, 7);
+    let list: Vec<i64> = redis::cmd("EVAL")
+        .arg("return {1, 2}")
+        .arg(0)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(list, vec![1, 2]);
+    let nothing: Option<i64> = redis::cmd("EVAL")
+        .arg("local x = 1")
+        .arg(0)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(nothing, None);
+
+    // KEYS and ARGV carry the bytes the command named, in order, and a script
+    // sees its own writes the way Redis' single thread makes it see them.
+    let echoed: String = redis::cmd("EVAL")
+        .arg("redis.call('SET', KEYS[1], ARGV[1]) return redis.call('GET', KEYS[1])")
+        .arg(1)
+        .arg("echoed:key")
+        .arg("an argument")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(echoed, "an argument");
+
+    // The claim a cache client sends. The read and the write are one
+    // operation, so the second caller is told nobody claimed it.
+    const CLAIM: &str = "if redis.call('GET', KEYS[1]) == '1' then return 0 end \
+                         redis.call('SET', KEYS[1], '1', 'EX', ARGV[1]) return 1";
+    let first: i64 = redis::cmd("EVAL")
+        .arg(CLAIM)
+        .arg(1)
+        .arg("claimed:key")
+        .arg(60)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(first, 1);
+    let second: i64 = redis::cmd("EVAL")
+        .arg(CLAIM)
+        .arg(1)
+        .arg("claimed:key")
+        .arg(60)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(second, 0, "the claim was not exclusive to its caller");
+    let stored: String = redis::cmd("GET")
+        .arg("claimed:key")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(stored, "1");
+
+    // Two gateways racing for one key still give one claim. Neither holds a
+    // lock the other can see, so it is the cluster's conditional write, and
+    // the script being run again when it finds the key changed, that makes
+    // this one claim rather than two.
+    let (_second_process, second_url) = cluster.second_gateway();
+    let urls = [cluster.url(None), second_url];
+    let mut racers = Vec::new();
+    for _ in 0..4 {
+        for url in &urls {
+            let url = url.clone();
+            racers.push(tokio::spawn(async move {
+                let mut connection = redis::Client::open(url)
+                    .unwrap()
+                    .get_multiplexed_async_connection()
+                    .await
+                    .unwrap();
+                redis::cmd("EVAL")
+                    .arg(CLAIM)
+                    .arg(1)
+                    .arg("raced:key")
+                    .arg(60)
+                    .query_async::<i64>(&mut connection)
+                    .await
+                    .unwrap()
+            }));
+        }
+    }
+    let mut claimed = 0;
+    for racer in racers {
+        claimed += tokio::time::timeout(Duration::from_secs(30), racer)
+            .await
+            .expect("a claim stalled")
+            .unwrap();
+    }
+    assert_eq!(claimed, 1, "a claim was not exclusive");
+
+    // The rate limiter's script, which is the other reason clients send one:
+    // an increment and its deadline in one round trip.
+    const LIMITER: &str = "redis.call('set', KEYS[1], 0, 'EX', ARGV[2], 'NX') \
+                           local consumed = redis.call('incrby', KEYS[1], ARGV[1]) \
+                           local ttl = redis.call('pttl', KEYS[1]) \
+                           if ttl == -1 then \
+                             redis.call('expire', KEYS[1], ARGV[2]) \
+                             ttl = 1000 * ARGV[2] \
+                           end \
+                           return {consumed, ttl}";
+    let consumed: Vec<i64> = redis::cmd("EVAL")
+        .arg(LIMITER)
+        .arg(1)
+        .arg("limited:key")
+        .arg(1)
+        .arg(20)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(consumed.len(), 2, "{consumed:?}");
+    assert_eq!(consumed[0], 1, "{consumed:?}");
+    assert!(consumed[1] > 0, "{consumed:?}");
+
+    // SCRIPT LOAD answers the hash a client sends next, and EVALSHA runs it.
+    let hash: String = redis::cmd("SCRIPT")
+        .arg("LOAD")
+        .arg(CLAIM)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(
+        hash.len(),
+        40,
+        "a script's hash is forty hex characters: {hash}"
+    );
+    let loaded: i64 = redis::cmd("EVALSHA")
+        .arg(&hash)
+        .arg(1)
+        .arg("sha:key")
+        .arg(60)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(loaded, 1);
+    let known: Vec<i64> = redis::cmd("SCRIPT")
+        .arg("EXISTS")
+        .arg(&hash)
+        .arg("0".repeat(40))
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(known, vec![1, 0]);
+
+    // NOSCRIPT is the code a client watches for to send the source instead,
+    // so it has to arrive as an error and not as a wrong answer.
+    let error = redis::cmd("EVALSHA")
+        .arg("0".repeat(40))
+        .arg(0)
+        .query_async::<i64>(&mut connection)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("No matching script"),
+        "unexpected error: {error}"
+    );
+    let _: String = redis::cmd("SCRIPT")
+        .arg("FLUSH")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    let error = redis::cmd("EVALSHA")
+        .arg(&hash)
+        .arg(0)
+        .query_async::<i64>(&mut connection)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("No matching script"),
+        "unexpected error: {error}"
+    );
+
+    // A script may only touch the keys it declared, which is the rule that
+    // lets the gateway hold locks for the whole run.
+    let error = redis::cmd("EVAL")
+        .arg("return redis.call('GET', 'not:declared')")
+        .arg(1)
+        .arg("declared:key")
+        .query_async::<i64>(&mut connection)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("declare"),
+        "unexpected error: {error}"
+    );
+    // An argument that is neither a string nor a number is refused before the
+    // command is built, as Redis refuses it.
+    let error = redis::cmd("EVAL")
+        .arg("return redis.call('GET', KEYS[2])")
+        .arg(1)
+        .arg("declared:key")
+        .query_async::<i64>(&mut connection)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("must be strings or integers"),
+        "unexpected error: {error}"
+    );
+
+    // A script may not change the connection, as in Redis.
+    let error = redis::cmd("EVAL")
+        .arg("return redis.call('SELECT', 1)")
+        .arg(0)
+        .query_async::<i64>(&mut connection)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("not allowed from a script"),
+        "unexpected error: {error}"
+    );
+
+    // A runaway script is stopped by its step budget rather than held.
+    let error = redis::cmd("EVAL")
+        .arg("while true do end")
+        .arg(0)
+        .query_async::<i64>(&mut connection)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("maximum number of steps"),
+        "unexpected error: {error}"
+    );
+
+    // None of that left the gateway unable to answer anything else.
+    let pong: String = redis::cmd("PING")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(pong, "PONG");
+    let still: i64 = redis::cmd("EVAL")
+        .arg("return 40 + 2")
+        .arg(0)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(still, 42);
 }
 
 #[tokio::test]
