@@ -555,8 +555,39 @@ message DeleteResponse {
   bool condition_failed = 3;
 }
 
+// One page of the live keys a node owns, in token order. The caller names the
+// epoch its walk started from; a node at a newer epoch answers MOVED, because
+// keys may have changed hands and the walk has to start over to see them.
+message ListKeysRequest {
+  uint64 topology_epoch = 1;
+  // Where the page starts: keys at or after this token, and when after_key is
+  // set, only the keys at this token that sort after it.
+  uint64 start_token = 2;
+  optional bytes after_key = 3;
+  // The page ends at whichever comes first: this many keys, this many key
+  // bytes, or a fixed number of entries examined.
+  uint32 max_keys = 4;
+  uint64 max_bytes = 5;
+  // Count the keys instead of returning them.
+  bool count_only = 6;
+}
+
+message ListKeysResponse {
+  repeated bytes keys = 1;
+  // How many live keys this page covered, whether or not they were returned.
+  uint64 count = 2;
+  // No owned keys remain after this page.
+  bool done = 3;
+  // Where the next page starts, when not done.
+  uint64 next_token = 4;
+  optional bytes next_after_key = 5;
+  uint64 current_epoch = 6;
+  OperationError error = 7;
+}
+
 service DataNode {
   rpc Get(GetRequest) returns (GetResponse);
+  rpc ListKeys(ListKeysRequest) returns (ListKeysResponse);
   rpc Put(PutRequest) returns (PutResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
   rpc ReplicateMutation(ReplicationEntry) returns (ReplicateMutationResponse);

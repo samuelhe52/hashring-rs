@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -26,6 +26,10 @@ use hashring_core::{
     topology::{Member, TopologyConfig, TopologyError, TopologySnapshot, WriteAckPolicy},
     transport::{configure_coordinator_client, fetch_topology},
 };
+
+mod keyspace;
+
+pub use keyspace::PER_KEY_OVERHEAD_BYTES;
 
 #[derive(Clone, Debug)]
 pub struct GetOutput {

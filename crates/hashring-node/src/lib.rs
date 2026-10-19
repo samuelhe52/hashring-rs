@@ -29,13 +29,13 @@ use hashring_core::{
         self, ApplyDedupBatchRequest, ApplyMigrationBatchRequest, ChangelogPageRequest,
         ChangelogPageResponse, DedupSnapshotPageResponse, DeduplicationRecord, DeleteRequest,
         DeleteResponse, ErrorCode, GetRequest, GetResponse, InstallTopologyRequest, JournalRecord,
-        MigrationRecord, NodeInfoResponse, OperationError, PauseRangeResponse,
-        PolicyWriteFenceRequest, PrepareDestinationRangeResponse, PrepareRangeRequest,
-        PrepareSourceRangeResponse, PutRequest, PutResponse, RangeControlRequest,
-        RangeDigestResponse, RecordVersion, RegisterNodeRequest, ReplicateMutationResponse,
-        ReplicateMutationsResponse, ReplicationBatch, ReplicationCheckpointRequest,
-        ReplicationEntry, ReplicationProgressRequest, ReplicationProgressResponse,
-        SnapshotPageRequest, SnapshotPageResponse, StopRequest,
+        ListKeysRequest, ListKeysResponse, MigrationRecord, NodeInfoResponse, OperationError,
+        PauseRangeResponse, PolicyWriteFenceRequest, PrepareDestinationRangeResponse,
+        PrepareRangeRequest, PrepareSourceRangeResponse, PutRequest, PutResponse,
+        RangeControlRequest, RangeDigestResponse, RecordVersion, RegisterNodeRequest,
+        ReplicateMutationResponse, ReplicateMutationsResponse, ReplicationBatch,
+        ReplicationCheckpointRequest, ReplicationEntry, ReplicationProgressRequest,
+        ReplicationProgressResponse, SnapshotPageRequest, SnapshotPageResponse, StopRequest,
         coordinator_client::CoordinatorClient, data_node_client::DataNodeClient,
         data_node_server::DataNode,
     },
@@ -755,6 +755,7 @@ pub struct DataNodeService {
 mod dedup;
 mod diagnostics;
 mod expiry;
+mod keyspace;
 mod migration;
 mod replication;
 mod rpc;
@@ -764,6 +765,7 @@ use dedup::*;
 use expiry::*;
 use migration::*;
 use replication::*;
+use service::lease_error;
 
 fn temporarily_unavailable(epoch: u64, message: impl Into<String>) -> OperationError {
     OperationError {

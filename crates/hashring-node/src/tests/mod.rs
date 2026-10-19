@@ -201,5 +201,6 @@ mod digest_bench;
 mod digest_stall_bench;
 mod expiry;
 mod index;
+mod keyspace;
 mod migration;
 mod replication;

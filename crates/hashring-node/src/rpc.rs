@@ -227,6 +227,82 @@ impl DataNode for DataNodeService {
         }))
     }
 
+    async fn list_keys(
+        &self,
+        request: Request<ListKeysRequest>,
+    ) -> Result<Response<ListKeysResponse>, Status> {
+        let request = request.into_inner();
+        self.refresh_if_newer(request.topology_epoch).await?;
+        let state = self.state.read().await;
+        let epoch = state.topology.epoch;
+        let refuse = |error: OperationError| {
+            Ok(Response::new(ListKeysResponse {
+                current_epoch: epoch,
+                error: Some(error),
+                ..Default::default()
+            }))
+        };
+        // A walk is only complete if every page came from the same epoch: a
+        // range that changed hands since the caller's first page may hold keys
+        // it already passed over at the old owner.
+        // A node still behind the caller is mid-install of the newer
+        // topology; it will catch up, so the walk only has to wait.
+        if epoch < request.topology_epoch {
+            return refuse(temporarily_unavailable(
+                epoch,
+                "this node has not installed the walk's topology yet",
+            ));
+        }
+        if epoch > request.topology_epoch {
+            return refuse(OperationError {
+                current_epoch: epoch,
+                ..operation_error(
+                    ErrorCode::Moved,
+                    "the topology changed during the key walk",
+                    true,
+                )
+            });
+        }
+        let owns_any = state
+            .topology
+            .assignments
+            .iter()
+            .any(|assignment| assignment.node_id == self.node_id);
+        if owns_any && let Some(error) = lease_error(&state) {
+            return refuse(error);
+        }
+        let limits = keyspace::PageLimits {
+            max_keys: (request.max_keys as usize).clamp(1, keyspace::MAX_KEYS_PER_PAGE),
+            max_bytes: usize::try_from(request.max_bytes)
+                .unwrap_or(usize::MAX)
+                .clamp(1, keyspace::MAX_KEY_BYTES_PER_PAGE),
+            max_examined: keyspace::MAX_EXAMINED_PER_PAGE,
+            count_only: request.count_only,
+        };
+        let page = state.owned_keys_page(
+            &self.node_id,
+            keyspace::KeyCursor {
+                token: request.start_token,
+                after_key: request.after_key,
+            },
+            now_unix_millis(),
+            &limits,
+        );
+        let (done, next_token, next_after_key) = match page.next {
+            Some(next) => (false, next.token, next.after_key),
+            None => (true, 0, None),
+        };
+        Ok(Response::new(ListKeysResponse {
+            keys: page.keys,
+            count: page.count,
+            done,
+            next_token,
+            next_after_key,
+            current_epoch: epoch,
+            error: None,
+        }))
+    }
+
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
         let _timer = hashring_core::rpc_profile::NODE_PUT.start();
         let request = request.into_inner();
