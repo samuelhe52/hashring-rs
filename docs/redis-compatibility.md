@@ -166,7 +166,8 @@ These are answered with a clear error rather than a wrong answer:
 
 Anything not in this document is answered with Redis' own unknown-command error.
 A data structure command (`HSET`, `ZADD`, `LPUSH`, …) is unknown here, because
-this gateway stores byte strings and nothing else. So are `MULTI`, `EXEC`,
+this gateway stores byte strings and nothing else, and will go on doing so; see
+[out of scope](#out-of-scope-data-structures). So are `MULTI`, `EXEC`,
 `WATCH`, `EVAL`, `SCRIPT`, and the `SUBSCRIBE` family.
 
 If a workload needs any of those, this is not a Redis substitute.
@@ -328,7 +329,9 @@ returns nil, `EXISTS` returns 0, `TTL` returns -2.
 - No atomicity across keys, ever.
 - No `FLUSHALL`. `KEYS` and `DBSIZE` walk every key on every owner,
   so they cost as much as the keyspace is large.
-- No data structures, transactions, scripting or Pub/Sub.
+- No data structures, by decision; see
+  [out of scope](#out-of-scope-data-structures). No transactions, scripting or
+  Pub/Sub.
 - The gateway keeps nothing, so it holds no expiry state, no keys and no
   replication state. Losing it loses no data; losing the *cluster* loses every
   value on every node, as the cluster's own guarantees describe.
@@ -352,7 +355,10 @@ returns nil, `EXISTS` returns 0, `TTL` returns -2.
     module rather than copying it.
   - Isolate cases by flushing the reference and giving each case its own key
     prefix on the gateway, since `FLUSHALL` is declined there.
-  - Compare error codes (`ERR`, `WRONGTYPE`, …) rather than whole messages.
+  - Compare error codes (`ERR`, `NOAUTH`, …) rather than whole messages.
+  - Leave data structure commands out of the scripts. They are
+    [out of scope](#out-of-scope-data-structures), so every key on both sides
+    is a string and `WRONGTYPE` never arises.
   - Normalize what is not deterministic: compare `KEYS` and a full `SCAN` as
     sets, check `RANDOMKEY` only for membership, allow ±1 on `TTL` and `PTTL`,
     and skip `INFO`, `CLIENT ID`/`LIST`, the server fields of `HELLO`, and
@@ -367,6 +373,37 @@ returns nil, `EXISTS` returns 0, `TTL` returns -2.
     checks what one sequential client sees on the wire, and the existing tests
     keep covering the rest.
 
+## Out of scope: data structures
+
+Hashes, sets, sorted sets, lists and streams will not be added. The gateway
+aims to be a drop-in for caching and key-value use, the Rails, Django and Spring
+cache stores and `INCR`-and-`EXPIRE` counters, which need only what is
+[supported](#supported-commands) now.
+
+The way this cluster could hold a structure is as one record under one key. That
+would make each structure atomic, since it would inherit the cluster's per-key
+linearizability, but:
+
+- **Every mutation rewrites the whole structure.** An `HSET` of one field sends
+  the whole hash to the owner and then to every follower, and a write that loses
+  a [conditional-write](#read-modify-write-is-a-conditional-write) race sends
+  it again.
+- **A structure is capped at 8 MiB**, the value limit. How many members that
+  holds depends on their size: about 50 000 of 150 bytes each, about 8 000 of
+  1 KiB. The rewrite cost bites well before that.
+- **It would not buy the libraries that need structures.** Job queues and locks
+  such as Sidekiq, Celery, BullMQ and Redlock also need blocking pops and Lua,
+  and honest scripting needs atomicity across keys, which is
+  [not available](#cross-key-atomicity-is-not-available-at-all).
+
+Lists and streams fit worst of all: `LPOP` and consumer groups want element
+access without a rewrite, and blocking reads across the cluster.
+
+Storing each member as its own record, placed by its parent key so a structure
+stays on one owner, would remove the size limit and the rewrite. It needs
+atomic multi-record writes on the node and changes to migration and range
+digests, which is a storage redesign rather than gateway work.
+
 ## Not attempted
 
 Recorded so the gap is deliberate rather than an oversight. In rough order of
@@ -374,7 +411,5 @@ how much each would cost:
 
 | | What it would take |
 | --- | --- |
-| Hashes, sets and sorted sets | Encoding each as one record under one key. A single structure would then inherit the cluster's per-key linearizability, which is the right guarantee for one. The costs are a whole-structure rewrite per mutation and the 8 MiB value limit, which bites in the tens of thousands of members. |
-| Lists and streams | Not a good fit. `LPOP` and consumer groups want O(1) element access and blocking reads across the cluster; a whole-structure rewrite does not give either. |
 | `MULTI`, `EXEC`, `WATCH` | Would need server-side execution, and cross-key atomicity is unavailable underneath, so `EXEC` could not honestly promise atomicity across keys. |
 | Durability | The cluster is in-memory by design; the gateway adds no storage. |
