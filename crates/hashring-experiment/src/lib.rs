@@ -902,6 +902,7 @@ async fn record_node_pressure(
                 "owner_write_timing": state_write_timing_json(info.owner_write_timing),
                 "follower_write_timing": state_write_timing_json(info.follower_write_timing),
                 "ack_write_timing": state_write_timing_json(info.ack_write_timing),
+                "ack_completion_write_timing": state_write_timing_json(info.ack_completion_write_timing),
                 "receipt_cleanup_timing": info.receipt_cleanup_timing.map(|t| json!({
                     "purge_calls": t.purge_calls, "purge_nanos": t.purge_nanos,
                     "max_purge_nanos": t.max_purge_nanos, "expired_receipts": t.expired_receipts,

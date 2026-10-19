@@ -313,6 +313,7 @@ message NodeInfoResponse {
   StateWriteTiming follower_write_timing = 12;
   StateWriteTiming ack_write_timing = 13;
   ReceiptCleanupTiming receipt_cleanup_timing = 14;
+  StateWriteTiming ack_completion_write_timing = 15;
 }
 
 // Cumulative per-process timings. Wait totals can overlap across tasks.

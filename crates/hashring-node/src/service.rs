@@ -183,7 +183,8 @@ impl DataNodeService {
             }
             return Ok(());
         }
-        let mut state = self.state.write().await;
+        let mut state =
+            diagnostics::write(&self.state, &self.pressure.ack_completion_write_timing).await;
         if state.lease.is_none_or(|(lease_epoch, expires_at)| {
             lease_epoch != epoch || state.topology.epoch != epoch || Instant::now() >= expires_at
         }) {

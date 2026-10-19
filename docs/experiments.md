@@ -112,7 +112,8 @@ sample:
 
 - per-node receipt-cleanup timings
 - state write-lock wait and hold times for owner mutations, follower
-  application, and replication ACK processing
+  application, replication ACK processing, and the owner's final check that a
+  write's required ACKs arrived
 
 These are cumulative wall-clock counters. Summed wait times can overlap across
 tasks and nodes. Without profiling, the timing fields are `null`.

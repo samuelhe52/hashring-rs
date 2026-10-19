@@ -1433,6 +1433,8 @@ impl DataNode for DataNodeService {
                 .then(|| self.pressure.follower_write_timing.snapshot()),
             ack_write_timing: diagnostics::enabled()
                 .then(|| self.pressure.ack_write_timing.snapshot()),
+            ack_completion_write_timing: diagnostics::enabled()
+                .then(|| self.pressure.ack_completion_write_timing.snapshot()),
             receipt_cleanup_timing: diagnostics::enabled().then_some(state.cleanup_timing),
             owner_dedup_rejections: self
                 .pressure

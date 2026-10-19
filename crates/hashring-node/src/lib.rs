@@ -411,6 +411,7 @@ struct NodePressureStats {
     owner_write_timing: diagnostics::StateWriteTiming,
     follower_write_timing: diagnostics::StateWriteTiming,
     ack_write_timing: diagnostics::StateWriteTiming,
+    ack_completion_write_timing: diagnostics::StateWriteTiming,
     owner_dedup_rejections: AtomicU64,
     follower_dedup_rejections: AtomicU64,
     replication_reservation_rejections: AtomicU64,
