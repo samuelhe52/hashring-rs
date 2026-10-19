@@ -12,48 +12,48 @@ use super::*;
 /// period only sets how long a value that nobody asks for stays resident.
 pub const EXPIRY_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Records removed per sweep pass. The sweep holds the write lock, so a pass
-/// over a node holding millions of expired keys cannot stall writers; the
-/// remainder is picked up by the next pass.
+/// Expiry entries examined per sweep pass, whether they are removed or
+/// deferred. The sweep holds the write lock, so a pass over a node holding
+/// millions of expired keys cannot stall writers; the remainder is picked up by
+/// the next pass.
 pub const EXPIRY_SWEEP_LIMIT: usize = 65_536;
 
-/// The instant an absolute Unix millisecond deadline falls on, for a heap that
-/// orders deadlines on the node's own monotonic clock. A deadline already in
-/// the past becomes `Instant::now()`, which the next sweep pops.
-pub(super) fn deadline_instant(expires_at_unix_millis: u64) -> Instant {
-    let now_unix_millis = now_unix_millis();
-    Instant::now()
-        + std::time::Duration::from_millis(expires_at_unix_millis.saturating_sub(now_unix_millis))
-}
-
-/// Removes up to `limit` records whose deadline has passed and returns how
-/// many it removed.
+/// Examines up to `limit` records whose deadline has passed at
+/// `now_unix_millis` and returns how many it removed.
 ///
-/// The heap can hold an entry for a key that was later written with a further
-/// deadline, or removed outright, so every popped key is confirmed against the
-/// record the map currently holds rather than trusted.
-pub(super) fn sweep_expired_records(state: &mut NodeState, now: Instant, limit: usize) -> usize {
-    let now_unix_millis = now_unix_millis();
+/// A record in a range this node is migrating out is deferred instead of
+/// removed (see `SourceMigration::deferred_expirations`); it stays hidden from reads
+/// either way.
+pub(super) fn sweep_expired_records(
+    state: &mut NodeState,
+    now_unix_millis: u64,
+    limit: usize,
+) -> usize {
     let mut removed = 0;
-    while removed < limit
-        && state
+    for _ in 0..limit {
+        let Some((deadline, key)) = state
             .record_expirations
-            .peek()
-            .is_some_and(|Reverse((deadline, _))| *deadline <= now)
-    {
-        let Reverse((_, key)) = state
-            .record_expirations
-            .pop()
-            .expect("expiration was checked above");
-        if !state
-            .records
-            .get(key.as_ref())
-            .is_some_and(|record| record.is_expired(now_unix_millis))
+            .first()
+            .filter(|(deadline, _)| *deadline <= now_unix_millis)
+            .cloned()
+        else {
+            break;
+        };
+        state.record_expirations.remove(&(deadline, key.clone()));
+        let token = state.token_of(&key);
+        if let Some(source) = state
+            .sources
+            .values_mut()
+            .find(|source| source.range.contains(token))
         {
+            source.deferred_expirations.insert((deadline, key));
             continue;
         }
-        let token = state.token_of(&key);
-        state.remove_record_at(token, key.as_ref());
+        let record = state.remove_record_at(token, &key);
+        debug_assert!(
+            record.is_some_and(|record| record.expires_at_unix_millis == Some(deadline)),
+            "the expiry index named a record that does not carry its deadline",
+        );
         removed += 1;
     }
     removed
@@ -65,7 +65,7 @@ pub(super) fn start_expiry_sweep(state: Arc<RwLock<NodeState>>) {
         loop {
             interval.tick().await;
             let mut guard = state.write().await;
-            sweep_expired_records(&mut guard, Instant::now(), EXPIRY_SWEEP_LIMIT);
+            sweep_expired_records(&mut guard, now_unix_millis(), EXPIRY_SWEEP_LIMIT);
         }
     });
 }

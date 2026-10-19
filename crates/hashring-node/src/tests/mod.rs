@@ -37,7 +37,7 @@ fn service_for(node_id: &str, topology: TopologySnapshot) -> DataNodeService {
         topology,
         records: HashMap::new(),
         records_by_token: TokenIndex::default(),
-        record_expirations: BinaryHeap::new(),
+        record_expirations: BTreeSet::new(),
         next_sequence: 0,
         owner_stream_sequences: HashMap::new(),
         owner_stream_unacked: HashMap::new(),

@@ -317,8 +317,7 @@ async fn the_sweep_reclaims_deadlines_nobody_asks_about() {
                 },
             );
         }
-        // A write that pushes a key's deadline out leaves the earlier entry in
-        // the heap, and the sweep has to notice rather than remove the key.
+        // A key whose deadline is still ahead is left alone.
         seed_record(
             &mut state,
             b"kept",
@@ -339,7 +338,7 @@ async fn the_sweep_reclaims_deadlines_nobody_asks_about() {
     // Every key but `kept` is already past its deadline.
     let removed = {
         let mut state = service.state.write().await;
-        sweep_expired_records(&mut state, Instant::now(), EXPIRY_SWEEP_LIMIT)
+        sweep_expired_records(&mut state, now_unix_millis(), EXPIRY_SWEEP_LIMIT)
     };
     assert_eq!(removed, 16);
     {
@@ -349,10 +348,10 @@ async fn the_sweep_reclaims_deadlines_nobody_asks_about() {
         state.debug_assert_index();
     }
 
-    // The heap is drained of expired entries, so the next pass costs nothing.
+    // The index is drained of expired entries, so the next pass costs nothing.
     let mut state = service.state.write().await;
     assert_eq!(
-        sweep_expired_records(&mut state, Instant::now(), EXPIRY_SWEEP_LIMIT),
+        sweep_expired_records(&mut state, now_unix_millis(), EXPIRY_SWEEP_LIMIT),
         0
     );
     drop(state);
@@ -612,4 +611,202 @@ async fn a_kept_deadline_is_not_inherited_from_an_expired_record() {
     assert!(read.error.is_none(), "an acknowledged write read as absent");
     assert_eq!(read.value, b"fresh");
     assert_eq!(read.expires_at_unix_millis, None);
+}
+
+#[tokio::test]
+async fn rewriting_a_key_keeps_one_expiry_entry_for_it() {
+    let service = service();
+    // A hot key rewritten with a long TTL, as `SET k v EX` or `INCR` on a key
+    // with a deadline would do, must not leave one entry behind per write.
+    for index in 0..100 {
+        write(
+            &service,
+            PutRequest {
+                expires_at_unix_millis: Some(deadline_in(600 + index)),
+                ..put(b"hot", b"value", &format!("write-{index}"))
+            },
+        )
+        .await;
+        write(&service, put(b"hot", b"kept", &format!("keep-{index}"))).await;
+    }
+    let state = service.state.read().await;
+    assert_eq!(state.record_expirations.len(), 1);
+    assert_eq!(
+        state.record_expirations.first().map(|(deadline, _)| *deadline),
+        state.records[b"hot".as_slice()].expires_at_unix_millis
+    );
+    state.debug_assert_index();
+}
+
+#[tokio::test]
+async fn a_sweep_pass_examines_at_most_its_limit() {
+    let service = service();
+    {
+        let mut state = service.state.write().await;
+        for index in 0..10_u32 {
+            seed_record(
+                &mut state,
+                format!("key-{index}").as_bytes(),
+                Record {
+                    value: Arc::from(b"value".as_slice()),
+                    version: RecordVersion {
+                        topology_epoch: 1,
+                        owner_sequence: u64::from(index) + 1,
+                        owner_node_id: "node-1".into(),
+                    },
+                    deleted: false,
+                    expires_at_unix_millis: Some(now_unix_millis() - 1),
+                },
+            );
+        }
+    }
+    let mut state = service.state.write().await;
+    assert_eq!(sweep_expired_records(&mut state, now_unix_millis(), 4), 4);
+    assert_eq!(state.records.len(), 6);
+    assert_eq!(sweep_expired_records(&mut state, now_unix_millis(), 100), 6);
+    state.debug_assert_index();
+}
+
+#[tokio::test]
+async fn an_expired_record_outlives_the_migration_that_copied_it() {
+    let topology = replication_topology(2);
+    let source = service_for("node-1", topology.clone());
+    let destination = service_for("node-2", topology.clone());
+    let key = key_with_placement(&topology, |replicas| replicas[0] == "node-1");
+    let token = topology.key_token(&key);
+    write(
+        &source,
+        PutRequest {
+            expires_at_unix_millis: Some(deadline_in(600)),
+            ..put(&key, b"value", "first")
+        },
+    )
+    .await;
+    source
+        .prepare_source_range(Request::new(PrepareRangeRequest {
+            range: Some(range_covering(token)),
+        }))
+        .await
+        .unwrap();
+    let page = source
+        .read_snapshot_page(Request::new(SnapshotPageRequest {
+            change_id: "change-1".into(),
+            range_id: "range-1".into(),
+            cursor: 0,
+            max_bytes: u64::MAX,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    destination
+        .prepare_destination_range(Request::new(PrepareRangeRequest {
+            range: Some(range_covering(token)),
+        }))
+        .await
+        .unwrap();
+    destination
+        .apply_migration_batch(Request::new(ApplyMigrationBatchRequest {
+            change_id: "change-1".into(),
+            range_id: "range-1".into(),
+            snapshot_records: page.records,
+            journal_records: Vec::new(),
+        }))
+        .await
+        .unwrap();
+
+    // The record's deadline passes after the snapshot reached the destination.
+    let later = deadline_in(601);
+    {
+        let mut state = source.state.write().await;
+        assert_eq!(sweep_expired_records(&mut state, later, EXPIRY_SWEEP_LIMIT), 0);
+        assert!(state.records.contains_key(key.as_slice()));
+        state.debug_assert_index();
+    }
+    let control = || RangeControlRequest {
+        change_id: "change-1".into(),
+        range_id: "range-1".into(),
+    };
+    let source_digest = source
+        .source_range_digest(Request::new(control()))
+        .await
+        .unwrap()
+        .into_inner();
+    let destination_digest = destination
+        .destination_range_digest(Request::new(control()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(source_digest.record_count, destination_digest.record_count);
+    assert_eq!(source_digest.digest, destination_digest.digest);
+
+    // Once the migration ends the record is reclaimed like any other.
+    source
+        .abort_range_migration(Request::new(control()))
+        .await
+        .unwrap();
+    let mut state = source.state.write().await;
+    assert_eq!(sweep_expired_records(&mut state, later, EXPIRY_SWEEP_LIMIT), 1);
+    assert!(!state.records.contains_key(key.as_slice()));
+    state.debug_assert_index();
+}
+
+#[tokio::test]
+async fn ending_one_migration_releases_only_its_own_deferred_records() {
+    let topology = replication_topology(2);
+    let source = service_for("node-1", topology.clone());
+    let owned: Vec<Vec<u8>> = (0..1_000)
+        .map(|index| format!("deferred-{index}").into_bytes())
+        .filter(|key| topology.owner(key).unwrap().node_id == "node-1")
+        .take(2)
+        .collect();
+    for (index, key) in owned.iter().enumerate() {
+        write(
+            &source,
+            PutRequest {
+                expires_at_unix_millis: Some(deadline_in(600)),
+                ..put(key, b"value", &format!("write-{index}"))
+            },
+        )
+        .await;
+        let token = topology.key_token(key);
+        source
+            .prepare_source_range(Request::new(PrepareRangeRequest {
+                range: Some(proto::RangeSpec {
+                    range_id: format!("range-{index}"),
+                    ..range_covering(token)
+                }),
+            }))
+            .await
+            .unwrap();
+    }
+    let later = deadline_in(601);
+    {
+        let mut state = source.state.write().await;
+        assert_eq!(
+            sweep_expired_records(&mut state, later, EXPIRY_SWEEP_LIMIT),
+            0
+        );
+        assert!(state.record_expirations.is_empty());
+        state.debug_assert_index();
+    }
+    source
+        .abort_range_migration(Request::new(RangeControlRequest {
+            change_id: "change-1".into(),
+            range_id: "range-0".into(),
+        }))
+        .await
+        .unwrap();
+    let mut state = source.state.write().await;
+    assert_eq!(
+        state.record_expirations.len(),
+        1,
+        "another range's record was requeued"
+    );
+    assert_eq!(
+        sweep_expired_records(&mut state, later, EXPIRY_SWEEP_LIMIT),
+        1
+    );
+    assert!(!state.records.contains_key(owned[0].as_slice()));
+    assert!(state.records.contains_key(owned[1].as_slice()));
+    state.debug_assert_index();
 }

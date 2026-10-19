@@ -510,7 +510,7 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
     let topology = replication_topology(3);
     let key = key_with_placement(&topology, |replicas| replicas[0] == "node-1");
     let mut state = NodeState {
-        record_expirations: BinaryHeap::new(),
+        record_expirations: BTreeSet::new(),
         topology,
         records: HashMap::new(),
         records_by_token: TokenIndex::default(),
@@ -1097,6 +1097,7 @@ async fn source_cleanup_retains_records_needed_as_follower_copies() {
                 journal_bytes: 0,
                 watermark: 0,
                 writes_paused: true,
+                deferred_expirations: BTreeSet::new(),
             },
         );
     }

@@ -1217,6 +1217,7 @@ impl DataNode for DataNodeService {
                     journal_bytes: 0,
                     watermark: 0,
                     writes_paused: false,
+                    deferred_expirations: BTreeSet::new(),
                 },
             );
         }
@@ -1791,11 +1792,7 @@ impl DataNode for DataNodeService {
         for (token, record_key) in keys {
             state.remove_record_at(token, &record_key);
         }
-        if let Some(source) = state.sources.remove(&key) {
-            state.journal_bytes_total = state
-                .journal_bytes_total
-                .saturating_sub(source.journal_bytes);
-        }
+        state.remove_source(&key);
         Ok(Response::new(proto::Empty {}))
     }
 
@@ -1806,11 +1803,7 @@ impl DataNode for DataNodeService {
         let request = request.into_inner();
         let key = (request.change_id, request.range_id);
         let mut state = self.state.write().await;
-        if let Some(source) = state.sources.remove(&key) {
-            state.journal_bytes_total = state
-                .journal_bytes_total
-                .saturating_sub(source.journal_bytes);
-        }
+        state.remove_source(&key);
         state.destinations.remove(&key);
         Ok(Response::new(proto::Empty {}))
     }

@@ -3,7 +3,7 @@
 
 use std::{
     cmp::{Ordering, Reverse},
-    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque},
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
@@ -298,6 +298,12 @@ struct SourceMigration {
     journal_bytes: usize,
     watermark: u64,
     writes_paused: bool,
+    /// Expired records in this range whose removal waits for the migration to
+    /// end. The source and destination digests both cover them, and the
+    /// destination receives no journal entry for a sweep, so removing one
+    /// mid-migration would fail verification. Held here rather than node-wide
+    /// so ending one migration releases only its own range's records.
+    deferred_expirations: BTreeSet<(u64, Arc<[u8]>)>,
 }
 
 struct DestinationMigration {
@@ -412,12 +418,14 @@ struct NodeState {
     /// members and virtual-node changes; only a reseed rebuilds it (see
     /// `set_topology`).
     records_by_token: TokenIndex<Arc<[u8]>>,
-    /// The same `Arc` keys as `records`, ordered by their expiry deadline.
-    /// Reads hide an expired record, so this heap exists only to find those
-    /// records again without scanning every key on the node. Entries left
-    /// behind by a later write to the same key are dropped when popped, since
-    /// the map holds the only current deadline.
-    record_expirations: BinaryHeap<Reverse<(Instant, Arc<[u8]>)>>,
+    /// `(deadline, key)` for every record in `records` that has a deadline
+    /// and is not deferred by a source migration
+    /// (`SourceMigration::deferred_expirations`), ordered by deadline. Reads hide an
+    /// expired record, so this exists only to find those records again without
+    /// scanning every key. A write replaces its key's entry rather than adding
+    /// one, so the index holds one entry per expiring record, however often
+    /// the record is rewritten.
+    record_expirations: BTreeSet<(u64, Arc<[u8]>)>,
     next_sequence: u64,
     owner_stream_sequences: HashMap<(u64, String), u64>,
     owner_stream_unacked: HashMap<(u64, String), VecDeque<(u64, u64)>>,
@@ -479,18 +487,39 @@ impl NodeState {
     /// computes its routing token before the write lock, and a reseed in
     /// between would index the key where no range query looks for it.
     fn insert_record(&mut self, key: Arc<[u8]>, record: Record) {
-        if let Some(expires_at_unix_millis) = record.expires_at_unix_millis {
-            self.record_expirations.push(Reverse((
-                deadline_instant(expires_at_unix_millis),
-                key.clone(),
-            )));
-        }
+        let deadline = record.expires_at_unix_millis;
         // Replacing an existing key keeps the map's original `Arc`, which the
-        // index already holds, so only a new key is indexed. Indexing the new
-        // `Arc` instead would leave the map and index with separate copies.
-        if self.records.insert(key.clone(), record).is_none() {
-            let token = self.token_of(&key);
-            self.records_by_token.insert(token, key);
+        // token index and the expiry index already hold, so only a new key is
+        // indexed. Indexing the new `Arc` instead would leave the map and the
+        // indices with separate copies.
+        let key = match self.records.get_key_value(&key) {
+            Some((existing, _)) => existing.clone(),
+            None => {
+                let token = self.token_of(&key);
+                self.records_by_token.insert(token, key.clone());
+                key
+            }
+        };
+        if let Some(replaced) = self.records.insert(key.clone(), record) {
+            self.forget_expiration(&key, replaced.expires_at_unix_millis);
+        }
+        if let Some(deadline) = deadline {
+            self.record_expirations.insert((deadline, key));
+        }
+    }
+
+    /// Drops the expiry entry a record that is being replaced or removed was
+    /// scheduled under, wherever it is waiting.
+    fn forget_expiration(&mut self, key: &Arc<[u8]>, deadline: Option<u64>) {
+        if let Some(deadline) = deadline {
+            let entry = (deadline, key.clone());
+            if !self.record_expirations.remove(&entry) {
+                for source in self.sources.values_mut() {
+                    if source.deferred_expirations.remove(&entry) {
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -515,12 +544,29 @@ impl NodeState {
     /// [`remove_record`] for a caller that already has the key's token from
     /// [`record_keys_in_range`] under the same lock, so it matches the index.
     fn remove_record_at(&mut self, token: u64, key: &[u8]) -> Option<Record> {
-        let removed = self.records.remove(key);
-        if removed.is_some() {
-            let removed = self.records_by_token.remove(token, key);
-            debug_assert!(removed, "removed record was missing from the index");
+        let (key, removed) = self.records.remove_entry(key)?;
+        let indexed = self.records_by_token.remove(token, &key);
+        debug_assert!(indexed, "removed record was missing from the index");
+        self.forget_expiration(&key, removed.expires_at_unix_millis);
+        Some(removed)
+    }
+
+    /// Ends a source migration, the only way one leaves `sources`, and hands
+    /// the expired records it was holding back to the sweep: only this range's,
+    /// so the work is proportional to the range rather than the node. Another
+    /// active source still covering one defers it again on the next pass.
+    fn remove_source(&mut self, key: &(String, String)) -> Option<SourceMigration> {
+        let mut source = self.sources.remove(key)?;
+        self.journal_bytes_total = self
+            .journal_bytes_total
+            .saturating_sub(source.journal_bytes);
+        // One insertion per released entry: `BTreeSet::append` would merge
+        // through the entries already in the index, which can be the whole
+        // node's backlog.
+        for entry in std::mem::take(&mut source.deferred_expirations) {
+            self.record_expirations.insert(entry);
         }
-        removed
+        Some(source)
     }
 
     /// Every record key in `range` with its token, in token order.
@@ -543,6 +589,10 @@ impl NodeState {
     fn clear_records(&mut self) {
         self.records.clear();
         self.records_by_token = TokenIndex::default();
+        self.record_expirations.clear();
+        for source in self.sources.values_mut() {
+            source.deferred_expirations.clear();
+        }
     }
 
     #[cfg(test)]
@@ -578,12 +628,38 @@ impl NodeState {
             self.dedup.len(),
             "dedup and dedup_by_token disagree",
         );
-        for key in self.records.keys() {
+        for (key, record) in &self.records {
             debug_assert!(
                 self.records_by_token.contains(self.token_of(key), key),
                 "record is missing from records_by_token",
             );
+            if let Some(deadline) = record.expires_at_unix_millis {
+                let entry = (deadline, key.clone());
+                let deferred = self
+                    .sources
+                    .values()
+                    .filter(|source| source.deferred_expirations.contains(&entry))
+                    .count();
+                debug_assert_eq!(
+                    usize::from(self.record_expirations.contains(&entry)) + deferred,
+                    1,
+                    "an expiring record is not scheduled exactly once",
+                );
+            }
         }
+        let deferred: usize = self
+            .sources
+            .values()
+            .map(|source| source.deferred_expirations.len())
+            .sum();
+        debug_assert_eq!(
+            self.record_expirations.len() + deferred,
+            self.records
+                .values()
+                .filter(|record| record.expires_at_unix_millis.is_some())
+                .count(),
+            "the expiry index holds entries for records that are gone",
+        );
         for (id, entry) in &self.dedup {
             debug_assert!(
                 self.dedup_by_token.contains(self.token_of(&entry.key), id),
@@ -735,11 +811,7 @@ fn clear_replica_repair_staging(state: &mut NodeState) {
         .cloned()
         .collect();
     for key in keys {
-        if let Some(source) = state.sources.remove(&key) {
-            state.journal_bytes_total = state
-                .journal_bytes_total
-                .saturating_sub(source.journal_bytes);
-        }
+        state.remove_source(&key);
     }
     state
         .destinations
