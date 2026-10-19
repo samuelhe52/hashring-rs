@@ -20,7 +20,7 @@ use tonic::{
 pub use expiry::{EXPIRY_SWEEP_INTERVAL, EXPIRY_SWEEP_LIMIT};
 pub use hashring_core::limits::{
     DEFAULT_MAX_KEY_BYTES, DEFAULT_MAX_VALUE_BYTES, MAX_CONTROL_MESSAGE_BYTES,
-    MAX_DATA_MESSAGE_BYTES, MAX_MIGRATION_PAGE_BYTES, MAX_MUTATION_ID_BYTES,
+    MAX_DATA_MESSAGE_BYTES, MAX_MIGRATION_PAGE_BYTES, MAX_MUTATION_ID_BYTES, MAX_VALUE_BYTES,
 };
 pub use hashring_core::transport::{configure_coordinator_client, fetch_topology};
 
@@ -686,6 +686,9 @@ pub struct NodeSettings {
     /// Retained deduplication receipts, and separately each migration
     /// destination's staged receipts.
     pub max_dedup_bytes: usize,
+    /// The largest value this node accepts. It must fit a replication batch
+    /// and a journaled write, so the two budgets below may not be smaller.
+    pub max_value_bytes: usize,
     /// Mutations queued for followers, and separately the payload copies held
     /// by in-flight replication RPCs.
     pub max_pending_replication_bytes: usize,
@@ -706,6 +709,7 @@ impl Default for NodeSettings {
     fn default() -> Self {
         Self {
             max_dedup_bytes: DEFAULT_MAX_DEDUP_BYTES,
+            max_value_bytes: DEFAULT_MAX_VALUE_BYTES,
             max_pending_replication_bytes: DEFAULT_MAX_PENDING_REPLICATION_BYTES,
             max_migration_journal_bytes: DEFAULT_MAX_MIGRATION_JOURNAL_BYTES,
             replication_stream_queue_capacity: DEFAULT_REPLICATION_STREAM_QUEUE_CAPACITY,
@@ -720,14 +724,33 @@ impl NodeSettings {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.max_dedup_bytes > 0, "max_dedup_bytes must be positive");
         anyhow::ensure!(
+            self.max_value_bytes > 0 && self.max_value_bytes <= MAX_VALUE_BYTES,
+            "max_value_bytes must be positive and at most {}",
+            MAX_VALUE_BYTES
+        );
+        anyhow::ensure!(
             self.max_pending_replication_bytes > 0
                 && self.max_pending_replication_bytes <= Semaphore::MAX_PERMITS,
             "max_pending_replication_bytes must be positive and at most {}",
             Semaphore::MAX_PERMITS
         );
         anyhow::ensure!(
+            self.max_pending_replication_bytes >= self.max_value_bytes,
+            "max_pending_replication_bytes ({}) must be at least max_value_bytes ({}), or a \
+             value that size never fits a replication batch",
+            self.max_pending_replication_bytes,
+            self.max_value_bytes
+        );
+        anyhow::ensure!(
             self.max_migration_journal_bytes > 0,
             "max_migration_journal_bytes must be positive"
+        );
+        anyhow::ensure!(
+            self.max_migration_journal_bytes >= self.max_value_bytes,
+            "max_migration_journal_bytes ({}) must be at least max_value_bytes ({}), or a \
+             value that size is rejected while a range is moving",
+            self.max_migration_journal_bytes,
+            self.max_value_bytes
         );
         anyhow::ensure!(
             self.replication_stream_queue_capacity > 0,

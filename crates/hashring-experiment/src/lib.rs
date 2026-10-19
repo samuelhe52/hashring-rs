@@ -16,7 +16,6 @@ use anyhow::{Context, Result, bail, ensure};
 use futures::{StreamExt, TryStreamExt, stream};
 use hashring_client::{ClientError, HashringClient};
 use hashring_core::{
-    limits::DEFAULT_MAX_VALUE_BYTES,
     migration::{MigrationPhase, TopologyChange},
     proto::{ErrorCode, PutRequest, data_node_client::DataNodeClient},
     topology::{Member, WriteAckPolicy},
@@ -72,6 +71,7 @@ pub struct ExperimentConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NodeOptions {
     pub max_dedup_bytes: usize,
+    pub max_value_bytes: usize,
     pub max_pending_replication_bytes: usize,
     pub max_migration_journal_bytes: usize,
     pub replication_stream_queue_capacity: usize,
@@ -84,6 +84,7 @@ impl NodeOptions {
     fn arguments(&self) -> Vec<String> {
         [
             ("--max-dedup-bytes", self.max_dedup_bytes.to_string()),
+            ("--max-value-bytes", self.max_value_bytes.to_string()),
             (
                 "--max-pending-replication-bytes",
                 self.max_pending_replication_bytes.to_string(),
@@ -1002,7 +1003,7 @@ async fn run_availability(
     let tail_key = *owner_keys.last().expect("nonempty sample was checked");
     let tail_bytes = config
         .value_bytes
-        .clamp(1024 * 1024, DEFAULT_MAX_VALUE_BYTES);
+        .clamp(1024 * 1024, config.node.max_value_bytes);
     let tail_value = deterministic_value(tail_key, 1, tail_bytes);
     let tail_put_started = Instant::now();
     let writer =
@@ -1709,7 +1710,7 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
     );
     ensure!(config.value_bytes > 0, "value_bytes must be positive");
     ensure!(
-        config.value_bytes <= DEFAULT_MAX_VALUE_BYTES,
+        config.value_bytes <= config.node.max_value_bytes,
         "value_bytes exceeds the data-node limit"
     );
     ensure!(config.virtual_nodes > 0, "virtual_nodes must be positive");

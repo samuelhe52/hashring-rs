@@ -60,6 +60,7 @@ The examples list every key: [`coordinator.yaml`](../examples/coordinator.yaml),
 | `--coordinator` | `coordinator` | `http://127.0.0.1:50050` | process | |
 | `--worker-threads` | `worker_threads` | one per available CPU | process | Lower it when the node shares its host. |
 | `--max-dedup-bytes` | `max_dedup_bytes` | 134217728 (128 MiB) | per node | Retained deduplication receipts, and separately each migration destination's staged receipts. When full, the node rejects writes before applying them, with a retryable error, until receipts expire. |
+| `--max-value-bytes` | `max_value_bytes` | 8388608 (8 MiB) | per node | The largest value the node accepts; a larger one is refused before it is written. Nodes may differ, and clients are checked against the largest the cluster allows, not against any one node. Raising it also raises what a replication batch and a journaled write need, so `--max-pending-replication-bytes` and `--max-migration-journal-bytes` must be at least as large or the node will not start. |
 | `--max-pending-replication-bytes` | `max_pending_replication_bytes` | 67108864 (64 MiB) | per node | Mutations queued for followers, and separately the payloads held by in-flight replication RPCs. A mutation larger than the budget is always rejected. |
 | `--max-migration-journal-bytes` | `max_migration_journal_bytes` | 16777216 (16 MiB) | per node | Writes journaled across the node's active migrations. When full, writes to moving ranges get a retryable rejection. |
 | `--replication-stream-queue-capacity` | `replication_stream_queue_capacity` | 32 | per node | Mutations queued per follower stream, whatever their size, so it limits small writes before the byte budget does. |
@@ -82,6 +83,7 @@ not guarantee.
 | `--deadline-ms` | `deadline_ms` | 5000 | process | How long one command may take against the cluster. Redis has no such deadline; a proxy in front of a migrating cluster needs one. `EVAL` is one command, so a script has this budget however many steps it takes, and is also stopped at 100 000 of them. |
 | `--requirepass` | `requirepass` | none | process | Falls back to the `HASHRING_GATEWAY_PASSWORD` environment variable, which keeps the secret out of both the file and the process list. |
 | `--maxclients` | `maxclients` | 10000 | process | Connections open at once. One more is answered `-ERR max number of clients reached` and closed, as Redis does. |
+| `--max-bulk-bytes` | `max_bulk_bytes` | 16777216 (16 MiB) | process | Largest bulk string a connection may send, so the largest value the gateway reads from a client; `SET`, `APPEND` and `SETRANGE` stop at the same number. It is the gateway's own ceiling and does not change what a node accepts, so raise it with `--max-value-bytes`. |
 | `--worker-threads` | `worker_threads` | one per available CPU | process | |
 
 ## `experiment`
@@ -108,7 +110,7 @@ replaced during the run.
 | `--worker-threads` | `worker_threads` | CPUs / (nodes + 2), at least 2 | process | For the driver and each node. |
 | `--coordinator-worker-threads` | `coordinator_worker_threads` | one per available CPU | process | For the run's coordinator, which is not on the data path. |
 | `--seed`, `--virtual-nodes`, `--range-move-concurrency`, `--replica-repair-concurrency`, `--prepublication-failure-grace-ms`, `--desired-replication-factor`, `--minimum-admitted-copies`, `--minimum-healthy-followers`, `--max-replica-lag-ms`, `--receipt-retention-ms`, `--lease-duration-ms` | as for `coordinator` | as for `coordinator` | as for `coordinator` | Passed to the run's coordinator. |
-| `--max-dedup-bytes`, `--max-pending-replication-bytes`, `--max-migration-journal-bytes`, `--replication-stream-queue-capacity`, `--required-ack-timeout-ms`, `--replication-rpc-timeout-ms`, `--replication-batch-linger-ms` | as for `node` | as for `node` | per node | Passed to every node of the run. |
+| `--max-dedup-bytes`, `--max-value-bytes`, `--max-pending-replication-bytes`, `--max-migration-journal-bytes`, `--replication-stream-queue-capacity`, `--required-ack-timeout-ms`, `--replication-rpc-timeout-ms`, `--replication-batch-linger-ms` | as for `node` | as for `node` | per node | Passed to every node of the run. |
 
 ## Client and admin commands
 

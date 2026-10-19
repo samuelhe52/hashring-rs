@@ -3,6 +3,8 @@
 use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
+use hashring_core::limits::MAX_VALUE_BYTES;
+use hashring_redis::resp::Limits;
 use serde::Deserialize;
 
 use super::LoadedFile;
@@ -25,6 +27,7 @@ pub struct GatewayFile {
     pub deadline_ms: Option<u64>,
     pub requirepass: Option<String>,
     pub maxclients: Option<NonZeroUsize>,
+    pub max_bulk_bytes: Option<usize>,
     pub worker_threads: Option<NonZeroUsize>,
 }
 
@@ -35,6 +38,10 @@ pub struct GatewaySettings {
     pub operation_timeout: Duration,
     pub password: Option<Arc<str>>,
     pub max_connections: NonZeroUsize,
+    /// Largest bulk string a connection may send, so it is the largest value
+    /// the gateway will read from a client. This is the gateway's own ceiling;
+    /// what a node accepts is the cluster's `--max-value-bytes`.
+    pub max_bulk_bytes: usize,
     /// `None` takes one worker per available CPU.
     pub worker_threads: Option<NonZeroUsize>,
 }
@@ -62,6 +69,15 @@ pub fn resolve(
         .or_else(|| std::env::var(PASSWORD_ENV).ok())
         .filter(|password| !password.is_empty())
         .map(Arc::<str>::from);
+    let max_bulk_bytes = args
+        .max_bulk_bytes
+        .or(file.max_bulk_bytes)
+        .unwrap_or(Limits::default().max_bulk_bytes);
+    anyhow::ensure!(max_bulk_bytes > 0, "max_bulk_bytes must be positive");
+    anyhow::ensure!(
+        max_bulk_bytes <= MAX_VALUE_BYTES,
+        "max_bulk_bytes must be at most {MAX_VALUE_BYTES}"
+    );
     Ok(GatewaySettings {
         listen: args.listen.or(file.listen).unwrap_or(
             DEFAULT_LISTEN
@@ -79,6 +95,7 @@ pub fn resolve(
             .maxclients
             .or(file.maxclients)
             .unwrap_or(NonZeroUsize::new(DEFAULT_MAXCLIENTS).expect("the default is positive")),
+        max_bulk_bytes,
         worker_threads: args.worker_threads.or(file.worker_threads),
     })
 }
@@ -139,6 +156,20 @@ mod tests {
     fn a_zero_deadline_is_rejected() {
         let args = gateway_args(&["--deadline-ms", "0"]);
         assert!(resolve(&args, None).is_err());
+    }
+
+    #[test]
+    fn the_bulk_limit_is_the_gateway_s_to_set_and_stops_at_what_can_be_stored() {
+        // Raised for a cluster that raises its own value limit.
+        let settings = resolve(&gateway_args(&["--max-bulk-bytes", "33554432"]), None).unwrap();
+        assert_eq!(settings.max_bulk_bytes, 32 * 1024 * 1024);
+        // The default is still what a node at its default limit never refuses.
+        let settings = resolve(&gateway_args(&[]), None).unwrap();
+        assert_eq!(settings.max_bulk_bytes, 16 * 1024 * 1024);
+        // Nothing can be stored past what the transport carries, so parsing
+        // more than that is refused rather than accepted and then dropped.
+        let error = resolve(&gateway_args(&["--max-bulk-bytes", "135267328"]), None).unwrap_err();
+        assert!(error.to_string().contains("max_bulk_bytes"), "{error}");
     }
 
     #[test]

@@ -129,7 +129,7 @@ pub(super) async fn replay_changelog(
                 change_id: change.change_id.clone(),
                 range_id: range.range_id.clone(),
                 after_watermark: watermark,
-                max_bytes: MAX_MIGRATION_PAGE_BYTES as u64,
+                max_bytes: DEFAULT_MIGRATION_PAGE_BYTES as u64,
             }),
         )
         .await?

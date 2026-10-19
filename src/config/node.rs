@@ -21,6 +21,7 @@ pub struct NodeFile {
     pub coordinator: Option<String>,
     pub worker_threads: Option<NonZeroUsize>,
     pub max_dedup_bytes: Option<usize>,
+    pub max_value_bytes: Option<usize>,
     pub max_pending_replication_bytes: Option<usize>,
     pub max_migration_journal_bytes: Option<usize>,
     pub replication_stream_queue_capacity: Option<NonZeroUsize>,
@@ -33,6 +34,7 @@ impl NodeFile {
     fn tuning(&self) -> NodeTuningArgs {
         NodeTuningArgs {
             max_dedup_bytes: self.max_dedup_bytes,
+            max_value_bytes: self.max_value_bytes,
             max_pending_replication_bytes: self.max_pending_replication_bytes,
             max_migration_journal_bytes: self.max_migration_journal_bytes,
             replication_stream_queue_capacity: self.replication_stream_queue_capacity,
@@ -90,6 +92,10 @@ pub fn settings(flags: &NodeTuningArgs, file: &NodeTuningArgs) -> NodeSettings {
             .max_dedup_bytes
             .or(file.max_dedup_bytes)
             .unwrap_or(defaults.max_dedup_bytes),
+        max_value_bytes: flags
+            .max_value_bytes
+            .or(file.max_value_bytes)
+            .unwrap_or(defaults.max_value_bytes),
         max_pending_replication_bytes: flags
             .max_pending_replication_bytes
             .or(file.max_pending_replication_bytes)
@@ -125,6 +131,7 @@ pub fn settings(flags: &NodeTuningArgs, file: &NodeTuningArgs) -> NodeSettings {
 pub fn options(settings: &NodeSettings) -> NodeOptions {
     NodeOptions {
         max_dedup_bytes: settings.max_dedup_bytes,
+        max_value_bytes: settings.max_value_bytes,
         max_pending_replication_bytes: settings.max_pending_replication_bytes,
         max_migration_journal_bytes: settings.max_migration_journal_bytes,
         replication_stream_queue_capacity: settings.replication_stream_queue_capacity,
@@ -143,7 +150,7 @@ mod tests {
     use std::{fs, path::Path, path::PathBuf};
 
     use clap::Parser;
-    use hashring_node::{DEFAULT_MAX_DEDUP_BYTES, DEFAULT_REQUIRED_ACK_TIMEOUT};
+    use hashring_node::{DEFAULT_MAX_DEDUP_BYTES, DEFAULT_REQUIRED_ACK_TIMEOUT, MAX_VALUE_BYTES};
 
     use super::*;
     use crate::{Cli, Command, config::load};
@@ -201,6 +208,77 @@ mod tests {
         let config = resolve(&node_args(&["--id", "a", "--listen", "127.0.0.1:1"]), None).unwrap();
         assert_eq!(config.runtime_workers(24), 24);
         assert_eq!(config.settings.max_dedup_bytes, DEFAULT_MAX_DEDUP_BYTES);
+    }
+
+    #[test]
+    fn a_raised_value_limit_brings_the_budgets_that_have_to_carry_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "id: node-1\nlisten: 127.0.0.1:50051\nmax_value_bytes: 33554432\n\
+             max_migration_journal_bytes: 33554432\n\
+             max_pending_replication_bytes: 67108864\n",
+        );
+        let config = resolve(&node_args(&[]), Some(load(&path).unwrap())).unwrap();
+        assert_eq!(config.settings.max_value_bytes, 32 * 1024 * 1024);
+
+        // The same limit without the budgets that would have to carry it is
+        // refused, and the refusal names the flag that is short.
+        let path = write(
+            dir.path(),
+            "id: node-1\nlisten: 127.0.0.1:50051\nmax_value_bytes: 33554432\n\
+             max_migration_journal_bytes: 16777216\n\
+             max_pending_replication_bytes: 67108864\n",
+        );
+        let error = resolve(&node_args(&[]), Some(load(&path).unwrap())).unwrap_err();
+        assert!(
+            error.to_string().contains("max_migration_journal_bytes"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_value_limit_stops_at_what_the_transport_can_carry() {
+        let error = resolve(
+            &node_args(&[
+                "--id",
+                "a",
+                "--listen",
+                "127.0.0.1:1",
+                "--max-value-bytes",
+                "135267328",
+                "--max-migration-journal-bytes",
+                "135267328",
+                "--max-pending-replication-bytes",
+                "135267328",
+            ]),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(&MAX_VALUE_BYTES.to_string()),
+            "{error}"
+        );
+
+        // The ceiling itself is a configuration, not only a constant: it takes
+        // the two budgets with it and the node starts.
+        let config = resolve(
+            &node_args(&[
+                "--id",
+                "a",
+                "--listen",
+                "127.0.0.1:1",
+                "--max-value-bytes",
+                &MAX_VALUE_BYTES.to_string(),
+                "--max-migration-journal-bytes",
+                &MAX_VALUE_BYTES.to_string(),
+                "--max-pending-replication-bytes",
+                &MAX_VALUE_BYTES.to_string(),
+            ]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.settings.max_value_bytes, MAX_VALUE_BYTES);
     }
 
     #[test]

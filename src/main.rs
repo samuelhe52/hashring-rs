@@ -175,6 +175,14 @@ struct NodeTuningArgs {
     /// applying them, with a retryable error. [default: 134217728 (128 MiB)]
     #[arg(long)]
     max_dedup_bytes: Option<usize>,
+    /// The largest value a node accepts. A larger one is refused before it is
+    /// written. Every node in a cluster may use its own; the wire and a
+    /// migration page are sized for the largest the cluster allows.
+    /// Raising it also raises what a replication batch and a journaled write
+    /// need, so raise `--max-pending-replication-bytes` and
+    /// `--max-migration-journal-bytes` with it. [default: 8388608 (8 MiB)]
+    #[arg(long)]
+    max_value_bytes: Option<usize>,
     /// Bytes of mutations queued for followers, and separately the bytes held
     /// by in-flight replication RPCs. [default: 67108864 (64 MiB)]
     #[arg(long)]
@@ -325,6 +333,11 @@ struct GatewayArgs {
     /// `maxclients`. [default: 10000]
     #[arg(long)]
     maxclients: Option<NonZeroUsize>,
+    /// Largest bulk string a connection may send, which is the largest value
+    /// the gateway reads from a client. Raise it alongside the cluster's
+    /// `--max-value-bytes` when that is raised. [default: 16777216 (16 MiB)]
+    #[arg(long)]
+    max_bulk_bytes: Option<usize>,
     /// Tokio worker threads. Defaults to one per CPU available to the process
     /// (affinity and cgroup limits included).
     #[arg(long)]
@@ -567,7 +580,10 @@ async fn run_redis_gateway(settings: config::gateway::GatewaySettings) -> Result
         operation_timeout: settings.operation_timeout,
         password: settings.password,
         max_connections: settings.max_connections.get(),
-        ..Default::default()
+        limits: hashring_redis::resp::Limits {
+            max_bulk_bytes: settings.max_bulk_bytes,
+            ..Default::default()
+        },
     };
     hashring_redis::serve(config, stopped.clone()).await?;
     stopped.changed().await.ok();

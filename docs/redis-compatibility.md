@@ -404,6 +404,12 @@ returns nil, `EXISTS` returns 0, `TTL` returns -2.
   no functions, no `repeat`, no generic `for`, and no `string`, `table`, `math`
   or `cjson` library. See [scripts](#scripts). A script is bounded by the
   command deadline and 100 000 steps, and one runs at a time per gateway.
+- A value larger than the owning node's `--max-value-bytes` is refused with
+  `OOM`, as Redis refuses one past its own limit. That default is 8 MiB and a
+  node may be raised to 128 MiB, so it is the node's to set and not the
+  gateway's; see [configuration](configuration.md#node). Above the gateway's
+  own `--max-bulk-bytes` (16 MiB by default) a value is refused before it is
+  parsed, with an `ERR Protocol error` on that connection.
 - The gateway keeps nothing, so it holds no expiry state, no keys and no
   replication state. Losing it loses no data; losing the *cluster* loses every
   value on every node, as the cluster's own guarantees describe.
@@ -460,7 +466,8 @@ linearizability, but:
   the whole hash to the owner and then to every follower, and a write that loses
   a [conditional-write](#read-modify-write-is-a-conditional-write) race sends
   it again.
-- **A structure is capped at 8 MiB**, the value limit. How many members that
+- **A structure is capped at the value limit**, 8 MiB by default and whatever
+  `--max-value-bytes` allows, up to 128 MiB. How many members that
   holds depends on their size: about 50 000 of 150 bytes each, about 8 000 of
   1 KiB. The rewrite cost bites well before that.
 - **It would not buy the libraries that need structures.** Job queues and locks

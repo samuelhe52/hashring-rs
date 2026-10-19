@@ -1,9 +1,13 @@
 use super::*;
 
-pub(super) fn page_limit(requested: u64) -> usize {
+pub(super) fn page_limit(requested: u64, max_value_bytes: usize) -> usize {
+    // Never smaller than one of this node's own largest values, which is the
+    // smallest page that can carry a record it holds; the ceiling is what the
+    // transport is sized for.
     usize::try_from(requested)
         .unwrap_or(MAX_MIGRATION_PAGE_BYTES)
         .clamp(1, MAX_MIGRATION_PAGE_BYTES)
+        .max(max_value_bytes)
 }
 
 pub(super) fn migration_record_size(record: &MigrationRecord) -> usize {

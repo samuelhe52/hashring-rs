@@ -1473,7 +1473,7 @@ impl DataNode for DataNodeService {
         if start > snapshot_keys.len() {
             return Err(Status::out_of_range("snapshot cursor exceeds record count"));
         }
-        let max_bytes = page_limit(request.max_bytes);
+        let max_bytes = page_limit(request.max_bytes, self.max_value_bytes);
         let mut bytes = 0;
         let mut records = Vec::new();
         let mut next_cursor = start;
@@ -1552,7 +1552,9 @@ impl DataNode for DataNodeService {
                 ),
             };
             let size = dedup_record_size(&record);
-            if !records.is_empty() && bytes + size > page_limit(request.max_bytes) {
+            if !records.is_empty()
+                && bytes + size > page_limit(request.max_bytes, self.max_value_bytes)
+            {
                 next_cursor -= 1;
                 break;
             }
@@ -1576,7 +1578,7 @@ impl DataNode for DataNodeService {
             .sources
             .get(&(request.change_id, request.range_id))
             .ok_or_else(|| Status::not_found("source migration not prepared"))?;
-        let max_bytes = page_limit(request.max_bytes);
+        let max_bytes = page_limit(request.max_bytes, self.max_value_bytes);
         let mut bytes = 0;
         let mut records = Vec::new();
         for entry in source

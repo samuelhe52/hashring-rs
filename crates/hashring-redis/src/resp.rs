@@ -28,8 +28,9 @@ impl Protocol {
 /// allocate without limit before a single command runs.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
-    /// Largest accepted bulk string. The largest value a node accepts is 8
-    /// MiB, and a key is 64 KiB, so nothing a node would store is refused here.
+    /// Largest accepted bulk string, and the largest value `SET`, `APPEND` and
+    /// `SETRANGE` will build. A node's own `--max-value-bytes` is a separate,
+    /// smaller question; `--max-bulk-bytes` is this one.
     pub max_bulk_bytes: usize,
     pub max_arguments: usize,
     /// Longest line without a newline: an inline command, or a `*` or `$`
