@@ -81,6 +81,26 @@ parameter it has no other value for; any other parameter is an error.
 | `TYPE` | Always `string` or `none`. |
 | `RENAME`, `RENAMENX` | The value and its deadline move together. `RENAMENX` on an existing destination errors, as Redis does. |
 
+### Keyspace
+
+| Command | Notes |
+| --- | --- |
+| `KEYS` | Redis' glob, matched over bytes; only `^` negates a class, and range ends compare as signed bytes, as in Redis on x86-64. Errors rather than answer with more than 64 MiB of keys, each key counted with 64 bytes of overhead, or spend more than 100 million pattern steps matching. |
+| `DBSIZE` | Live keys only: each owner counts its own ranges, without its follower copies or keys past their deadline. |
+| `RANDOMKEY` | The first key at or after a random point on the ring, or nil when there are none. Not uniform: a key after a wide gap is likelier, as Redis' choice is not uniform either. |
+
+These walk every owner, all at once, page by page; each node pages only
+through the ranges it owns at the topology epoch the walk started from. If
+ranges change hands mid-walk, a node at the newer epoch refuses the page and the
+walk starts over. So an answer counts every key that was live for the whole
+command exactly once; a key written or deleted while it ran may or may not be
+in it. Under constant topology churn a walk can run out of its deadline and
+answer `TRYAGAIN`.
+
+Unlike Redis, `DBSIZE` is not a stored counter: it costs a walk over every key,
+on every node. `KEYS` costs the same plus the matching keys' bytes, buffered at
+the gateway before the reply is sent, hence its limit.
+
 ### Strings
 
 | Command | Notes |
@@ -117,9 +137,8 @@ These are answered with a clear error rather than a wrong answer:
 
 | Command | Why |
 | --- | --- |
-| `SCAN`, `KEYS` | The data node holds a token index over its keys but no RPC to enumerate a range of it. `DBSIZE` is declined for the same reason: a count would have to be summed across every owner, and two callers would never agree on the answer. |
-| `FLUSHALL`, `FLUSHDB` | The same enumeration, plus the question of what flushing a sharded cache should even mean. |
-| `RANDOMKEY` | Needs the keyspace. |
+| `SCAN` | Not built yet. Its cursor would have to resume on any gateway and across ranges that move between calls. See [not attempted](#not-attempted). |
+| `FLUSHALL`, `FLUSHDB` | A write to every key on every owner, which no node can apply atomically across owners: a flush that failed part-way would leave some ranges emptied and others not. |
 | `MSETNX` with more than one key | Cannot set its keys atomically; see [cross-key atomicity](#cross-key-atomicity-is-not-available-at-all). |
 
 Anything not in this document is answered with Redis' own unknown-command error.
@@ -208,9 +227,9 @@ combined, nor two expiry options, nor `KEEPTTL` with one.
 
 ### `INFO` reports an empty keyspace section
 
-`# Keyspace` has no `db0:keys=` line, because counting would mean asking every
-owner. A tool that reads key counts from `INFO` will see nothing rather than a
-wrong number.
+`# Keyspace` has no `db0:keys=` line, because counting means walking every key
+on every owner, which `INFO` should not cost. `DBSIZE` does that walk. A tool
+that reads key counts from `INFO` will see nothing rather than a wrong number.
 
 ## How expiry works
 
@@ -242,9 +261,8 @@ Two consequences worth knowing:
   deadline a minute early. Cluster nodes should be on NTP.
 - **Expiry is not a deletion.** Nothing is deleted at the deadline, so an
   expired key is invisible but still occupies memory until the sweep. This is
-  what avoids a delete having to travel through replication, which in turn means
-  `DBSIZE`-style counts cannot include expired keys, and is the reason the
-  keyspace commands are declined rather than approximated.
+  what avoids a delete having to travel through replication, and why `KEYS`
+  and `DBSIZE` check each key's deadline rather than count what is stored.
 
 ## Errors
 
@@ -285,7 +303,8 @@ returns nil, `EXISTS` returns 0, `TTL` returns -2.
 
 - One process, one extra hop. See [what it is not](#what-it-is-not).
 - No atomicity across keys, ever.
-- No keyspace enumeration, so no `SCAN`, `KEYS`, `DBSIZE` or `FLUSHALL`.
+- No `SCAN` or `FLUSHALL`. `KEYS` and `DBSIZE` walk every key on every owner,
+  so they cost as much as the keyspace is large.
 - No data structures, transactions, scripting or Pub/Sub.
 - The gateway keeps nothing, so it holds no expiry state, no keys and no
   replication state. Losing it loses no data; losing the *cluster* loses every
@@ -304,7 +323,7 @@ how much each would cost:
 
 | | What it would take |
 | --- | --- |
-| Keyspace enumeration | A range-enumeration RPC on the data node over the token index it already keeps, plus client-side fan-out and a cursor. The cheapest item here. |
+| `SCAN` | A cursor holding a ring position and the last key returned, so that any gateway can continue a scan, and a range that moved between calls is read again from its new owner. The node already pages through its ranges for `KEYS`. The cheapest item here. |
 | Hashes, sets and sorted sets | Encoding each as one record under one key. A single structure would then inherit the cluster's per-key linearizability, which is the right guarantee for one. The costs are a whole-structure rewrite per mutation and the 8 MiB value limit, which bites in the tens of thousands of members. |
 | Lists and streams | Not a good fit. `LPOP` and consumer groups want O(1) element access and blocking reads across the cluster; a whole-structure rewrite does not give either. |
 | `MULTI`, `EXEC`, `WATCH` | Would need server-side execution, and cross-key atomicity is unavailable underneath, so `EXEC` could not honestly promise atomicity across keys. |

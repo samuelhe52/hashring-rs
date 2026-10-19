@@ -331,11 +331,11 @@ fn command_command(mut args: Args<'_>) -> RedisResult<Reply> {
 fn config(mut args: Args<'_>) -> RedisResult<Reply> {
     match args.next_keyword().as_deref() {
         Some("get") => {
-            let pattern = keyword(args.next()?);
+            let pattern = super::glob::Pattern::new(keyword(args.next()?).as_bytes());
             Ok(Reply::Map(
                 config_entries()
                     .into_iter()
-                    .filter(|(name, _)| matches_pattern(&pattern, name))
+                    .filter(|(name, _)| pattern.matches(name.as_bytes()))
                     .map(|(name, value)| (name.as_bytes().to_vec(), Reply::bulk(value)))
                     .collect(),
             ))
@@ -384,56 +384,10 @@ fn config_entries() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-/// `CONFIG GET` takes a glob, and only the characters Redis supports matter
-/// here: `*`, `?`, character classes and a backslash escape.
+/// `CONFIG GET` takes the same glob as `KEYS`.
+#[cfg(test)]
 fn matches_pattern(pattern: &str, name: &str) -> bool {
-    let pattern: Vec<char> = pattern.chars().collect();
-    let name: Vec<char> = name.chars().collect();
-    glob(&pattern, &name)
-}
-
-fn glob(pattern: &[char], name: &[char]) -> bool {
-    if pattern.is_empty() {
-        return name.is_empty();
-    }
-    match pattern[0] {
-        '*' => (0..=name.len()).any(|skip| glob(&pattern[1..], &name[skip..])),
-        '?' => !name.is_empty() && glob(&pattern[1..], &name[1..]),
-        '[' => {
-            let Some(close) = pattern.iter().position(|c| *c == ']') else {
-                return false;
-            };
-            if name.is_empty() {
-                return false;
-            }
-            let mut set = &pattern[1..close];
-            // Redis treats `!` and `^` alike at the front of a class.
-            let negated = matches!(set.first(), Some('!' | '^'));
-            if negated {
-                set = &set[1..];
-            }
-            let mut matched = false;
-            let mut index = 0;
-            while index < set.len() {
-                if index + 2 < set.len() && set[index + 1] == '-' {
-                    if name[0] >= set[index] && name[0] <= set[index + 2] {
-                        matched = true;
-                    }
-                    index += 3;
-                } else {
-                    if set[index] == name[0] {
-                        matched = true;
-                    }
-                    index += 1;
-                }
-            }
-            matched != negated && glob(&pattern[close + 1..], &name[1..])
-        }
-        '\\' if pattern.len() > 1 => {
-            !name.is_empty() && pattern[1] == name[0] && glob(&pattern[2..], &name[1..])
-        }
-        literal => !name.is_empty() && literal == name[0] && glob(&pattern[1..], &name[1..]),
-    }
+    super::glob::Pattern::new(pattern.as_bytes()).matches(name.as_bytes())
 }
 
 fn client_info(connection: &Connection) -> String {
@@ -561,6 +515,6 @@ mod tests {
         assert!(matches_pattern("save", "save"));
         assert!(!matches_pattern("sav", "save"));
         assert!(matches_pattern("[ms]*", "save"));
-        assert!(!matches_pattern("[!s]*", "save"));
+        assert!(!matches_pattern("[^s]*", "save"));
     }
 }

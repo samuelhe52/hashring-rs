@@ -826,6 +826,162 @@ async fn expiry_is_the_clusters_own_and_survives_a_membership_change() {
     );
 }
 
+async fn dbsize(connection: &mut redis::aio::MultiplexedConnection) -> redis::RedisResult<i64> {
+    redis::cmd("DBSIZE").query_async(connection).await
+}
+
+async fn keys_matching(
+    connection: &mut redis::aio::MultiplexedConnection,
+    pattern: &str,
+) -> redis::RedisResult<Vec<String>> {
+    let mut keys: Vec<String> = redis::cmd("KEYS")
+        .arg(pattern)
+        .query_async(connection)
+        .await?;
+    keys.sort();
+    Ok(keys)
+}
+
+#[tokio::test]
+async fn keyspace_commands_count_each_key_once_even_while_ranges_move() {
+    let _guard = test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let cluster = Cluster::start(&directory.path().join("coordinator.redb"), None);
+    let mut connection = cluster.client().await;
+
+    assert_eq!(dbsize(&mut connection).await.unwrap(), 0);
+    assert!(
+        keys_matching(&mut connection, "*")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let none: Option<String> = redis::cmd("RANDOMKEY")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(none, None);
+
+    // Every node also holds follower copies of the others' keys, so a count
+    // that did not keep to each owner's own ranges would come out tripled.
+    let mut expected: Vec<String> = (0..300).map(|index| format!("walk:{index}")).collect();
+    let pairs: Vec<(String, String)> = expected
+        .iter()
+        .map(|key| (key.clone(), "value".to_owned()))
+        .collect();
+    let _: () = redis::cmd("MSET")
+        .arg(&pairs)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("other")
+        .arg("value")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    // Neither an expired key nor a deleted one is a key.
+    let _: () = redis::cmd("SET")
+        .arg("gone")
+        .arg("value")
+        .arg("PX")
+        .arg(1)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("deleted")
+        .arg("value")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    let _: i64 = redis::cmd("DEL")
+        .arg("deleted")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    expected.push("other".to_owned());
+    expected.sort();
+
+    assert_eq!(dbsize(&mut connection).await.unwrap(), 301);
+    assert_eq!(keys_matching(&mut connection, "*").await.unwrap(), expected);
+    let tens: Vec<String> = (10..20).map(|index| format!("walk:{index}")).collect();
+    assert_eq!(
+        keys_matching(&mut connection, "walk:1?").await.unwrap(),
+        tens
+    );
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..20 {
+        let key: String = redis::cmd("RANDOMKEY")
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert!(expected.binary_search(&key).is_ok(), "{key} is not a key");
+        seen.insert(key);
+    }
+    assert!(seen.len() > 1, "RANDOMKEY kept answering {seen:?}");
+
+    // A fourth node joins and ranges move to it. A walk that straddles a move
+    // starts over, so whenever one answers, it has still seen every key once.
+    let client = cluster.cluster_client().await;
+    let port = unused_ports(1)[0];
+    let mut members: Vec<Member> = client.topology().await.members;
+    members.push(Member {
+        node_id: "node-4".to_owned(),
+        endpoint: format!("http://127.0.0.1:{port}"),
+    });
+    let change = client.begin_topology_change(members).await.unwrap();
+    let _node = spawn(&[
+        "node".to_owned(),
+        "--id".to_owned(),
+        "node-4".to_owned(),
+        "--listen".to_owned(),
+        format!("127.0.0.1:{port}"),
+        "--coordinator".to_owned(),
+        cluster.coordinator.clone(),
+    ]);
+    wait_for_listener(port);
+    let executor = client.clone();
+    let execution = tokio::spawn(async move {
+        executor
+            .execute_topology_change(
+                change.change_id.clone(),
+                change.base_epoch,
+                change.target_topology.epoch,
+            )
+            .await
+    });
+    let mut answered = 0;
+    while !execution.is_finished() {
+        // Only "try again" may stand in for an answer: a walk that ran out
+        // of time restarting is not a wrong count.
+        match dbsize(&mut connection).await {
+            Ok(count) => {
+                assert_eq!(count, 301, "DBSIZE during the move");
+                answered += 1;
+            }
+            Err(error) => assert_eq!(error.code(), Some("TRYAGAIN"), "{error}"),
+        }
+        match keys_matching(&mut connection, "*").await {
+            Ok(keys) => {
+                assert_eq!(keys, expected, "KEYS during the move");
+                answered += 1;
+            }
+            Err(error) => assert_eq!(error.code(), Some("TRYAGAIN"), "{error}"),
+        }
+    }
+    let completed = tokio::time::timeout(Duration::from_secs(90), execution)
+        .await
+        .expect("the membership change did not finish in time")
+        .unwrap()
+        .expect("the membership change was not published");
+    assert!(completed.target_topology.epoch > 1);
+    assert!(answered > 0, "no walk answered while the change ran");
+    assert_eq!(dbsize(&mut connection).await.unwrap(), 301);
+    assert_eq!(keys_matching(&mut connection, "*").await.unwrap(), expected);
+}
+
 #[tokio::test]
 async fn a_connection_may_be_required_to_authenticate() {
     let _guard = test_lock().lock().await;
@@ -945,8 +1101,6 @@ async fn a_declined_command_says_so_instead_of_failing_obscurely() {
 
     for (command, expected) in [
         ("SCAN", "SCAN is not supported"),
-        ("KEYS", "KEYS is not supported"),
-        ("DBSIZE", "DBSIZE is not supported"),
         ("FLUSHALL", "FLUSHALL is not supported"),
     ] {
         let error = redis::cmd(command)

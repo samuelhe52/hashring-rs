@@ -6,15 +6,17 @@
 //! handshake. A handler then reads its arguments through [`args::Args`].
 //!
 //! Commands that answer from the gateway live in [`connection`]; the ones that
-//! reach the cluster live in [`strings`] and [`keys`] and go through
-//! [`store::Store`], which routes each key to its owner through
+//! reach the cluster live in [`strings`], [`keys`] and [`keyspace`] and go
+//! through [`store::Store`], which routes each key to its owner through
 //! [`hashring_client`] and makes every read-modify-write conditional on the
 //! version it read. See docs/redis-compatibility.md for the semantics this
 //! reproduces and the ones it deliberately does not.
 
 mod args;
 mod connection;
+mod glob;
 mod keys;
+mod keyspace;
 mod store;
 mod strings;
 
@@ -124,16 +126,16 @@ impl Dispatcher {
             return Response::error(RedisError::unsupported(&command.name.to_ascii_uppercase()));
         }
         let args = args::Args::new(command.name, rest);
-        if !command.has_keys() {
+        if !command.reaches_cluster() {
             return self.local(command, connection, args);
         }
-        match tokio::time::timeout(self.command_timeout, self.keyed(command, args)).await {
+        match tokio::time::timeout(self.command_timeout, self.cluster(command, args)).await {
             Ok(reply) => Response::reply(reply),
             Err(_) => Response::error(RedisError::deadline(command.writes())),
         }
     }
 
-    async fn keyed(&self, command: &CommandInfo, args: args::Args<'_>) -> RedisResult<Reply> {
+    async fn cluster(&self, command: &CommandInfo, args: args::Args<'_>) -> RedisResult<Reply> {
         let store = store::Store::new(&self.client, &self.locks);
         let max_value = self.limits.max_bulk_bytes;
         use args::{DeadlineMode::*, TimeUnit::*, TtlForm};
@@ -169,6 +171,9 @@ impl Dispatcher {
             "persist" => keys::persist(&store, args).await,
             "ttl" => keys::ttl(&store, args, Seconds).await,
             "pttl" => keys::ttl(&store, args, Milliseconds).await,
+            "keys" => keyspace::keys(&store, args).await,
+            "dbsize" => keyspace::dbsize(&store).await,
+            "randomkey" => keyspace::randomkey(&store).await,
             other => Err(RedisError::unsupported(&other.to_ascii_uppercase())),
         }
     }

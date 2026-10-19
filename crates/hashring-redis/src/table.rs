@@ -20,6 +20,8 @@ pub struct CommandInfo {
     pub step: i64,
     /// Known but refused; see docs/redis-compatibility.md.
     pub declined: bool,
+    /// Reaches the cluster without naming a key: it walks the keyspace.
+    pub keyspace: bool,
 }
 
 const READ: &[&str] = &["readonly", "fast"];
@@ -36,12 +38,20 @@ const fn command(name: &'static str, arity: i64, flags: &'static [&'static str])
         last_key: 0,
         step: 0,
         declined: false,
+        keyspace: false,
     }
 }
 
 const fn declined(name: &'static str, arity: i64, flags: &'static [&'static str]) -> CommandInfo {
     CommandInfo {
         declined: true,
+        ..command(name, arity, flags)
+    }
+}
+
+const fn keyspace(name: &'static str, arity: i64, flags: &'static [&'static str]) -> CommandInfo {
+    CommandInfo {
+        keyspace: true,
         ..command(name, arity, flags)
     }
 }
@@ -62,6 +72,7 @@ const fn keyed(
         last_key,
         step,
         declined: false,
+        keyspace: false,
     }
 }
 
@@ -117,15 +128,16 @@ pub const COMMANDS: &[CommandInfo] = &[
     keyed("persist", 2, WRITE, 1, 1, 1),
     keyed("ttl", 2, READ, 1, 1, 1),
     keyed("pttl", 2, READ, 1, 1, 1),
+    // The keyspace. These walk every owner rather than naming keys.
+    keyspace("keys", 2, &["readonly"]),
+    keyspace("dbsize", 1, &["readonly", "fast"]),
+    keyspace("randomkey", 1, &["readonly"]),
     // Declined. Listed so that a client asking what the server knows is told
     // the command exists and was refused, rather than that the server does not
     // exist. See docs/redis-compatibility.md for why each one is absent.
-    declined("scan", -2, &["readonly", "random"]),
-    declined("keys", 2, &["readonly", "random"]),
-    declined("dbsize", 1, &["readonly", "fast"]),
+    declined("scan", -2, &["readonly"]),
     declined("flushdb", -1, WRITE),
     declined("flushall", -1, WRITE),
-    declined("randomkey", 1, &["readonly", "random"]),
 ];
 
 pub fn lookup(name: &str) -> Option<&'static CommandInfo> {
@@ -155,9 +167,14 @@ impl CommandInfo {
         self.flags.contains(&"write")
     }
 
-    /// Reaches the cluster, rather than answering from the gateway.
+    /// Names keys, at the positions `first_key`, `last_key` and `step` give.
     pub fn has_keys(&self) -> bool {
         self.first_key != 0
+    }
+
+    /// Reaches the cluster, rather than answering from the gateway.
+    pub fn reaches_cluster(&self) -> bool {
+        self.has_keys() || self.keyspace
     }
 
     pub fn to_reply(&self) -> Reply {
@@ -204,6 +221,15 @@ mod tests {
         assert_eq!((rename.first_key, rename.last_key), (1, 2));
         assert_eq!(lookup("get").unwrap().first_key, 1);
         assert_eq!(lookup("ping").unwrap().first_key, 0);
+    }
+
+    #[test]
+    fn keyspace_commands_reach_the_cluster_without_naming_keys() {
+        for name in ["keys", "dbsize", "randomkey"] {
+            let command = lookup(name).unwrap();
+            assert!(!command.has_keys() && command.reaches_cluster(), "{name}");
+        }
+        assert!(!lookup("ping").unwrap().reaches_cluster());
     }
 
     #[test]
