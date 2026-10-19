@@ -58,6 +58,13 @@ to relocate. Two caveats found while reading the call sites:
 - `prepare_replication_entries` also registers `ack_progress` entries, under the
   same `NodeState` write lock, so it inherits that same order.
 
+Directions 1 and 2 were later implemented, measured and rejected in
+[ack-state-lock.md](ack-state-lock.md). The ACK split regressed `FirstSuccessor`.
+The epoch atomic made ACK writebacks wait longer. That work also timed a second
+write lock per ACK-waiting write. Turning it into a read
+([lazy-ack-completion.md](lazy-ack-completion.md)) shortened lock queues but
+did not change throughput.
+
 Direction 2 (cache the topology epoch in an `Arc<AtomicU64>` so the delivery loop
 stops taking a read lock per retry) is consistent with this order and strictly
 removes work; it is worth doing first because it cannot deadlock.

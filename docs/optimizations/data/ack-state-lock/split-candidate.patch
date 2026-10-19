@@ -1,0 +1,951 @@
+diff --git a/crates/hashring-core/proto/hashring.proto b/crates/hashring-core/proto/hashring.proto
+index b56f3e8..13950b6 100644
+--- a/crates/hashring-core/proto/hashring.proto
++++ b/crates/hashring-core/proto/hashring.proto
+@@ -313,6 +313,7 @@ message NodeInfoResponse {
+   StateWriteTiming follower_write_timing = 12;
+   StateWriteTiming ack_write_timing = 13;
+   ReceiptCleanupTiming receipt_cleanup_timing = 14;
++  StateWriteTiming ack_completion_write_timing = 15;
+ }
+ 
+ // Cumulative per-process timings. Wait totals can overlap across tasks.
+diff --git a/crates/hashring-experiment/src/lib.rs b/crates/hashring-experiment/src/lib.rs
+index 420f138..286277c 100644
+--- a/crates/hashring-experiment/src/lib.rs
++++ b/crates/hashring-experiment/src/lib.rs
+@@ -902,6 +902,7 @@ async fn record_node_pressure(
+                 "owner_write_timing": state_write_timing_json(info.owner_write_timing),
+                 "follower_write_timing": state_write_timing_json(info.follower_write_timing),
+                 "ack_write_timing": state_write_timing_json(info.ack_write_timing),
++                "ack_completion_write_timing": state_write_timing_json(info.ack_completion_write_timing),
+                 "receipt_cleanup_timing": info.receipt_cleanup_timing.map(|t| json!({
+                     "purge_calls": t.purge_calls, "purge_nanos": t.purge_nanos,
+                     "max_purge_nanos": t.max_purge_nanos, "expired_receipts": t.expired_receipts,
+diff --git a/crates/hashring-node/src/diagnostics.rs b/crates/hashring-node/src/diagnostics.rs
+index b498781..55d6bd9 100644
+--- a/crates/hashring-node/src/diagnostics.rs
++++ b/crates/hashring-node/src/diagnostics.rs
+@@ -34,49 +34,63 @@ pub(super) fn nanos(duration: std::time::Duration) -> u64 {
+     duration.as_nanos().min(u64::MAX as u128) as u64
+ }
+ 
+-pub(super) struct TimedWriteGuard<'a> {
+-    guard: tokio::sync::RwLockWriteGuard<'a, NodeState>,
++pub(super) struct TimedGuard<'a, G> {
++    guard: G,
+     timing: &'a StateWriteTiming,
+     acquired: Option<Instant>,
+ }
+ 
++impl<'a, G> TimedGuard<'a, G> {
++    fn record_wait(guard: G, timing: &'a StateWriteTiming, started: Option<Instant>) -> Self {
++        let acquired = started.map(|started| {
++            let acquired = Instant::now();
++            let wait = nanos(acquired.duration_since(started));
++            timing.acquisitions.fetch_add(1, AtomicOrdering::Relaxed);
++            timing.wait_nanos.fetch_add(wait, AtomicOrdering::Relaxed);
++            timing
++                .max_wait_nanos
++                .fetch_max(wait, AtomicOrdering::Relaxed);
++            acquired
++        });
++        Self {
++            guard,
++            timing,
++            acquired,
++        }
++    }
++}
++
+ pub(super) async fn write<'a>(
+     state: &'a RwLock<NodeState>,
+     timing: &'a StateWriteTiming,
+-) -> TimedWriteGuard<'a> {
++) -> TimedGuard<'a, tokio::sync::RwLockWriteGuard<'a, NodeState>> {
+     let started = enabled().then(Instant::now);
+-    let guard = state.write().await;
+-    let acquired = started.map(|started| {
+-        let acquired = Instant::now();
+-        let wait = nanos(acquired.duration_since(started));
+-        timing.acquisitions.fetch_add(1, AtomicOrdering::Relaxed);
+-        timing.wait_nanos.fetch_add(wait, AtomicOrdering::Relaxed);
+-        timing
+-            .max_wait_nanos
+-            .fetch_max(wait, AtomicOrdering::Relaxed);
+-        acquired
+-    });
+-    TimedWriteGuard {
+-        guard,
+-        timing,
+-        acquired,
+-    }
++    TimedGuard::record_wait(state.write().await, timing, started)
++}
++
++/// Times an `AckState` acquisition the way `write` times the state lock.
++pub(super) fn lock_acks<'a>(
++    acks: &'a StdMutex<AckState>,
++    timing: &'a StateWriteTiming,
++) -> TimedGuard<'a, std::sync::MutexGuard<'a, AckState>> {
++    let started = enabled().then(Instant::now);
++    TimedGuard::record_wait(super::lock_acks(acks), timing, started)
+ }
+ 
+-impl Deref for TimedWriteGuard<'_> {
+-    type Target = NodeState;
+-    fn deref(&self) -> &NodeState {
++impl<G: Deref> Deref for TimedGuard<'_, G> {
++    type Target = G::Target;
++    fn deref(&self) -> &G::Target {
+         &self.guard
+     }
+ }
+ 
+-impl DerefMut for TimedWriteGuard<'_> {
+-    fn deref_mut(&mut self) -> &mut NodeState {
++impl<G: DerefMut> DerefMut for TimedGuard<'_, G> {
++    fn deref_mut(&mut self) -> &mut G::Target {
+         &mut self.guard
+     }
+ }
+ 
+-impl Drop for TimedWriteGuard<'_> {
++impl<G> Drop for TimedGuard<'_, G> {
+     fn drop(&mut self) {
+         let Some(acquired) = self.acquired else {
+             return;
+diff --git a/crates/hashring-node/src/lib.rs b/crates/hashring-node/src/lib.rs
+index 55e546f..bed69a8 100644
+--- a/crates/hashring-node/src/lib.rs
++++ b/crates/hashring-node/src/lib.rs
+@@ -394,7 +394,8 @@ type ReplicationStreamKey = (u64, String, String);
+ 
+ #[derive(Clone)]
+ struct ReplicationDispatcher {
+-    state: Arc<RwLock<NodeState>>,
++    topology_epoch: Arc<AtomicU64>,
++    acks: Arc<StdMutex<AckState>>,
+     streams: Arc<StdMutex<HashMap<ReplicationStreamKey, mpsc::Sender<PendingReplication>>>>,
+     failed_streams: Arc<StdMutex<HashSet<ReplicationStreamKey>>>,
+     retained_budget: Arc<Semaphore>,
+@@ -411,6 +412,7 @@ struct NodePressureStats {
+     owner_write_timing: diagnostics::StateWriteTiming,
+     follower_write_timing: diagnostics::StateWriteTiming,
+     ack_write_timing: diagnostics::StateWriteTiming,
++    ack_completion_write_timing: diagnostics::StateWriteTiming,
+     owner_dedup_rejections: AtomicU64,
+     follower_dedup_rejections: AtomicU64,
+     replication_reservation_rejections: AtomicU64,
+@@ -420,6 +422,10 @@ struct NodePressureStats {
+ 
+ struct NodeState {
+     topology: TopologySnapshot,
++    /// `topology.epoch`, readable without this lock. The replication delivery
++    /// loop checks it before every RPC attempt, and taking the state lock for
++    /// one integer queued it behind every writer.
++    topology_epoch: Arc<AtomicU64>,
+     records: HashMap<Arc<[u8]>, Record>,
+     /// The same `Arc` keys as `records`, ordered by
+     /// `TopologySnapshot::key_token`. A key's token depends only on its bytes
+@@ -437,9 +443,7 @@ struct NodeState {
+     record_expirations: BTreeSet<(u64, Arc<[u8]>)>,
+     next_sequence: u64,
+     owner_stream_sequences: HashMap<(u64, String), u64>,
+-    owner_stream_unacked: HashMap<(u64, String), VecDeque<(u64, u64)>>,
+-    ack_progress: HashMap<(u64, String), watch::Sender<u64>>,
+-    ack_process_instances: HashMap<(u64, String), String>,
++    acks: Arc<StdMutex<AckState>>,
+     admitted_followers: HashMap<String, String>,
+     follower_streams: HashMap<(u64, String), FollowerStreamState>,
+     sources: HashMap<(String, String), SourceMigration>,
+@@ -459,6 +463,27 @@ struct NodeState {
+     cleanup_timing: proto::ReceiptCleanupTiming,
+ }
+ 
++/// Follower ACK bookkeeping for this node's owner streams, kept off
++/// `NodeState` so the replication ACK writeback, which touches nothing else,
++/// does not queue behind record writers. Lock order is `NodeState` then
++/// `AckState`: a path holding both takes the state lock first, and no holder
++/// of this lock awaits or takes the state lock.
++#[derive(Default)]
++struct AckState {
++    /// `(sequence, sent_at_unix_millis)` per stream, oldest first, for every
++    /// entry the follower has not yet ACKed.
++    owner_stream_unacked: HashMap<(u64, String), VecDeque<(u64, u64)>>,
++    ack_progress: HashMap<(u64, String), watch::Sender<u64>>,
++    ack_process_instances: HashMap<(u64, String), String>,
++}
++
++/// A panic under this lock leaves at worst stale ACK progress, which the next
++/// ACK or epoch prune overwrites, so a poisoned lock is still used.
++fn lock_acks(acks: &StdMutex<AckState>) -> std::sync::MutexGuard<'_, AckState> {
++    acks.lock()
++        .unwrap_or_else(std::sync::PoisonError::into_inner)
++}
++
+ /// Every mutation of `records` and `dedup` goes through these, so the token
+ /// indices cannot drift from the maps they mirror. Reaching into either map
+ /// directly is the one way to break that, which is what the tests'
+@@ -476,6 +501,8 @@ impl NodeState {
+     /// range queries answering from stale positions.
+     fn set_topology(&mut self, topology: TopologySnapshot) {
+         let reseeded = topology.hash_seed != self.topology.hash_seed;
++        self.topology_epoch
++            .store(topology.epoch, AtomicOrdering::Relaxed);
+         self.topology = topology;
+         if !reseeded {
+             return;
+diff --git a/crates/hashring-node/src/replication.rs b/crates/hashring-node/src/replication.rs
+index 60c975c..c4a12d5 100644
+--- a/crates/hashring-node/src/replication.rs
++++ b/crates/hashring-node/src/replication.rs
+@@ -147,11 +147,11 @@ pub(super) fn prepare_replication_entries(
+         request_fingerprint,
+     });
+ 
++    let mut acks = lock_acks(&state.acks);
+     Ok(followers
+         .into_iter()
+         .map(|(follower_node_id, follower_endpoint)| {
+-            state
+-                .ack_progress
++            acks.ack_progress
+                 .entry((state.topology.epoch, follower_node_id.clone()))
+                 .or_insert_with(|| watch::channel(0).0);
+             let sequence = state
+@@ -247,12 +247,14 @@ pub(super) fn prune_ack_progress(state: &mut NodeState) {
+     // ACK waiters. Receipt references matter only when retiring older streams.
+     // Checking the small stream tables avoids scanning every live receipt on
+     // each expiry tick during steady-state writes.
+-    if state
+-        .ack_progress
+-        .keys()
+-        .chain(state.ack_process_instances.keys())
+-        .all(|(epoch, _)| *epoch == current_epoch)
+-    {
++    let only_current_epoch = {
++        let acks = lock_acks(&state.acks);
++        acks.ack_progress
++            .keys()
++            .chain(acks.ack_process_instances.keys())
++            .all(|(epoch, _)| *epoch == current_epoch)
++    };
++    if only_current_epoch {
+         if let Some(started) = started {
+             state.cleanup_timing.ack_prune_nanos += diagnostics::nanos(started.elapsed());
+         }
+@@ -271,11 +273,14 @@ pub(super) fn prune_ack_progress(state: &mut NodeState) {
+                 .map(|(epoch, node_id, _)| (*epoch, node_id.clone()))
+         })
+         .collect();
+-    state
+-        .ack_progress
++    // The receipt scan above runs without the ACK lock so ACK writebacks are
++    // not held up behind it. `dedup` cannot change meanwhile, since the caller
++    // holds the state lock, so the live set is the one a single acquisition
++    // would have seen.
++    let mut acks = lock_acks(&state.acks);
++    acks.ack_progress
+         .retain(|key, _| key.0 == current_epoch || live.contains(key));
+-    state
+-        .ack_process_instances
++    acks.ack_process_instances
+         .retain(|key, _| key.0 == current_epoch || live.contains(key));
+     if let Some(started) = started {
+         state.cleanup_timing.ack_prune_nanos += diagnostics::nanos(started.elapsed());
+@@ -283,13 +288,15 @@ pub(super) fn prune_ack_progress(state: &mut NodeState) {
+ }
+ 
+ pub(super) fn start_replication_dispatch(
+-    state: Arc<RwLock<NodeState>>,
++    topology_epoch: Arc<AtomicU64>,
++    acks: Arc<StdMutex<AckState>>,
+     pressure: Arc<NodePressureStats>,
+     settings: &NodeSettings,
+ ) -> ReplicationDispatcher {
+     let max_pending_bytes = settings.max_pending_replication_bytes;
+     ReplicationDispatcher {
+-        state,
++        topology_epoch,
++        acks,
+         streams: Arc::new(StdMutex::new(HashMap::new())),
+         failed_streams: Arc::new(StdMutex::new(HashSet::new())),
+         retained_budget: Arc::new(Semaphore::new(max_pending_bytes)),
+@@ -369,7 +376,8 @@ impl ReplicationDispatcher {
+             let sender = streams.entry(stream_key.clone()).or_insert_with(|| {
+                 let (sender, receiver) = mpsc::channel(self.stream_queue_capacity);
+                 tokio::spawn(deliver_replication_stream(
+-                    self.state.clone(),
++                    self.topology_epoch.clone(),
++                    self.acks.clone(),
+                     self.failed_streams.clone(),
+                     self.active_rpc_budget.clone(),
+                     self.rpc_timeout,
+@@ -474,7 +482,8 @@ pub(super) async fn collect_replication_batch(
+ 
+ #[allow(clippy::too_many_arguments)]
+ pub(super) async fn deliver_replication_stream(
+-    state: Arc<RwLock<NodeState>>,
++    topology_epoch: Arc<AtomicU64>,
++    acks: Arc<StdMutex<AckState>>,
+     failed_streams: Arc<StdMutex<HashSet<ReplicationStreamKey>>>,
+     active_rpc_budget: Arc<Semaphore>,
+     rpc_timeout: std::time::Duration,
+@@ -502,7 +511,7 @@ pub(super) async fn deliver_replication_stream(
+         let last_sequence = batch[batch.len() - 1].prepared.stream_sequence;
+         let mut retry_delay = std::time::Duration::from_millis(25);
+         loop {
+-            if state.read().await.topology.epoch != epoch {
++            if topology_epoch.load(AtomicOrdering::Relaxed) != epoch {
+                 return;
+             }
+             if client.is_none() {
+@@ -555,15 +564,15 @@ pub(super) async fn deliver_replication_stream(
+                         && response.applied_stream_sequence
+                             >= batch[0].prepared.stream_sequence =>
+                 {
+-                    let mut state = diagnostics::write(&state, &pressure.ack_write_timing).await;
++                    let mut acks = diagnostics::lock_acks(&acks, &pressure.ack_write_timing);
+                     let stream = (epoch, follower_node_id.clone());
+-                    let previous_instance = state
++                    let previous_instance = acks
+                         .ack_process_instances
+                         .insert(stream, response.process_instance_id.clone());
+                     let instance_changed =
+                         previous_instance.as_ref() != Some(&response.process_instance_id);
+                     if let Some(progress) =
+-                        state.ack_progress.get(&(epoch, follower_node_id.clone()))
++                        acks.ack_progress.get(&(epoch, follower_node_id.clone()))
+                     {
+                         progress.send_if_modified(|sequence| {
+                             if instance_changed || *sequence < response.applied_stream_sequence {
+@@ -574,7 +583,7 @@ pub(super) async fn deliver_replication_stream(
+                             }
+                         });
+                     }
+-                    if let Some(queue) = state
++                    if let Some(queue) = acks
+                         .owner_stream_unacked
+                         .get_mut(&(epoch, follower_node_id.clone()))
+                     {
+@@ -584,7 +593,7 @@ pub(super) async fn deliver_replication_stream(
+                             queue.pop_front();
+                         }
+                     }
+-                    drop(state);
++                    drop(acks);
+                     if response.applied_stream_sequence >= last_sequence {
+                         break;
+                     }
+diff --git a/crates/hashring-node/src/rpc.rs b/crates/hashring-node/src/rpc.rs
+index 98bc980..3f601d4 100644
+--- a/crates/hashring-node/src/rpc.rs
++++ b/crates/hashring-node/src/rpc.rs
+@@ -693,15 +693,17 @@ impl DataNode for DataNodeService {
+             .collect();
+         state.next_sequence = next_sequence;
+         let now = now_unix_millis();
+-        for entry in &replications {
+-            state
+-                .owner_stream_unacked
+-                .entry((
+-                    entry.mutation.topology_epoch,
+-                    entry.follower_node_id.clone(),
+-                ))
+-                .or_default()
+-                .push_back((entry.stream_sequence, now));
++        {
++            let mut acks = lock_acks(&state.acks);
++            for entry in &replications {
++                acks.owner_stream_unacked
++                    .entry((
++                        entry.mutation.topology_epoch,
++                        entry.follower_node_id.clone(),
++                    ))
++                    .or_default()
++                    .push_back((entry.stream_sequence, now));
++            }
+         }
+         let record_key: Arc<[u8]> = Arc::from(request.key.as_slice());
+         state.insert_record(record_key.clone(), record.clone());
+@@ -1054,15 +1056,17 @@ impl DataNode for DataNodeService {
+         };
+         state.next_sequence = next_sequence;
+         let now = now_unix_millis();
+-        for entry in &replications {
+-            state
+-                .owner_stream_unacked
+-                .entry((
+-                    entry.mutation.topology_epoch,
+-                    entry.follower_node_id.clone(),
+-                ))
+-                .or_default()
+-                .push_back((entry.stream_sequence, now));
++        {
++            let mut acks = lock_acks(&state.acks);
++            for entry in &replications {
++                acks.owner_stream_unacked
++                    .entry((
++                        entry.mutation.topology_epoch,
++                        entry.follower_node_id.clone(),
++                    ))
++                    .or_default()
++                    .push_back((entry.stream_sequence, now));
++            }
+         }
+         // One allocation shared by the record, its index entry and the receipt.
+         let record_key: Arc<[u8]> = Arc::from(request.key.as_slice());
+@@ -1137,6 +1141,8 @@ impl DataNode for DataNodeService {
+                 "replication stream identity is empty",
+             ));
+         }
++        // Read with the stream sequence so the reported ACK never runs ahead of it.
++        let acks = lock_acks(&state.acks);
+         let (stream_sequence, oldest_unacked_unix_millis) = if self.node_id == request.owner_node_id
+         {
+             if self
+@@ -1161,8 +1167,7 @@ impl DataNode for DataNodeService {
+                     .get(&key)
+                     .copied()
+                     .unwrap_or_default(),
+-                state
+-                    .owner_stream_unacked
++                acks.owner_stream_unacked
+                     .get(&key)
+                     .and_then(|queue| queue.front().map(|(_, at)| *at))
+                     .unwrap_or_default(),
+@@ -1183,8 +1188,7 @@ impl DataNode for DataNodeService {
+             stream_sequence,
+             oldest_unacked_unix_millis,
+             last_ack_sequence: if self.node_id == request.owner_node_id {
+-                state
+-                    .ack_progress
++                acks.ack_progress
+                     .get(&(request.topology_epoch, request.follower_node_id.clone()))
+                     .map_or(0, |progress| *progress.borrow())
+             } else {
+@@ -1192,7 +1196,7 @@ impl DataNode for DataNodeService {
+             },
+             last_ack_known: self.node_id == request.owner_node_id
+                 && (stream_sequence == 0
+-                    || state
++                    || acks
+                         .ack_progress
+                         .contains_key(&(request.topology_epoch, request.follower_node_id))),
+         }))
+@@ -1433,6 +1437,8 @@ impl DataNode for DataNodeService {
+                 .then(|| self.pressure.follower_write_timing.snapshot()),
+             ack_write_timing: diagnostics::enabled()
+                 .then(|| self.pressure.ack_write_timing.snapshot()),
++            ack_completion_write_timing: diagnostics::enabled()
++                .then(|| self.pressure.ack_completion_write_timing.snapshot()),
+             receipt_cleanup_timing: diagnostics::enabled().then_some(state.cleanup_timing),
+             owner_dedup_rejections: self
+                 .pressure
+@@ -2001,7 +2007,7 @@ impl DataNode for DataNodeService {
+         state
+             .owner_stream_sequences
+             .retain(|(stream_epoch, _), _| *stream_epoch == epoch);
+-        state
++        lock_acks(&state.acks)
+             .owner_stream_unacked
+             .retain(|(stream_epoch, _), _| *stream_epoch == epoch);
+         state
+diff --git a/crates/hashring-node/src/service.rs b/crates/hashring-node/src/service.rs
+index 6755995..6878778 100644
+--- a/crates/hashring-node/src/service.rs
++++ b/crates/hashring-node/src/service.rs
+@@ -85,9 +85,9 @@ impl DataNodeService {
+                 ));
+             }
+             let now = now_unix_millis();
++            let acks = lock_acks(&state.acks);
+             if followers.clone().any(|node_id| {
+-                state
+-                    .owner_stream_unacked
++                acks.owner_stream_unacked
+                     .get(&(topology.epoch, (*node_id).to_owned()))
+                     .and_then(|queue| queue.front())
+                     .is_some_and(|(_, sent_at)| {
+@@ -145,12 +145,11 @@ impl DataNodeService {
+     ) -> Result<(), OperationError> {
+         if !required.is_empty() {
+             let mut receivers = {
+-                let state = self.state.read().await;
++                let acks = lock_acks(&self.replication_dispatch.acks);
+                 required
+                     .iter()
+                     .map(|(stream_epoch, node_id, sequence)| {
+-                        state
+-                            .ack_progress
++                        acks.ack_progress
+                             .get(&(*stream_epoch, node_id.clone()))
+                             .map(|sender| (sender.subscribe(), *sequence))
+                     })
+@@ -183,24 +182,28 @@ impl DataNodeService {
+             }
+             return Ok(());
+         }
+-        let mut state = self.state.write().await;
++        let mut state =
++            diagnostics::write(&self.state, &self.pressure.ack_completion_write_timing).await;
+         if state.lease.is_none_or(|(lease_epoch, expires_at)| {
+             lease_epoch != epoch || state.topology.epoch != epoch || Instant::now() >= expires_at
+         }) {
+             return Err(outcome_unknown(epoch));
+         }
+-        for (stream_epoch, node_id, sequence) in required {
+-            let stream = (*stream_epoch, node_id.clone());
+-            let admitted = state.admitted_followers.get(node_id);
+-            if admitted.is_none()
+-                || state.ack_process_instances.get(&stream) != admitted
+-                || state
+-                    .ack_progress
+-                    .get(&stream)
+-                    .is_none_or(|progress| *progress.borrow() < *sequence)
+-            {
+-                return Err(outcome_unknown(epoch));
+-            }
++        let acked = {
++            let acks = lock_acks(&state.acks);
++            required.iter().all(|(stream_epoch, node_id, sequence)| {
++                let stream = (*stream_epoch, node_id.clone());
++                let admitted = state.admitted_followers.get(node_id);
++                admitted.is_some()
++                    && acks.ack_process_instances.get(&stream) == admitted
++                    && acks
++                        .ack_progress
++                        .get(&stream)
++                        .is_some_and(|progress| *progress.borrow() >= *sequence)
++            })
++        };
++        if !acked {
++            return Err(outcome_unknown(epoch));
+         }
+         complete_required_acks(&mut state, mutation_id, version);
+         Ok(())
+@@ -244,16 +247,17 @@ impl DataNodeService {
+         let coordinator_channel =
+             Endpoint::from_shared(coordinator_endpoint.clone())?.connect_lazy();
+         let (shutdown, _) = watch::channel(false);
++        let topology_epoch = Arc::new(AtomicU64::new(topology.epoch));
++        let acks = Arc::<StdMutex<AckState>>::default();
+         let state = Arc::new(RwLock::new(NodeState {
++            topology_epoch: topology_epoch.clone(),
+             topology,
+             records: HashMap::new(),
+             records_by_token: TokenIndex::default(),
+             record_expirations: BTreeSet::new(),
+             next_sequence: 0,
+             owner_stream_sequences: HashMap::new(),
+-            owner_stream_unacked: HashMap::new(),
+-            ack_progress: HashMap::new(),
+-            ack_process_instances: HashMap::new(),
++            acks: acks.clone(),
+             admitted_followers: HashMap::new(),
+             follower_streams: HashMap::new(),
+             sources: HashMap::new(),
+@@ -272,7 +276,7 @@ impl DataNodeService {
+         }));
+         let pressure = Arc::new(NodePressureStats::default());
+         let replication_dispatch =
+-            start_replication_dispatch(state.clone(), pressure.clone(), &settings);
++            start_replication_dispatch(topology_epoch, acks, pressure.clone(), &settings);
+         start_expiry_sweep(state.clone());
+         let service = Self {
+             node_id,
+@@ -484,7 +488,7 @@ impl DataNodeService {
+             state
+                 .owner_stream_sequences
+                 .retain(|(stream_epoch, _), _| *stream_epoch == epoch);
+-            state
++            lock_acks(&state.acks)
+                 .owner_stream_unacked
+                 .retain(|(stream_epoch, _), _| *stream_epoch == epoch);
+             state
+diff --git a/crates/hashring-node/src/tests/mod.rs b/crates/hashring-node/src/tests/mod.rs
+index 0bb7a06..35ecc81 100644
+--- a/crates/hashring-node/src/tests/mod.rs
++++ b/crates/hashring-node/src/tests/mod.rs
+@@ -33,16 +33,17 @@ fn service() -> DataNodeService {
+ fn service_for(node_id: &str, topology: TopologySnapshot) -> DataNodeService {
+     let (shutdown, _) = watch::channel(false);
+     let test_epoch = topology.epoch;
++    let topology_epoch = Arc::new(AtomicU64::new(topology.epoch));
++    let acks = Arc::<StdMutex<AckState>>::default();
+     let state = Arc::new(RwLock::new(NodeState {
++        topology_epoch: topology_epoch.clone(),
+         topology,
+         records: HashMap::new(),
+         records_by_token: TokenIndex::default(),
+         record_expirations: BTreeSet::new(),
+         next_sequence: 0,
+         owner_stream_sequences: HashMap::new(),
+-        owner_stream_unacked: HashMap::new(),
+-        ack_progress: HashMap::new(),
+-        ack_process_instances: HashMap::new(),
++        acks: acks.clone(),
+         admitted_followers: HashMap::new(),
+         follower_streams: HashMap::new(),
+         sources: HashMap::new(),
+@@ -63,8 +64,12 @@ fn service_for(node_id: &str, topology: TopologySnapshot) -> DataNodeService {
+         cleanup_timing: proto::ReceiptCleanupTiming::default(),
+     }));
+     let pressure = Arc::new(NodePressureStats::default());
+-    let replication_dispatch =
+-        start_replication_dispatch(state.clone(), pressure.clone(), &NodeSettings::default());
++    let replication_dispatch = start_replication_dispatch(
++        topology_epoch,
++        acks,
++        pressure.clone(),
++        &NodeSettings::default(),
++    );
+     DataNodeService {
+         node_id: node_id.into(),
+         process_instance_id: "instance-1".into(),
+@@ -85,6 +90,10 @@ fn service_for(node_id: &str, topology: TopologySnapshot) -> DataNodeService {
+     }
+ }
+ 
++fn acks(service: &DataNodeService) -> std::sync::MutexGuard<'_, AckState> {
++    lock_acks(&service.replication_dispatch.acks)
++}
++
+ fn replication_topology(desired_replication_factor: u32) -> TopologySnapshot {
+     TopologySnapshot::new_with_config(
+         1,
+diff --git a/crates/hashring-node/src/tests/replication.rs b/crates/hashring-node/src/tests/replication.rs
+index 4fb264b..5b7b3bb 100644
+--- a/crates/hashring-node/src/tests/replication.rs
++++ b/crates/hashring-node/src/tests/replication.rs
+@@ -24,10 +24,7 @@ async fn replication_progress_reports_owner_ack_only_when_known() {
+     assert!(!unknown.last_ack_known);
+ 
+     let (ack, _) = watch::channel(2);
+-    service
+-        .state
+-        .write()
+-        .await
++    acks(&service)
+         .ack_progress
+         .insert((topology.epoch, "node-2".into()), ack);
+     let known = service
+@@ -362,7 +359,7 @@ async fn expired_mutation_ids_eventually_release_old_ack_progress() {
+     let mut state = service.state.write().await;
+     let now = Instant::now();
+     let (sender, _) = watch::channel(0);
+-    state
++    lock_acks(&state.acks)
+         .ack_progress
+         .insert((0, "old-follower".into()), sender);
+     insert_dedup_until(
+@@ -382,10 +379,18 @@ async fn expired_mutation_ids_eventually_release_old_ack_progress() {
+ 
+     purge_expired_dedup(&mut state, now);
+     assert!(state.dedup.is_empty());
+-    assert!(state.ack_progress.contains_key(&(0, "old-follower".into())));
++    assert!(
++        lock_acks(&state.acks)
++            .ack_progress
++            .contains_key(&(0, "old-follower".into()))
++    );
+ 
+     purge_expired_dedup(&mut state, now + std::time::Duration::from_secs(1));
+-    assert!(!state.ack_progress.contains_key(&(0, "old-follower".into())));
++    assert!(
++        !lock_acks(&state.acks)
++            .ack_progress
++            .contains_key(&(0, "old-follower".into()))
++    );
+ }
+ 
+ #[tokio::test]
+@@ -419,11 +424,13 @@ async fn acknowledged_mutation_releases_ack_metadata_but_keeps_retry_result() {
+         entry.retained_bytes += ack_bytes;
+         state.dedup_bytes += ack_bytes;
+         let (sender, _) = watch::channel(1);
+-        state.ack_progress.insert((1, "node-2".into()), sender);
++        lock_acks(&state.acks)
++            .ack_progress
++            .insert((1, "node-2".into()), sender);
+         state
+             .admitted_followers
+             .insert("node-2".into(), "follower-process".into());
+-        state
++        lock_acks(&state.acks)
+             .ack_process_instances
+             .insert((1, "node-2".into()), "follower-process".into());
+     }
+@@ -470,7 +477,7 @@ async fn unacknowledged_mutation_retains_ack_requirements_for_retry() {
+         entry.required_acks = required.clone();
+         entry.retained_bytes += ack_bytes;
+         state.dedup_bytes += ack_bytes;
+-        state
++        lock_acks(&state.acks)
+             .ack_progress
+             .insert((1, "node-2".into()), sender.clone());
+     }
+@@ -490,7 +497,7 @@ async fn unacknowledged_mutation_retains_ack_requirements_for_retry() {
+         state
+             .admitted_followers
+             .insert("node-2".into(), "follower-process".into());
+-        state
++        lock_acks(&state.acks)
+             .ack_process_instances
+             .insert((1, "node-2".into()), "follower-process".into());
+     }
+@@ -511,14 +518,13 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
+     let key = key_with_placement(&topology, |replicas| replicas[0] == "node-1");
+     let mut state = NodeState {
+         record_expirations: BTreeSet::new(),
++        topology_epoch: Arc::new(AtomicU64::new(topology.epoch)),
+         topology,
+         records: HashMap::new(),
+         records_by_token: TokenIndex::default(),
+         next_sequence: 0,
+         owner_stream_sequences: HashMap::new(),
+-        owner_stream_unacked: HashMap::new(),
+-        ack_progress: HashMap::new(),
+-        ack_process_instances: HashMap::new(),
++        acks: Arc::default(),
+         admitted_followers: HashMap::new(),
+         follower_streams: HashMap::new(),
+         sources: HashMap::new(),
+@@ -892,7 +898,11 @@ async fn dispatcher_resumes_after_a_verified_gap_checkpoint() {
+     tokio::time::timeout(std::time::Duration::from_secs(2), async {
+         loop {
+             let state = owner.state.read().await;
+-            if state.owner_stream_unacked.values().all(VecDeque::is_empty) {
++            if lock_acks(&state.acks)
++                .owner_stream_unacked
++                .values()
++                .all(VecDeque::is_empty)
++            {
+                 break;
+             }
+             drop(state);
+@@ -1275,13 +1285,13 @@ async fn first_successor_requires_the_exact_healthy_follower_and_its_ack() {
+         state
+             .admitted_followers
+             .insert(first.clone(), "follower-process".into());
+-        state
++        lock_acks(&state.acks)
+             .ack_process_instances
+             .insert((1, first.clone()), "follower-process".into());
+-        state
++        lock_acks(&state.acks)
+             .ack_progress
+             .insert((1, first.clone()), first_sender.clone());
+-        state
++        lock_acks(&state.acks)
+             .ack_progress
+             .insert((1, second), second_sender.clone());
+     }
+@@ -1317,13 +1327,13 @@ async fn required_ack_rejects_a_restarted_follower_until_its_new_process_is_admi
+     };
+     {
+         let mut state = service.state.write().await;
+-        state
++        lock_acks(&state.acks)
+             .ack_progress
+             .insert((1, "node-2".into()), watch::channel(1).0);
+         state
+             .admitted_followers
+             .insert("node-2".into(), "old-process".into());
+-        state
++        lock_acks(&state.acks)
+             .ack_process_instances
+             .insert((1, "node-2".into()), "new-process".into());
+     }
+@@ -1344,10 +1354,7 @@ async fn required_ack_rejects_a_restarted_follower_until_its_new_process_is_admi
+         .await
+         .unwrap();
+     // A late waiter cannot use a sequence acknowledged by the previous process.
+-    service
+-        .state
+-        .write()
+-        .await
++    acks(&service)
+         .ack_progress
+         .get(&(1, "node-2".into()))
+         .unwrap()
+@@ -1396,7 +1403,7 @@ async fn local_readiness_requires_admission_and_bounds_unacknowledged_lag() {
+         std::slice::from_ref(&follower)
+     );
+     {
+-        let mut state = service.state.write().await;
++        let state = service.state.read().await;
+         let old = now_unix_millis().saturating_sub(
+             state
+                 .topology
+@@ -1404,12 +1411,12 @@ async fn local_readiness_requires_admission_and_bounds_unacknowledged_lag() {
+                 .max_replica_lag_millis
+                 + 1,
+         );
+-        state
++        lock_acks(&state.acks)
+             .owner_stream_unacked
+             .insert((1, follower.clone()), [(1, old)].into());
+     }
+     assert!(service.ready_followers(token).await.is_err());
+-    service.state.write().await.owner_stream_unacked.clear();
++    acks(&service).owner_stream_unacked.clear();
+     assert_eq!(service.ready_followers(token).await.unwrap().1, [follower]);
+ }
+ 
+@@ -1422,15 +1429,15 @@ async fn ack_pruning_preserves_live_old_requirements_and_skips_current_epoch_sca
+     let orphan = (0, "orphan-instance".to_owned());
+     let current = (current_epoch, "current-follower".to_owned());
+     for stream in [&old, &current] {
+-        state
++        lock_acks(&state.acks)
+             .ack_progress
+             .insert(stream.clone(), watch::channel(1).0);
+-        state
++        lock_acks(&state.acks)
+             .ack_process_instances
+             .insert(stream.clone(), "process".into());
+     }
+     // An identity can require retirement even without a corresponding sender.
+-    state
++    lock_acks(&state.acks)
+         .ack_process_instances
+         .insert(orphan.clone(), "process".into());
+     let version = RecordVersion {
+@@ -1449,25 +1456,45 @@ async fn ack_pruning_preserves_live_old_requirements_and_skips_current_epoch_sca
+     );
+     state.dedup.get_mut("live").unwrap().required_acks = vec![(0, old.1.clone(), 1)];
+     prune_ack_progress(&mut state);
+-    assert!(state.ack_progress.contains_key(&old));
+-    assert!(state.ack_process_instances.contains_key(&old));
+-    assert!(!state.ack_process_instances.contains_key(&orphan));
+-    assert!(state.ack_progress.contains_key(&current));
++    assert!(lock_acks(&state.acks).ack_progress.contains_key(&old));
++    assert!(
++        lock_acks(&state.acks)
++            .ack_process_instances
++            .contains_key(&old)
++    );
++    assert!(
++        !lock_acks(&state.acks)
++            .ack_process_instances
++            .contains_key(&orphan)
++    );
++    assert!(lock_acks(&state.acks).ack_progress.contains_key(&current));
+ 
+     state.dedup.get_mut("live").unwrap().required_acks.clear();
+     prune_ack_progress(&mut state);
+-    assert!(!state.ack_progress.contains_key(&old));
+-    assert!(!state.ack_process_instances.contains_key(&old));
++    assert!(!lock_acks(&state.acks).ack_progress.contains_key(&old));
++    assert!(
++        !lock_acks(&state.acks)
++            .ack_process_instances
++            .contains_key(&old)
++    );
+     let scanned = state.cleanup_timing.ack_prune_scanned_receipts;
+     prune_ack_progress(&mut state);
+     assert_eq!(state.cleanup_timing.ack_prune_scanned_receipts, scanned);
+-    assert!(state.ack_progress.contains_key(&current));
+-    assert!(state.ack_process_instances.contains_key(&current));
+-    state
++    assert!(lock_acks(&state.acks).ack_progress.contains_key(&current));
++    assert!(
++        lock_acks(&state.acks)
++            .ack_process_instances
++            .contains_key(&current)
++    );
++    lock_acks(&state.acks)
+         .ack_process_instances
+         .insert(orphan.clone(), "late-instance".into());
+     prune_ack_progress(&mut state);
+-    assert!(!state.ack_process_instances.contains_key(&orphan));
++    assert!(
++        !lock_acks(&state.acks)
++            .ack_process_instances
++            .contains_key(&orphan)
++    );
+ }
+ 
+ // Run alone: RSS is process-wide and requires the Unix `ps` utility.
+@@ -1532,7 +1559,8 @@ async fn unreachable_streams_do_not_copy_unbudgeted_payloads() {
+             .await
+             .unwrap();
+         tasks.push(tokio::spawn(deliver_replication_stream(
+-            service.state.clone(),
++            service.replication_dispatch.topology_epoch.clone(),
++            service.replication_dispatch.acks.clone(),
+             failed.clone(),
+             active.clone(),
+             DEFAULT_REPLICATION_RPC_TIMEOUT,
+@@ -1623,16 +1651,17 @@ async fn delivery_publishes_partial_ack_and_retries_suffix_after_capacity_return
+             .unwrap();
+     }
+     let stream = (topology.epoch, "node-2".to_owned());
+-    state
++    lock_acks(&state.acks)
+         .owner_stream_unacked
+         .insert(stream.clone(), [(1, 0), (2, 0)].into());
+-    let mut progress = state.ack_progress[&stream].subscribe();
++    let mut progress = lock_acks(&state.acks).ack_progress[&stream].subscribe();
+     drop(state);
+     drop(sender);
+     let failed = Arc::new(StdMutex::new(HashSet::new()));
+     let active = Arc::new(Semaphore::new(DEFAULT_MAX_PENDING_REPLICATION_BYTES));
+     let delivery = tokio::spawn(deliver_replication_stream(
+-        owner.state.clone(),
++        owner.replication_dispatch.topology_epoch.clone(),
++        owner.replication_dispatch.acks.clone(),
+         failed.clone(),
+         active.clone(),
+         DEFAULT_REPLICATION_RPC_TIMEOUT,
+@@ -1660,7 +1689,7 @@ async fn delivery_publishes_partial_ack_and_retries_suffix_after_capacity_return
+     .await
+     .unwrap();
+     assert_eq!(
+-        owner.state.read().await.owner_stream_unacked[&stream]
++        acks(&owner).owner_stream_unacked[&stream]
+             .front()
+             .unwrap()
+             .0,
+@@ -1684,7 +1713,7 @@ async fn delivery_publishes_partial_ack_and_retries_suffix_after_capacity_return
+         .unwrap()
+         .unwrap();
+     assert_eq!(*progress.borrow(), 2);
+-    assert!(owner.state.read().await.owner_stream_unacked[&stream].is_empty());
++    assert!(acks(&owner).owner_stream_unacked[&stream].is_empty());
+     assert_eq!(
+         follower_state.read().await.records[key.as_slice()]
+             .value
+diff --git a/docs/experiments.md b/docs/experiments.md
+index 57345fe..242a98e 100644
+--- a/docs/experiments.md
++++ b/docs/experiments.md
+@@ -112,7 +112,8 @@ sample:
+ 
+ - per-node receipt-cleanup timings
+ - state write-lock wait and hold times for owner mutations, follower
+-  application, and replication ACK processing
++  application, replication ACK processing, and the owner's final check that a
++  write's required ACKs arrived
+ 
+ These are cumulative wall-clock counters. Summed wait times can overlap across
+ tasks and nodes. Without profiling, the timing fields are `null`.
+diff --git a/docs/optimizations/state-write-lock-profile.md b/docs/optimizations/state-write-lock-profile.md
+index cd99b97..5a9b9dc 100644
+--- a/docs/optimizations/state-write-lock-profile.md
++++ b/docs/optimizations/state-write-lock-profile.md
+@@ -58,6 +58,12 @@ to relocate. Two caveats found while reading the call sites:
+ - `prepare_replication_entries` also registers `ack_progress` entries, under the
+   same `NodeState` write lock, so it inherits that same order.
+ 
++Directions 1 and 2 were later implemented and measured in
++[ack-state-lock.md](ack-state-lock.md). The ACK path's wait collapsed, but
++throughput did not move. Under `FirstSuccessor` at concurrency 256, owner and
++follower lock waits rose 15-18%. That note also times a second state write lock
++per ACK-waiting write, which this profile never saw.
++
+ Direction 2 (cache the topology epoch in an `Arc<AtomicU64>` so the delivery loop
+ stops taking a read lock per retry) is consistent with this order and strictly
+ removes work; it is worth doing first because it cannot deadlock.

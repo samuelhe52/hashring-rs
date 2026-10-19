@@ -1,0 +1,347 @@
+commit 0c6c9af025894fbde43696382b67924910a5ceaa
+Author: Samuel He <samuelhe52@outlook.com>
+Date:   Tue Oct 20 00:26:09 2026 +0800
+
+    perf: Complete required ACKs under the state read lock
+    
+    An ACK-waiting write took the NodeState write lock a second time only to
+    clear its receipt's required-ACK list and release the retained bytes.
+    Make the final ACK check under the read lock and queue the release; the
+    next write-lock holder applies it in purge_expired_dedup, and the expiry
+    sweep drains it on an idle node. A retry that arrives before the release
+    waits on ACKs that already arrived and returns at once.
+    
+    The completion timing now measures a read acquisition, so rename it to
+    ack_completion_timing.
+
+diff --git a/crates/hashring-core/proto/hashring.proto b/crates/hashring-core/proto/hashring.proto
+index 13950b6..6519721 100644
+--- a/crates/hashring-core/proto/hashring.proto
++++ b/crates/hashring-core/proto/hashring.proto
+@@ -313,7 +313,8 @@ message NodeInfoResponse {
+   StateWriteTiming follower_write_timing = 12;
+   StateWriteTiming ack_write_timing = 13;
+   ReceiptCleanupTiming receipt_cleanup_timing = 14;
+-  StateWriteTiming ack_completion_write_timing = 15;
++  // The owner's final required-ACK check, under the state read lock.
++  StateWriteTiming ack_completion_timing = 15;
+ }
+ 
+ // Cumulative per-process timings. Wait totals can overlap across tasks.
+diff --git a/crates/hashring-experiment/src/lib.rs b/crates/hashring-experiment/src/lib.rs
+index 286277c..da04407 100644
+--- a/crates/hashring-experiment/src/lib.rs
++++ b/crates/hashring-experiment/src/lib.rs
+@@ -902,7 +902,7 @@ async fn record_node_pressure(
+                 "owner_write_timing": state_write_timing_json(info.owner_write_timing),
+                 "follower_write_timing": state_write_timing_json(info.follower_write_timing),
+                 "ack_write_timing": state_write_timing_json(info.ack_write_timing),
+-                "ack_completion_write_timing": state_write_timing_json(info.ack_completion_write_timing),
++                "ack_completion_timing": state_write_timing_json(info.ack_completion_timing),
+                 "receipt_cleanup_timing": info.receipt_cleanup_timing.map(|t| json!({
+                     "purge_calls": t.purge_calls, "purge_nanos": t.purge_nanos,
+                     "max_purge_nanos": t.max_purge_nanos, "expired_receipts": t.expired_receipts,
+diff --git a/crates/hashring-node/src/dedup.rs b/crates/hashring-node/src/dedup.rs
+index 220ce87..52fe940 100644
+--- a/crates/hashring-node/src/dedup.rs
++++ b/crates/hashring-node/src/dedup.rs
+@@ -158,11 +158,30 @@ fn required_ack_entry_bytes(node_id_len: usize) -> usize {
+     2 * std::mem::size_of::<RequiredAck>() + node_id_len + 64
+ }
+ 
+-pub(super) fn complete_required_acks(
+-    state: &mut NodeState,
+-    mutation_id: &str,
+-    version: &RecordVersion,
+-) {
++/// Releases the ACK lists queued by `wait_required_acks`. A retry that reaches
++/// a receipt before this runs still finds its ACK list and waits on ACKs that
++/// already arrived, which returns at once while the follower is unchanged.
++pub(super) fn apply_completed_acks(state: &mut NodeState) {
++    let queue = state
++        .completed_acks
++        .get_mut()
++        .unwrap_or_else(std::sync::PoisonError::into_inner);
++    if queue.is_empty() {
++        return;
++    }
++    let mut completed = std::mem::take(queue);
++    for (mutation_id, version) in completed.drain(..) {
++        complete_required_acks(state, &mutation_id, &version);
++    }
++    // Pushers hold the read lock, so nothing was queued meanwhile; keep the
++    // allocation for the next batch.
++    *state
++        .completed_acks
++        .get_mut()
++        .unwrap_or_else(std::sync::PoisonError::into_inner) = completed;
++}
++
++fn complete_required_acks(state: &mut NodeState, mutation_id: &str, version: &RecordVersion) {
+     let Some(entry) = state.dedup.get_mut(mutation_id) else {
+         return;
+     };
+@@ -271,6 +290,7 @@ pub(super) fn purge_expired_dedup(state: &mut NodeState, now: Instant) {
+     if started.is_some() {
+         state.cleanup_timing.purge_calls += 1;
+     }
++    apply_completed_acks(state);
+     let mut removed = false;
+     while state
+         .dedup_expirations
+diff --git a/crates/hashring-node/src/diagnostics.rs b/crates/hashring-node/src/diagnostics.rs
+index b498781..26e4a31 100644
+--- a/crates/hashring-node/src/diagnostics.rs
++++ b/crates/hashring-node/src/diagnostics.rs
+@@ -34,49 +34,62 @@ pub(super) fn nanos(duration: std::time::Duration) -> u64 {
+     duration.as_nanos().min(u64::MAX as u128) as u64
+ }
+ 
+-pub(super) struct TimedWriteGuard<'a> {
+-    guard: tokio::sync::RwLockWriteGuard<'a, NodeState>,
++pub(super) struct TimedGuard<'a, G> {
++    guard: G,
+     timing: &'a StateWriteTiming,
+     acquired: Option<Instant>,
+ }
+ 
++impl<'a, G> TimedGuard<'a, G> {
++    fn new(guard: G, timing: &'a StateWriteTiming, started: Option<Instant>) -> Self {
++        let acquired = started.map(|started| {
++            let acquired = Instant::now();
++            let wait = nanos(acquired.duration_since(started));
++            timing.acquisitions.fetch_add(1, AtomicOrdering::Relaxed);
++            timing.wait_nanos.fetch_add(wait, AtomicOrdering::Relaxed);
++            timing
++                .max_wait_nanos
++                .fetch_max(wait, AtomicOrdering::Relaxed);
++            acquired
++        });
++        Self {
++            guard,
++            timing,
++            acquired,
++        }
++    }
++}
++
+ pub(super) async fn write<'a>(
+     state: &'a RwLock<NodeState>,
+     timing: &'a StateWriteTiming,
+-) -> TimedWriteGuard<'a> {
++) -> TimedGuard<'a, tokio::sync::RwLockWriteGuard<'a, NodeState>> {
+     let started = enabled().then(Instant::now);
+-    let guard = state.write().await;
+-    let acquired = started.map(|started| {
+-        let acquired = Instant::now();
+-        let wait = nanos(acquired.duration_since(started));
+-        timing.acquisitions.fetch_add(1, AtomicOrdering::Relaxed);
+-        timing.wait_nanos.fetch_add(wait, AtomicOrdering::Relaxed);
+-        timing
+-            .max_wait_nanos
+-            .fetch_max(wait, AtomicOrdering::Relaxed);
+-        acquired
+-    });
+-    TimedWriteGuard {
+-        guard,
+-        timing,
+-        acquired,
+-    }
++    TimedGuard::new(state.write().await, timing, started)
++}
++
++pub(super) async fn read<'a>(
++    state: &'a RwLock<NodeState>,
++    timing: &'a StateWriteTiming,
++) -> TimedGuard<'a, tokio::sync::RwLockReadGuard<'a, NodeState>> {
++    let started = enabled().then(Instant::now);
++    TimedGuard::new(state.read().await, timing, started)
+ }
+ 
+-impl Deref for TimedWriteGuard<'_> {
+-    type Target = NodeState;
+-    fn deref(&self) -> &NodeState {
++impl<G: Deref> Deref for TimedGuard<'_, G> {
++    type Target = G::Target;
++    fn deref(&self) -> &G::Target {
+         &self.guard
+     }
+ }
+ 
+-impl DerefMut for TimedWriteGuard<'_> {
+-    fn deref_mut(&mut self) -> &mut NodeState {
++impl<G: DerefMut> DerefMut for TimedGuard<'_, G> {
++    fn deref_mut(&mut self) -> &mut G::Target {
+         &mut self.guard
+     }
+ }
+ 
+-impl Drop for TimedWriteGuard<'_> {
++impl<G> Drop for TimedGuard<'_, G> {
+     fn drop(&mut self) {
+         let Some(acquired) = self.acquired else {
+             return;
+diff --git a/crates/hashring-node/src/expiry.rs b/crates/hashring-node/src/expiry.rs
+index 9fad73c..393562e 100644
+--- a/crates/hashring-node/src/expiry.rs
++++ b/crates/hashring-node/src/expiry.rs
+@@ -65,6 +65,8 @@ pub(super) fn start_expiry_sweep(state: Arc<RwLock<NodeState>>) {
+         loop {
+             interval.tick().await;
+             let mut guard = state.write().await;
++            // An idle owner has no writes to release completed ACK lists.
++            apply_completed_acks(&mut guard);
+             sweep_expired_records(&mut guard, now_unix_millis(), EXPIRY_SWEEP_LIMIT);
+         }
+     });
+diff --git a/crates/hashring-node/src/lib.rs b/crates/hashring-node/src/lib.rs
+index 5a66c9c..75e282f 100644
+--- a/crates/hashring-node/src/lib.rs
++++ b/crates/hashring-node/src/lib.rs
+@@ -411,7 +411,7 @@ struct NodePressureStats {
+     owner_write_timing: diagnostics::StateWriteTiming,
+     follower_write_timing: diagnostics::StateWriteTiming,
+     ack_write_timing: diagnostics::StateWriteTiming,
+-    ack_completion_write_timing: diagnostics::StateWriteTiming,
++    ack_completion_timing: diagnostics::StateWriteTiming,
+     owner_dedup_rejections: AtomicU64,
+     follower_dedup_rejections: AtomicU64,
+     replication_reservation_rejections: AtomicU64,
+@@ -457,6 +457,13 @@ struct NodeState {
+     dedup_peak_bytes: usize,
+     ack_progress_needs_prune: bool,
+     next_ack_prune_at: Instant,
++    /// `(mutation_id, version)` of receipts whose required ACKs a writer
++    /// confirmed under the read lock. Their `required_acks` and its retained
++    /// bytes are released by the next write-lock holder, in
++    /// `apply_completed_acks`, so completing a write does not take the write
++    /// lock a second time. Pushed under the read lock, drained under the write
++    /// lock.
++    completed_acks: StdMutex<Vec<(Arc<str>, RecordVersion)>>,
+     cleanup_timing: proto::ReceiptCleanupTiming,
+ }
+ 
+diff --git a/crates/hashring-node/src/rpc.rs b/crates/hashring-node/src/rpc.rs
+index c3781e2..0d2ed85 100644
+--- a/crates/hashring-node/src/rpc.rs
++++ b/crates/hashring-node/src/rpc.rs
+@@ -1433,8 +1433,8 @@ impl DataNode for DataNodeService {
+                 .then(|| self.pressure.follower_write_timing.snapshot()),
+             ack_write_timing: diagnostics::enabled()
+                 .then(|| self.pressure.ack_write_timing.snapshot()),
+-            ack_completion_write_timing: diagnostics::enabled()
+-                .then(|| self.pressure.ack_completion_write_timing.snapshot()),
++            ack_completion_timing: diagnostics::enabled()
++                .then(|| self.pressure.ack_completion_timing.snapshot()),
+             receipt_cleanup_timing: diagnostics::enabled().then_some(state.cleanup_timing),
+             owner_dedup_rejections: self
+                 .pressure
+diff --git a/crates/hashring-node/src/service.rs b/crates/hashring-node/src/service.rs
+index 04f3479..8ac6be0 100644
+--- a/crates/hashring-node/src/service.rs
++++ b/crates/hashring-node/src/service.rs
+@@ -183,8 +183,7 @@ impl DataNodeService {
+             }
+             return Ok(());
+         }
+-        let mut state =
+-            diagnostics::write(&self.state, &self.pressure.ack_completion_write_timing).await;
++        let state = diagnostics::read(&self.state, &self.pressure.ack_completion_timing).await;
+         if state.lease.is_none_or(|(lease_epoch, expires_at)| {
+             lease_epoch != epoch || state.topology.epoch != epoch || Instant::now() >= expires_at
+         }) {
+@@ -203,7 +202,15 @@ impl DataNodeService {
+                 return Err(outcome_unknown(epoch));
+             }
+         }
+-        complete_required_acks(&mut state, mutation_id, version);
++        // Releasing the receipt's ACK list needs the write lock. Queue it for
++        // the next writer rather than take that lock a second time per write.
++        if let Some((id, _)) = state.dedup.get_key_value(mutation_id) {
++            state
++                .completed_acks
++                .lock()
++                .unwrap_or_else(std::sync::PoisonError::into_inner)
++                .push((id.clone(), version.clone()));
++        }
+         Ok(())
+     }
+ 
+@@ -269,6 +276,7 @@ impl DataNodeService {
+             dedup_peak_bytes: 0,
+             ack_progress_needs_prune: false,
+             next_ack_prune_at: Instant::now(),
++            completed_acks: StdMutex::default(),
+             cleanup_timing: proto::ReceiptCleanupTiming::default(),
+         }));
+         let pressure = Arc::new(NodePressureStats::default());
+diff --git a/crates/hashring-node/src/tests/mod.rs b/crates/hashring-node/src/tests/mod.rs
+index 0bb7a06..b904c4c 100644
+--- a/crates/hashring-node/src/tests/mod.rs
++++ b/crates/hashring-node/src/tests/mod.rs
+@@ -60,6 +60,7 @@ fn service_for(node_id: &str, topology: TopologySnapshot) -> DataNodeService {
+         dedup_peak_bytes: 0,
+         ack_progress_needs_prune: false,
+         next_ack_prune_at: Instant::now(),
++        completed_acks: StdMutex::default(),
+         cleanup_timing: proto::ReceiptCleanupTiming::default(),
+     }));
+     let pressure = Arc::new(NodePressureStats::default());
+diff --git a/crates/hashring-node/src/tests/replication.rs b/crates/hashring-node/src/tests/replication.rs
+index 4fb264b..863339e 100644
+--- a/crates/hashring-node/src/tests/replication.rs
++++ b/crates/hashring-node/src/tests/replication.rs
+@@ -432,7 +432,15 @@ async fn acknowledged_mutation_releases_ack_metadata_but_keeps_retry_result() {
+         .wait_required_acks(&required, 1, "mutation-1", &version)
+         .await
+         .unwrap();
+-    let state = service.state.read().await;
++    // Completion only queues the release; a retry before it is applied waits on
++    // the ACKs that already arrived.
++    service
++        .wait_required_acks(&required, 1, "mutation-1", &version)
++        .await
++        .unwrap();
++    let mut state = service.state.write().await;
++    assert_eq!(state.dedup["mutation-1"].required_acks, required);
++    purge_expired_dedup(&mut state, Instant::now());
+     let entry = &state.dedup["mutation-1"];
+     assert!(entry.required_acks.is_empty());
+     assert_eq!(state.dedup_bytes, base_bytes);
+@@ -498,11 +506,9 @@ async fn unacknowledged_mutation_retains_ack_requirements_for_retry() {
+         .wait_required_acks(&required, 1, "mutation-1", &version)
+         .await
+         .unwrap();
+-    assert!(
+-        service.state.read().await.dedup["mutation-1"]
+-            .required_acks
+-            .is_empty()
+-    );
++    let mut state = service.state.write().await;
++    purge_expired_dedup(&mut state, Instant::now());
++    assert!(state.dedup["mutation-1"].required_acks.is_empty());
+ }
+ 
+ #[test]
+@@ -533,6 +539,7 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
+         dedup_peak_bytes: 0,
+         ack_progress_needs_prune: false,
+         next_ack_prune_at: Instant::now(),
++        completed_acks: StdMutex::default(),
+         cleanup_timing: proto::ReceiptCleanupTiming::default(),
+     };
+     let version = RecordVersion {
+diff --git a/docs/experiments.md b/docs/experiments.md
+index 242a98e..a0d0ae8 100644
+--- a/docs/experiments.md
++++ b/docs/experiments.md
+@@ -112,7 +112,8 @@ sample:
+ 
+ - per-node receipt-cleanup timings
+ - state write-lock wait and hold times for owner mutations, follower
+-  application, replication ACK processing, and the owner's final check that a
++  application, and replication ACK processing
++- state read-lock wait and hold times for the owner's final check that a
+   write's required ACKs arrived
+ 
+ These are cumulative wall-clock counters. Summed wait times can overlap across
