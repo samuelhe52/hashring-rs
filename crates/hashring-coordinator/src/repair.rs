@@ -26,6 +26,7 @@ impl CoordinatorService {
             node_channels: Arc::new(Mutex::new(BTreeMap::new())),
             startup_at: Instant::now(),
             repair_interrupt: Arc::new(repair_interrupt),
+            repair_wake: Arc::new(Notify::new()),
         }
     }
 
@@ -224,94 +225,144 @@ impl CoordinatorService {
 
     /// Retry durable follower repairs when no topology transition is active.
     /// A failed task remains pending; the next call can safely start it again.
+    ///
+    /// One call drains every group that is due rather than a fixed batch. Each
+    /// group leaves the due set as soon as it is seeded -- its admissions make
+    /// it `Complete`, and a failure backs its `next_attempt` off into the
+    /// future -- so the loop terminates on its own and a cluster with more
+    /// groups than fit in a batch converges in one pass instead of one batch
+    /// per recovery interval.
+    ///
+    /// The pass holds `execution_lock`, so it stops launching groups once
+    /// `migration_timeout` has elapsed or a topology change has been planned,
+    /// and only drains the groups already in flight. Groups it did not launch
+    /// keep their durable `Pending` state for the next pass.
     pub async fn resume_replica_repairs(&self) -> Result<usize, Status> {
         let _execution = self.execution_lock.lock().await;
         let mut interrupt = self.repair_interrupt.subscribe();
-        let tasks = {
-            let mut state = self.state.write().await;
-            if state
-                .active_change
-                .as_ref()
-                .is_some_and(|change| !change.phase.is_terminal())
-            {
-                return Ok(0);
+        let started = Instant::now();
+        let deadline = started + self.migration_timeout;
+        let mut seeded = 0usize;
+        loop {
+            let tasks = self.select_due_repair_groups().await?;
+            if tasks.is_empty() {
+                return Ok(seeded);
             }
-            let mut next = state.clone();
-            reconcile_replica_repairs(&mut next)
-                .map_err(|error| Status::internal(error.to_string()))?;
-            for repair in &mut next.replica_repairs {
-                if repair.phase != ReplicaRepairPhase::Complete {
-                    repair.phase = ReplicaRepairPhase::Pending;
+            let work =
+                try_map_bounded(tasks, self.replica_repair_concurrency, |tasks| async move {
+                    // `try_map_bounded` starts each future as a slot frees up, so
+                    // this is the check before launching the group.
+                    if Instant::now() >= deadline || self.transition_active().await {
+                        return Ok::<_, Status>(None);
+                    }
+                    // Keep other ranges available if one destination is down. Failed
+                    // tasks retain durable Pending state for the next retry.
+                    match self.seed_replica_group(&tasks).await {
+                        Ok(()) => Ok(Some(tasks.len())),
+                        Err(error) => {
+                            self.record_repair_failure(&tasks, &error).await?;
+                            tracing::warn!(
+                                owner = %tasks[0].owner_node_id,
+                                follower = %tasks[0].node_id,
+                                %error,
+                                "replica seed remains pending"
+                            );
+                            Ok(Some(0))
+                        }
+                    }
+                });
+            let results = tokio::select! {
+                results = work => results?,
+                changed = interrupt.changed() => {
+                    if changed.is_ok() {
+                        self.cleanup_interrupted_repairs().await?;
+                        return Ok(seeded);
+                    }
+                    return Err(Status::internal("repair interruption channel closed"));
                 }
-            }
-            if next != *state {
-                self.repository
-                    .store_state(&next)
-                    .map_err(|error| Status::internal(error.to_string()))?;
-                *state = next;
-            }
-            let mut groups: BTreeMap<(String, String), Vec<ReplicaRepair>> = BTreeMap::new();
-            let now_unix_millis = unix_millis_now();
-            for repair in &state.replica_repairs {
-                if state.process_instances.contains_key(&repair.owner_node_id)
-                    && state.process_instances.contains_key(&repair.node_id)
-                {
-                    groups
-                        .entry((repair.owner_node_id.clone(), repair.node_id.clone()))
-                        .or_default()
-                        .push(repair.clone());
-                }
-            }
-            groups.retain(|_, repairs| {
-                repairs
-                    .iter()
-                    .any(|repair| repair.phase == ReplicaRepairPhase::Pending)
-                    && repairs.iter().all(|repair| {
-                        repair.phase == ReplicaRepairPhase::Complete
-                            || repair.next_attempt_unix_millis <= now_unix_millis
-                    })
-            });
-            // Bound one pass as well as in-flight work. Remaining groups stay
-            // durable and are considered on the next periodic pass.
-            let mut due = groups.into_values().collect::<Vec<_>>();
-            due.sort_by_key(|group| {
-                group
-                    .iter()
-                    .map(|repair| repair.retry_count)
-                    .max()
-                    .unwrap_or(0)
-            });
-            due.truncate(MAX_REPAIR_GROUPS_PER_PASS);
-            due
-        };
-        let work = try_map_bounded(tasks, self.replica_repair_concurrency, |tasks| async move {
-            // Keep other ranges available if one destination is down. Failed
-            // tasks retain durable Pending state for the next retry.
-            match self.seed_replica_group(&tasks).await {
-                Ok(()) => Ok::<_, Status>(tasks.len()),
-                Err(error) => {
-                    self.record_repair_failure(&tasks, &error).await?;
+            };
+            let skipped = results.iter().filter(|result| result.is_none()).count();
+            seeded += results.into_iter().flatten().sum::<usize>();
+            if skipped > 0 {
+                if Instant::now() >= deadline {
                     tracing::warn!(
-                        owner = %tasks[0].owner_node_id,
-                        follower = %tasks[0].node_id,
-                        %error,
-                        "replica seed remains pending"
+                        skipped_groups = skipped,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "replica repair pass hit its time budget; remaining groups stay durable"
                     );
-                    Ok(0)
                 }
+                return Ok(seeded);
             }
+        }
+    }
+
+    /// Whether a topology change owns the replica state, in which case a repair
+    /// pass must not start more work.
+    async fn transition_active(&self) -> bool {
+        self.state
+            .read()
+            .await
+            .active_change
+            .as_ref()
+            .is_some_and(|change| !change.phase.is_terminal())
+    }
+
+    /// Groups whose owner and follower are both registered and whose repairs are
+    /// due now, ordered by [`sort_due_repair_groups`]. Empty when a topology
+    /// transition is running, because that transition owns the replica state.
+    async fn select_due_repair_groups(&self) -> Result<Vec<Vec<ReplicaRepair>>, Status> {
+        let mut state = self.state.write().await;
+        if state
+            .active_change
+            .as_ref()
+            .is_some_and(|change| !change.phase.is_terminal())
+        {
+            return Ok(Vec::new());
+        }
+        let mut next = state.clone();
+        reconcile_replica_repairs(&mut next)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        for repair in &mut next.replica_repairs {
+            if repair.phase != ReplicaRepairPhase::Complete {
+                repair.phase = ReplicaRepairPhase::Pending;
+            }
+        }
+        if next != *state {
+            self.repository
+                .store_state(&next)
+                .map_err(|error| Status::internal(error.to_string()))?;
+            *state = next;
+        }
+        let mut groups: BTreeMap<(String, String), Vec<ReplicaRepair>> = BTreeMap::new();
+        let now_unix_millis = unix_millis_now();
+        for repair in &state.replica_repairs {
+            if state.process_instances.contains_key(&repair.owner_node_id)
+                && state.process_instances.contains_key(&repair.node_id)
+            {
+                groups
+                    .entry((repair.owner_node_id.clone(), repair.node_id.clone()))
+                    .or_default()
+                    .push(repair.clone());
+            }
+        }
+        groups.retain(|_, repairs| {
+            repairs
+                .iter()
+                .any(|repair| repair.phase == ReplicaRepairPhase::Pending)
+                && repairs.iter().all(|repair| {
+                    repair.phase == ReplicaRepairPhase::Complete
+                        || repair.next_attempt_unix_millis <= now_unix_millis
+                })
         });
-        let results = tokio::select! {
-            results = work => results?,
-            changed = interrupt.changed() => {
-                if changed.is_ok() {
-                    self.cleanup_interrupted_repairs().await?;
-                    return Ok(0);
-                }
-                return Err(Status::internal("repair interruption channel closed"));
-            }
-        };
-        Ok(results.into_iter().sum())
+        let mut due = groups.into_values().collect::<Vec<_>>();
+        sort_due_repair_groups(&mut due);
+        Ok(due)
+    }
+
+    /// Resolves once a node registers, so a recovery pass can start as soon as
+    /// the registrations it is gated on exist rather than on the next tick.
+    pub async fn wait_for_repair_wake(&self) {
+        self.repair_wake.notified().await;
     }
 
     pub(super) async fn record_repair_failure(
@@ -645,16 +696,12 @@ impl CoordinatorService {
         final_watermark: u64,
         deadline: Instant,
     ) -> Result<PreparedReplicaSeed, Status> {
-        let verified = self
+        // `finalize_range` has already fetched the source digest and compared it
+        // against the destination's over the same frozen range, so it is handed
+        // back here instead of being fetched a second time.
+        let (verified, digest) = self
             .finalize_range(&copied.change, &copied.range, final_watermark, deadline)
             .await?;
-        let mut source = self
-            .connect_node(&copied.range.source_endpoint, deadline)
-            .await?;
-        let digest = rpc_before(deadline, source.source_range_digest(copied.control.clone()))
-            .await?
-            .into_inner()
-            .digest;
         Ok(PreparedReplicaSeed {
             task: copied.task.clone(),
             control: copied.control,
@@ -914,4 +961,22 @@ impl CoordinatorService {
         *state = next;
         Ok(())
     }
+}
+
+/// Orders the groups one repair pass will seed.
+///
+/// A pass seeds every due group unless it runs out of time, so the order only
+/// decides which groups are left for the next pass. Groups that have failed
+/// least go first, so a flapping follower cannot hold back healthy ones, then
+/// the groups covering the most ranges. The sort is stable, so ties keep the
+/// `(owner, follower)` order the groups were collected in.
+fn sort_due_repair_groups(groups: &mut [Vec<ReplicaRepair>]) {
+    groups.sort_by_key(|group| {
+        let attempts = group
+            .iter()
+            .map(|repair| repair.retry_count)
+            .max()
+            .unwrap_or(0);
+        (attempts, std::cmp::Reverse(group.len()))
+    });
 }

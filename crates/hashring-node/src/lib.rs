@@ -38,7 +38,7 @@ use hashring_core::{
         coordinator_client::CoordinatorClient, data_node_client::DataNodeClient,
         data_node_server::DataNode,
     },
-    topology::{TopologySnapshot, WriteAckPolicy},
+    topology::{TopologySnapshot, WriteAckPolicy, key_token},
     transport::configure_data_node_client,
 };
 

@@ -15,7 +15,7 @@ use redb::{Database, TableDefinition};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
-    sync::{Mutex, RwLock, watch},
+    sync::{Mutex, Notify, RwLock, watch},
     time::Instant,
 };
 use tonic::{
@@ -50,7 +50,6 @@ fn unix_millis_now() -> u64 {
         .unwrap_or(u64::MAX)
 }
 pub const DEFAULT_RANGE_MOVE_CONCURRENCY: usize = 16;
-const MAX_REPAIR_GROUPS_PER_PASS: usize = 32;
 const MAX_PENDING_PROBES_PER_PASS: usize = 32;
 /// A peer-failure report stays current this long after its latest probe.
 /// Nodes probe their peers every second, so one missed report is tolerated.
@@ -521,6 +520,12 @@ pub struct CoordinatorService {
     node_channels: Arc<Mutex<BTreeMap<String, Channel>>>,
     startup_at: Instant,
     repair_interrupt: Arc<watch::Sender<u64>>,
+    /// Signalled when a node registers. A repair pass can only seed a group
+    /// once both of its endpoints are in `process_instances`, so a freshly
+    /// bootstrapped cluster has nothing for the first pass to do. Waking the
+    /// recovery loop on registration is what lets that cluster converge inside
+    /// one pass instead of waiting out a whole recovery interval.
+    repair_wake: Arc<Notify>,
 }
 
 #[derive(Clone)]
