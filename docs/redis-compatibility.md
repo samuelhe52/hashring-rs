@@ -93,7 +93,8 @@ parameter it has no other value for; any other parameter is an error.
 | `SETNX`, `GETSET` | |
 | `SETRANGE` | Pads with zero bytes. An empty patch reports the length and creates nothing. |
 | `APPEND`, `STRLEN` | |
-| `MSET`, `MSETNX`, `MGET` | Not atomic across owners. A key named twice takes its later value. See [cross-key atomicity](#cross-key-atomicity-is-not-available-at-all). |
+| `MSET`, `MGET` | Not atomic across owners. A key named twice takes its later value. See [cross-key atomicity](#cross-key-atomicity-is-not-available-at-all). |
+| `MSETNX` | One key only, where it is `SETNX`. With more than one key it is declined, since it cannot set them atomically; see [cross-key atomicity](#cross-key-atomicity-is-not-available-at-all). |
 | `INCR`, `DECR`, `INCRBY`, `DECRBY` | Atomic against every writer. A value that is not an integer is an error and the value is left alone. |
 | `INCRBYFLOAT` | Atomic against every writer. The result is printed in the shortest form that reads back as the same double. |
 
@@ -119,6 +120,7 @@ These are answered with a clear error rather than a wrong answer:
 | `SCAN`, `KEYS` | The data node holds a token index over its keys but no RPC to enumerate a range of it. `DBSIZE` is declined for the same reason: a count would have to be summed across every owner, and two callers would never agree on the answer. |
 | `FLUSHALL`, `FLUSHDB` | The same enumeration, plus the question of what flushing a sharded cache should even mean. |
 | `RANDOMKEY` | Needs the keyspace. |
+| `MSETNX` with more than one key | Cannot set its keys atomically; see [cross-key atomicity](#cross-key-atomicity-is-not-available-at-all). |
 
 Anything not in this document is answered with Redis' own unknown-command error.
 A data structure command (`HSET`, `ZADD`, `LPUSH`, …) is unknown here, because
@@ -156,7 +158,7 @@ unconditional write. A read-modify-write that raced it simply reads again.
 
 ### Cross-key atomicity is not available at all
 
-`MSET`, `MSETNX`, `DEL`, `EXISTS`, `MGET` and `RENAME` fan out to whichever
+`MSET`, `DEL`, `EXISTS`, `MGET` and `RENAME` fan out to whichever
 owners hold their keys, and each key is applied on its own. There is no
 operation that spans two nodes atomically, and none can be added at this layer:
 the keys are on different machines.
@@ -167,16 +169,16 @@ such as `DEL` or `MSET` failed on one key after writing another, that error is
 `ERR` and says its writes may have been applied, never `TRYAGAIN`: sending the
 command again could undo someone else's write in between.
 
-Two commands make the best of it and report what they could not do:
+`RENAME` makes the best of it and reports what it could not do. It writes the
+destination, then deletes the source on condition that it is still the version
+it copied. A source rewritten in between is left in place and the command
+answers with an error, since the destination holds the earlier value.
 
-- `MSETNX` checks every key, then writes each one on condition that it is still
-  absent, so it never overwrites a value. A key created by someone else between
-  the check and the writes leaves the others written; that is answered with an
-  error, not with `0` or `1`.
-- `RENAME` writes the destination, then deletes the source on condition that it
-  is still the version it copied. A source rewritten in between is left in place
-  and the command answers with an error, since the destination holds the
-  earlier value.
+`MSETNX` is declined when it names more than one key. Its whole purpose is to
+set several keys as one, typically to claim them together, and a version that
+can leave some of them set would break exactly that use: two clients racing on
+overlapping keys could each set part of them and neither hold the set. With one
+key it is `SETNX` and atomic.
 
 This is the same trade Redis Cluster makes, where such commands fail with
 `CROSSSLOT`. Here they succeed but are not atomic. The honest comparison for

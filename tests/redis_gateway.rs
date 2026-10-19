@@ -586,18 +586,28 @@ async fn multi_key_commands_reach_every_owner() {
         .unwrap();
     assert_eq!(found, 0);
 
-    // MSETNX sets every pair only when none of them exists.
-    let fresh: Vec<(String, String)> = (0..8)
-        .map(|index| (format!("nx-{index}"), format!("{index}")))
-        .collect();
+    // MSETNX cannot set several keys atomically, so it is declined for more
+    // than one key and is SETNX for one. A key named twice is one key.
+    let refused = redis::cmd("MSETNX")
+        .arg(&[("nx-1", "1"), ("nx-2", "2")])
+        .query_async::<i64>(&mut connection)
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("cannot be set atomically"));
+    let present: i64 = redis::cmd("EXISTS")
+        .arg(&["nx-1", "nx-2"])
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(present, 0);
     let written: i64 = redis::cmd("MSETNX")
-        .arg(&fresh)
+        .arg(&[("nx-0", "stale"), ("nx-0", "0")])
         .query_async(&mut connection)
         .await
         .unwrap();
     assert_eq!(written, 1);
     let written: i64 = redis::cmd("MSETNX")
-        .arg(&fresh)
+        .arg(&[("nx-0", "other")])
         .query_async(&mut connection)
         .await
         .unwrap();

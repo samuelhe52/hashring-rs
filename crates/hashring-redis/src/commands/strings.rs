@@ -451,44 +451,32 @@ pub async fn mset(store: &Store<'_>, args: Args<'_>) -> RedisResult<Reply> {
     Ok(Reply::status())
 }
 
-/// Every key is checked first and only then written, each write on condition
-/// that its key is still absent, so `MSETNX` never overwrites a value. What it
-/// cannot do is make the writes one operation across owners: a key created by
-/// someone else between the check and the writes leaves the others written,
-/// which is reported as an error rather than as either answer Redis gives.
+/// `MSETNX` exists to set several keys as one: all of them or none. The keys may
+/// live on different owners and no node offers a write that spans two, so
+/// that promise cannot be kept, and a version that sometimes leaves part of
+/// the keys set would break the callers that use it to claim keys together.
+/// It is declined unless it names one key, where it is `SETNX`.
 pub async fn msetnx(store: &Store<'_>, args: Args<'_>) -> RedisResult<Reply> {
     let pairs = pairs(&args)?;
-    let keys: Vec<Vec<u8>> = pairs.iter().map(|(key, _)| key.to_vec()).collect();
-    let present = store
-        .each(
-            &keys,
-            |key| async move { Ok(store.read(key).await?.is_some()) },
+    let [(key, value)] = pairs[..] else {
+        return Err(RedisError::new(
+            "ERR",
+            "MSETNX with more than one key is not supported by the hashring-rs \
+             Redis gateway: the keys cannot be set atomically; see \
+             docs/redis-compatibility.md",
+        ));
+    };
+    let applied = store
+        .client()
+        .await?
+        .put_if(
+            key.to_vec(),
+            value.to_vec(),
+            Expiry::Clear,
+            Precondition::Absent,
         )
         .await?;
-    if present.into_iter().any(|present| present) {
-        return Ok(Reply::Integer(0));
-    }
-    let values: HashMap<&[u8], &[u8]> = pairs.into_iter().collect();
-    let client = store.client().await?;
-    let written = store
-        .each_write(&keys, |key| {
-            let (client, value) = (client.clone(), values[key].to_vec());
-            async move {
-                let applied = client
-                    .put_if(key.to_vec(), value, Expiry::Clear, Precondition::Absent)
-                    .await?;
-                Ok(applied.is_some())
-            }
-        })
-        .await?;
-    match written.iter().filter(|written| **written).count() {
-        count if count == written.len() => Ok(Reply::Integer(1)),
-        0 => Ok(Reply::Integer(0)),
-        _ => Err(RedisError::new(
-            "ERR",
-            "MSETNX raced with another write: some keys were set and others were not",
-        )),
-    }
+    Ok(Reply::Integer(applied.is_some() as i64))
 }
 
 /// Redis's `GETRANGE` index rules: a negative index counts from the end, and
