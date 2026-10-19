@@ -1146,3 +1146,113 @@ async fn delete_leaves_the_value_when_the_journal_budget_is_full() {
     );
     assert_eq!(service.state.read().await.next_sequence, 1);
 }
+
+/// Pairs of distinct 16-byte keys whose tokens collide under `seed`.
+///
+/// XXH3 is invertible for 9-16 byte inputs: with `lo` and `hi` the two input
+/// words XORed with seed-dependent constants of the default secret, the hash is
+/// `avalanche(len + swap_bytes(lo) + hi + fold(lo * hi))`. A key with `lo == 0`
+/// reaches any accumulator through `hi` alone, so it can be aimed at any other
+/// key's accumulator.
+fn colliding_key_pairs(seed: u64, pairs: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let flip_lo = 0x6782_737b_ea42_39b9_u64.wrapping_add(seed);
+    let flip_hi = 0xaf56_bc3b_0996_523a_u64.wrapping_sub(seed);
+    let fold = |left: u64, right: u64| {
+        let product = u128::from(left) * u128::from(right);
+        (product as u64) ^ ((product >> 64) as u64)
+    };
+    let key = |lo: u64, hi: u64| {
+        let mut key = (lo ^ flip_lo).to_le_bytes().to_vec();
+        key.extend_from_slice(&(hi ^ flip_hi).to_le_bytes());
+        key
+    };
+    (1..=pairs)
+        .map(|pair| {
+            let lo = pair << 56;
+            let hi = pair.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let aimed = lo.swap_bytes().wrapping_add(hi).wrapping_add(fold(lo, hi));
+            (key(0, aimed), key(lo, hi))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn range_digest_agrees_when_keys_share_a_token() {
+    let source = service();
+    let topology = source.state.read().await.topology.clone();
+    // The destination orders ties out of a randomly seeded `HashMap`, so one
+    // pair would expose a wrong tie break only half the time. Sixteen pairs
+    // leave a 1 in 65,536 chance of passing by luck.
+    let pairs = colliding_key_pairs(topology.hash_seed, 16);
+    for (index, (left, right)) in pairs.iter().enumerate() {
+        assert_ne!(left, right);
+        assert_eq!(
+            topology.key_token(left),
+            topology.key_token(right),
+            "pair {index} does not collide, so the test exercises nothing"
+        );
+        for (side, key) in [("left", left), ("right", right)] {
+            source
+                .put(Request::new(PutRequest {
+                    key: key.clone(),
+                    value: format!("value-{index}-{side}").into_bytes(),
+                    topology_epoch: 1,
+                    request_id: format!("put-{index}-{side}"),
+                }))
+                .await
+                .unwrap();
+        }
+    }
+    source
+        .prepare_source_range(Request::new(PrepareRangeRequest {
+            range: Some(range(0)),
+        }))
+        .await
+        .unwrap();
+    let control = RangeControlRequest {
+        change_id: "change-1".into(),
+        range_id: "range-1".into(),
+    };
+    let snapshot = source
+        .read_snapshot_page(Request::new(SnapshotPageRequest {
+            change_id: "change-1".into(),
+            range_id: "range-1".into(),
+            cursor: 0,
+            max_bytes: MAX_MIGRATION_PAGE_BYTES as u64,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(snapshot.done);
+    assert_eq!(snapshot.records.len(), pairs.len() * 2);
+    let source_digest = source
+        .source_range_digest(Request::new(control.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let mut destination = service();
+    destination.node_id = "node-2".into();
+    destination
+        .prepare_destination_range(Request::new(PrepareRangeRequest {
+            range: Some(range(0)),
+        }))
+        .await
+        .unwrap();
+    destination
+        .apply_migration_batch(Request::new(ApplyMigrationBatchRequest {
+            change_id: "change-1".into(),
+            range_id: "range-1".into(),
+            snapshot_records: snapshot.records,
+            journal_records: Vec::new(),
+        }))
+        .await
+        .unwrap();
+    let destination_digest = destination
+        .destination_range_digest(Request::new(control))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(destination_digest.record_count, source_digest.record_count);
+    assert_eq!(destination_digest.digest, source_digest.digest);
+}

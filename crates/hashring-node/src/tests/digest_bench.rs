@@ -28,9 +28,10 @@ use std::time::{Duration, Instant};
 
 use super::*;
 
-/// What both sides did before: order the records by key byte and hash. Kept
-/// verbatim so the comparison measures the code it replaced rather than a
-/// paraphrase of it.
+/// What both sides did before: order the records by key byte and hash. Kept as
+/// it was, except for the `v3` domain separator, so the comparison measures the
+/// code it replaced rather than a paraphrase of it and the two orders can be
+/// compared digest for digest.
 fn sorted_by_key(records: &HashMap<Vec<u8>, Record>, watermark: u64) -> RangeDigestResponse {
     let mut ordered: Vec<_> = records.iter().collect();
     ordered.sort_by_key(|(key, _)| *key);
@@ -96,15 +97,10 @@ fn destination_now(
 ) -> RangeDigestResponse {
     let mut by_token: Vec<_> = records
         .iter()
-        .map(|(key, record)| (topology.key_token(key), key, record))
+        .map(|(key, record)| (topology.key_token(key), key.as_slice(), record))
         .collect();
-    by_token.sort_unstable_by_key(|(token, _, _)| *token);
-    range_digest(
-        by_token
-            .iter()
-            .map(|(_, key, record)| (key.as_slice(), *record)),
-        0,
-    )
+    sort_into_token_order(&mut by_token);
+    range_digest(by_token.iter().map(|(_, key, record)| (*key, *record)), 0)
 }
 
 /// Same shape as the test helper in `mod.rs`: one member, replication factor 1,
@@ -131,13 +127,16 @@ fn bench_topology() -> TopologySnapshot {
     .unwrap()
 }
 
+/// The source's view of a range: its keys, in token order.
+type TokenOrderedKeys = Vec<Arc<[u8]>>;
+
 /// Counter keys, whose byte order is their numeric order, plus their token
 /// order. `xxh3` is not monotonic, so the two are genuinely different
 /// permutations — without that the sort being removed would not have been work.
 fn bench_records(
     count: usize,
     topology: &TopologySnapshot,
-) -> (Vec<Arc<[u8]>>, HashMap<Vec<u8>, Record>) {
+) -> (TokenOrderedKeys, HashMap<Vec<u8>, Record>) {
     let mut records = HashMap::with_capacity(count);
     let mut index = Vec::with_capacity(count);
     for counter in 0..count {

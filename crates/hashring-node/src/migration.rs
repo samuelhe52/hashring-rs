@@ -62,12 +62,14 @@ pub(super) fn compare_versions(left: &RecordVersion, right: &RecordVersion) -> O
 
 /// Digest of one range's records, taken in the order the caller supplies.
 ///
-/// The caller must supply **token order**, and that is part of this function's
-/// contract rather than an implementation detail: `RangeDigestResponse` is
-/// compared between a source and a destination, so both sides have to agree on
-/// the byte stream. Token order is the one ordering both sides can produce
-/// without re-sorting keys, because a token depends only on the key bytes and
-/// the committed seed, which the two nodes share.
+/// The caller must supply **token order, ties broken by key bytes**, and that
+/// is part of this function's contract rather than an implementation detail:
+/// `RangeDigestResponse` is compared between a source and a destination, so
+/// both sides have to agree on the byte stream. Token order is the one ordering
+/// both sides can produce without re-sorting keys, because a token depends only
+/// on the key bytes and the committed seed, which the two nodes share. The tie
+/// break is what the source's `TokenIndex` yields for keys whose tokens
+/// collide, and [`sort_into_token_order`] reproduces it on the destination.
 ///
 /// The previous version took a `HashMap`, sorted it by key bytes, and hashed
 /// the result. Two costs are gone now. `source_range_digest` no longer builds a
@@ -80,6 +82,18 @@ pub(super) fn compare_versions(left: &RecordVersion, right: &RecordVersion) -> O
 /// The digest bytes differ from v2 because the order differs, so the domain
 /// separator is bumped: a digest from a node running the old code must never be
 /// compared against one from a node running this.
+/// Sorts `(token, key, _)` entries into the order [`range_digest`] requires.
+///
+/// The key comparison runs only when two tokens are equal, which for distinct
+/// keys means a 64-bit hash collision, so the sort still compares integers.
+pub(super) fn sort_into_token_order<T>(entries: &mut [(u64, &[u8], T)]) {
+    entries.sort_unstable_by(|(left_token, left_key, _), (right_token, right_key, _)| {
+        left_token
+            .cmp(right_token)
+            .then_with(|| left_key.cmp(right_key))
+    });
+}
+
 pub(super) fn range_digest<'a>(
     records: impl IntoIterator<Item = (&'a [u8], &'a Record)>,
     watermark: u64,

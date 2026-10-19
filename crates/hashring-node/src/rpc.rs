@@ -1484,10 +1484,10 @@ impl DataNode for DataNodeService {
         // first, copying every key of the range before anything was hashed; the
         // only allocation left is the vector of index handles below, which
         // shares each key's `Arc` rather than copying its bytes. The read lock
-        // is held across the hashing, which the old code avoided by cloning: the
-        // source range is frozen (`writes_paused`) for the life of the
-        // migration, and nothing else on this node contends for that lock
-        // during the digest.
+        // is held across the hashing, so writers to every range on this node
+        // wait for it. That is still shorter than the copy it replaces, which
+        // also ran under the lock: over 200,000 records, 79 ms for this whole
+        // path against 106 ms for the old copy alone (`tests/digest_bench.rs`).
         let in_token_order: Vec<_> = state
             .record_keys_in_range(&range)
             .into_iter()
@@ -1516,17 +1516,19 @@ impl DataNode for DataNodeService {
         // `DestinationMigration::records` is a plain map, so token order has to
         // be established here rather than read off an index. Sorting by the u64
         // token compares integers where the old path compared key byte slices,
-        // and it drops the clone of the whole map.
+        // and it drops the clone of the whole map. The price is that computing
+        // tokens, sorting and hashing all run under the read lock, where the old
+        // path held it only for the clone: 61 ms against 24 ms over 200,000
+        // records. A range is one of hundreds per ring, so in practice this is
+        // short.
         let mut by_token: Vec<_> = destination
             .records
             .iter()
-            .map(|(key, record)| (state.topology.key_token(key), key, record))
+            .map(|(key, record)| (state.topology.key_token(key), key.as_slice(), record))
             .collect();
-        by_token.sort_unstable_by_key(|(token, _, _)| *token);
+        sort_into_token_order(&mut by_token);
         let response = range_digest(
-            by_token
-                .iter()
-                .map(|(_, key, record)| (key.as_slice(), *record)),
+            by_token.iter().map(|(_, key, record)| (*key, *record)),
             watermark,
         );
         Ok(Response::new(response))
