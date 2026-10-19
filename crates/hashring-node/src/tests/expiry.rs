@@ -489,7 +489,7 @@ async fn a_range_digest_covers_the_deadline() {
                     mutation_id: String::new(),
                     remaining_retention_millis: 0,
                     expires_at_unix_millis: expires_at,
-                    preserve_value: false,
+                    request_fingerprint: Vec::new(),
                 }],
                 journal_records: Vec::new(),
             }))
@@ -516,4 +516,100 @@ async fn a_range_digest_covers_the_deadline() {
             "{expires_at:?} was accepted as the same record"
         );
     }
+}
+
+#[tokio::test]
+async fn a_kept_deadline_travels_as_the_deadline_the_owner_stored() {
+    let topology = replication_topology(2);
+    let source = service_for("node-1", topology.clone());
+    let destination = service_for("node-2", topology.clone());
+    let key = key_with_placement(&topology, |replicas| replicas[0] == "node-1");
+    let token = topology.key_token(&key);
+    let expires_at = deadline_in(600);
+    write(
+        &source,
+        PutRequest {
+            expires_at_unix_millis: Some(expires_at),
+            ..put(&key, b"first", "first")
+        },
+    )
+    .await;
+    source
+        .prepare_source_range(Request::new(PrepareRangeRequest {
+            range: Some(range_covering(token)),
+        }))
+        .await
+        .unwrap();
+
+    // The request says "keep", which a follower or destination has no way to
+    // resolve the same way the owner did, so the journal must carry the result.
+    let kept = write(&source, put(&key, b"second", "second")).await;
+    assert!(kept.error.is_none());
+    let page = source
+        .read_changelog_page(Request::new(ChangelogPageRequest {
+            change_id: "change-1".into(),
+            range_id: "range-1".into(),
+            after_watermark: 0,
+            max_bytes: u64::MAX,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let record = page.records[0].record.clone().unwrap();
+    assert_eq!(record.expires_at_unix_millis, Some(expires_at));
+    assert!(
+        record.remaining_retention_millis > 0,
+        "the carried fingerprint matches the owner's receipt"
+    );
+
+    // The destination stages the receipt of the request, not of the record it
+    // resolved to, so a retry of the same "keep" write is still recognized.
+    destination
+        .prepare_destination_range(Request::new(PrepareRangeRequest {
+            range: Some(range_covering(token)),
+        }))
+        .await
+        .unwrap();
+    destination
+        .apply_migration_batch(Request::new(ApplyMigrationBatchRequest {
+            change_id: "change-1".into(),
+            range_id: "range-1".into(),
+            snapshot_records: Vec::new(),
+            journal_records: page.records,
+        }))
+        .await
+        .unwrap();
+    let state = destination.state.read().await;
+    let staged = state
+        .destinations
+        .values()
+        .next()
+        .unwrap()
+        .dedup
+        .get("second")
+        .expect("the receipt was staged");
+    assert_eq!(
+        staged.record.fingerprint,
+        mutation_fingerprint(&key, MutationShape::value(b"second", false, None)).to_vec()
+    );
+}
+
+#[tokio::test]
+async fn a_kept_deadline_is_not_inherited_from_an_expired_record() {
+    let service = service();
+    write(
+        &service,
+        PutRequest {
+            expires_at_unix_millis: Some(now_unix_millis()),
+            ..put(b"key", b"expired", "first")
+        },
+    )
+    .await;
+    // The record is past its deadline but no sweep has removed it yet.
+    let rewritten = write(&service, put(b"key", b"fresh", "second")).await;
+    assert!(rewritten.error.is_none());
+    let read = get(&service, b"key").await;
+    assert!(read.error.is_none(), "an acknowledged write read as absent");
+    assert_eq!(read.value, b"fresh");
+    assert_eq!(read.expires_at_unix_millis, None);
 }

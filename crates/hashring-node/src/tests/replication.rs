@@ -544,9 +544,8 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
     let first = prepare_replication_entries(
         &mut state,
         &key,
-        b"one",
-        MutationShape::value(b"value", false, None),
-        &version,
+        &value_record(b"one", &version),
+        [1; 32],
         "mutation-1".into(),
         token,
         DEFAULT_MAX_PENDING_REPLICATION_BYTES,
@@ -556,12 +555,14 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
     let second = prepare_replication_entries(
         &mut state,
         &key,
-        b"two",
-        MutationShape::value(b"two", false, None),
-        &RecordVersion {
-            owner_sequence: 2,
-            ..version
-        },
+        &value_record(
+            b"two",
+            &RecordVersion {
+                owner_sequence: 2,
+                ..version
+            },
+        ),
+        [2; 32],
         "mutation-2".into(),
         token,
         DEFAULT_MAX_PENDING_REPLICATION_BYTES,
@@ -1489,7 +1490,7 @@ async fn unreachable_streams_do_not_copy_unbudgeted_payloads() {
         },
         mutation_id: "memory-reproduction".into(),
         expires_at_unix_millis: None,
-        preserve_value: false,
+        request_fingerprint: [0; 32],
     });
     let bytes = replication_mutation_bytes(&mutation);
     let retained = Arc::new(Semaphore::new(DEFAULT_MAX_PENDING_REPLICATION_BYTES));
@@ -1586,9 +1587,8 @@ async fn delivery_publishes_partial_ack_and_retries_suffix_after_capacity_return
         let prepared = prepare_replication_entries(
             &mut state,
             &key,
-            &[sequence as u8],
-            MutationShape::value(b"value", false, None),
-            &version,
+            &value_record(&[sequence as u8], &version),
+            [sequence as u8; 32],
             format!("mutation-{sequence}"),
             token,
             DEFAULT_MAX_PENDING_REPLICATION_BYTES,
@@ -1707,7 +1707,7 @@ async fn linger_test_entry(sequence: u64, ack_awaited: bool) -> PendingReplicati
         },
         mutation_id: format!("mutation-{sequence}"),
         expires_at_unix_millis: None,
-        preserve_value: false,
+        request_fingerprint: [0; 32],
     });
     let budget = Arc::new(Semaphore::new(1 << 20))
         .acquire_many_owned(replication_mutation_bytes(&mutation) as u32)
@@ -1789,4 +1789,13 @@ async fn batch_linger_never_delays_an_acknowledged_write() {
         collect_with_late_entries(5, false, &[(2, true), (3, false)]).await,
         (vec![1, 2, 3], ms(1))
     );
+}
+
+fn value_record(value: &[u8], version: &RecordVersion) -> Record {
+    Record {
+        value: Arc::from(value),
+        version: version.clone(),
+        deleted: false,
+        expires_at_unix_millis: None,
+    }
 }

@@ -343,7 +343,7 @@ struct ReplicationMutation {
     version: RecordVersion,
     mutation_id: String,
     expires_at_unix_millis: Option<u64>,
-    preserve_value: bool,
+    request_fingerprint: [u8; 32],
 }
 
 impl PreparedReplication {
@@ -358,7 +358,7 @@ impl PreparedReplication {
             version: Some(self.mutation.version.clone()),
             mutation_id: self.mutation.mutation_id.clone(),
             expires_at_unix_millis: self.mutation.expires_at_unix_millis,
-            preserve_value: self.mutation.preserve_value,
+            request_fingerprint: self.mutation.request_fingerprint.to_vec(),
         }
     }
 }

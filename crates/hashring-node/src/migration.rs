@@ -10,27 +10,6 @@ pub(super) fn migration_record_size(record: &MigrationRecord) -> usize {
     record.key.len() + record.value.len() + record.mutation_id.len() + 128
 }
 
-/// The shape whose fingerprint the owner stored in the deduplication receipt of
-/// the mutation that produced this record. Reconstructing it from the record is
-/// what lets a destination, a follower and a retried client agree on the same
-/// receipt without the node ever keeping the request itself.
-///
-/// An expiry-only write carries the value it kept rather than an empty one,
-/// because a follower has to store it; `preserve_value` is what says that value
-/// was not the one the client sent, so the request value was empty.
-pub(super) fn migration_record_shape(record: &MigrationRecord) -> MutationShape<'_> {
-    MutationShape {
-        value: if record.preserve_value {
-            &[]
-        } else {
-            record.value.as_slice()
-        },
-        deleted: record.deleted,
-        preserve_value: record.preserve_value,
-        expires_at_unix_millis: record.expires_at_unix_millis,
-    }
-}
-
 pub(super) fn apply_record(
     records: &mut HashMap<Vec<u8>, Record>,
     record: MigrationRecord,

@@ -88,12 +88,14 @@ pub(super) fn required_followers(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Fans out the record a mutation produced, not the request that produced it:
+/// a follower stores exactly what the owner stored, so a write that kept the
+/// owner's deadline does not reach a follower as one that clears it.
 pub(super) fn prepare_replication_entries(
     state: &mut NodeState,
     key: &[u8],
-    value: &[u8],
-    shape: MutationShape<'_>,
-    version: &RecordVersion,
+    record: &Record,
+    request_fingerprint: [u8; 32],
     mutation_id: String,
     token: u64,
     max_pending_bytes: usize,
@@ -122,9 +124,10 @@ pub(super) fn prepare_replication_entries(
         })
         .collect();
 
+    let version = &record.version;
     let per_entry_bytes = key
         .len()
-        .checked_add(value.len())
+        .checked_add(record.value.len())
         .and_then(|bytes| bytes.checked_add(version.owner_node_id.len()))
         .and_then(|bytes| bytes.checked_add(mutation_id.len()))
         .and_then(|bytes| bytes.checked_add(256))
@@ -136,12 +139,12 @@ pub(super) fn prepare_replication_entries(
         topology_epoch: state.topology.epoch,
         owner_node_id: version.owner_node_id.clone(),
         key: Arc::from(key),
-        value: Arc::from(value),
-        deleted: shape.deleted,
+        value: record.value.clone(),
+        deleted: record.deleted,
         version: version.clone(),
         mutation_id,
-        expires_at_unix_millis: shape.expires_at_unix_millis,
-        preserve_value: shape.preserve_value,
+        expires_at_unix_millis: record.expires_at_unix_millis,
+        request_fingerprint,
     });
 
     Ok(followers
@@ -201,7 +204,7 @@ pub(super) fn replication_backpressure_error(epoch: u64) -> OperationError {
 
 pub(super) fn replication_fingerprint(entry: &ReplicationEntry) -> String {
     let mut digest = blake3::Hasher::new();
-    digest.update(b"hashring-rs:replication-entry:v2\0");
+    digest.update(b"hashring-rs:replication-entry:v3\0");
     digest.update(&entry.topology_epoch.to_be_bytes());
     digest.update(&(entry.owner_node_id.len() as u64).to_be_bytes());
     digest.update(entry.owner_node_id.as_bytes());
@@ -210,7 +213,9 @@ pub(super) fn replication_fingerprint(entry: &ReplicationEntry) -> String {
     digest.update(&entry.key);
     digest.update(&(entry.value.len() as u64).to_be_bytes());
     digest.update(&entry.value);
-    digest.update(&[u8::from(entry.deleted), u8::from(entry.preserve_value)]);
+    digest.update(&[u8::from(entry.deleted)]);
+    digest.update(&(entry.request_fingerprint.len() as u64).to_be_bytes());
+    digest.update(&entry.request_fingerprint);
     match entry.expires_at_unix_millis {
         Some(expires_at) => {
             digest.update(&[1]);

@@ -248,12 +248,15 @@ message MigrationRecord {
   bool deleted = 4;
   string mutation_id = 5;
   uint64 remaining_retention_millis = 6;
-  // The expiry the record carries once this record is applied.
+  // The deadline the record carries once applied: the owner's resolved
+  // result, never the request's "keep" or "clear" intent.
   optional uint64 expires_at_unix_millis = 7;
-  // Set when the mutation that produced this record changed only the expiry.
-  // `value` then holds the value the record kept, not one the client sent, so
-  // a rebuilt deduplication fingerprint uses an empty request value.
-  bool preserve_value = 8;
+  // The deduplication fingerprint of the request that produced this record,
+  // empty when `mutation_id` is. Carried rather than rebuilt from the record,
+  // because the record holds what the request resolved to, and two different
+  // requests (one keeping a deadline, one setting the same deadline) can
+  // resolve to the same record.
+  bytes request_fingerprint = 8;
 }
 
 message DeduplicationRecord {
@@ -407,10 +410,11 @@ message ReplicationEntry {
   bool deleted = 6;
   RecordVersion version = 7;
   string mutation_id = 8;
-  // The expiry the follower stores with the record. See PutRequest.
+  // The deadline the follower stores with the record, as the owner resolved
+  // it. See MigrationRecord.
   optional uint64 expires_at_unix_millis = 9;
-  // Set when the mutation changed only the expiry; see MigrationRecord.
-  bool preserve_value = 10;
+  // See MigrationRecord.request_fingerprint.
+  bytes request_fingerprint = 10;
 }
 
 message ReplicateMutationResponse {

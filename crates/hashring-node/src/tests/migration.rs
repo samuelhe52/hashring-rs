@@ -182,7 +182,7 @@ async fn committed_destination_fences_writes_until_idempotent_activation() {
                 mutation_id: String::new(),
                 remaining_retention_millis: 0,
                 expires_at_unix_millis: None,
-                preserve_value: false,
+                request_fingerprint: Vec::new(),
             }],
             journal_records: Vec::new(),
         }))
@@ -953,7 +953,7 @@ async fn deletion_replay_and_commit_remove_stale_destination_data() {
             mutation_id: String::new(),
             remaining_retention_millis: 0,
             expires_at_unix_millis: None,
-            preserve_value: false,
+            request_fingerprint: Vec::new(),
         }),
     };
     let batch = ApplyMigrationBatchRequest {
@@ -1008,7 +1008,7 @@ async fn migration_replay_preserves_delete_and_put_order() {
             mutation_id: String::new(),
             remaining_retention_millis: 0,
             expires_at_unix_millis: None,
-            preserve_value: false,
+            request_fingerprint: Vec::new(),
         }),
     };
     let put = |watermark, owner_sequence, value: &[u8]| JournalRecord {
@@ -1021,7 +1021,7 @@ async fn migration_replay_preserves_delete_and_put_order() {
             mutation_id: String::new(),
             remaining_retention_millis: 0,
             expires_at_unix_millis: None,
-            preserve_value: false,
+            request_fingerprint: Vec::new(),
         }),
     };
 

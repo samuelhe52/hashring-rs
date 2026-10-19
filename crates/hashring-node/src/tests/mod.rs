@@ -162,6 +162,9 @@ fn replication_entry(
     expires_at_unix_millis: Option<u64>,
 ) -> ReplicationEntry {
     let owner = topology.owner(&key).unwrap();
+    let request_fingerprint =
+        mutation_fingerprint(&key, MutationShape::value(value, deleted, expires_at_unix_millis))
+            .to_vec();
     ReplicationEntry {
         topology_epoch: topology.epoch,
         owner_node_id: owner.node_id.clone(),
@@ -176,7 +179,7 @@ fn replication_entry(
         }),
         mutation_id: format!("mutation-{stream_sequence}"),
         expires_at_unix_millis,
-        preserve_value: false,
+        request_fingerprint,
     }
 }
 

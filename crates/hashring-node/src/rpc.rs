@@ -125,19 +125,11 @@ fn apply_replication_entry(
 
     let dedup_now = Instant::now();
     purge_expired_dedup(state, dedup_now);
-    let mutation_fingerprint = mutation_fingerprint(
-        &entry.key,
-        MutationShape {
-            value: if entry.preserve_value {
-                &[]
-            } else {
-                entry.value.as_slice()
-            },
-            deleted: entry.deleted,
-            preserve_value: entry.preserve_value,
-            expires_at_unix_millis: entry.expires_at_unix_millis,
-        },
-    );
+    let mutation_fingerprint: [u8; 32] = entry
+        .request_fingerprint
+        .as_slice()
+        .try_into()
+        .map_err(|_| Status::invalid_argument("replication entry fingerprint is invalid"))?;
     if state.dedup.contains_key(entry.mutation_id.as_str()) {
         return Err(Status::already_exists(
             "replication stream reused a live mutation ID",
@@ -426,16 +418,24 @@ impl DataNode for DataNodeService {
         };
         // A write that does not mention a deadline keeps the one it finds,
         // which is what a caller's `KEEPTTL` asks for; one that sets a deadline
-        // of zero clears it.
+        // of zero clears it. Only a live record has a deadline to keep: one
+        // that is deleted, or expired but not yet swept, is absent, and its
+        // deadline would make the new value unreadable the moment it is stored.
         let expires_at_unix_millis = if request.preserve_value {
             shape.expires_at_unix_millis
         } else {
             match request.expires_at_unix_millis {
                 Some(expires_at) => Some(expires_at),
-                None => state
-                    .records
-                    .get(request.key.as_slice())
-                    .and_then(|record| record.expires_at_unix_millis),
+                None => {
+                    let now_unix_millis = now_unix_millis();
+                    state
+                        .records
+                        .get(request.key.as_slice())
+                        .filter(|record| {
+                            !record.deleted && !record.is_expired(now_unix_millis)
+                        })
+                        .and_then(|record| record.expires_at_unix_millis)
+                }
             }
         };
         let ack_cost = required_ack_retained_bytes(&ready_followers);
@@ -532,12 +532,20 @@ impl DataNode for DataNodeService {
             owner_node_id: self.node_id.clone(),
         };
         let mutation_id = request.request_id.clone();
+        // What every copy of the key stores: the owner's map, each follower
+        // and each migration journal all receive this record, so none of them
+        // has to resolve the request's expiry intent again.
+        let record = Record {
+            value: kept.value.clone(),
+            version: version.clone(),
+            deleted: false,
+            expires_at_unix_millis: stored_deadline(expires_at_unix_millis),
+        };
         let replications = match prepare_replication_entries(
             &mut state,
             &request.key,
-            &kept.value,
-            shape,
-            &version,
+            &record,
+            fingerprint,
             request.request_id,
             token,
             self.replication_dispatch.max_pending_bytes(),
@@ -586,12 +594,6 @@ impl DataNode for DataNodeService {
                 .or_default()
                 .push_back((entry.stream_sequence, now));
         }
-        let record = Record {
-            value: kept.value.clone(),
-            version: version.clone(),
-            deleted: false,
-            expires_at_unix_millis: stored_deadline(expires_at_unix_millis),
-        };
         let record_key: Arc<[u8]> = Arc::from(request.key.as_slice());
         state.insert_record(record_key.clone(), record.clone());
         for source in state
@@ -610,8 +612,8 @@ impl DataNode for DataNodeService {
                     deleted: false,
                     mutation_id: mutation_id.clone(),
                     remaining_retention_millis: 0,
-                    expires_at_unix_millis: shape.expires_at_unix_millis,
-                    preserve_value: request.preserve_value,
+                    expires_at_unix_millis: record.expires_at_unix_millis,
+                    request_fingerprint: fingerprint.to_vec(),
                 }),
             });
         }
@@ -856,12 +858,17 @@ impl DataNode for DataNodeService {
             owner_node_id: self.node_id.clone(),
         };
         let mutation_id = request.request_id.clone();
+        let tombstone = Record {
+            value: Arc::from([]),
+            version: version.clone(),
+            deleted: true,
+            expires_at_unix_millis: None,
+        };
         let replications = match prepare_replication_entries(
             &mut state,
             &request.key,
-            &[],
-            MutationShape::value(&[], true, None),
-            &version,
+            &tombstone,
+            fingerprint,
             request.request_id,
             token,
             self.replication_dispatch.max_pending_bytes(),
@@ -910,15 +917,7 @@ impl DataNode for DataNodeService {
         }
         // One allocation shared by the record, its index entry and the receipt.
         let record_key: Arc<[u8]> = Arc::from(request.key.as_slice());
-        state.apply_record(
-            record_key.clone(),
-            Record {
-                value: Arc::from([]),
-                version: version.clone(),
-                deleted: true,
-                expires_at_unix_millis: None,
-            },
-        );
+        state.apply_record(record_key.clone(), tombstone);
         for source in state
             .sources
             .values_mut()
@@ -936,7 +935,7 @@ impl DataNode for DataNodeService {
                     mutation_id: mutation_id.clone(),
                     remaining_retention_millis: 0,
                     expires_at_unix_millis: None,
-                    preserve_value: false,
+                    request_fingerprint: fingerprint.to_vec(),
                 }),
             });
         }
@@ -1343,7 +1342,7 @@ impl DataNode for DataNodeService {
                 // destination enforces the same absolute deadline, and skipping
                 // it here would make the two sides disagree about the range.
                 expires_at_unix_millis: record.expires_at_unix_millis,
-                preserve_value: false,
+                request_fingerprint: Vec::new(),
             };
             let size = migration_record_size(&record);
             if !records.is_empty() && bytes + size > max_bytes {
@@ -1450,8 +1449,7 @@ impl DataNode for DataNodeService {
                     .dedup
                     .get(record.mutation_id.as_str())
                     .filter(|dedup| {
-                        dedup.fingerprint
-                            == mutation_fingerprint(&record.key, migration_record_shape(record))
+                        dedup.fingerprint.as_slice() == record.request_fingerprint.as_slice()
                             && Some(&dedup.version) == record.version.as_ref()
                     })
                     .map_or(0, |dedup| {
@@ -1515,12 +1513,10 @@ impl DataNode for DataNodeService {
                 ));
             }
             if !record.mutation_id.is_empty() {
-                let fingerprint =
-                    mutation_fingerprint(&record.key, migration_record_shape(&record));
                 let dedup = DeduplicationRecord {
                     mutation_id: record.mutation_id.clone(),
                     key: record.key.clone(),
-                    fingerprint: fingerprint.to_vec(),
+                    fingerprint: record.request_fingerprint.clone(),
                     version: record.version.clone(),
                     deleted: record.deleted,
                     remaining_retention_millis: record.remaining_retention_millis,
