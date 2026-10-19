@@ -1,8 +1,8 @@
 use super::*;
 
 /// An expiry-only write replaces the deadline of a record it does not carry a
-/// value for, so it needs both an empty value and a deadline to set, while an
-/// ordinary write may carry either.
+/// value for, so it needs an empty value and an expiry to store (zero clears
+/// it), while an ordinary write may carry either.
 fn validate_expiry_request(
     preserve_value: bool,
     has_value: bool,
@@ -15,10 +15,10 @@ fn validate_expiry_request(
             false,
         ));
     }
-    if preserve_value && expires_at_unix_millis.is_none_or(|at| at == 0) {
+    if preserve_value && expires_at_unix_millis.is_none() {
         return Some(operation_error(
             ErrorCode::InvalidArgument,
-            "an expiry-only write must set a non-zero expiry",
+            "an expiry-only write must say which expiry to store",
             false,
         ));
     }

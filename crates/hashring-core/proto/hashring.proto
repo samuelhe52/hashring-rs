@@ -522,8 +522,8 @@ message PutRequest {
   // expires and a retried mutation carries the deadline it was first sent with.
   optional uint64 expires_at_unix_millis = 5;
   // Replace only the expiry and keep the stored value. `value` must then be
-  // empty and `expires_at_unix_millis` must be set and non-zero; a key that
-  // does not exist is reported through PutResponse.key_missing.
+  // empty and `expires_at_unix_millis` must be set, 0 clearing the deadline; a
+  // key that does not exist is reported through PutResponse.key_missing.
   bool preserve_value = 6;
   // Apply the write only if this holds; see PutResponse.condition_failed.
   Precondition precondition = 7;

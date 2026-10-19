@@ -964,7 +964,7 @@ impl Dispatcher {
             client.delete(rest[0].clone()).await?;
             return Ok(Reply::Integer(1));
         }
-        let applied = client.set_expiry(rest[0].clone(), expires_at).await?;
+        let applied = client.set_expiry(rest[0].clone(), Some(expires_at)).await?;
         Ok(Reply::Integer(i64::from(applied.is_some())))
     }
 

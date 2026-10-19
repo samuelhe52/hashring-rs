@@ -257,6 +257,35 @@ async fn an_expiry_only_write_needs_a_deadline_and_no_value() {
 }
 
 #[tokio::test]
+async fn an_expiry_only_write_of_zero_clears_the_deadline() {
+    let service = service();
+    write(
+        &service,
+        PutRequest {
+            expires_at_unix_millis: Some(deadline_in(600)),
+            ..put(b"key", b"value", "first")
+        },
+    )
+    .await;
+    let cleared = write(
+        &service,
+        PutRequest {
+            key: b"key".to_vec(),
+            topology_epoch: 1,
+            request_id: "persist".into(),
+            expires_at_unix_millis: Some(0),
+            preserve_value: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(cleared.error.is_none() && !cleared.key_missing);
+    let read = get(&service, b"key").await;
+    assert_eq!(read.value, b"value");
+    assert_eq!(read.expires_at_unix_millis, None);
+}
+
+#[tokio::test]
 async fn a_retried_expiry_only_write_returns_the_first_answer() {
     let service = service();
     write(&service, put(b"key", b"value", "first")).await;

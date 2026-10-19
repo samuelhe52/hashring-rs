@@ -582,28 +582,45 @@ impl HashringClient {
         }
     }
 
-    /// Replaces the deadline of an existing record, keeping its value.
+    /// Replaces the deadline of an existing record, keeping its value:
+    /// `Some` stores that absolute deadline and `None` removes it.
     ///
     /// Returns `None` rather than an error when the key is absent, and writes
     /// nothing in that case: no record, no sequence and no receipt.
     pub async fn set_expiry(
         &self,
         key: Vec<u8>,
-        expires_at_unix_millis: u64,
+        expires_at_unix_millis: Option<u64>,
     ) -> Result<Option<PutOutput>, ClientError> {
+        self.expiry_record(key, expires_at_unix_millis, None).await
+    }
+
+    /// [`HashringClient::set_expiry`] applied only if `precondition` holds;
+    /// `None` when it did not or the key is absent, which the precondition
+    /// already tells apart.
+    pub async fn set_expiry_if(
+        &self,
+        key: Vec<u8>,
+        expires_at_unix_millis: Option<u64>,
+        precondition: Precondition,
+    ) -> Result<Option<PutOutput>, ClientError> {
+        self.expiry_record(key, expires_at_unix_millis, Some(precondition))
+            .await
+    }
+
+    async fn expiry_record(
+        &self,
+        key: Vec<u8>,
+        expires_at_unix_millis: Option<u64>,
+        precondition: Option<Precondition>,
+    ) -> Result<Option<PutOutput>, ClientError> {
+        let expiry = expires_at_unix_millis.map_or(Expiry::Clear, Expiry::At);
         match self
-            .put_record(
-                key,
-                Vec::new(),
-                Expiry::At(expires_at_unix_millis),
-                true,
-                None,
-            )
+            .put_record(key, Vec::new(), expiry, true, precondition)
             .await?
         {
             PutResult::Applied(output) => Ok(Some(output)),
-            PutResult::KeyMissing => Ok(None),
-            PutResult::ConditionFailed => Err(ClientError::MissingVersion),
+            PutResult::KeyMissing | PutResult::ConditionFailed => Ok(None),
         }
     }
 
