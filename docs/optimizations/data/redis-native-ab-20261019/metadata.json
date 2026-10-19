@@ -1,0 +1,276 @@
+{
+  "date": "2026-10-19",
+  "comparison_direction": "redis / main: positive throughput changes favor redis",
+  "revisions": {
+    "main": "214daee57de65e0658ffed4486807ba865d7dd19",
+    "redis": "2e05385c3c2169837bcc3daefd100e8cd7a54024"
+  },
+  "binary_sha256": {
+    "main": "1e069a9179832fe44ea19c084c22ce503c1c14aa377b4138af3f6bf71ada0660",
+    "redis": "ad4b83c1400bcecf0ffa520c8381724ef66111a314fa9153297a2a75bfb86ac4"
+  },
+  "binary_blake3": {
+    "main": "2bd434a8e5778d710aad6024ac69593601e68dbd66f534f7140f4b317682ec72",
+    "redis": "af349ff551969d5deaa45a4e950bfaa12fec2a04ee10220c646d3b08b3a2542b"
+  },
+  "host": {
+    "cpu": "Apple M1 Pro",
+    "logical_cpus": 8,
+    "memory_bytes": 17179869184,
+    "os": "macOS (Darwin 27.0.0)",
+    "power": "AC",
+    "thermal_warning_before_and_after": false,
+    "cpu_isolated": false
+  },
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: aarch64-apple-darwin\nrelease: 1.98.1\nLLVM version: 22.1.8\n",
+  "build_command": [
+    "cargo",
+    "build",
+    "--locked",
+    "--release",
+    "--bin",
+    "hashring-rs",
+    "-j",
+    "4"
+  ],
+  "build_env": {
+    "RUSTFLAGS": null,
+    "CARGO_ENCODED_RUSTFLAGS": null,
+    "CARGO_BUILD_TARGET": null
+  },
+  "build_isolation": "Measured baseline built in a fresh target directory; measured redis rebuilt in its own fresh target directory. A failed shared-cache candidate build was excluded before measurements.",
+  "plan": {
+    "cases": [
+      {
+        "name": "rf1-owner-128",
+        "rf": 1,
+        "policy": "owner-only",
+        "keys": 300000,
+        "value": 128
+      },
+      {
+        "name": "rf3-owner-128",
+        "rf": 3,
+        "policy": "owner-only",
+        "keys": 300000,
+        "value": 128
+      },
+      {
+        "name": "rf3-first-128",
+        "rf": 3,
+        "policy": "first-successor",
+        "keys": 300000,
+        "value": 128
+      },
+      {
+        "name": "rf3-owner-4096",
+        "rf": 3,
+        "policy": "owner-only",
+        "keys": 100000,
+        "value": 4096
+      }
+    ],
+    "pairs_per_case": 6,
+    "base_arguments": [
+      "experiment",
+      "--mode",
+      "performance",
+      "--nodes",
+      "6",
+      "--concurrency",
+      "64",
+      "--seed",
+      "1",
+      "--virtual-nodes",
+      "128",
+      "--worker-threads",
+      "2",
+      "--coordinator-worker-threads",
+      "2",
+      "--minimum-admitted-copies",
+      "1",
+      "--minimum-healthy-followers",
+      "0",
+      "--operation-timeout-ms",
+      "30000",
+      "--require-clean-source"
+    ],
+    "order": "rotate cases per pair; alternate main/redis within adjacent pair",
+    "warmup": "one 10000-key RF3/OwnerOnly run per binary, excluded",
+    "profiling": false,
+    "samples": "ps process CPU time and RSS at 0.5-second intervals; no application profiling",
+    "warmup_in_measured_cluster": false
+  },
+  "effective_configs_by_case": {
+    "rf1-owner-128": {
+      "mode": "performance",
+      "node_count": 6,
+      "key_count": 300000,
+      "value_bytes": 128,
+      "concurrency": 64,
+      "hash_seed": 1,
+      "virtual_nodes": 128,
+      "operation_timeout_ms": 30000,
+      "migration_timeout_ms": 600000,
+      "range_move_concurrency": 16,
+      "replica_repair_concurrency": 4,
+      "prepublication_failure_grace_ms": 30000,
+      "pre_publish_delay_ms": 250,
+      "require_clean_source": true,
+      "verbose": false,
+      "worker_threads": 2,
+      "coordinator_worker_threads": 2,
+      "desired_replication_factor": 1,
+      "minimum_admitted_copies": 1,
+      "minimum_healthy_followers": 0,
+      "max_replica_lag_ms": 5000,
+      "receipt_retention_ms": 60000,
+      "lease_duration_ms": 5000,
+      "write_ack_policy": "OwnerOnly",
+      "node": {
+        "max_dedup_bytes": 134217728,
+        "max_pending_replication_bytes": 67108864,
+        "max_migration_journal_bytes": 16777216,
+        "replication_stream_queue_capacity": 32,
+        "required_ack_timeout_ms": 2000,
+        "replication_rpc_timeout_ms": 2000,
+        "replication_batch_linger_ms": 2
+      }
+    },
+    "rf3-owner-128": {
+      "mode": "performance",
+      "node_count": 6,
+      "key_count": 300000,
+      "value_bytes": 128,
+      "concurrency": 64,
+      "hash_seed": 1,
+      "virtual_nodes": 128,
+      "operation_timeout_ms": 30000,
+      "migration_timeout_ms": 600000,
+      "range_move_concurrency": 16,
+      "replica_repair_concurrency": 4,
+      "prepublication_failure_grace_ms": 30000,
+      "pre_publish_delay_ms": 250,
+      "require_clean_source": true,
+      "verbose": false,
+      "worker_threads": 2,
+      "coordinator_worker_threads": 2,
+      "desired_replication_factor": 3,
+      "minimum_admitted_copies": 1,
+      "minimum_healthy_followers": 0,
+      "max_replica_lag_ms": 5000,
+      "receipt_retention_ms": 60000,
+      "lease_duration_ms": 5000,
+      "write_ack_policy": "OwnerOnly",
+      "node": {
+        "max_dedup_bytes": 134217728,
+        "max_pending_replication_bytes": 67108864,
+        "max_migration_journal_bytes": 16777216,
+        "replication_stream_queue_capacity": 32,
+        "required_ack_timeout_ms": 2000,
+        "replication_rpc_timeout_ms": 2000,
+        "replication_batch_linger_ms": 2
+      }
+    },
+    "rf3-first-128": {
+      "mode": "performance",
+      "node_count": 6,
+      "key_count": 300000,
+      "value_bytes": 128,
+      "concurrency": 64,
+      "hash_seed": 1,
+      "virtual_nodes": 128,
+      "operation_timeout_ms": 30000,
+      "migration_timeout_ms": 600000,
+      "range_move_concurrency": 16,
+      "replica_repair_concurrency": 4,
+      "prepublication_failure_grace_ms": 30000,
+      "pre_publish_delay_ms": 250,
+      "require_clean_source": true,
+      "verbose": false,
+      "worker_threads": 2,
+      "coordinator_worker_threads": 2,
+      "desired_replication_factor": 3,
+      "minimum_admitted_copies": 1,
+      "minimum_healthy_followers": 0,
+      "max_replica_lag_ms": 5000,
+      "receipt_retention_ms": 60000,
+      "lease_duration_ms": 5000,
+      "write_ack_policy": "FirstSuccessor",
+      "node": {
+        "max_dedup_bytes": 134217728,
+        "max_pending_replication_bytes": 67108864,
+        "max_migration_journal_bytes": 16777216,
+        "replication_stream_queue_capacity": 32,
+        "required_ack_timeout_ms": 2000,
+        "replication_rpc_timeout_ms": 2000,
+        "replication_batch_linger_ms": 2
+      }
+    },
+    "rf3-owner-4096": {
+      "mode": "performance",
+      "node_count": 6,
+      "key_count": 100000,
+      "value_bytes": 4096,
+      "concurrency": 64,
+      "hash_seed": 1,
+      "virtual_nodes": 128,
+      "operation_timeout_ms": 30000,
+      "migration_timeout_ms": 600000,
+      "range_move_concurrency": 16,
+      "replica_repair_concurrency": 4,
+      "prepublication_failure_grace_ms": 30000,
+      "pre_publish_delay_ms": 250,
+      "require_clean_source": true,
+      "verbose": false,
+      "worker_threads": 2,
+      "coordinator_worker_threads": 2,
+      "desired_replication_factor": 3,
+      "minimum_admitted_copies": 1,
+      "minimum_healthy_followers": 0,
+      "max_replica_lag_ms": 5000,
+      "receipt_retention_ms": 60000,
+      "lease_duration_ms": 5000,
+      "write_ack_policy": "OwnerOnly",
+      "node": {
+        "max_dedup_bytes": 134217728,
+        "max_pending_replication_bytes": 67108864,
+        "max_migration_journal_bytes": 16777216,
+        "replication_stream_queue_capacity": 32,
+        "required_ack_timeout_ms": 2000,
+        "replication_rpc_timeout_ms": 2000,
+        "replication_batch_linger_ms": 2
+      }
+    }
+  },
+  "measured_runs": 48,
+  "all_runs_succeeded": true,
+  "all_sources_reproducible": true,
+  "bootstrap": {
+    "resamples": 20000,
+    "seed": 20261019,
+    "statistic": "geometric mean of paired redis/main ratios, reported as percent change",
+    "interval": "percentile 95%; sorted bootstrap samples at indices 500 and 19499",
+    "seed_reset_per_case_and_metric": true
+  },
+  "resource_sampling": "ps cumulative process CPU time and RSS every 0.5 seconds; aggregate driver, coordinator and six nodes. CPU interpolated at event-derived phase boundaries; RSS median computed within GET verification phase.",
+  "limitations": [
+    "Active macOS desktop without CPU isolation",
+    "Some early trials overlapped interim analysis",
+    "Short throughput phases, especially 100k-key 4 KiB case",
+    "Sequential latency probes do not measure loaded tail latency",
+    "Summed RSS includes allocator retention and shared mappings; it is not unique physical memory or live heap usage",
+    "DELETE, migration, TTL, conditional-write, scan and overwrite throughput were not measured"
+  ],
+  "local_raw_artifacts": "results/redis-ab-20261019T184459",
+  "local_scripts": [
+    "run_ab.py",
+    "analyze.py"
+  ],
+  "pressure_totals": {
+    "owner_dedup_rejections": 0,
+    "follower_dedup_rejections": 0,
+    "replication_reservation_rejections": 1615,
+    "replication_rpc_retries": 0
+  }
+}
