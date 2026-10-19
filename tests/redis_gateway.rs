@@ -982,6 +982,170 @@ async fn keyspace_commands_count_each_key_once_even_while_ranges_move() {
     assert_eq!(keys_matching(&mut connection, "*").await.unwrap(), expected);
 }
 
+/// One `SCAN` step: the next cursor and the keys it returned. A step that
+/// answers `TRYAGAIN` is sent again with the same cursor, as a client would.
+async fn scan_step(
+    connection: &mut redis::aio::MultiplexedConnection,
+    cursor: u64,
+    options: &[&str],
+) -> (u64, Vec<String>) {
+    loop {
+        let mut command = redis::cmd("SCAN");
+        command.arg(cursor.to_string());
+        for option in options {
+            command.arg(*option);
+        }
+        match command
+            .query_async::<(String, Vec<String>)>(&mut *connection)
+            .await
+        {
+            Ok((next, keys)) => return (next.parse().expect("a numeric cursor"), keys),
+            Err(error) if error.code() == Some("TRYAGAIN") => continue,
+            Err(error) => panic!("SCAN failed: {error}"),
+        }
+    }
+}
+
+/// A whole scan from cursor 0 back to 0, sorted, checking that no key came
+/// back twice.
+async fn full_scan(
+    connection: &mut redis::aio::MultiplexedConnection,
+    options: &[&str],
+) -> Vec<String> {
+    let mut cursor = 0;
+    let mut keys = Vec::new();
+    for _ in 0..100_000 {
+        let (next, step) = scan_step(connection, cursor, options).await;
+        keys.extend(step);
+        if next == 0 {
+            let unique: std::collections::HashSet<_> = keys.iter().collect();
+            assert_eq!(unique.len(), keys.len(), "a scan returned a key twice");
+            keys.sort();
+            return keys;
+        }
+        cursor = next;
+    }
+    panic!("the scan never finished");
+}
+
+#[tokio::test]
+async fn scan_returns_each_key_once_across_gateways_and_a_membership_change() {
+    let _guard = test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let cluster = Cluster::start(&directory.path().join("coordinator.redb"), None);
+    let mut connection = cluster.client().await;
+
+    assert!(full_scan(&mut connection, &[]).await.is_empty());
+
+    let mut expected: Vec<String> = (0..300).map(|index| format!("walk:{index}")).collect();
+    let pairs: Vec<(String, String)> = expected
+        .iter()
+        .map(|key| (key.clone(), "value".to_owned()))
+        .collect();
+    let _: () = redis::cmd("MSET")
+        .arg(&pairs)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    expected.sort();
+
+    assert_eq!(full_scan(&mut connection, &[]).await, expected);
+    assert_eq!(full_scan(&mut connection, &["COUNT", "1"]).await, expected);
+    assert_eq!(
+        full_scan(&mut connection, &["COUNT", "1000"]).await,
+        expected
+    );
+    assert_eq!(
+        full_scan(&mut connection, &["TYPE", "string"]).await,
+        expected
+    );
+    let tens: Vec<String> = (10..20).map(|index| format!("walk:{index}")).collect();
+    assert_eq!(
+        full_scan(&mut connection, &["MATCH", "walk:1?"]).await,
+        tens
+    );
+    let hashes = scan_step(&mut connection, 0, &["TYPE", "hash"]).await;
+    assert_eq!(hashes, (0, Vec::new()));
+
+    // A client's own scan iterator, which parses the cursor itself.
+    let mut iterated: Vec<String> = {
+        let mut iterator =
+            redis::AsyncCommands::scan_match::<_, String>(&mut connection, "walk:1?")
+                .await
+                .unwrap();
+        let mut keys = Vec::new();
+        while let Some(key) = iterator.next_item().await {
+            keys.push(key.unwrap());
+        }
+        keys
+    };
+    iterated.sort();
+    assert_eq!(iterated, tens);
+
+    // The cursor is all the state, so a scan begun through one gateway can be
+    // finished through another.
+    let (_second, url) = cluster.second_gateway();
+    let mut other = cluster.connect(&url).await;
+    let (mut cursor, mut keys) = scan_step(&mut connection, 0, &["COUNT", "20"]).await;
+    assert_ne!(cursor, 0);
+    while cursor != 0 {
+        let (next, step) = scan_step(&mut other, cursor, &["COUNT", "20"]).await;
+        keys.extend(step);
+        cursor = next;
+    }
+    keys.sort();
+    assert_eq!(keys, expected);
+
+    // A fourth node joins and ranges move to it, between and during scans.
+    // A cursor is a token, which the move does not change, so every scan that
+    // finishes still returns each key exactly once.
+    let client = cluster.cluster_client().await;
+    let port = unused_ports(1)[0];
+    let mut members: Vec<Member> = client.topology().await.members;
+    members.push(Member {
+        node_id: "node-4".to_owned(),
+        endpoint: format!("http://127.0.0.1:{port}"),
+    });
+    let change = client.begin_topology_change(members).await.unwrap();
+    let _node = spawn(&[
+        "node".to_owned(),
+        "--id".to_owned(),
+        "node-4".to_owned(),
+        "--listen".to_owned(),
+        format!("127.0.0.1:{port}"),
+        "--coordinator".to_owned(),
+        cluster.coordinator.clone(),
+    ]);
+    wait_for_listener(port);
+    let executor = client.clone();
+    let execution = tokio::spawn(async move {
+        executor
+            .execute_topology_change(
+                change.change_id.clone(),
+                change.base_epoch,
+                change.target_topology.epoch,
+            )
+            .await
+    });
+    let mut scans = 0;
+    while !execution.is_finished() {
+        assert_eq!(
+            full_scan(&mut connection, &["COUNT", "15"]).await,
+            expected,
+            "a scan during the move"
+        );
+        scans += 1;
+    }
+    let completed = tokio::time::timeout(Duration::from_secs(90), execution)
+        .await
+        .expect("the membership change did not finish in time")
+        .unwrap()
+        .expect("the membership change was not published");
+    assert!(completed.target_topology.epoch > 1);
+    assert!(scans > 0, "no scan ran while the change did");
+    assert_eq!(full_scan(&mut other, &[]).await, expected);
+}
+
 #[tokio::test]
 async fn a_connection_may_be_required_to_authenticate() {
     let _guard = test_lock().lock().await;
@@ -1099,10 +1263,7 @@ async fn a_declined_command_says_so_instead_of_failing_obscurely() {
     let cluster = Cluster::start(&directory.path().join("coordinator.redb"), None);
     let mut connection = cluster.client().await;
 
-    for (command, expected) in [
-        ("SCAN", "SCAN is not supported"),
-        ("FLUSHALL", "FLUSHALL is not supported"),
-    ] {
+    for (command, expected) in [("FLUSHALL", "FLUSHALL is not supported")] {
         let error = redis::cmd(command)
             .arg("*")
             .query_async::<()>(&mut connection)

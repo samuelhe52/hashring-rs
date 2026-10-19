@@ -130,12 +130,12 @@ pub const COMMANDS: &[CommandInfo] = &[
     keyed("pttl", 2, READ, 1, 1, 1),
     // The keyspace. These walk every owner rather than naming keys.
     keyspace("keys", 2, &["readonly"]),
+    keyspace("scan", -2, &["readonly"]),
     keyspace("dbsize", 1, &["readonly", "fast"]),
     keyspace("randomkey", 1, &["readonly"]),
     // Declined. Listed so that a client asking what the server knows is told
     // the command exists and was refused, rather than that the server does not
     // exist. See docs/redis-compatibility.md for why each one is absent.
-    declined("scan", -2, &["readonly"]),
     declined("flushdb", -1, WRITE),
     declined("flushall", -1, WRITE),
 ];
@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn keyspace_commands_reach_the_cluster_without_naming_keys() {
-        for name in ["keys", "dbsize", "randomkey"] {
+        for name in ["keys", "scan", "dbsize", "randomkey"] {
             let command = lookup(name).unwrap();
             assert!(!command.has_keys() && command.reaches_cluster(), "{name}");
         }

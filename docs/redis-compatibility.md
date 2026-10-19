@@ -86,16 +86,40 @@ parameter it has no other value for; any other parameter is an error.
 | Command | Notes |
 | --- | --- |
 | `KEYS` | Redis' glob, matched over bytes; only `^` negates a class, and range ends compare as signed bytes, as in Redis on x86-64. Errors rather than answer with more than 64 MiB of keys, each key counted with 64 bytes of overhead, or spend more than 100 million pattern steps matching. |
+| `SCAN` | `MATCH`, `COUNT` (default 10) and `TYPE`. Returns each key that is live for the whole scan exactly once, where Redis promises at least once. A cursor may be continued through any gateway and across membership changes. `MATCH` and the reply size have `KEYS`' limits. |
 | `DBSIZE` | Live keys only: each owner counts its own ranges, without its follower copies or keys past their deadline. |
 | `RANDOMKEY` | The first key at or after a random point on the ring, or nil when there are none. Not uniform: a key after a wide gap is likelier, as Redis' choice is not uniform either. |
 
-These walk every owner, all at once, page by page; each node pages only
-through the ranges it owns at the topology epoch the walk started from. If
+`KEYS`, `DBSIZE` and `RANDOMKEY` walk every owner, all at once, page by page;
+each node pages only through the ranges it owns at the topology epoch the walk
+started from. If
 ranges change hands mid-walk, a node at the newer epoch refuses the page and the
 walk starts over. So an answer counts every key that was live for the whole
 command exactly once; a key written or deleted while it ran may or may not be
 in it. Under constant topology churn a walk can run out of its deadline and
 answer `TRYAGAIN`.
+
+`SCAN` goes round the ring in hash order instead, one owner's stretch at a
+time, asking whichever node owns the next stretch when it gets there. Its
+cursor is the ring position to continue from, printed as the decimal integer
+clients expect, so the gateway keeps no state between calls. A position means
+the same thing in every topology: a range that moved between two calls is read
+from its new owner, which holds all of it before it owns it, and a range the
+scan already passed is not read again. That is why a key that is live
+throughout comes back exactly once. As in Redis, a key written or deleted
+during the scan may or may not come back, a step may return fewer keys than
+`COUNT`, or none, before the scan is done, and with `TYPE` naming anything but
+`string`, a type Redis knows or not, the scan is over at once, since every key
+is a string.
+
+A page of keys always ends between two ring positions, so that the cursor can
+be one number. That needs a bound on how many keys one position holds: by
+chance two keys share a 64-bit position almost never, but keys can be built to
+collide by anyone who knows the cluster's hash seed. So a node refuses to
+create a seventeenth key at one position, with an error, while writes to the
+keys already there go on working. A coordinator
+recreated from scratch picks a new hash seed, which moves every key and so
+invalidates every cursor; nothing else does.
 
 Unlike Redis, `DBSIZE` is not a stored counter: it costs a walk over every key,
 on every node. `KEYS` costs the same plus the matching keys' bytes, buffered at
@@ -131,13 +155,12 @@ the gateway before the reply is sent, hence its limit.
 These are answered with a clear error rather than a wrong answer:
 
 ```
-127.0.0.1:6379> scan 0
-(error) ERR SCAN is not supported by the hashring-rs Redis gateway; see docs/redis-compatibility.md
+127.0.0.1:6379> flushall
+(error) ERR FLUSHALL is not supported by the hashring-rs Redis gateway; see docs/redis-compatibility.md
 ```
 
 | Command | Why |
 | --- | --- |
-| `SCAN` | Not built yet. Its cursor would have to resume on any gateway and across ranges that move between calls. See [not attempted](#not-attempted). |
 | `FLUSHALL`, `FLUSHDB` | A write to every key on every owner, which no node can apply atomically across owners: a flush that failed part-way would leave some ranges emptied and others not. |
 | `MSETNX` with more than one key | Cannot set its keys atomically; see [cross-key atomicity](#cross-key-atomicity-is-not-available-at-all). |
 
@@ -303,7 +326,7 @@ returns nil, `EXISTS` returns 0, `TTL` returns -2.
 
 - One process, one extra hop. See [what it is not](#what-it-is-not).
 - No atomicity across keys, ever.
-- No `SCAN` or `FLUSHALL`. `KEYS` and `DBSIZE` walk every key on every owner,
+- No `FLUSHALL`. `KEYS` and `DBSIZE` walk every key on every owner,
   so they cost as much as the keyspace is large.
 - No data structures, transactions, scripting or Pub/Sub.
 - The gateway keeps nothing, so it holds no expiry state, no keys and no
@@ -323,7 +346,6 @@ how much each would cost:
 
 | | What it would take |
 | --- | --- |
-| `SCAN` | A cursor holding a ring position and the last key returned, so that any gateway can continue a scan, and a range that moved between calls is read again from its new owner. The node already pages through its ranges for `KEYS`. The cheapest item here. |
 | Hashes, sets and sorted sets | Encoding each as one record under one key. A single structure would then inherit the cluster's per-key linearizability, which is the right guarantee for one. The costs are a whole-structure rewrite per mutation and the 8 MiB value limit, which bites in the tens of thousands of members. |
 | Lists and streams | Not a good fit. `LPOP` and consumer groups want O(1) element access and blocking reads across the cluster; a whole-structure rewrite does not give either. |
 | `MULTI`, `EXEC`, `WATCH` | Would need server-side execution, and cross-key atomicity is unavailable underneath, so `EXEC` could not honestly promise atomicity across keys. |

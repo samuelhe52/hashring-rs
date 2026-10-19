@@ -172,6 +172,7 @@ impl Dispatcher {
             "ttl" => keys::ttl(&store, args, Seconds).await,
             "pttl" => keys::ttl(&store, args, Milliseconds).await,
             "keys" => keyspace::keys(&store, args).await,
+            "scan" => keyspace::scan(&store, args).await,
             "dbsize" => keyspace::dbsize(&store).await,
             "randomkey" => keyspace::randomkey(&store).await,
             other => Err(RedisError::unsupported(&other.to_ascii_uppercase())),
@@ -243,6 +244,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scan_checks_its_arguments_before_reaching_the_cluster() {
+        let dispatcher = dispatcher(None);
+        for (parts, expected) in [
+            (&["SCAN", "abc"][..], "ERR invalid cursor"),
+            (&["SCAN", "-1"], "ERR invalid cursor"),
+            (&["SCAN", "0", "COUNT", "0"], "ERR syntax error"),
+            (
+                &["SCAN", "0", "COUNT", "ten"],
+                "ERR value is not an integer",
+            ),
+            (&["SCAN", "0", "MATCH"], "ERR syntax error"),
+            (&["SCAN", "0", "BOGUS", "1"], "ERR syntax error"),
+        ] {
+            let error = error(&dispatcher, parts).await;
+            assert!(error.starts_with(expected), "{parts:?} answered {error}");
+        }
+
+        // Every key is a string, so a scan for another type, known to Redis or
+        // not, is done at once, without asking the cluster, which here is
+        // unreachable.
+        for type_name in ["HASH", "nosuchtype"] {
+            let mut connection = Connection::new(1, true);
+            let reply = dispatcher
+                .execute(&mut connection, &args(&["SCAN", "42", "TYPE", type_name]))
+                .await
+                .reply
+                .unwrap();
+            assert_eq!(
+                reply,
+                Reply::Array(vec![Reply::bulk("0"), Reply::Array(Vec::new())])
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn every_command_in_the_table_reaches_a_handler() {
         let dispatcher = dispatcher(None);
         for command in table::COMMANDS.iter().filter(|command| !command.declined) {
@@ -286,9 +322,9 @@ mod tests {
     async fn a_declined_command_is_refused_by_name() {
         let dispatcher = dispatcher(None);
         assert!(
-            error(&dispatcher, &["scan", "0"])
+            error(&dispatcher, &["flushall"])
                 .await
-                .contains("SCAN is not supported")
+                .contains("FLUSHALL is not supported")
         );
     }
 
