@@ -34,6 +34,7 @@ fn bench_record(counter: usize, value_bytes: usize) -> Record {
             owner_node_id: "node-1".into(),
         },
         deleted: false,
+        expires_at_unix_millis: None,
     }
 }
 
@@ -90,6 +91,9 @@ fn spawn_writer(
                     value: vec![7; 128],
                     topology_epoch: 1,
                     request_id: format!("writer-{sequence}"),
+                    expires_at_unix_millis: None,
+                    preserve_value: false,
+                    ..Default::default()
                 }))
                 .await
                 .unwrap()

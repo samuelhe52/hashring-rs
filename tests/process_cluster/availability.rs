@@ -677,6 +677,9 @@ async fn lost_first_successor_blocks_raw_writes_until_replacement_is_ready() {
             value: b"during-loss".to_vec(),
             topology_epoch: topology.epoch,
             request_id: "lost-first-successor-blocked".into(),
+            expires_at_unix_millis: None,
+            preserve_value: false,
+            ..Default::default()
         }),
     )
     .await
@@ -741,6 +744,9 @@ async fn lost_first_successor_blocks_raw_writes_until_replacement_is_ready() {
                     value: b"after-recovery".to_vec(),
                     topology_epoch: promoted.epoch,
                     request_id: format!("lost-first-successor-recovered-{attempt}"),
+                    expires_at_unix_millis: None,
+                    preserve_value: false,
+                    ..Default::default()
                 })
                 .await
                 .unwrap()
@@ -1238,6 +1244,9 @@ async fn node_self_fences_client_operations_when_coordinator_lease_expires() {
             value: b"new".to_vec(),
             topology_epoch: 1,
             request_id: "expired-put".into(),
+            expires_at_unix_millis: None,
+            preserve_value: false,
+            ..Default::default()
         })
         .await
         .unwrap()

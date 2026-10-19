@@ -14,6 +14,7 @@ use serde::de::DeserializeOwned;
 
 pub mod coordinator;
 pub mod experiment;
+pub mod gateway;
 pub mod node;
 
 #[derive(Debug)]
@@ -69,7 +70,7 @@ mod tests {
 
     #[test]
     fn every_flag_is_documented() {
-        for subcommand in ["coordinator", "node", "experiment"] {
+        for subcommand in ["coordinator", "node", "experiment", "redis-gateway"] {
             for flag in flags(subcommand) {
                 assert!(
                     CONFIGURATION_DOC.contains(&format!("`--{flag}`")),
@@ -84,10 +85,12 @@ mod tests {
         load::<coordinator::CoordinatorFile>(&example("coordinator.yaml")).unwrap();
         load::<node::NodeFile>(&example("node.yaml")).unwrap();
         load::<experiment::ExperimentFile>(&example("experiment.yaml")).unwrap();
+        load::<gateway::GatewayFile>(&example("redis-gateway.yaml")).unwrap();
         for (subcommand, file) in [
             ("coordinator", "coordinator.yaml"),
             ("node", "node.yaml"),
             ("experiment", "experiment.yaml"),
+            ("redis-gateway", "redis-gateway.yaml"),
         ] {
             let text = fs::read_to_string(example(file)).unwrap();
             for flag in flags(subcommand) {

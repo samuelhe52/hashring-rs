@@ -37,6 +37,7 @@ fn service_for(node_id: &str, topology: TopologySnapshot) -> DataNodeService {
         topology,
         records: HashMap::new(),
         records_by_token: TokenIndex::default(),
+        record_expirations: BTreeSet::new(),
         next_sequence: 0,
         owner_stream_sequences: HashMap::new(),
         owner_stream_unacked: HashMap::new(),
@@ -150,6 +151,7 @@ fn key_with_placement(topology: &TopologySnapshot, predicate: impl Fn(&[&str]) -
         .expect("test topology should contain a matching placement")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn replication_entry(
     topology: &TopologySnapshot,
     key: Vec<u8>,
@@ -157,8 +159,14 @@ fn replication_entry(
     owner_sequence: u64,
     value: &[u8],
     deleted: bool,
+    expires_at_unix_millis: Option<u64>,
 ) -> ReplicationEntry {
     let owner = topology.owner(&key).unwrap();
+    let request_fingerprint = mutation_fingerprint(
+        &key,
+        MutationShape::value(value, deleted, expires_at_unix_millis),
+    )
+    .to_vec();
     ReplicationEntry {
         topology_epoch: topology.epoch,
         owner_node_id: owner.node_id.clone(),
@@ -172,6 +180,8 @@ fn replication_entry(
             owner_node_id: owner.node_id.clone(),
         }),
         mutation_id: format!("mutation-{stream_sequence}"),
+        expires_at_unix_millis,
+        request_fingerprint,
     }
 }
 
@@ -186,8 +196,11 @@ fn range(end_inclusive: u64) -> proto::RangeSpec {
     }
 }
 
+mod conditional;
 mod digest_bench;
 mod digest_stall_bench;
+mod expiry;
 mod index;
+mod keyspace;
 mod migration;
 mod replication;

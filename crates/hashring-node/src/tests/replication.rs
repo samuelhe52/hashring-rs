@@ -44,7 +44,7 @@ async fn follower_applies_only_contiguous_authorized_replication() {
     let topology = replication_topology(3);
     let key = key_with_placement(&topology, |replicas| replicas[1..].contains(&"node-2"));
     let service = service_for("node-2", topology.clone());
-    let put = replication_entry(&topology, key.clone(), 1, 10, b"value", false);
+    let put = replication_entry(&topology, key.clone(), 1, 10, b"value", false, None);
 
     let applied = service
         .replicate_mutation(Request::new(put.clone()))
@@ -86,7 +86,7 @@ async fn follower_applies_only_contiguous_authorized_replication() {
         tonic::Code::AlreadyExists
     );
 
-    let gap = replication_entry(&topology, key.clone(), 3, 12, b"later", false);
+    let gap = replication_entry(&topology, key.clone(), 3, 12, b"later", false, None);
     assert_eq!(
         service
             .replicate_mutation(Request::new(gap))
@@ -95,7 +95,7 @@ async fn follower_applies_only_contiguous_authorized_replication() {
             .code(),
         tonic::Code::Aborted
     );
-    let stale_version = replication_entry(&topology, key.clone(), 2, 10, b"later", false);
+    let stale_version = replication_entry(&topology, key.clone(), 2, 10, b"later", false, None);
     assert_eq!(
         service
             .replicate_mutation(Request::new(stale_version))
@@ -105,7 +105,7 @@ async fn follower_applies_only_contiguous_authorized_replication() {
         tonic::Code::FailedPrecondition
     );
 
-    let delete = replication_entry(&topology, key.clone(), 2, 11, b"", true);
+    let delete = replication_entry(&topology, key.clone(), 2, 11, b"", true, None);
     let applied = service
         .replicate_mutation(Request::new(delete))
         .await
@@ -121,9 +121,9 @@ async fn follower_applies_a_replication_batch_in_order() {
     let key = key_with_placement(&topology, |replicas| replicas[1..].contains(&"node-2"));
     let service = service_for("node-2", topology.clone());
     let entries = vec![
-        replication_entry(&topology, key.clone(), 1, 10, b"one", false),
-        replication_entry(&topology, key.clone(), 2, 11, b"two", false),
-        replication_entry(&topology, key.clone(), 3, 12, b"", true),
+        replication_entry(&topology, key.clone(), 1, 10, b"one", false, None),
+        replication_entry(&topology, key.clone(), 2, 11, b"two", false, None),
+        replication_entry(&topology, key.clone(), 3, 12, b"", true, None),
     ];
     let applied = service
         .replicate_mutations(Request::new(ReplicationBatch { entries }))
@@ -149,8 +149,8 @@ async fn replication_batch_acknowledges_prefix_before_a_gap() {
     let topology = replication_topology(3);
     let key = key_with_placement(&topology, |replicas| replicas[1..].contains(&"node-2"));
     let service = service_for("node-2", topology.clone());
-    let first = replication_entry(&topology, key.clone(), 1, 10, b"one", false);
-    let gap = replication_entry(&topology, key.clone(), 3, 11, b"three", false);
+    let first = replication_entry(&topology, key.clone(), 1, 10, b"one", false, None);
+    let gap = replication_entry(&topology, key.clone(), 3, 11, b"three", false, None);
     // Replay also returns the applied prefix; the failing suffix alone still errors.
     for _ in 0..2 {
         let response = service
@@ -252,7 +252,7 @@ async fn full_stream_checkpoint_repairs_a_gap_without_replaying_old_entries() {
     let key = key_with_placement(&topology, |replicas| {
         replicas[0] == "node-1" && replicas.contains(&"node-2")
     });
-    let old = replication_entry(&topology, key.clone(), 1, 1, b"stale", false);
+    let old = replication_entry(&topology, key.clone(), 1, 1, b"stale", false, None);
     assert_eq!(
         follower
             .replicate_mutation(Request::new(old))
@@ -270,7 +270,7 @@ async fn full_stream_checkpoint_repairs_a_gap_without_replaying_old_entries() {
             .records
             .contains_key(key.as_slice())
     );
-    let gap = replication_entry(&topology, key.clone(), 7, 7, b"gap", false);
+    let gap = replication_entry(&topology, key.clone(), 7, 7, b"gap", false, None);
     assert_eq!(
         follower
             .replicate_mutation(Request::new(gap))
@@ -279,7 +279,7 @@ async fn full_stream_checkpoint_repairs_a_gap_without_replaying_old_entries() {
             .code(),
         tonic::Code::Aborted
     );
-    let next = replication_entry(&topology, key.clone(), 6, 6, b"current", false);
+    let next = replication_entry(&topology, key.clone(), 6, 6, b"current", false, None);
     follower
         .replicate_mutation(Request::new(next))
         .await
@@ -301,7 +301,7 @@ async fn follower_rejects_stale_wrong_owner_and_out_of_coverage_entries() {
     let outside_key = key_with_placement(&topology, |replicas| !replicas.contains(&"node-2"));
     let service = service_for("node-2", topology.clone());
 
-    let mut stale = replication_entry(&topology, follower_key.clone(), 1, 1, b"value", false);
+    let mut stale = replication_entry(&topology, follower_key.clone(), 1, 1, b"value", false, None);
     stale.topology_epoch = 0;
     stale.version.as_mut().unwrap().topology_epoch = 0;
     assert_eq!(
@@ -314,7 +314,7 @@ async fn follower_rejects_stale_wrong_owner_and_out_of_coverage_entries() {
     );
 
     let mut oversized_id =
-        replication_entry(&topology, follower_key.clone(), 1, 1, b"value", false);
+        replication_entry(&topology, follower_key.clone(), 1, 1, b"value", false, None);
     oversized_id.mutation_id = "x".repeat(MAX_MUTATION_ID_BYTES + 1);
     assert_eq!(
         service
@@ -325,7 +325,8 @@ async fn follower_rejects_stale_wrong_owner_and_out_of_coverage_entries() {
         tonic::Code::InvalidArgument
     );
 
-    let mut wrong_owner = replication_entry(&topology, follower_key, 1, 1, b"value", false);
+    let mut wrong_owner =
+        replication_entry(&topology, follower_key.clone(), 1, 1, b"value", false, None);
     let incorrect_node_id = topology
         .members
         .iter()
@@ -344,7 +345,7 @@ async fn follower_rejects_stale_wrong_owner_and_out_of_coverage_entries() {
         tonic::Code::FailedPrecondition
     );
 
-    let outside = replication_entry(&topology, outside_key, 1, 1, b"value", false);
+    let outside = replication_entry(&topology, outside_key.clone(), 1, 1, b"value", false, None);
     assert_eq!(
         service
             .replicate_mutation(Request::new(outside))
@@ -509,6 +510,7 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
     let topology = replication_topology(3);
     let key = key_with_placement(&topology, |replicas| replicas[0] == "node-1");
     let mut state = NodeState {
+        record_expirations: BTreeSet::new(),
         topology,
         records: HashMap::new(),
         records_by_token: TokenIndex::default(),
@@ -542,9 +544,8 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
     let first = prepare_replication_entries(
         &mut state,
         &key,
-        b"one",
-        false,
-        &version,
+        &value_record(b"one", &version),
+        [1; 32],
         "mutation-1".into(),
         token,
         DEFAULT_MAX_PENDING_REPLICATION_BYTES,
@@ -554,12 +555,14 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
     let second = prepare_replication_entries(
         &mut state,
         &key,
-        b"two",
-        false,
-        &RecordVersion {
-            owner_sequence: 2,
-            ..version
-        },
+        &value_record(
+            b"two",
+            &RecordVersion {
+                owner_sequence: 2,
+                ..version
+            },
+        ),
+        [2; 32],
         "mutation-2".into(),
         token,
         DEFAULT_MAX_PENDING_REPLICATION_BYTES,
@@ -624,6 +627,9 @@ async fn owner_only_delivers_put_and_delete_to_follower_in_order() {
             value: b"replicated".to_vec(),
             topology_epoch: 1,
             request_id: "put-1".into(),
+            expires_at_unix_millis: None,
+            preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -657,6 +663,7 @@ async fn owner_only_delivers_put_and_delete_to_follower_in_order() {
             key: key.clone(),
             topology_epoch: 1,
             request_id: "delete-1".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -694,6 +701,9 @@ async fn owner_only_delivers_put_and_delete_to_follower_in_order() {
                     value: vec![index],
                     topology_epoch: 1,
                     request_id: format!("concurrent-{index}"),
+                    expires_at_unix_millis: None,
+                    preserve_value: false,
+                    ..Default::default()
                 }))
                 .await
                 .unwrap()
@@ -768,6 +778,9 @@ async fn dispatcher_resumes_after_a_verified_gap_checkpoint() {
                 value: value.to_vec(),
                 topology_epoch: 1,
                 request_id: id.into(),
+                expires_at_unix_millis: None,
+                preserve_value: false,
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -801,6 +814,9 @@ async fn dispatcher_resumes_after_a_verified_gap_checkpoint() {
             value: b"two".to_vec(),
             topology_epoch: 1,
             request_id: "second".into(),
+            expires_at_unix_millis: None,
+            preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -891,6 +907,9 @@ async fn dispatcher_resumes_after_a_verified_gap_checkpoint() {
             value: b"three".to_vec(),
             topology_epoch: 1,
             request_id: "third".into(),
+            expires_at_unix_millis: None,
+            preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -953,6 +972,9 @@ async fn unavailable_follower_backpressures_before_unbounded_queue_growth() {
                 value: vec![successful as u8],
                 topology_epoch: 1,
                 request_id: format!("put-{successful}"),
+                expires_at_unix_millis: None,
+                preserve_value: false,
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -1009,10 +1031,11 @@ async fn older_replicated_delete_cannot_erase_newer_seeded_value() {
                 owner_node_id,
             },
             deleted: false,
+            expires_at_unix_millis: None,
         },
     );
 
-    let delete = replication_entry(&topology, key.clone(), 1, 10, b"", true);
+    let delete = replication_entry(&topology, key.clone(), 1, 10, b"", true, None);
     service
         .replicate_mutation(Request::new(delete))
         .await
@@ -1061,6 +1084,7 @@ async fn source_cleanup_retains_records_needed_as_follower_copies() {
                     owner_node_id: "node-1".into(),
                 },
                 deleted: false,
+                expires_at_unix_millis: None,
             },
         );
         state.sources.insert(
@@ -1080,6 +1104,7 @@ async fn source_cleanup_retains_records_needed_as_follower_copies() {
                 journal_bytes: 0,
                 watermark: 0,
                 writes_paused: true,
+                deferred_expirations: BTreeSet::new(),
             },
         );
     }
@@ -1135,6 +1160,9 @@ async fn strong_ack_policies_fail_writes_closed_until_replication_is_active() {
                 value: b"value".to_vec(),
                 topology_epoch: 2,
                 request_id: "put".into(),
+                expires_at_unix_millis: None,
+                preserve_value: false,
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -1148,6 +1176,7 @@ async fn strong_ack_policies_fail_writes_closed_until_replication_is_active() {
                 key: b"key".to_vec(),
                 topology_epoch: 2,
                 request_id: "delete".into(),
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -1470,6 +1499,8 @@ async fn unreachable_streams_do_not_copy_unbudgeted_payloads() {
             owner_node_id: "node-1".into(),
         },
         mutation_id: "memory-reproduction".into(),
+        expires_at_unix_millis: None,
+        request_fingerprint: [0; 32],
     });
     let bytes = replication_mutation_bytes(&mutation);
     let retained = Arc::new(Semaphore::new(DEFAULT_MAX_PENDING_REPLICATION_BYTES));
@@ -1566,9 +1597,8 @@ async fn delivery_publishes_partial_ack_and_retries_suffix_after_capacity_return
         let prepared = prepare_replication_entries(
             &mut state,
             &key,
-            &[sequence as u8],
-            false,
-            &version,
+            &value_record(&[sequence as u8], &version),
+            [sequence as u8; 32],
             format!("mutation-{sequence}"),
             token,
             DEFAULT_MAX_PENDING_REPLICATION_BYTES,
@@ -1686,6 +1716,8 @@ async fn linger_test_entry(sequence: u64, ack_awaited: bool) -> PendingReplicati
             owner_node_id: "node-1".into(),
         },
         mutation_id: format!("mutation-{sequence}"),
+        expires_at_unix_millis: None,
+        request_fingerprint: [0; 32],
     });
     let budget = Arc::new(Semaphore::new(1 << 20))
         .acquire_many_owned(replication_mutation_bytes(&mutation) as u32)
@@ -1767,4 +1799,13 @@ async fn batch_linger_never_delays_an_acknowledged_write() {
         collect_with_late_entries(5, false, &[(2, true), (3, false)]).await,
         (vec![1, 2, 3], ms(1))
     );
+}
+
+fn value_record(value: &[u8], version: &RecordVersion) -> Record {
+    Record {
+        value: Arc::from(value),
+        version: version.clone(),
+        deleted: false,
+        expires_at_unix_millis: None,
+    }
 }

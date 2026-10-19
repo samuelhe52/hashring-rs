@@ -1,5 +1,30 @@
 use super::*;
 
+/// An expiry-only write replaces the deadline of a record it does not carry a
+/// value for, so it needs an empty value and an expiry to store (zero clears
+/// it), while an ordinary write may carry either.
+fn validate_expiry_request(
+    preserve_value: bool,
+    has_value: bool,
+    expires_at_unix_millis: Option<u64>,
+) -> Option<OperationError> {
+    if preserve_value && has_value {
+        return Some(operation_error(
+            ErrorCode::InvalidArgument,
+            "an expiry-only write must not carry a value",
+            false,
+        ));
+    }
+    if preserve_value && expires_at_unix_millis.is_none() {
+        return Some(operation_error(
+            ErrorCode::InvalidArgument,
+            "an expiry-only write must say which expiry to store",
+            false,
+        ));
+    }
+    None
+}
+
 fn apply_replication_entry(
     node: &DataNodeService,
     state: &mut NodeState,
@@ -100,7 +125,11 @@ fn apply_replication_entry(
 
     let dedup_now = Instant::now();
     purge_expired_dedup(state, dedup_now);
-    let mutation_fingerprint = mutation_fingerprint(&entry.key, &entry.value, entry.deleted);
+    let mutation_fingerprint: [u8; 32] = entry
+        .request_fingerprint
+        .as_slice()
+        .try_into()
+        .map_err(|_| Status::invalid_argument("replication entry fingerprint is invalid"))?;
     if state.dedup.contains_key(entry.mutation_id.as_str()) {
         return Err(Status::already_exists(
             "replication stream reused a live mutation ID",
@@ -125,6 +154,7 @@ fn apply_replication_entry(
             value: entry.value.into(),
             version: version.clone(),
             deleted: entry.deleted,
+            expires_at_unix_millis: stored_deadline(entry.expires_at_unix_millis),
         },
     );
     let stream = state
@@ -177,7 +207,7 @@ impl DataNode for DataNodeService {
         let Some(record) = state
             .records
             .get(request.key.as_slice())
-            .filter(|record| !record.deleted)
+            .filter(|record| !record.deleted && !record.is_expired(now_unix_millis()))
         else {
             return Ok(Response::new(GetResponse {
                 current_epoch: state.topology.epoch,
@@ -192,6 +222,86 @@ impl DataNode for DataNodeService {
             value: record.value.to_vec(),
             version: Some(record.version.clone()),
             current_epoch: state.topology.epoch,
+            error: None,
+            expires_at_unix_millis: record.expires_at_unix_millis,
+        }))
+    }
+
+    async fn list_keys(
+        &self,
+        request: Request<ListKeysRequest>,
+    ) -> Result<Response<ListKeysResponse>, Status> {
+        let request = request.into_inner();
+        self.refresh_if_newer(request.topology_epoch).await?;
+        let state = self.state.read().await;
+        let epoch = state.topology.epoch;
+        let refuse = |error: OperationError| {
+            Ok(Response::new(ListKeysResponse {
+                current_epoch: epoch,
+                error: Some(error),
+                ..Default::default()
+            }))
+        };
+        if request.one_stretch {
+            // Only ownership matters here. A source keeps a range's keys until
+            // every node has the topology that moved it, and a destination
+            // holds all of them before it owns the range, so whichever node
+            // owns a token now can answer for it.
+            if let Some(error) = self.owner_error(&state, request.start_token)? {
+                return refuse(error);
+            }
+        } else {
+            // A node still behind the caller is mid-install of the newer
+            // topology; it will catch up, so the walk only has to wait.
+            if epoch < request.topology_epoch {
+                return refuse(temporarily_unavailable(
+                    epoch,
+                    "this node has not installed the walk's topology yet",
+                ));
+            }
+            // A walk is only complete if every page came from the same epoch:
+            // a range that changed hands since the caller's first page may
+            // hold keys it already passed over at the old owner.
+            if epoch > request.topology_epoch {
+                return refuse(OperationError {
+                    current_epoch: epoch,
+                    ..operation_error(
+                        ErrorCode::Moved,
+                        "the topology changed during the key walk",
+                        true,
+                    )
+                });
+            }
+            let owns_any = state
+                .topology
+                .assignments
+                .iter()
+                .any(|assignment| assignment.node_id == self.node_id);
+            if owns_any && let Some(error) = lease_error(&state) {
+                return refuse(error);
+            }
+        }
+        let limits = keyspace::PageLimits {
+            max_keys: (request.max_keys as usize).clamp(1, keyspace::MAX_KEYS_PER_PAGE),
+            max_bytes: usize::try_from(request.max_bytes)
+                .unwrap_or(usize::MAX)
+                .clamp(1, keyspace::MAX_KEY_BYTES_PER_PAGE),
+            max_examined: keyspace::MAX_EXAMINED_PER_PAGE,
+            count_only: request.count_only,
+            one_stretch: request.one_stretch,
+        };
+        let page = state.owned_keys_page(
+            &self.node_id,
+            request.start_token,
+            now_unix_millis(),
+            &limits,
+        );
+        Ok(Response::new(ListKeysResponse {
+            keys: page.keys,
+            count: page.count,
+            done: page.next.is_none(),
+            next_token: page.next.unwrap_or(0),
+            current_epoch: epoch,
             error: None,
         }))
     }
@@ -225,6 +335,25 @@ impl DataNode for DataNodeService {
                 ..Default::default()
             }));
         }
+        if let Some(error) = validate_expiry_request(
+            request.preserve_value,
+            !request.value.is_empty(),
+            request.expires_at_unix_millis,
+        ) {
+            return Ok(Response::new(PutResponse {
+                error: Some(error),
+                ..Default::default()
+            }));
+        }
+        let condition = match Condition::from_proto(request.precondition.as_ref()) {
+            Ok(condition) => condition,
+            Err(error) => {
+                return Ok(Response::new(PutResponse {
+                    error: Some(error),
+                    ..Default::default()
+                }));
+            }
+        };
         self.refresh_if_newer(request.topology_epoch).await?;
         // The routing token and the mutation fingerprint are computed once and
         // reused by every check below instead of being recomputed under each
@@ -232,7 +361,20 @@ impl DataNode for DataNodeService {
         // the write lock checks again.
         let token;
         let token_seed;
-        let fingerprint = mutation_fingerprint(&request.key, &request.value, false);
+        // The shape is what the mutation does, not what it leaves behind, so it
+        // is computable before the record is read. That is what lets a retried
+        // expiry-only write be recognized as the same operation without first
+        // loading the value it keeps.
+        let shape = match request.preserve_value {
+            true => MutationShape::expiry_only(
+                request
+                    .expires_at_unix_millis
+                    .expect("an expiry-only write's expiry was validated"),
+            ),
+            false => MutationShape::value(&request.value, false, request.expires_at_unix_millis),
+        }
+        .with_condition(condition);
+        let fingerprint = mutation_fingerprint(&request.key, shape);
         {
             let state = self.state.read().await;
             token = state.topology.key_token(&request.key);
@@ -272,6 +414,8 @@ impl DataNode for DataNodeService {
                     version: error.is_none().then_some(version),
                     current_epoch: epoch,
                     error,
+                    key_missing: false,
+                    ..Default::default()
                 }));
             }
         }
@@ -322,6 +466,8 @@ impl DataNode for DataNodeService {
                     version: error.is_none().then_some(version),
                     current_epoch: epoch,
                     error,
+                    key_missing: false,
+                    ..Default::default()
                 }));
             }
             return Ok(Response::new(PutResponse {
@@ -334,6 +480,73 @@ impl DataNode for DataNodeService {
                 ..Default::default()
             }));
         }
+        let now_millis = now_unix_millis();
+        let live = state
+            .records
+            .get(request.key.as_slice())
+            .filter(|record| !record.deleted && !record.is_expired(now_millis));
+        if !condition.holds(live) {
+            return Ok(Response::new(PutResponse {
+                current_epoch: state.topology.epoch,
+                condition_failed: true,
+                ..Default::default()
+            }));
+        }
+        // A key-listing page ends only between tokens, so a token shared by
+        // too many keys would be a page no budget bounds. Only a new key can
+        // grow a token's bucket; rewriting one already there never does.
+        if !state.records.contains_key(request.key.as_slice())
+            && state.records_by_token.len_at(state.token_of(&request.key))
+                >= keyspace::MAX_KEYS_PER_TOKEN
+        {
+            return Ok(Response::new(PutResponse {
+                current_epoch: state.topology.epoch,
+                error: Some(operation_error(
+                    ErrorCode::ResourceExhausted,
+                    format!(
+                        "{} keys already share this key's position on the ring",
+                        keyspace::MAX_KEYS_PER_TOKEN
+                    ),
+                    false,
+                )),
+                ..Default::default()
+            }));
+        }
+        // An expiry-only write replaces the deadline of a record it never
+        // received, so the value it keeps is read here, under the same write
+        // lock that applies it, and reported as missing rather than stored.
+        let kept = if request.preserve_value {
+            match live {
+                Some(record) => record.clone(),
+                None => {
+                    return Ok(Response::new(PutResponse {
+                        current_epoch: state.topology.epoch,
+                        key_missing: true,
+                        ..Default::default()
+                    }));
+                }
+            }
+        } else {
+            Record {
+                value: request.value.clone().into(),
+                version: RecordVersion::default(),
+                deleted: false,
+                expires_at_unix_millis: None,
+            }
+        };
+        // A write that does not mention a deadline keeps the one it finds,
+        // which is what a caller's `KEEPTTL` asks for; one that sets a deadline
+        // of zero clears it. Only a live record has a deadline to keep: one
+        // that is deleted, or expired but not yet swept, is absent, and its
+        // deadline would make the new value unreadable the moment it is stored.
+        let expires_at_unix_millis = if request.preserve_value {
+            shape.expires_at_unix_millis
+        } else {
+            match request.expires_at_unix_millis {
+                Some(expires_at) => Some(expires_at),
+                None => live.and_then(|record| record.expires_at_unix_millis),
+            }
+        };
         let ack_cost = required_ack_retained_bytes(&ready_followers);
         let dedup_cost =
             dedup_retained_bytes(&request.request_id, request.key.len(), self.node_id.len())
@@ -361,7 +574,7 @@ impl DataNode for DataNodeService {
             }));
         }
         let journal_record_bytes =
-            request.key.len() + request.value.len() + request.request_id.len() + 128;
+            request.key.len() + kept.value.len() + request.request_id.len() + 128;
         let matching_sources = state
             .sources
             .values()
@@ -428,12 +641,20 @@ impl DataNode for DataNodeService {
             owner_node_id: self.node_id.clone(),
         };
         let mutation_id = request.request_id.clone();
+        // What every copy of the key stores: the owner's map, each follower
+        // and each migration journal all receive this record, so none of them
+        // has to resolve the request's expiry intent again.
+        let record = Record {
+            value: kept.value.clone(),
+            version: version.clone(),
+            deleted: false,
+            expires_at_unix_millis: stored_deadline(expires_at_unix_millis),
+        };
         let replications = match prepare_replication_entries(
             &mut state,
             &request.key,
-            &request.value,
-            false,
-            &version,
+            &record,
+            fingerprint,
             request.request_id,
             token,
             self.replication_dispatch.max_pending_bytes(),
@@ -482,11 +703,6 @@ impl DataNode for DataNodeService {
                 .or_default()
                 .push_back((entry.stream_sequence, now));
         }
-        let record = Record {
-            value: request.value.into(),
-            version: version.clone(),
-            deleted: false,
-        };
         let record_key: Arc<[u8]> = Arc::from(request.key.as_slice());
         state.insert_record(record_key.clone(), record.clone());
         for source in state
@@ -505,6 +721,8 @@ impl DataNode for DataNodeService {
                     deleted: false,
                     mutation_id: mutation_id.clone(),
                     remaining_retention_millis: 0,
+                    expires_at_unix_millis: record.expires_at_unix_millis,
+                    request_fingerprint: fingerprint.to_vec(),
                 }),
             });
         }
@@ -538,6 +756,8 @@ impl DataNode for DataNodeService {
             version: error.is_none().then_some(version),
             current_epoch,
             error,
+            key_missing: false,
+            ..Default::default()
         }))
     }
 
@@ -562,10 +782,22 @@ impl DataNode for DataNodeService {
                 ..Default::default()
             }));
         }
+        let condition = match Condition::from_proto(request.precondition.as_ref()) {
+            Ok(condition) => condition,
+            Err(error) => {
+                return Ok(Response::new(DeleteResponse {
+                    error: Some(error),
+                    ..Default::default()
+                }));
+            }
+        };
         self.refresh_if_newer(request.topology_epoch).await?;
         let token;
         let token_seed;
-        let fingerprint = mutation_fingerprint(&request.key, &[], true);
+        let fingerprint = mutation_fingerprint(
+            &request.key,
+            MutationShape::value(&[], true, None).with_condition(condition),
+        );
         {
             let state = self.state.read().await;
             token = state.topology.key_token(&request.key);
@@ -574,6 +806,7 @@ impl DataNode for DataNodeService {
                 return Ok(Response::new(DeleteResponse {
                     current_epoch: error.current_epoch,
                     error: Some(error),
+                    ..Default::default()
                 }));
             }
             if let Some(existing) = state
@@ -589,6 +822,7 @@ impl DataNode for DataNodeService {
                             "mutation ID was reused with a different operation or payload",
                             false,
                         )),
+                        ..Default::default()
                     }));
                 }
                 let version = existing.version.clone();
@@ -602,6 +836,7 @@ impl DataNode for DataNodeService {
                 return Ok(Response::new(DeleteResponse {
                     current_epoch: epoch,
                     error,
+                    ..Default::default()
                 }));
             }
         }
@@ -611,6 +846,7 @@ impl DataNode for DataNodeService {
                 return Ok(Response::new(DeleteResponse {
                     current_epoch: error.current_epoch,
                     error: Some(error),
+                    ..Default::default()
                 }));
             }
         };
@@ -619,6 +855,7 @@ impl DataNode for DataNodeService {
             return Ok(Response::new(DeleteResponse {
                 current_epoch: error.current_epoch,
                 error: Some(error),
+                ..Default::default()
             }));
         }
         // A reseed at the same epoch moves every key, so the routing token,
@@ -631,6 +868,7 @@ impl DataNode for DataNodeService {
             return Ok(Response::new(DeleteResponse {
                 current_epoch: error.current_epoch,
                 error: Some(error),
+                ..Default::default()
             }));
         }
         let dedup_now = Instant::now();
@@ -648,6 +886,7 @@ impl DataNode for DataNodeService {
                 return Ok(Response::new(DeleteResponse {
                     current_epoch: epoch,
                     error,
+                    ..Default::default()
                 }));
             }
             return Ok(Response::new(DeleteResponse {
@@ -657,6 +896,19 @@ impl DataNode for DataNodeService {
                     "mutation ID was reused with a different operation or payload",
                     false,
                 )),
+                ..Default::default()
+            }));
+        }
+        let now_millis = now_unix_millis();
+        let live = state
+            .records
+            .get(request.key.as_slice())
+            .filter(|record| !record.deleted && !record.is_expired(now_millis));
+        if !condition.holds(live) {
+            return Ok(Response::new(DeleteResponse {
+                current_epoch: state.topology.epoch,
+                condition_failed: true,
+                ..Default::default()
             }));
         }
         let ack_cost = required_ack_retained_bytes(&ready_followers);
@@ -667,6 +919,7 @@ impl DataNode for DataNodeService {
             return Ok(Response::new(DeleteResponse {
                 current_epoch: state.topology.epoch,
                 error: Some(self.owner_dedup_full_error(&state)),
+                ..Default::default()
             }));
         }
 
@@ -681,6 +934,7 @@ impl DataNode for DataNodeService {
                         true,
                     )
                 }),
+                ..Default::default()
             }));
         }
         for source in state
@@ -699,6 +953,7 @@ impl DataNode for DataNodeService {
                             true,
                         )
                     }),
+                    ..Default::default()
                 }));
             }
         }
@@ -717,6 +972,7 @@ impl DataNode for DataNodeService {
                         true,
                     )
                 }),
+                ..Default::default()
             }));
         }
 
@@ -738,6 +994,7 @@ impl DataNode for DataNodeService {
                         true,
                     )
                 }),
+                ..Default::default()
             }));
         }
 
@@ -748,12 +1005,17 @@ impl DataNode for DataNodeService {
             owner_node_id: self.node_id.clone(),
         };
         let mutation_id = request.request_id.clone();
+        let tombstone = Record {
+            value: Arc::from([]),
+            version: version.clone(),
+            deleted: true,
+            expires_at_unix_millis: None,
+        };
         let replications = match prepare_replication_entries(
             &mut state,
             &request.key,
-            &[],
-            true,
-            &version,
+            &tombstone,
+            fingerprint,
             request.request_id,
             token,
             self.replication_dispatch.max_pending_bytes(),
@@ -764,6 +1026,7 @@ impl DataNode for DataNodeService {
                 return Ok(Response::new(DeleteResponse {
                     current_epoch: state.topology.epoch,
                     error: Some(replication_backpressure_error(state.topology.epoch)),
+                    ..Default::default()
                 }));
             }
         };
@@ -785,6 +1048,7 @@ impl DataNode for DataNodeService {
                 return Ok(Response::new(DeleteResponse {
                     current_epoch: state.topology.epoch,
                     error: Some(replication_backpressure_error(state.topology.epoch)),
+                    ..Default::default()
                 }));
             }
         };
@@ -802,14 +1066,7 @@ impl DataNode for DataNodeService {
         }
         // One allocation shared by the record, its index entry and the receipt.
         let record_key: Arc<[u8]> = Arc::from(request.key.as_slice());
-        state.apply_record(
-            record_key.clone(),
-            Record {
-                value: Arc::from([]),
-                version: version.clone(),
-                deleted: true,
-            },
-        );
+        state.apply_record(record_key.clone(), tombstone);
         for source in state
             .sources
             .values_mut()
@@ -826,6 +1083,8 @@ impl DataNode for DataNodeService {
                     deleted: true,
                     mutation_id: mutation_id.clone(),
                     remaining_retention_millis: 0,
+                    expires_at_unix_millis: None,
+                    request_fingerprint: fingerprint.to_vec(),
                 }),
             });
         }
@@ -858,6 +1117,7 @@ impl DataNode for DataNodeService {
         Ok(Response::new(DeleteResponse {
             current_epoch,
             error,
+            ..Default::default()
         }))
     }
 
@@ -1107,6 +1367,7 @@ impl DataNode for DataNodeService {
                     journal_bytes: 0,
                     watermark: 0,
                     writes_paused: false,
+                    deferred_expirations: BTreeSet::new(),
                 },
             );
         }
@@ -1228,6 +1489,11 @@ impl DataNode for DataNodeService {
                 deleted: record.deleted,
                 mutation_id: String::new(),
                 remaining_retention_millis: 0,
+                // An expired record is carried across like any other: the
+                // destination enforces the same absolute deadline, and skipping
+                // it here would make the two sides disagree about the range.
+                expires_at_unix_millis: record.expires_at_unix_millis,
+                request_fingerprint: Vec::new(),
             };
             let size = migration_record_size(&record);
             if !records.is_empty() && bytes + size > max_bytes {
@@ -1334,8 +1600,7 @@ impl DataNode for DataNodeService {
                     .dedup
                     .get(record.mutation_id.as_str())
                     .filter(|dedup| {
-                        dedup.fingerprint
-                            == mutation_fingerprint(&record.key, &record.value, record.deleted)
+                        dedup.fingerprint.as_slice() == record.request_fingerprint.as_slice()
                             && Some(&dedup.version) == record.version.as_ref()
                     })
                     .map_or(0, |dedup| {
@@ -1402,8 +1667,7 @@ impl DataNode for DataNodeService {
                 let dedup = DeduplicationRecord {
                     mutation_id: record.mutation_id.clone(),
                     key: record.key.clone(),
-                    fingerprint: mutation_fingerprint(&record.key, &record.value, record.deleted)
-                        .to_vec(),
+                    fingerprint: record.request_fingerprint.clone(),
                     version: record.version.clone(),
                     deleted: record.deleted,
                     remaining_retention_millis: record.remaining_retention_millis,
@@ -1678,11 +1942,7 @@ impl DataNode for DataNodeService {
         for (token, record_key) in keys {
             state.remove_record_at(token, &record_key);
         }
-        if let Some(source) = state.sources.remove(&key) {
-            state.journal_bytes_total = state
-                .journal_bytes_total
-                .saturating_sub(source.journal_bytes);
-        }
+        state.remove_source(&key);
         Ok(Response::new(proto::Empty {}))
     }
 
@@ -1693,11 +1953,7 @@ impl DataNode for DataNodeService {
         let request = request.into_inner();
         let key = (request.change_id, request.range_id);
         let mut state = self.state.write().await;
-        if let Some(source) = state.sources.remove(&key) {
-            state.journal_bytes_total = state
-                .journal_bytes_total
-                .saturating_sub(source.journal_bytes);
-        }
+        state.remove_source(&key);
         state.destinations.remove(&key);
         Ok(Response::new(proto::Empty {}))
     }

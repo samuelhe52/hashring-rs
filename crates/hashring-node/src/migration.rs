@@ -29,6 +29,7 @@ pub(super) fn apply_record(
             value: record.value.into(),
             version,
             deleted: record.deleted,
+            expires_at_unix_millis: stored_deadline(record.expires_at_unix_millis),
         },
     );
     Ok(())
@@ -60,6 +61,18 @@ pub(super) fn compare_versions(left: &RecordVersion, right: &RecordVersion) -> O
         ))
 }
 
+/// Sorts `(token, key, _)` entries into the order [`range_digest`] requires.
+///
+/// The key comparison runs only when two tokens are equal, which for distinct
+/// keys means a 64-bit hash collision, so the sort still compares integers.
+pub(super) fn sort_into_token_order<T>(entries: &mut [(u64, &[u8], T)]) {
+    entries.sort_unstable_by(|(left_token, left_key, _), (right_token, right_key, _)| {
+        left_token
+            .cmp(right_token)
+            .then_with(|| left_key.cmp(right_key))
+    });
+}
+
 /// Digest of one range's records, taken in the order the caller supplies.
 ///
 /// The caller must supply **token order, ties broken by key bytes**, and that
@@ -82,24 +95,17 @@ pub(super) fn compare_versions(left: &RecordVersion, right: &RecordVersion) -> O
 /// The digest bytes differ from v2 because the order differs, so the domain
 /// separator is bumped: a digest from a node running the old code must never be
 /// compared against one from a node running this.
-/// Sorts `(token, key, _)` entries into the order [`range_digest`] requires.
 ///
-/// The key comparison runs only when two tokens are equal, which for distinct
-/// keys means a 64-bit hash collision, so the sort still compares integers.
-pub(super) fn sort_into_token_order<T>(entries: &mut [(u64, &[u8], T)]) {
-    entries.sort_unstable_by(|(left_token, left_key, _), (right_token, right_key, _)| {
-        left_token
-            .cmp(right_token)
-            .then_with(|| left_key.cmp(right_key))
-    });
-}
-
+/// Records now carry an expiry, so the digest covers it as well: a source and a
+/// destination that disagreed about a deadline would hand over keys that stop
+/// being readable at different times. The digest bytes change again, hence the
+/// new domain separator.
 pub(super) fn range_digest<'a>(
     records: impl IntoIterator<Item = (&'a [u8], &'a Record)>,
     watermark: u64,
 ) -> RangeDigestResponse {
     let mut digest = blake3::Hasher::new();
-    digest.update(b"hashring-rs:records:v3\0");
+    digest.update(b"hashring-rs:records:v4\0");
     let mut count = 0u64;
     for (key, record) in records {
         count += 1;
@@ -112,6 +118,16 @@ pub(super) fn range_digest<'a>(
         digest.update(&(record.value.len() as u64).to_be_bytes());
         digest.update(record.value.as_ref());
         digest.update(&[u8::from(record.deleted)]);
+        match record.expires_at_unix_millis {
+            Some(expires_at) => {
+                digest.update(&[1]);
+                let deadline = expires_at.to_be_bytes();
+                digest.update(&deadline);
+            }
+            None => {
+                digest.update(&[0]);
+            }
+        }
     }
     RangeDigestResponse {
         record_count: count,
