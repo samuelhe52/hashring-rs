@@ -121,7 +121,7 @@ cd "$PROJECT_ROOT"
 if [[ ! -f "$CONFIG" ]]; then
   echo "error: config '$CONFIG' not found." >&2
   echo "       set CONFIG=..., for example" >&2
-  echo "       CONFIG=experiments/experiment_cmach.yaml ./scripts/flamegraph.sh" >&2
+  echo "       CONFIG=examples/experiment.yaml ./scripts/flamegraph.sh" >&2
   exit 1
 fi
 
@@ -136,16 +136,16 @@ if grep -qE '^[[:space:]]*(id|coordinator):' "$CONFIG"; then
   echo "       flamegraph.sh profiles a whole experiment and runs" >&2
   echo "           $BINARY experiment --config <experiment config> ..." >&2
   echo "       which rejects 'id' and 'coordinator' outright." >&2
-  echo "       To profile these node settings, put them under the 'node:'" >&2
-  echo "       section of experiments/experiment_cmach.yaml instead --" >&2
-  echo "       ExperimentConfig forwards that block to every node it starts." >&2
+  echo "       To profile node tuning such as max_dedup_bytes, set it as a" >&2
+  echo "       top-level key of an experiment config instead -- the experiment" >&2
+  echo "       forwards those keys to every node it starts." >&2
   exit 1
 fi
 if grep -qE '^[[:space:]]*members:' "$CONFIG"; then
   echo "error: '$CONFIG' is a coordinator config, not an experiment config." >&2
   echo "       'members' is a bootstrap key of the coordinator subcommand." >&2
   echo "       Use an experiment config, for example" >&2
-  echo "       CONFIG=experiments/experiment_cmach.yaml ./scripts/flamegraph.sh" >&2
+  echo "       CONFIG=examples/experiment.yaml ./scripts/flamegraph.sh" >&2
   exit 1
 fi
 

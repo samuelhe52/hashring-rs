@@ -510,7 +510,7 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
     let topology = replication_topology(3);
     let key = key_with_placement(&topology, |replicas| replicas[0] == "node-1");
     let mut state = NodeState {
-        record_expirations: BinaryHeap::new(),
+        record_expirations: BTreeSet::new(),
         topology,
         records: HashMap::new(),
         records_by_token: TokenIndex::default(),
@@ -544,26 +544,29 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
     let first = prepare_replication_entries(
         &mut state,
         &key,
-        b"one",
-        MutationShape::value(b"value", false, None),
-        &version,
+        &value_record(b"one", &version),
+        [1; 32],
         "mutation-1".into(),
         token,
         DEFAULT_MAX_PENDING_REPLICATION_BYTES,
+        &[],
     )
     .unwrap();
     let second = prepare_replication_entries(
         &mut state,
         &key,
-        b"two",
-        MutationShape::value(b"two", false, None),
-        &RecordVersion {
-            owner_sequence: 2,
-            ..version
-        },
+        &value_record(
+            b"two",
+            &RecordVersion {
+                owner_sequence: 2,
+                ..version
+            },
+        ),
+        [2; 32],
         "mutation-2".into(),
         token,
         DEFAULT_MAX_PENDING_REPLICATION_BYTES,
+        &[],
     )
     .unwrap();
 
@@ -626,6 +629,7 @@ async fn owner_only_delivers_put_and_delete_to_follower_in_order() {
             request_id: "put-1".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -659,6 +663,7 @@ async fn owner_only_delivers_put_and_delete_to_follower_in_order() {
             key: key.clone(),
             topology_epoch: 1,
             request_id: "delete-1".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -698,6 +703,7 @@ async fn owner_only_delivers_put_and_delete_to_follower_in_order() {
                     request_id: format!("concurrent-{index}"),
                     expires_at_unix_millis: None,
                     preserve_value: false,
+                    ..Default::default()
                 }))
                 .await
                 .unwrap()
@@ -774,6 +780,7 @@ async fn dispatcher_resumes_after_a_verified_gap_checkpoint() {
                 request_id: id.into(),
                 expires_at_unix_millis: None,
                 preserve_value: false,
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -809,6 +816,7 @@ async fn dispatcher_resumes_after_a_verified_gap_checkpoint() {
             request_id: "second".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -901,6 +909,7 @@ async fn dispatcher_resumes_after_a_verified_gap_checkpoint() {
             request_id: "third".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -965,6 +974,7 @@ async fn unavailable_follower_backpressures_before_unbounded_queue_growth() {
                 request_id: format!("put-{successful}"),
                 expires_at_unix_millis: None,
                 preserve_value: false,
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -1094,6 +1104,7 @@ async fn source_cleanup_retains_records_needed_as_follower_copies() {
                 journal_bytes: 0,
                 watermark: 0,
                 writes_paused: true,
+                deferred_expirations: BTreeSet::new(),
             },
         );
     }
@@ -1151,6 +1162,7 @@ async fn strong_ack_policies_fail_writes_closed_until_replication_is_active() {
                 request_id: "put".into(),
                 expires_at_unix_millis: None,
                 preserve_value: false,
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -1164,6 +1176,7 @@ async fn strong_ack_policies_fail_writes_closed_until_replication_is_active() {
                 key: b"key".to_vec(),
                 topology_epoch: 2,
                 request_id: "delete".into(),
+                ..Default::default()
             }))
             .await
             .unwrap()
@@ -1487,7 +1500,7 @@ async fn unreachable_streams_do_not_copy_unbudgeted_payloads() {
         },
         mutation_id: "memory-reproduction".into(),
         expires_at_unix_millis: None,
-        preserve_value: false,
+        request_fingerprint: [0; 32],
     });
     let bytes = replication_mutation_bytes(&mutation);
     let retained = Arc::new(Semaphore::new(DEFAULT_MAX_PENDING_REPLICATION_BYTES));
@@ -1512,6 +1525,7 @@ async fn unreachable_streams_do_not_copy_unbudgeted_payloads() {
                     follower_endpoint: "http://127.0.0.1:1".into(),
                     stream_sequence: 1,
                     mutation: mutation.clone(),
+                    ack_awaited: false,
                 },
                 _budget: budget.clone(),
             })
@@ -1522,6 +1536,7 @@ async fn unreachable_streams_do_not_copy_unbudgeted_payloads() {
             failed.clone(),
             active.clone(),
             DEFAULT_REPLICATION_RPC_TIMEOUT,
+            std::time::Duration::ZERO,
             service.pressure.clone(),
             (1, "node-1".into(), follower),
             receiver,
@@ -1582,12 +1597,12 @@ async fn delivery_publishes_partial_ack_and_retries_suffix_after_capacity_return
         let prepared = prepare_replication_entries(
             &mut state,
             &key,
-            &[sequence as u8],
-            MutationShape::value(b"value", false, None),
-            &version,
+            &value_record(&[sequence as u8], &version),
+            [sequence as u8; 32],
             format!("mutation-{sequence}"),
             token,
             DEFAULT_MAX_PENDING_REPLICATION_BYTES,
+            &[],
         )
         .unwrap()
         .pop()
@@ -1621,6 +1636,7 @@ async fn delivery_publishes_partial_ack_and_retries_suffix_after_capacity_return
         failed.clone(),
         active.clone(),
         DEFAULT_REPLICATION_RPC_TIMEOUT,
+        std::time::Duration::ZERO,
         owner.pressure.clone(),
         (topology.epoch, "node-1".into(), "node-2".into()),
         receiver,
@@ -1685,4 +1701,111 @@ async fn delivery_publishes_partial_ack_and_retries_suffix_after_capacity_return
         DEFAULT_MAX_PENDING_REPLICATION_BYTES
     );
     server.abort();
+}
+
+async fn linger_test_entry(sequence: u64, ack_awaited: bool) -> PendingReplication {
+    let mutation = Arc::new(ReplicationMutation {
+        topology_epoch: 1,
+        owner_node_id: "node-1".into(),
+        key: Arc::from(format!("key-{sequence}").into_bytes()),
+        value: Arc::from(b"value".as_slice()),
+        deleted: false,
+        version: RecordVersion {
+            topology_epoch: 1,
+            owner_sequence: sequence,
+            owner_node_id: "node-1".into(),
+        },
+        mutation_id: format!("mutation-{sequence}"),
+        expires_at_unix_millis: None,
+        request_fingerprint: [0; 32],
+    });
+    let budget = Arc::new(Semaphore::new(1 << 20))
+        .acquire_many_owned(replication_mutation_bytes(&mutation) as u32)
+        .await
+        .unwrap();
+    PendingReplication {
+        prepared: PreparedReplication {
+            follower_node_id: "node-2".into(),
+            follower_endpoint: "http://127.0.0.1:1".into(),
+            stream_sequence: sequence,
+            mutation,
+            ack_awaited,
+        },
+        _budget: Arc::new(ReplicationBudget(budget)),
+    }
+}
+
+/// Collects one batch whose first entry is queued at once and whose later
+/// entries arrive 1 ms after the start, returning the batch's sequences and
+/// how long collection took.
+async fn collect_with_late_entries(
+    linger_ms: u64,
+    first_awaited: bool,
+    late: &[(u64, bool)],
+) -> (Vec<u64>, std::time::Duration) {
+    let (sender, mut receiver) = mpsc::channel(8);
+    let first = linger_test_entry(1, first_awaited).await;
+    let late = late.to_vec();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        for (sequence, awaited) in late {
+            sender
+                .send(linger_test_entry(sequence, awaited).await)
+                .await
+                .unwrap();
+        }
+        // Keep the stream open past any linger so closing never ends a batch.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    });
+    let started = tokio::time::Instant::now();
+    let (batch, _, carry) = collect_replication_batch(
+        first,
+        &mut receiver,
+        std::time::Duration::from_millis(linger_ms),
+    )
+    .await;
+    assert!(carry.is_none());
+    let sequences = batch
+        .iter()
+        .map(|pending| pending.prepared.stream_sequence)
+        .collect();
+    (sequences, started.elapsed())
+}
+
+#[tokio::test(start_paused = true)]
+async fn batch_linger_collects_entries_that_arrive_while_waiting() {
+    let ms = std::time::Duration::from_millis;
+    assert_eq!(
+        collect_with_late_entries(0, false, &[(2, false), (3, false)]).await,
+        (vec![1], ms(0))
+    );
+    assert_eq!(
+        collect_with_late_entries(5, false, &[(2, false), (3, false)]).await,
+        (vec![1, 2, 3], ms(5))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn batch_linger_never_delays_an_acknowledged_write() {
+    let ms = std::time::Duration::from_millis;
+    // A first entry with a waiting write is sent at once.
+    assert_eq!(
+        collect_with_late_entries(5, true, &[(2, false)]).await,
+        (vec![1], ms(0))
+    );
+    // An awaited entry that arrives during the linger ends the wait; entries
+    // already queued behind it still join the batch.
+    assert_eq!(
+        collect_with_late_entries(5, false, &[(2, true), (3, false)]).await,
+        (vec![1, 2, 3], ms(1))
+    );
+}
+
+fn value_record(value: &[u8], version: &RecordVersion) -> Record {
+    Record {
+        value: Arc::from(value),
+        version: version.clone(),
+        deleted: false,
+        expires_at_unix_millis: None,
+    }
 }

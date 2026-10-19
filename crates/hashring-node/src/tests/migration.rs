@@ -29,6 +29,7 @@ async fn paused_source_range_keeps_reads_available_and_blocks_writes() {
             request_id: "put-1".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -65,6 +66,7 @@ async fn paused_source_range_keeps_reads_available_and_blocks_writes() {
             request_id: "put-2".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -75,6 +77,7 @@ async fn paused_source_range_keeps_reads_available_and_blocks_writes() {
             key: b"key".to_vec(),
             topology_epoch: 1,
             request_id: "delete-1".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -95,6 +98,7 @@ async fn paused_source_range_keeps_reads_available_and_blocks_writes() {
             request_id: "put-3".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -129,6 +133,7 @@ async fn interrupted_repair_cleanup_unpauses_only_repair_ranges() {
             request_id: "before-cleanup".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -149,6 +154,7 @@ async fn interrupted_repair_cleanup_unpauses_only_repair_ranges() {
             request_id: "after-cleanup".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -182,7 +188,7 @@ async fn committed_destination_fences_writes_until_idempotent_activation() {
                 mutation_id: String::new(),
                 remaining_retention_millis: 0,
                 expires_at_unix_millis: None,
-                preserve_value: false,
+                request_fingerprint: Vec::new(),
             }],
             journal_records: Vec::new(),
         }))
@@ -262,6 +268,7 @@ async fn committed_destination_fences_writes_until_idempotent_activation() {
             request_id: "put-1".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -272,6 +279,7 @@ async fn committed_destination_fences_writes_until_idempotent_activation() {
             key: b"key".to_vec(),
             topology_epoch: 2,
             request_id: "delete-1".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -297,6 +305,7 @@ async fn committed_destination_fences_writes_until_idempotent_activation() {
             request_id: "put-2".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -319,6 +328,7 @@ async fn committed_destination_fences_writes_until_idempotent_activation() {
             key: b"key".to_vec(),
             topology_epoch: 2,
             request_id: "delete-2".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -336,6 +346,7 @@ async fn owner_retries_reuse_original_result_and_reject_mutation_id_conflicts() 
         request_id: "same-id".into(),
         expires_at_unix_millis: None,
         preserve_value: false,
+        ..Default::default()
     };
     let original = service
         .put(Request::new(first.clone()))
@@ -367,6 +378,7 @@ async fn owner_retries_reuse_original_result_and_reject_mutation_id_conflicts() 
             key: b"key".to_vec(),
             topology_epoch: 1,
             request_id: "same-id".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -387,6 +399,7 @@ async fn owner_retries_reuse_original_result_and_reject_mutation_id_conflicts() 
         key: b"key".to_vec(),
         topology_epoch: 1,
         request_id: "delete-id".into(),
+        ..Default::default()
     };
     assert!(
         service
@@ -420,6 +433,7 @@ async fn dedup_budget_rejects_before_apply_and_expired_records_free_capacity() {
         request_id: "first".into(),
         expires_at_unix_millis: None,
         preserve_value: false,
+        ..Default::default()
     };
     assert!(
         service
@@ -437,6 +451,7 @@ async fn dedup_budget_rejects_before_apply_and_expired_records_free_capacity() {
         request_id: "other".into(),
         expires_at_unix_millis: None,
         preserve_value: false,
+        ..Default::default()
     };
     let rejected = service
         .put(Request::new(second.clone()))
@@ -497,6 +512,7 @@ async fn migration_carries_snapshot_and_journal_mutation_ids() {
         request_id: "before-id".into(),
         expires_at_unix_millis: None,
         preserve_value: false,
+        ..Default::default()
     };
     let first_version = source
         .put(Request::new(before.clone()))
@@ -518,6 +534,7 @@ async fn migration_carries_snapshot_and_journal_mutation_ids() {
         request_id: "after-id".into(),
         expires_at_unix_millis: None,
         preserve_value: false,
+        ..Default::default()
     };
     let second_version = source
         .put(Request::new(after.clone()))
@@ -707,6 +724,7 @@ async fn delete_is_idempotent_and_put_restores_an_empty_value() {
             request_id: "put-1".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -716,6 +734,7 @@ async fn delete_is_idempotent_and_put_restores_an_empty_value() {
             key: b"key".to_vec(),
             topology_epoch: 1,
             request_id: "delete-1".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -729,6 +748,7 @@ async fn delete_is_idempotent_and_put_restores_an_empty_value() {
             key: b"key".to_vec(),
             topology_epoch: 1,
             request_id: "delete-2".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -744,6 +764,7 @@ async fn delete_is_idempotent_and_put_restores_an_empty_value() {
             request_id: "put-2".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -768,6 +789,7 @@ async fn delete_validates_empty_and_oversized_keys() {
             key: Vec::new(),
             topology_epoch: 1,
             request_id: "delete-empty".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -779,6 +801,7 @@ async fn delete_validates_empty_and_oversized_keys() {
             key: vec![0; DEFAULT_MAX_KEY_BYTES + 1],
             topology_epoch: 1,
             request_id: "delete-oversized".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -790,6 +813,7 @@ async fn delete_validates_empty_and_oversized_keys() {
             key: b"key".to_vec(),
             topology_epoch: 1,
             request_id: "x".repeat(MAX_MUTATION_ID_BYTES + 1),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -812,6 +836,7 @@ async fn snapshot_and_changelog_preserve_a_deleted_key_tombstone() {
             request_id: "put-1".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -826,6 +851,7 @@ async fn snapshot_and_changelog_preserve_a_deleted_key_tombstone() {
             key: b"key".to_vec(),
             topology_epoch: 1,
             request_id: "delete-1".into(),
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -953,7 +979,7 @@ async fn deletion_replay_and_commit_remove_stale_destination_data() {
             mutation_id: String::new(),
             remaining_retention_millis: 0,
             expires_at_unix_millis: None,
-            preserve_value: false,
+            request_fingerprint: Vec::new(),
         }),
     };
     let batch = ApplyMigrationBatchRequest {
@@ -1008,7 +1034,7 @@ async fn migration_replay_preserves_delete_and_put_order() {
             mutation_id: String::new(),
             remaining_retention_millis: 0,
             expires_at_unix_millis: None,
-            preserve_value: false,
+            request_fingerprint: Vec::new(),
         }),
     };
     let put = |watermark, owner_sequence, value: &[u8]| JournalRecord {
@@ -1021,7 +1047,7 @@ async fn migration_replay_preserves_delete_and_put_order() {
             mutation_id: String::new(),
             remaining_retention_millis: 0,
             expires_at_unix_millis: None,
-            preserve_value: false,
+            request_fingerprint: Vec::new(),
         }),
     };
 
@@ -1131,6 +1157,7 @@ async fn journal_budget_is_aggregate_across_ranges() {
             request_id: "put-1".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -1153,6 +1180,7 @@ async fn delete_leaves_the_value_when_the_journal_budget_is_full() {
             request_id: "put-1".into(),
             expires_at_unix_millis: None,
             preserve_value: false,
+            ..Default::default()
         }))
         .await
         .unwrap();
@@ -1168,6 +1196,7 @@ async fn delete_leaves_the_value_when_the_journal_budget_is_full() {
             key: b"key".to_vec(),
             topology_epoch: 1,
             request_id: "delete-1".into(),
+            ..Default::default()
         }))
         .await
         .unwrap()
@@ -1189,6 +1218,119 @@ async fn delete_leaves_the_value_when_the_journal_budget_is_full() {
         b"value"
     );
     assert_eq!(service.state.read().await.next_sequence, 1);
+}
+
+/// Pairs of distinct 16-byte keys whose tokens collide under `seed`.
+///
+/// XXH3 is invertible for 9-16 byte inputs: with `lo` and `hi` the two input
+/// words XORed with seed-dependent constants of the default secret, the hash is
+/// `avalanche(len + swap_bytes(lo) + hi + fold(lo * hi))`. A key with `lo == 0`
+/// reaches any accumulator through `hi` alone, so it can be aimed at any other
+/// key's accumulator.
+fn colliding_key_pairs(seed: u64, pairs: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let flip_lo = 0x6782_737b_ea42_39b9_u64.wrapping_add(seed);
+    let flip_hi = 0xaf56_bc3b_0996_523a_u64.wrapping_sub(seed);
+    let fold = |left: u64, right: u64| {
+        let product = u128::from(left) * u128::from(right);
+        (product as u64) ^ ((product >> 64) as u64)
+    };
+    let key = |lo: u64, hi: u64| {
+        let mut key = (lo ^ flip_lo).to_le_bytes().to_vec();
+        key.extend_from_slice(&(hi ^ flip_hi).to_le_bytes());
+        key
+    };
+    (1..=pairs)
+        .map(|pair| {
+            let lo = pair << 56;
+            let hi = pair.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let aimed = lo.swap_bytes().wrapping_add(hi).wrapping_add(fold(lo, hi));
+            (key(0, aimed), key(lo, hi))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn range_digest_agrees_when_keys_share_a_token() {
+    let source = service();
+    let topology = source.state.read().await.topology.clone();
+    // The destination orders ties out of a randomly seeded `HashMap`, so one
+    // pair would expose a wrong tie break only half the time. Sixteen pairs
+    // leave a 1 in 65,536 chance of passing by luck.
+    let pairs = colliding_key_pairs(topology.hash_seed, 16);
+    for (index, (left, right)) in pairs.iter().enumerate() {
+        assert_ne!(left, right);
+        assert_eq!(
+            topology.key_token(left),
+            topology.key_token(right),
+            "pair {index} does not collide, so the test exercises nothing"
+        );
+        for (side, key) in [("left", left), ("right", right)] {
+            source
+                .put(Request::new(PutRequest {
+                    key: key.clone(),
+                    value: format!("value-{index}-{side}").into_bytes(),
+                    topology_epoch: 1,
+                    request_id: format!("put-{index}-{side}"),
+                    expires_at_unix_millis: None,
+                    preserve_value: false,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap();
+        }
+    }
+    source
+        .prepare_source_range(Request::new(PrepareRangeRequest {
+            range: Some(range(0)),
+        }))
+        .await
+        .unwrap();
+    let control = RangeControlRequest {
+        change_id: "change-1".into(),
+        range_id: "range-1".into(),
+    };
+    let snapshot = source
+        .read_snapshot_page(Request::new(SnapshotPageRequest {
+            change_id: "change-1".into(),
+            range_id: "range-1".into(),
+            cursor: 0,
+            max_bytes: MAX_MIGRATION_PAGE_BYTES as u64,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(snapshot.done);
+    assert_eq!(snapshot.records.len(), pairs.len() * 2);
+    let source_digest = source
+        .source_range_digest(Request::new(control.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let mut destination = service();
+    destination.node_id = "node-2".into();
+    destination
+        .prepare_destination_range(Request::new(PrepareRangeRequest {
+            range: Some(range(0)),
+        }))
+        .await
+        .unwrap();
+    destination
+        .apply_migration_batch(Request::new(ApplyMigrationBatchRequest {
+            change_id: "change-1".into(),
+            range_id: "range-1".into(),
+            snapshot_records: snapshot.records,
+            journal_records: Vec::new(),
+        }))
+        .await
+        .unwrap();
+    let destination_digest = destination
+        .destination_range_digest(Request::new(control))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(destination_digest.record_count, source_digest.record_count);
+    assert_eq!(destination_digest.digest, source_digest.digest);
 }
 
 /// Source and destination must digest a range to the same value.

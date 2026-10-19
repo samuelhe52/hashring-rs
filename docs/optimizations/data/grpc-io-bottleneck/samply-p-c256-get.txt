@@ -1,0 +1,93 @@
+on-CPU sampled 6.45s over 3.39s window = 1.90 cores
+
+### coordinator  (1 proc)  on-CPU 0.00s = 0% of all on-CPU, 0.00 cores
+  of this role's CPU-delta: parked-at-sample 69.5%, mutexwait 0.1% (excluded below)
+  owner view:
+     50.6%  hashring
+     17.4%  tower
+     11.9%  tonic
+     11.7%  hyper
+      8.4%  h2
+  self view (top 25); libsystem_kernel leaf total 11.7%:
+     30.4%  rust:?
+     25.5%  malloc/free
+     18.2%  rust:alloc
+     11.7%  sys:net __recvfrom
+      5.8%  rust:tonic
+      4.7%  rust:bytes
+      2.5%  rust:http
+      1.2%  rust:h2
+
+### driver  (1 proc)  on-CPU 4.82s = 75% of all on-CPU, 1.42 cores
+  of this role's CPU-delta: parked-at-sample 7.9%, mutexwait 19.0% (excluded below)
+  owner view:
+     50.2%  h2
+     16.7%  hashring
+     13.2%  hyper
+     11.2%  tonic
+      4.1%  tower
+      3.7%  runtime
+      0.9%  prost
+  self view (top 25); libsystem_kernel leaf total 34.5%:
+     19.4%  sys:net writev
+     16.3%  rust:h2
+      9.7%  rust:tokio
+      8.0%  malloc/free
+      6.2%  sys:net __recvfrom
+      6.1%  memcpy/platform _platform_memmove
+      5.7%  sys:other getentropy
+      4.5%  rust:http
+      3.3%  rust:tonic
+      2.7%  libsystem other (libsystem_pthread.dylib)
+      2.0%  rust:core
+      1.9%  sys:lock/park __psynch_mutexdrop
+      1.8%  rust:bytes
+      1.7%  rust:?
+      1.6%  rust:hyper
+      1.0%  sys:other mach_absolute_time
+      0.9%  rust:futures_util
+      0.8%  rust:std
+      0.7%  rust:tower
+      0.7%  rust:tokio_util
+      0.7%  rust:hashring_client
+      0.5%  memcpy/platform _platform_memcmp
+      0.5%  rust:alloc
+      0.4%  rust:prost
+      0.4%  rust:futures_core
+
+### node  (6 proc)  on-CPU 1.63s = 25% of all on-CPU, 0.48 cores
+  of this role's CPU-delta: parked-at-sample 76.4%, mutexwait 4.1% (excluded below)
+  owner view:
+     51.3%  h2
+     14.7%  hyper
+     14.6%  tonic
+      9.6%  hashring
+      5.7%  runtime
+      3.0%  tower
+      1.2%  prost
+  self view (top 25); libsystem_kernel leaf total 33.2%:
+     19.6%  sys:net writev
+     15.8%  rust:h2
+      8.3%  malloc/free
+      6.6%  sys:net __recvfrom
+      6.0%  rust:tokio
+      5.4%  memcpy/platform _platform_memmove
+      4.3%  rust:http
+      3.9%  rust:tonic
+      3.1%  rust:core
+      2.8%  sys:lock/park __psynch_mutexdrop
+      2.8%  libsystem other (libsystem_pthread.dylib)
+      2.2%  rust:bytes
+      2.0%  sys:other mach_absolute_time
+      2.0%  rust:?
+      1.9%  rust:hyper
+      1.8%  sys:lock/park __psynch_cvsignal
+      1.3%  rust:hashring_core
+      1.0%  rust:hashring_node
+      0.8%  rust:std
+      0.8%  memcpy/platform _platform_memcmp
+      0.8%  rust:tower
+      0.8%  rust:alloc
+      0.7%  rust:http_body_util
+      0.6%  rust:axum
+      0.5%  rust:indexmap

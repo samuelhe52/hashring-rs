@@ -1,5 +1,5 @@
 //! The cluster connection a connection's commands share, and the locks that
-//! serialize read-modify-write commands within one gateway.
+//! keep read-modify-write commands within one gateway from colliding.
 
 use std::sync::{
     Arc,
@@ -85,17 +85,15 @@ fn connect_error(error: ClientError) -> RedisError {
     RedisError::new("TRYAGAIN", format!("cluster is unavailable: {message}"))
 }
 
-/// Read-modify-write commands need the read and the write to be one operation.
+/// Keeps two read-modify-write commands on one key from the same gateway from
+/// running at once.
 ///
-/// Redis makes `INCR` atomic because it holds the single thread that owns the
-/// key. A gateway has no such owner: the key lives on a data node, and the
-/// node only offers get, put and delete. What this lock buys is the next best
-/// thing: two such commands from clients of the same gateway never interleave,
-/// so they behave exactly as they would in Redis.
-///
-/// It deliberately does not reach across gateways, and a second gateway behind
-/// the same load balancer breaks that guarantee. See
-/// docs/redis-compatibility.md.
+/// Correctness does not depend on it: every such command writes on condition
+/// that the key is still the version it read, and the owner enforces that
+/// against every writer. What the lock saves is the retry. Without it, eight
+/// clients incrementing one hot key would each read the same version and all
+/// but one would have to read again; with it they take turns within this
+/// gateway and only collide with writers elsewhere.
 pub struct KeyLocks {
     stripes: Vec<Arc<Mutex<()>>>,
 }
@@ -113,8 +111,7 @@ impl KeyLocks {
     }
 
     fn stripe(&self, key: &[u8]) -> usize {
-        // FNV-1a: a stable hash across processes, which matters because two
-        // gateways must pick the same stripe for the same key.
+        // FNV-1a: cheap, and the same for a key every time.
         let mut hash = 0xcbf2_9ce4_8422_2325_u64;
         for byte in key {
             hash ^= u64::from(*byte);

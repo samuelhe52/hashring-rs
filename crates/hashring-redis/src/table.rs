@@ -1,9 +1,11 @@
 //! The commands this gateway claims, and how much of each one it implements.
 //!
-//! `COMMAND` answers from this table, so a client that asks what the server
-//! supports sees the same list the dispatcher dispatches on. Arity and key
-//! positions follow Redis, because clients use them to check a command before
-//! sending it and to split a multi-key command across a cluster.
+//! `COMMAND` answers from this table, and the dispatcher checks every request
+//! against it before a handler runs: whether the command exists, whether it is
+//! declined, its arity, and whether it may run before `AUTH`. So what a client
+//! is told the server supports is what the server enforces. Arity, flags and
+//! key positions follow Redis, because clients use them to check a command
+//! before sending it and to split a multi-key command across a cluster.
 
 use crate::resp::Reply;
 
@@ -16,11 +18,15 @@ pub struct CommandInfo {
     pub first_key: i64,
     pub last_key: i64,
     pub step: i64,
+    /// Known but refused; see docs/redis-compatibility.md.
+    pub declined: bool,
+    /// Reaches the cluster without naming a key: it walks the keyspace.
+    pub keyspace: bool,
 }
 
 const READ: &[&str] = &["readonly", "fast"];
 const WRITE: &[&str] = &["write", "denyoom"];
-const ADMIN: &[&str] = &["admin", "no_auth", "loading", "stale"];
+const ADMIN: &[&str] = &["admin", "loading", "stale"];
 const LOCAL: &[&str] = &["loading", "stale", "fast"];
 
 const fn command(name: &'static str, arity: i64, flags: &'static [&'static str]) -> CommandInfo {
@@ -31,6 +37,22 @@ const fn command(name: &'static str, arity: i64, flags: &'static [&'static str])
         first_key: 0,
         last_key: 0,
         step: 0,
+        declined: false,
+        keyspace: false,
+    }
+}
+
+const fn declined(name: &'static str, arity: i64, flags: &'static [&'static str]) -> CommandInfo {
+    CommandInfo {
+        declined: true,
+        ..command(name, arity, flags)
+    }
+}
+
+const fn keyspace(name: &'static str, arity: i64, flags: &'static [&'static str]) -> CommandInfo {
+    CommandInfo {
+        keyspace: true,
+        ..command(name, arity, flags)
     }
 }
 
@@ -49,6 +71,8 @@ const fn keyed(
         first_key,
         last_key,
         step,
+        declined: false,
+        keyspace: false,
     }
 }
 
@@ -61,7 +85,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     command("hello", -1, &["no_auth"]),
     command("auth", -2, &["no_auth", "loading", "stale"]),
     command("select", 2, LOCAL),
-    command("client", -2, &["no_auth"]),
+    command("client", -2, ADMIN),
     command("reset", 1, &["no_auth", "loading", "stale"]),
     command("quit", -1, &["no_auth", "loading", "stale"]),
     command("command", -1, LOCAL),
@@ -104,15 +128,16 @@ pub const COMMANDS: &[CommandInfo] = &[
     keyed("persist", 2, WRITE, 1, 1, 1),
     keyed("ttl", 2, READ, 1, 1, 1),
     keyed("pttl", 2, READ, 1, 1, 1),
+    // The keyspace. These walk every owner rather than naming keys.
+    keyspace("keys", 2, &["readonly"]),
+    keyspace("scan", -2, &["readonly"]),
+    keyspace("dbsize", 1, &["readonly", "fast"]),
+    keyspace("randomkey", 1, &["readonly"]),
     // Declined. Listed so that a client asking what the server knows is told
     // the command exists and was refused, rather than that the server does not
     // exist. See docs/redis-compatibility.md for why each one is absent.
-    command("scan", -2, &["readonly", "random"]),
-    command("keys", 2, &["readonly", "random"]),
-    command("dbsize", 1, &["readonly", "fast"]),
-    command("flushdb", -1, WRITE),
-    command("flushall", -1, WRITE),
-    command("randomkey", 1, &["readonly", "random"]),
+    declined("flushdb", -1, WRITE),
+    declined("flushall", -1, WRITE),
 ];
 
 pub fn lookup(name: &str) -> Option<&'static CommandInfo> {
@@ -122,6 +147,36 @@ pub fn lookup(name: &str) -> Option<&'static CommandInfo> {
 }
 
 impl CommandInfo {
+    /// `given` counts the command name, as Redis's arity does.
+    pub fn accepts(&self, given: usize) -> bool {
+        let given = given as i64;
+        if self.arity < 0 {
+            given >= -self.arity
+        } else {
+            given == self.arity
+        }
+    }
+
+    /// May run before the connection authenticates.
+    pub fn pre_auth(&self) -> bool {
+        self.flags.contains(&"no_auth")
+    }
+
+    /// Changes data, so a command that passes its deadline may have done so.
+    pub fn writes(&self) -> bool {
+        self.flags.contains(&"write")
+    }
+
+    /// Names keys, at the positions `first_key`, `last_key` and `step` give.
+    pub fn has_keys(&self) -> bool {
+        self.first_key != 0
+    }
+
+    /// Reaches the cluster, rather than answering from the gateway.
+    pub fn reaches_cluster(&self) -> bool {
+        self.has_keys() || self.keyspace
+    }
+
     pub fn to_reply(&self) -> Reply {
         Reply::Array(vec![
             Reply::bulk(self.name),
@@ -139,13 +194,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_command_the_dispatcher_handles_is_in_the_table() {
-        for name in crate::commands::HANDLED {
-            assert!(
-                lookup(name).is_some(),
-                "{name} is dispatched but missing from the command table"
-            );
-        }
+    fn only_the_handshake_runs_before_authentication() {
+        let pre_auth: Vec<_> = COMMANDS
+            .iter()
+            .filter(|command| command.pre_auth())
+            .map(|command| command.name)
+            .collect();
+        assert_eq!(pre_auth, ["hello", "auth", "reset", "quit"]);
+    }
+
+    #[test]
+    fn arity_counts_the_name_and_a_negative_one_is_a_minimum() {
+        let get = lookup("get").unwrap();
+        assert!(get.accepts(2) && !get.accepts(1) && !get.accepts(3));
+        let set = lookup("set").unwrap();
+        assert!(set.accepts(3) && set.accepts(9) && !set.accepts(2));
     }
 
     #[test]
@@ -158,6 +221,15 @@ mod tests {
         assert_eq!((rename.first_key, rename.last_key), (1, 2));
         assert_eq!(lookup("get").unwrap().first_key, 1);
         assert_eq!(lookup("ping").unwrap().first_key, 0);
+    }
+
+    #[test]
+    fn keyspace_commands_reach_the_cluster_without_naming_keys() {
+        for name in ["keys", "scan", "dbsize", "randomkey"] {
+            let command = lookup(name).unwrap();
+            assert!(!command.has_keys() && command.reaches_cluster(), "{name}");
+        }
+        assert!(!lookup("ping").unwrap().reaches_cluster());
     }
 
     #[test]

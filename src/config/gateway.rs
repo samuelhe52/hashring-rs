@@ -11,6 +11,7 @@ use crate::GatewayArgs;
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:6379";
 pub const DEFAULT_COORDINATOR: &str = "http://127.0.0.1:50050";
 pub const DEFAULT_DEADLINE_MS: u64 = 5_000;
+pub const DEFAULT_MAXCLIENTS: usize = 10_000;
 
 /// Read when neither the flag nor the file sets a password, so a deployment can
 /// keep the secret out of both the process list and the config file.
@@ -23,6 +24,7 @@ pub struct GatewayFile {
     pub coordinator: Option<String>,
     pub deadline_ms: Option<u64>,
     pub requirepass: Option<String>,
+    pub maxclients: Option<NonZeroUsize>,
     pub worker_threads: Option<NonZeroUsize>,
 }
 
@@ -32,6 +34,7 @@ pub struct GatewaySettings {
     pub coordinator: String,
     pub operation_timeout: Duration,
     pub password: Option<Arc<str>>,
+    pub max_connections: NonZeroUsize,
     /// `None` takes one worker per available CPU.
     pub worker_threads: Option<NonZeroUsize>,
 }
@@ -72,6 +75,10 @@ pub fn resolve(
             .unwrap_or_else(|| DEFAULT_COORDINATOR.to_owned()),
         operation_timeout: Duration::from_millis(deadline_ms),
         password,
+        max_connections: args
+            .maxclients
+            .or(file.maxclients)
+            .unwrap_or(NonZeroUsize::new(DEFAULT_MAXCLIENTS).expect("the default is positive")),
         worker_threads: args.worker_threads.or(file.worker_threads),
     })
 }
@@ -107,6 +114,7 @@ mod tests {
         assert_eq!(settings.coordinator, DEFAULT_COORDINATOR);
         assert_eq!(settings.operation_timeout, Duration::from_secs(5));
         assert!(settings.password.is_none());
+        assert_eq!(settings.max_connections.get(), DEFAULT_MAXCLIENTS);
         assert_eq!(settings.runtime_workers(24), 24);
     }
 

@@ -71,10 +71,11 @@ cargo run -- redis-gateway --listen 127.0.0.1:6379 \
 It answers the string and key commands, the connection handshake, and the
 expiry commands, and declines the rest with a clear error rather than a wrong
 answer. It is **not** Redis and not Redis Cluster: there are no data structures,
-no transactions or scripting, no keyspace enumeration, no atomicity across
-keys, and read-modify-write commands are atomic only within a single gateway
-process. [docs/redis-compatibility.md](docs/redis-compatibility.md) documents
-every command, every difference, and what each limitation would cost to close.
+no transactions or scripting, no keyspace enumeration, and no atomicity
+across keys. Read-modify-write commands such as `INCR` are conditional writes the
+owning node checks, so they stay atomic however many gateways are running.
+[docs/redis-compatibility.md](docs/redis-compatibility.md) documents every
+command, every difference, and what each limitation would cost to close.
 
 Expiry itself belongs to the cluster, not the gateway: a deadline is a field on
 the record, so it survives failover, migration and restart. `SET key value EX

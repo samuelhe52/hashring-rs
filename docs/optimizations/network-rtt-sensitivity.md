@@ -186,6 +186,11 @@ a property of the network.
 
 ## Reproduce
 
+The sweep defaults to the tracked `examples/experiment.yaml` and pins
+`--mode correctness`. The numbers above came from a local, untracked config with the
+same replication factor, policy and virtual nodes but seed 114514 and the default
+byte budgets, so expect the same slope and not the same digits.
+
 ```sh
 cargo build --release
 
@@ -197,7 +202,7 @@ DELAYS="0 1ms" CONCS="64 128 256 512" REPS=2 ./scripts/netem-sweep.sh
 
 # the same slope under a policy that waits for no follower
 sed 's/^policy: first-successor/policy: owner-only/' \
-  experiments/experiment_cmach.yaml > /tmp/owner-only.yaml
+  examples/experiment.yaml > /tmp/owner-only.yaml
 DELAYS="0 200us 400us 800us" CONFIG=/tmp/owner-only.yaml REPS=2 ./scripts/netem-sweep.sh
 ```
 

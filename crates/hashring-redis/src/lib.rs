@@ -47,6 +47,9 @@ pub struct GatewayConfig {
     /// When set, a connection must send `AUTH` before it may read or write.
     pub password: Option<Arc<str>>,
     pub limits: resp::Limits,
+    /// Connections open at once; one more is answered with Redis's
+    /// `max number of clients reached` and closed. Redis's `maxclients`.
+    pub max_connections: usize,
 }
 
 impl Default for GatewayConfig {
@@ -57,6 +60,7 @@ impl Default for GatewayConfig {
             operation_timeout: Duration::from_secs(5),
             password: None,
             limits: resp::Limits::default(),
+            max_connections: 10_000,
         }
     }
 }
@@ -80,15 +84,17 @@ pub async fn serve(
         client,
         config.password.clone(),
         config.limits,
+        config.operation_timeout,
     ));
     tracing::info!(
         listen = %local,
         coordinator = %config.coordinator,
         operation_timeout_ms = config.operation_timeout.as_millis(),
         authentication = config.password.is_some(),
+        max_connections = config.max_connections,
         "redis gateway ready"
     );
-    server::Gateway::new(dispatcher, shutdown)
+    server::Gateway::new(dispatcher, shutdown, config.max_connections)
         .serve(listener)
         .await
 }

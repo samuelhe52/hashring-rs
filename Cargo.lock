@@ -542,6 +542,7 @@ name = "hashring-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "futures",
  "hashring-core",
  "rand",
  "thiserror",
@@ -549,7 +550,6 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -619,6 +619,7 @@ dependencies = [
 name = "hashring-redis"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "hashring-client",
  "hashring-core",
  "redis",

@@ -1,0 +1,87 @@
+on-CPU sampled 9.20s over 4.27s window = 2.15 cores
+
+### coordinator  (1 proc)  on-CPU 0.00s = 0% of all on-CPU, 0.00 cores
+  of this role's CPU-delta: parked-at-sample 83.6%, mutexwait 0.0% (excluded below)
+  owner view:
+     72.0%  h2
+     21.9%  hyper
+      6.1%  runtime
+  self view (top 25); libsystem_kernel leaf total 33.8%:
+     60.1%  rust:h2
+     21.9%  sys:net __recvfrom
+     11.9%  sys:net writev
+      6.1%  memcpy/platform _platform_memmove
+
+### driver  (1 proc)  on-CPU 6.46s = 70% of all on-CPU, 1.51 cores
+  of this role's CPU-delta: parked-at-sample 2.8%, mutexwait 5.0% (excluded below)
+  owner view:
+     50.5%  h2
+     17.4%  hyper
+     14.7%  hashring
+      9.9%  tonic
+      3.4%  runtime
+      3.2%  tower
+      0.8%  prost
+  self view (top 25); libsystem_kernel leaf total 47.9%:
+     29.4%  sys:net writev
+     10.9%  rust:h2
+     10.9%  sys:net __recvfrom
+      9.5%  rust:tokio
+      6.8%  sys:other getentropy
+      6.3%  malloc/free
+      4.2%  rust:http
+      4.0%  memcpy/platform _platform_memmove
+      2.9%  rust:tonic
+      1.9%  rust:core
+      1.8%  libsystem other (libsystem_pthread.dylib)
+      1.7%  rust:?
+      1.4%  rust:hyper
+      1.3%  rust:bytes
+      1.1%  rust:hashring_client
+      0.8%  rust:tower
+      0.7%  rust:tokio_util
+      0.6%  sys:other mach_absolute_time
+      0.5%  memcpy/platform _platform_memcmp
+      0.4%  rust:alloc
+      0.4%  rust:hashring_experiment
+      0.4%  rust:prost
+      0.3%  rust:__rustc
+      0.3%  rust:std
+      0.3%  rust:indexmap
+
+### node  (6 proc)  on-CPU 2.74s = 30% of all on-CPU, 0.64 cores
+  of this role's CPU-delta: parked-at-sample 77.0%, mutexwait 1.3% (excluded below)
+  owner view:
+     38.9%  h2
+     19.7%  hyper
+     18.7%  hashring
+     10.9%  tonic
+      7.6%  runtime
+      2.7%  tower
+      1.6%  prost
+  self view (top 25); libsystem_kernel leaf total 34.7%:
+     16.1%  sys:net writev
+     12.6%  rust:h2
+     12.3%  sys:net __recvfrom
+      8.9%  malloc/free
+      6.7%  rust:tokio
+      3.7%  memcpy/platform _platform_memmove
+      3.6%  rust:hashring_node
+      3.4%  rust:http
+      3.1%  rust:core
+      3.1%  sys:other mach_absolute_time
+      2.8%  rust:tonic
+      2.1%  libsystem other (libsystem_pthread.dylib)
+      2.0%  sys:lock/park __psynch_cvsignal
+      1.9%  rust:?
+      1.7%  rust:bytes
+      1.6%  rust:hyper
+      1.6%  rust:hashring_core
+      1.5%  rust:std
+      1.4%  rust:hashbrown
+      1.4%  rust:alloc
+      1.1%  rust:blake3
+      0.8%  sys:lock/park __psynch_mutexdrop
+      0.7%  rust:tower
+      0.7%  rust:tokio_util
+      0.6%  rust:prost

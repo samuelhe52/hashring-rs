@@ -194,6 +194,10 @@ struct NodeTuningArgs {
     /// Bounds each replication connect and batch RPC. [default: 2000]
     #[arg(long)]
     replication_rpc_timeout_ms: Option<u64>,
+    /// How long a follower stream waits to fill a replication batch when no
+    /// write waits for its ACK. 0 sends at once. [default: 2]
+    #[arg(long)]
+    replication_batch_linger_ms: Option<u64>,
 }
 
 #[derive(Args, Clone)]
@@ -317,6 +321,10 @@ struct GatewayArgs {
     /// secret need not appear in the process list.
     #[arg(long)]
     requirepass: Option<String>,
+    /// Connections open at once before a new one is refused, as Redis's
+    /// `maxclients`. [default: 10000]
+    #[arg(long)]
+    maxclients: Option<NonZeroUsize>,
     /// Tokio worker threads. Defaults to one per CPU available to the process
     /// (affinity and cgroup limits included).
     #[arg(long)]
@@ -460,6 +468,7 @@ fn main() -> Result<()> {
             let file = args.config.as_deref().map(config::load).transpose()?;
             let config = config::experiment::resolve(args, file, cpus)?;
             init_tracing(config.verbose)?;
+            hashring_core::rpc_profile::start_reporter("driver");
             return build_runtime(Some(config.worker_threads))?
                 .block_on(run_local_experiment(config));
         }
@@ -467,6 +476,7 @@ fn main() -> Result<()> {
             let file = args.config.as_deref().map(config::load).transpose()?;
             let config = config::node::resolve(args, file)?;
             init_tracing(false)?;
+            hashring_core::rpc_profile::start_reporter("node");
             return build_runtime(Some(config.runtime_workers(cpus)))?
                 .block_on(run_node(config, args.stop_response_delay_ms));
         }
@@ -556,6 +566,7 @@ async fn run_redis_gateway(settings: config::gateway::GatewaySettings) -> Result
         listen: settings.listen,
         operation_timeout: settings.operation_timeout,
         password: settings.password,
+        max_connections: settings.max_connections.get(),
         ..Default::default()
     };
     hashring_redis::serve(config, stopped.clone()).await?;

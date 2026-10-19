@@ -154,6 +154,27 @@ impl Cluster {
         }
     }
 
+    /// Another gateway in front of the same cluster, as a second process
+    /// behind a load balancer would be. Its URL, and the process to keep alive.
+    fn second_gateway(&self) -> (Process, String) {
+        let port = unused_ports(1)[0];
+        let mut arguments = vec![
+            "redis-gateway".to_owned(),
+            "--listen".to_owned(),
+            format!("127.0.0.1:{port}"),
+            "--coordinator".to_owned(),
+            self.coordinator.clone(),
+            "--deadline-ms".to_owned(),
+            "10000".to_owned(),
+        ];
+        if let Some(password) = &self.password {
+            arguments.extend(["--requirepass".to_owned(), password.clone()]);
+        }
+        let process = spawn(&arguments);
+        wait_for_listener(port);
+        (process, format!("redis://127.0.0.1:{port}"))
+    }
+
     fn authenticated_url(&self) -> String {
         self.url(self.password.as_deref())
     }
@@ -565,18 +586,28 @@ async fn multi_key_commands_reach_every_owner() {
         .unwrap();
     assert_eq!(found, 0);
 
-    // MSETNX sets every pair only when none of them exists.
-    let fresh: Vec<(String, String)> = (0..8)
-        .map(|index| (format!("nx-{index}"), format!("{index}")))
-        .collect();
+    // MSETNX cannot set several keys atomically, so it is declined for more
+    // than one key and is SETNX for one. A key named twice is one key.
+    let refused = redis::cmd("MSETNX")
+        .arg(&[("nx-1", "1"), ("nx-2", "2")])
+        .query_async::<i64>(&mut connection)
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("cannot be set atomically"));
+    let present: i64 = redis::cmd("EXISTS")
+        .arg(&["nx-1", "nx-2"])
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(present, 0);
     let written: i64 = redis::cmd("MSETNX")
-        .arg(&fresh)
+        .arg(&[("nx-0", "stale"), ("nx-0", "0")])
         .query_async(&mut connection)
         .await
         .unwrap();
     assert_eq!(written, 1);
     let written: i64 = redis::cmd("MSETNX")
-        .arg(&fresh)
+        .arg(&[("nx-0", "other")])
         .query_async(&mut connection)
         .await
         .unwrap();
@@ -795,6 +826,326 @@ async fn expiry_is_the_clusters_own_and_survives_a_membership_change() {
     );
 }
 
+async fn dbsize(connection: &mut redis::aio::MultiplexedConnection) -> redis::RedisResult<i64> {
+    redis::cmd("DBSIZE").query_async(connection).await
+}
+
+async fn keys_matching(
+    connection: &mut redis::aio::MultiplexedConnection,
+    pattern: &str,
+) -> redis::RedisResult<Vec<String>> {
+    let mut keys: Vec<String> = redis::cmd("KEYS")
+        .arg(pattern)
+        .query_async(connection)
+        .await?;
+    keys.sort();
+    Ok(keys)
+}
+
+#[tokio::test]
+async fn keyspace_commands_count_each_key_once_even_while_ranges_move() {
+    let _guard = test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let cluster = Cluster::start(&directory.path().join("coordinator.redb"), None);
+    let mut connection = cluster.client().await;
+
+    assert_eq!(dbsize(&mut connection).await.unwrap(), 0);
+    assert!(
+        keys_matching(&mut connection, "*")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let none: Option<String> = redis::cmd("RANDOMKEY")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(none, None);
+
+    // Every node also holds follower copies of the others' keys, so a count
+    // that did not keep to each owner's own ranges would come out tripled.
+    let mut expected: Vec<String> = (0..300).map(|index| format!("walk:{index}")).collect();
+    let pairs: Vec<(String, String)> = expected
+        .iter()
+        .map(|key| (key.clone(), "value".to_owned()))
+        .collect();
+    let _: () = redis::cmd("MSET")
+        .arg(&pairs)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("other")
+        .arg("value")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    // Neither an expired key nor a deleted one is a key.
+    let _: () = redis::cmd("SET")
+        .arg("gone")
+        .arg("value")
+        .arg("PX")
+        .arg(1)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("deleted")
+        .arg("value")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    let _: i64 = redis::cmd("DEL")
+        .arg("deleted")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    expected.push("other".to_owned());
+    expected.sort();
+
+    assert_eq!(dbsize(&mut connection).await.unwrap(), 301);
+    assert_eq!(keys_matching(&mut connection, "*").await.unwrap(), expected);
+    let tens: Vec<String> = (10..20).map(|index| format!("walk:{index}")).collect();
+    assert_eq!(
+        keys_matching(&mut connection, "walk:1?").await.unwrap(),
+        tens
+    );
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..20 {
+        let key: String = redis::cmd("RANDOMKEY")
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert!(expected.binary_search(&key).is_ok(), "{key} is not a key");
+        seen.insert(key);
+    }
+    assert!(seen.len() > 1, "RANDOMKEY kept answering {seen:?}");
+
+    // A fourth node joins and ranges move to it. A walk that straddles a move
+    // starts over, so whenever one answers, it has still seen every key once.
+    let client = cluster.cluster_client().await;
+    let port = unused_ports(1)[0];
+    let mut members: Vec<Member> = client.topology().await.members;
+    members.push(Member {
+        node_id: "node-4".to_owned(),
+        endpoint: format!("http://127.0.0.1:{port}"),
+    });
+    let change = client.begin_topology_change(members).await.unwrap();
+    let _node = spawn(&[
+        "node".to_owned(),
+        "--id".to_owned(),
+        "node-4".to_owned(),
+        "--listen".to_owned(),
+        format!("127.0.0.1:{port}"),
+        "--coordinator".to_owned(),
+        cluster.coordinator.clone(),
+    ]);
+    wait_for_listener(port);
+    let executor = client.clone();
+    let execution = tokio::spawn(async move {
+        executor
+            .execute_topology_change(
+                change.change_id.clone(),
+                change.base_epoch,
+                change.target_topology.epoch,
+            )
+            .await
+    });
+    let mut answered = 0;
+    while !execution.is_finished() {
+        // Only "try again" may stand in for an answer: a walk that ran out
+        // of time restarting is not a wrong count.
+        match dbsize(&mut connection).await {
+            Ok(count) => {
+                assert_eq!(count, 301, "DBSIZE during the move");
+                answered += 1;
+            }
+            Err(error) => assert_eq!(error.code(), Some("TRYAGAIN"), "{error}"),
+        }
+        match keys_matching(&mut connection, "*").await {
+            Ok(keys) => {
+                assert_eq!(keys, expected, "KEYS during the move");
+                answered += 1;
+            }
+            Err(error) => assert_eq!(error.code(), Some("TRYAGAIN"), "{error}"),
+        }
+    }
+    let completed = tokio::time::timeout(Duration::from_secs(90), execution)
+        .await
+        .expect("the membership change did not finish in time")
+        .unwrap()
+        .expect("the membership change was not published");
+    assert!(completed.target_topology.epoch > 1);
+    assert!(answered > 0, "no walk answered while the change ran");
+    assert_eq!(dbsize(&mut connection).await.unwrap(), 301);
+    assert_eq!(keys_matching(&mut connection, "*").await.unwrap(), expected);
+}
+
+/// One `SCAN` step: the next cursor and the keys it returned. A step that
+/// answers `TRYAGAIN` is sent again with the same cursor, as a client would.
+async fn scan_step(
+    connection: &mut redis::aio::MultiplexedConnection,
+    cursor: u64,
+    options: &[&str],
+) -> (u64, Vec<String>) {
+    loop {
+        let mut command = redis::cmd("SCAN");
+        command.arg(cursor.to_string());
+        for option in options {
+            command.arg(*option);
+        }
+        match command
+            .query_async::<(String, Vec<String>)>(&mut *connection)
+            .await
+        {
+            Ok((next, keys)) => return (next.parse().expect("a numeric cursor"), keys),
+            Err(error) if error.code() == Some("TRYAGAIN") => continue,
+            Err(error) => panic!("SCAN failed: {error}"),
+        }
+    }
+}
+
+/// A whole scan from cursor 0 back to 0, sorted, checking that no key came
+/// back twice.
+async fn full_scan(
+    connection: &mut redis::aio::MultiplexedConnection,
+    options: &[&str],
+) -> Vec<String> {
+    let mut cursor = 0;
+    let mut keys = Vec::new();
+    for _ in 0..100_000 {
+        let (next, step) = scan_step(connection, cursor, options).await;
+        keys.extend(step);
+        if next == 0 {
+            let unique: std::collections::HashSet<_> = keys.iter().collect();
+            assert_eq!(unique.len(), keys.len(), "a scan returned a key twice");
+            keys.sort();
+            return keys;
+        }
+        cursor = next;
+    }
+    panic!("the scan never finished");
+}
+
+#[tokio::test]
+async fn scan_returns_each_key_once_across_gateways_and_a_membership_change() {
+    let _guard = test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let cluster = Cluster::start(&directory.path().join("coordinator.redb"), None);
+    let mut connection = cluster.client().await;
+
+    assert!(full_scan(&mut connection, &[]).await.is_empty());
+
+    let mut expected: Vec<String> = (0..300).map(|index| format!("walk:{index}")).collect();
+    let pairs: Vec<(String, String)> = expected
+        .iter()
+        .map(|key| (key.clone(), "value".to_owned()))
+        .collect();
+    let _: () = redis::cmd("MSET")
+        .arg(&pairs)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    expected.sort();
+
+    assert_eq!(full_scan(&mut connection, &[]).await, expected);
+    assert_eq!(full_scan(&mut connection, &["COUNT", "1"]).await, expected);
+    assert_eq!(
+        full_scan(&mut connection, &["COUNT", "1000"]).await,
+        expected
+    );
+    assert_eq!(
+        full_scan(&mut connection, &["TYPE", "string"]).await,
+        expected
+    );
+    let tens: Vec<String> = (10..20).map(|index| format!("walk:{index}")).collect();
+    assert_eq!(
+        full_scan(&mut connection, &["MATCH", "walk:1?"]).await,
+        tens
+    );
+    let hashes = scan_step(&mut connection, 0, &["TYPE", "hash"]).await;
+    assert_eq!(hashes, (0, Vec::new()));
+
+    // A client's own scan iterator, which parses the cursor itself.
+    let mut iterated: Vec<String> = {
+        let mut iterator =
+            redis::AsyncCommands::scan_match::<_, String>(&mut connection, "walk:1?")
+                .await
+                .unwrap();
+        let mut keys = Vec::new();
+        while let Some(key) = iterator.next_item().await {
+            keys.push(key.unwrap());
+        }
+        keys
+    };
+    iterated.sort();
+    assert_eq!(iterated, tens);
+
+    // The cursor is all the state, so a scan begun through one gateway can be
+    // finished through another.
+    let (_second, url) = cluster.second_gateway();
+    let mut other = cluster.connect(&url).await;
+    let (mut cursor, mut keys) = scan_step(&mut connection, 0, &["COUNT", "20"]).await;
+    assert_ne!(cursor, 0);
+    while cursor != 0 {
+        let (next, step) = scan_step(&mut other, cursor, &["COUNT", "20"]).await;
+        keys.extend(step);
+        cursor = next;
+    }
+    keys.sort();
+    assert_eq!(keys, expected);
+
+    // A fourth node joins and ranges move to it, between and during scans.
+    // A cursor is a token, which the move does not change, so every scan that
+    // finishes still returns each key exactly once.
+    let client = cluster.cluster_client().await;
+    let port = unused_ports(1)[0];
+    let mut members: Vec<Member> = client.topology().await.members;
+    members.push(Member {
+        node_id: "node-4".to_owned(),
+        endpoint: format!("http://127.0.0.1:{port}"),
+    });
+    let change = client.begin_topology_change(members).await.unwrap();
+    let _node = spawn(&[
+        "node".to_owned(),
+        "--id".to_owned(),
+        "node-4".to_owned(),
+        "--listen".to_owned(),
+        format!("127.0.0.1:{port}"),
+        "--coordinator".to_owned(),
+        cluster.coordinator.clone(),
+    ]);
+    wait_for_listener(port);
+    let executor = client.clone();
+    let execution = tokio::spawn(async move {
+        executor
+            .execute_topology_change(
+                change.change_id.clone(),
+                change.base_epoch,
+                change.target_topology.epoch,
+            )
+            .await
+    });
+    let mut scans = 0;
+    while !execution.is_finished() {
+        assert_eq!(
+            full_scan(&mut connection, &["COUNT", "15"]).await,
+            expected,
+            "a scan during the move"
+        );
+        scans += 1;
+    }
+    let completed = tokio::time::timeout(Duration::from_secs(90), execution)
+        .await
+        .expect("the membership change did not finish in time")
+        .unwrap()
+        .expect("the membership change was not published");
+    assert!(completed.target_topology.epoch > 1);
+    assert!(scans > 0, "no scan ran while the change did");
+    assert_eq!(full_scan(&mut other, &[]).await, expected);
+}
+
 #[tokio::test]
 async fn a_connection_may_be_required_to_authenticate() {
     let _guard = test_lock().lock().await;
@@ -912,12 +1263,7 @@ async fn a_declined_command_says_so_instead_of_failing_obscurely() {
     let cluster = Cluster::start(&directory.path().join("coordinator.redb"), None);
     let mut connection = cluster.client().await;
 
-    for (command, expected) in [
-        ("SCAN", "SCAN is not supported"),
-        ("KEYS", "KEYS is not supported"),
-        ("DBSIZE", "DBSIZE is not supported"),
-        ("FLUSHALL", "FLUSHALL is not supported"),
-    ] {
+    for (command, expected) in [("FLUSHALL", "FLUSHALL is not supported")] {
         let error = redis::cmd(command)
             .arg("*")
             .query_async::<()>(&mut connection)
@@ -1089,4 +1435,275 @@ async fn a_gateway_outlives_its_coordinator() {
         "a gateway with no cluster must ask the client to retry, not guess"
     );
     drop(gateway);
+}
+
+/// Sends one inline command over a raw socket and reads whatever comes back
+/// before the gateway stops writing, for checks the client library would hide.
+async fn raw_exchange(port: u16, request: &[u8]) -> Vec<u8> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    socket.write_all(request).await.unwrap();
+    let mut answer = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match tokio::time::timeout(Duration::from_millis(500), socket.read(&mut chunk)).await {
+            Ok(Ok(0)) | Err(_) => return answer,
+            Ok(Ok(read)) => answer.extend_from_slice(&chunk[..read]),
+            Ok(Err(error)) => panic!("{error}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn increments_through_two_gateways_are_not_lost() {
+    let _guard = test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let cluster = Cluster::start(&directory.path().join("coordinator.redb"), None);
+    let (_second, second_url) = cluster.second_gateway();
+    let _: () = redis::cmd("SET")
+        .arg("two-gateway-counter")
+        .arg(0)
+        .query_async(&mut cluster.client().await)
+        .await
+        .unwrap();
+
+    // The gateways share no lock. What keeps every increment is the owner
+    // applying each write only if the key is still the version that was read.
+    let mut tasks = Vec::new();
+    for url in [cluster.url(None), second_url].into_iter().cycle().take(8) {
+        tasks.push(tokio::spawn(async move {
+            let mut connection = redis::Client::open(url)
+                .unwrap()
+                .get_multiplexed_async_connection()
+                .await
+                .unwrap();
+            for _ in 0..25 {
+                redis::cmd("INCR")
+                    .arg("two-gateway-counter")
+                    .query_async::<i64>(&mut connection)
+                    .await
+                    .unwrap();
+            }
+        }));
+    }
+    for task in tasks {
+        tokio::time::timeout(Duration::from_secs(60), task)
+            .await
+            .expect("an increment task stalled")
+            .unwrap();
+    }
+    let total: String = redis::cmd("GET")
+        .arg("two-gateway-counter")
+        .query_async(&mut cluster.client().await)
+        .await
+        .unwrap();
+    assert_eq!(total, "200", "an increment was lost between two gateways");
+}
+
+#[tokio::test]
+async fn options_and_edge_cases_answer_the_way_redis_does() {
+    let _guard = test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let cluster = Cluster::start(&directory.path().join("coordinator.redb"), None);
+    let mut connection = cluster.client().await;
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Each expiry option in its own unit.
+    let _: () = redis::cmd("SET")
+        .arg("px")
+        .arg("v")
+        .arg("PX")
+        .arg(5_000)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    let pttl: i64 = redis::cmd("PTTL")
+        .arg("px")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert!((1..=5_000).contains(&pttl), "PX 5000 left a PTTL of {pttl}");
+    let _: () = redis::cmd("SET")
+        .arg("exat")
+        .arg("v")
+        .arg("EXAT")
+        .arg(now_secs + 100)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert!((98..=101).contains(&ttl(&mut connection, "exat").await));
+    let value: Option<String> = redis::cmd("GETEX")
+        .arg("exat")
+        .arg("PX")
+        .arg(2_000)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(value.as_deref(), Some("v"));
+    assert!((1..=2).contains(&ttl(&mut connection, "exat").await));
+
+    // An option with its operand missing is a syntax error on a connection
+    // that keeps working.
+    let error = redis::cmd("SET")
+        .arg("k")
+        .arg("v")
+        .arg("EX")
+        .query_async::<()>(&mut connection)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("syntax error"), "{error}");
+    let pong: String = redis::cmd("PING")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(pong, "PONG");
+
+    // `SET ... NX GET` answers with the value it did not replace.
+    let _: () = redis::cmd("SET")
+        .arg("nxget")
+        .arg("old")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    let old: Option<String> = redis::cmd("SET")
+        .arg("nxget")
+        .arg("new")
+        .arg("NX")
+        .arg("GET")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(old.as_deref(), Some("old"));
+
+    // An empty `SETRANGE` creates nothing.
+    let length: i64 = redis::cmd("SETRANGE")
+        .arg("never")
+        .arg(100)
+        .arg("")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(length, 0);
+    let exists: i64 = redis::cmd("EXISTS")
+        .arg("never")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(exists, 0);
+
+    // A deadline in the past deletes; a key without one accepts `LT`.
+    let _: () = redis::cmd("SET")
+        .arg("gone")
+        .arg("v")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    let expired: i64 = redis::cmd("EXPIRE")
+        .arg("gone")
+        .arg(-1)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(expired, 1);
+    assert_eq!(ttl(&mut connection, "gone").await, -2);
+    let _: () = redis::cmd("SET")
+        .arg("lt")
+        .arg("v")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    let applied: i64 = redis::cmd("EXPIRE")
+        .arg("lt")
+        .arg(10)
+        .arg("LT")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(applied, 1);
+    assert!((9..=10).contains(&ttl(&mut connection, "lt").await));
+    let persisted: i64 = redis::cmd("PERSIST")
+        .arg("lt")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(persisted, 1);
+    assert_eq!(ttl(&mut connection, "lt").await, -1);
+
+    // The smallest integer is a result, not an overflow.
+    let _: () = redis::cmd("SET")
+        .arg("min")
+        .arg(i64::MIN + 1)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    let min: i64 = redis::cmd("DECR")
+        .arg("min")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(min, i64::MIN);
+
+    // A key named twice in `MSET` takes its later value.
+    let _: () = redis::cmd("MSET")
+        .arg("twice")
+        .arg(1)
+        .arg("twice")
+        .arg(2)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    let twice: String = redis::cmd("GET")
+        .arg("twice")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(twice, "2");
+
+    // A key the cluster refuses fails the whole multi-key command instead of
+    // counting as absent.
+    let oversized = "k".repeat(70 * 1024);
+    for command in ["DEL", "EXISTS"] {
+        let error = redis::cmd(command)
+            .arg("twice")
+            .arg(&oversized)
+            .query_async::<i64>(&mut connection)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds"), "{command}: {error}");
+    }
+}
+
+#[tokio::test]
+async fn the_combined_handshake_authenticates_and_quit_is_answered() {
+    let _guard = test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let cluster = Cluster::start(&directory.path().join("coordinator.redb"), Some("s3cret"));
+
+    let answer = raw_exchange(
+        cluster.port,
+        b"HELLO 3 AUTH default s3cret\r\nPING\r\nQUIT\r\n",
+    )
+    .await;
+    let text = String::from_utf8_lossy(&answer);
+    assert!(
+        text.starts_with('%'),
+        "HELLO 3 did not answer with a RESP3 map: {text}"
+    );
+    assert!(
+        text.ends_with("+PONG\r\n+OK\r\n"),
+        "unexpected tail: {text}"
+    );
+
+    // Replies switched off stay off until switched back on, which answers.
+    let answer = raw_exchange(
+        cluster.port,
+        b"AUTH s3cret\r\nCLIENT REPLY OFF\r\nPING\r\nCLIENT REPLY ON\r\nPING\r\n",
+    )
+    .await;
+    assert_eq!(answer, b"+OK\r\n+OK\r\n+PONG\r\n");
 }

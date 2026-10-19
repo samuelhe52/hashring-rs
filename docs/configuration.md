@@ -65,6 +65,7 @@ The examples list every key: [`coordinator.yaml`](../examples/coordinator.yaml),
 | `--replication-stream-queue-capacity` | `replication_stream_queue_capacity` | 32 | per node | Mutations queued per follower stream, whatever their size, so it limits small writes before the byte budget does. |
 | `--required-ack-timeout-ms` | `required_ack_timeout_ms` | 2000 | per node | How long a write waits for its required follower ACKs before reporting an unknown outcome. |
 | `--replication-rpc-timeout-ms` | `replication_rpc_timeout_ms` | 2000 | per node | Bounds each replication connect and batch RPC; a timed-out batch is retried. |
+| `--replication-batch-linger-ms` | `replication_batch_linger_ms` | 2 | per node | How long a follower stream waits to fill a replication batch. It never waits once a write in the batch is waiting for that follower's ACK. Under `owner-only` it also delays the first copy of an acknowledged write by up to this long. 0 sends at once. See [replication-batch-linger.md](optimizations/replication-batch-linger.md). |
 
 ## `redis-gateway`
 
@@ -80,6 +81,7 @@ not guarantee.
 | `--coordinator` | `coordinator` | `http://127.0.0.1:50050` | process | Contacted on the first command, so the gateway may start before the coordinator. |
 | `--deadline-ms` | `deadline_ms` | 5000 | process | How long one command may take against the cluster. Redis has no such deadline; a proxy in front of a migrating cluster needs one. |
 | `--requirepass` | `requirepass` | none | process | Falls back to the `HASHRING_GATEWAY_PASSWORD` environment variable, which keeps the secret out of both the file and the process list. |
+| `--maxclients` | `maxclients` | 10000 | process | Connections open at once. One more is answered `-ERR max number of clients reached` and closed, as Redis does. |
 | `--worker-threads` | `worker_threads` | one per available CPU | process | |
 
 ## `experiment`
@@ -106,7 +108,7 @@ replaced during the run.
 | `--worker-threads` | `worker_threads` | CPUs / (nodes + 2), at least 2 | process | For the driver and each node. |
 | `--coordinator-worker-threads` | `coordinator_worker_threads` | one per available CPU | process | For the run's coordinator, which is not on the data path. |
 | `--seed`, `--virtual-nodes`, `--range-move-concurrency`, `--replica-repair-concurrency`, `--prepublication-failure-grace-ms`, `--desired-replication-factor`, `--minimum-admitted-copies`, `--minimum-healthy-followers`, `--max-replica-lag-ms`, `--receipt-retention-ms`, `--lease-duration-ms` | as for `coordinator` | as for `coordinator` | as for `coordinator` | Passed to the run's coordinator. |
-| `--max-dedup-bytes`, `--max-pending-replication-bytes`, `--max-migration-journal-bytes`, `--replication-stream-queue-capacity`, `--required-ack-timeout-ms`, `--replication-rpc-timeout-ms` | as for `node` | as for `node` | per node | Passed to every node of the run. |
+| `--max-dedup-bytes`, `--max-pending-replication-bytes`, `--max-migration-journal-bytes`, `--replication-stream-queue-capacity`, `--required-ack-timeout-ms`, `--replication-rpc-timeout-ms`, `--replication-batch-linger-ms` | as for `node` | as for `node` | per node | Passed to every node of the run. |
 
 ## Client and admin commands
 

@@ -88,15 +88,18 @@ pub(super) fn required_followers(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Fans out the record a mutation produced, not the request that produced it:
+/// a follower stores exactly what the owner stored, so a write that kept the
+/// owner's deadline does not reach a follower as one that clears it.
 pub(super) fn prepare_replication_entries(
     state: &mut NodeState,
     key: &[u8],
-    value: &[u8],
-    shape: MutationShape<'_>,
-    version: &RecordVersion,
+    record: &Record,
+    request_fingerprint: [u8; 32],
     mutation_id: String,
     token: u64,
     max_pending_bytes: usize,
+    ack_awaited_followers: &[String],
 ) -> Result<Vec<PreparedReplication>, ()> {
     let follower_ids: Vec<_> = state
         .topology
@@ -121,9 +124,10 @@ pub(super) fn prepare_replication_entries(
         })
         .collect();
 
+    let version = &record.version;
     let per_entry_bytes = key
         .len()
-        .checked_add(value.len())
+        .checked_add(record.value.len())
         .and_then(|bytes| bytes.checked_add(version.owner_node_id.len()))
         .and_then(|bytes| bytes.checked_add(mutation_id.len()))
         .and_then(|bytes| bytes.checked_add(256))
@@ -135,12 +139,12 @@ pub(super) fn prepare_replication_entries(
         topology_epoch: state.topology.epoch,
         owner_node_id: version.owner_node_id.clone(),
         key: Arc::from(key),
-        value: Arc::from(value),
-        deleted: shape.deleted,
+        value: record.value.clone(),
+        deleted: record.deleted,
         version: version.clone(),
         mutation_id,
-        expires_at_unix_millis: shape.expires_at_unix_millis,
-        preserve_value: shape.preserve_value,
+        expires_at_unix_millis: record.expires_at_unix_millis,
+        request_fingerprint,
     });
 
     Ok(followers
@@ -156,6 +160,7 @@ pub(super) fn prepare_replication_entries(
                 .or_default();
             *sequence += 1;
             PreparedReplication {
+                ack_awaited: ack_awaited_followers.contains(&follower_node_id),
                 follower_node_id,
                 follower_endpoint,
                 stream_sequence: *sequence,
@@ -199,7 +204,7 @@ pub(super) fn replication_backpressure_error(epoch: u64) -> OperationError {
 
 pub(super) fn replication_fingerprint(entry: &ReplicationEntry) -> String {
     let mut digest = blake3::Hasher::new();
-    digest.update(b"hashring-rs:replication-entry:v2\0");
+    digest.update(b"hashring-rs:replication-entry:v3\0");
     digest.update(&entry.topology_epoch.to_be_bytes());
     digest.update(&(entry.owner_node_id.len() as u64).to_be_bytes());
     digest.update(entry.owner_node_id.as_bytes());
@@ -208,7 +213,9 @@ pub(super) fn replication_fingerprint(entry: &ReplicationEntry) -> String {
     digest.update(&entry.key);
     digest.update(&(entry.value.len() as u64).to_be_bytes());
     digest.update(&entry.value);
-    digest.update(&[u8::from(entry.deleted), u8::from(entry.preserve_value)]);
+    digest.update(&[u8::from(entry.deleted)]);
+    digest.update(&(entry.request_fingerprint.len() as u64).to_be_bytes());
+    digest.update(&entry.request_fingerprint);
     match entry.expires_at_unix_millis {
         Some(expires_at) => {
             digest.update(&[1]);
@@ -290,6 +297,7 @@ pub(super) fn start_replication_dispatch(
         max_pending_bytes,
         stream_queue_capacity: settings.replication_stream_queue_capacity,
         rpc_timeout: settings.replication_rpc_timeout,
+        batch_linger: settings.replication_batch_linger,
         pressure,
     }
 }
@@ -365,6 +373,7 @@ impl ReplicationDispatcher {
                     self.failed_streams.clone(),
                     self.active_rpc_budget.clone(),
                     self.rpc_timeout,
+                    self.batch_linger,
                     self.pressure.clone(),
                     stream_key.clone(),
                     receiver,
@@ -417,11 +426,59 @@ pub(super) fn replication_mutation_bytes(mutation: &ReplicationMutation) -> usiz
         + 256
 }
 
+/// Accumulates a contiguous run of queued entries for one follower so a single
+/// RPC carries many mutations. Returns the batch, its byte size, and the entry
+/// that would have overflowed the byte budget, which starts the next batch
+/// instead of being dropped, preserving the per-stream ordering that gap
+/// detection needs.
+///
+/// Without lingering, a stream sends whatever queued during its last round
+/// trip, which is one or two entries at moderate load. Waiting up to
+/// `batch_linger` for more trades follower lag for fewer RPCs, so it stops as
+/// soon as any entry in the batch has a write waiting for its ACK.
+pub(super) async fn collect_replication_batch(
+    first: PendingReplication,
+    entries: &mut mpsc::Receiver<PendingReplication>,
+    batch_linger: std::time::Duration,
+) -> (Vec<PendingReplication>, usize, Option<PendingReplication>) {
+    let mut batch: Vec<PendingReplication> = Vec::with_capacity(REPLICATION_BATCH_MAX_ENTRIES);
+    let mut batch_bytes = replication_mutation_bytes(&first.prepared.mutation);
+    let mut ack_awaited = first.prepared.ack_awaited;
+    batch.push(first);
+    let linger_until =
+        (!batch_linger.is_zero()).then(|| tokio::time::Instant::now() + batch_linger);
+    while batch.len() < REPLICATION_BATCH_MAX_ENTRIES {
+        let next = match entries.try_recv() {
+            Ok(next) => next,
+            Err(mpsc::error::TryRecvError::Disconnected) => break,
+            Err(mpsc::error::TryRecvError::Empty) => {
+                let Some(deadline) = linger_until.filter(|_| !ack_awaited) else {
+                    break;
+                };
+                match tokio::time::timeout_at(deadline, entries.recv()).await {
+                    Ok(Some(next)) => next,
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        };
+        let next_bytes = replication_mutation_bytes(&next.prepared.mutation);
+        if batch_bytes.saturating_add(next_bytes) > REPLICATION_BATCH_MAX_BYTES {
+            return (batch, batch_bytes, Some(next));
+        }
+        batch_bytes += next_bytes;
+        ack_awaited |= next.prepared.ack_awaited;
+        batch.push(next);
+    }
+    (batch, batch_bytes, None)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn deliver_replication_stream(
     state: Arc<RwLock<NodeState>>,
     failed_streams: Arc<StdMutex<HashSet<ReplicationStreamKey>>>,
     active_rpc_budget: Arc<Semaphore>,
     rpc_timeout: std::time::Duration,
+    batch_linger: std::time::Duration,
     pressure: Arc<NodePressureStats>,
     stream_key: ReplicationStreamKey,
     mut entries: mpsc::Receiver<PendingReplication>,
@@ -436,27 +493,9 @@ pub(super) async fn deliver_replication_stream(
                 None => return,
             },
         };
-        // Accumulate a contiguous run of queued entries for this follower so a
-        // single RPC carries many mutations. Entries that would overflow the
-        // byte or count budget are carried to the next batch instead of being
-        // dropped, preserving the per-stream ordering that gap detection needs.
-        let mut batch: Vec<PendingReplication> = Vec::with_capacity(REPLICATION_BATCH_MAX_ENTRIES);
-        let mut batch_bytes = replication_mutation_bytes(&first.prepared.mutation);
-        batch.push(first);
-        while batch.len() < REPLICATION_BATCH_MAX_ENTRIES {
-            match entries.try_recv() {
-                Ok(next) => {
-                    let next_bytes = replication_mutation_bytes(&next.prepared.mutation);
-                    if batch_bytes.saturating_add(next_bytes) > REPLICATION_BATCH_MAX_BYTES {
-                        carry = Some(next);
-                        break;
-                    }
-                    batch_bytes += next_bytes;
-                    batch.push(next);
-                }
-                Err(_) => break,
-            }
-        }
+        let (mut batch, mut batch_bytes, next_carry) =
+            collect_replication_batch(first, &mut entries, batch_linger).await;
+        carry = next_carry;
         let epoch = batch[0].prepared.mutation.topology_epoch;
         let follower_node_id = batch[0].prepared.follower_node_id.clone();
         let follower_endpoint = batch[0].prepared.follower_endpoint.clone();
@@ -497,6 +536,8 @@ pub(super) async fn deliver_replication_stream(
                     .map(|pending| pending.prepared.to_proto())
                     .collect(),
             };
+            hashring_core::rpc_profile::REPLICATION_BATCH_ENTRIES.record_value(batch.len() as u64);
+            let rpc_timer = hashring_core::rpc_profile::OWNER_REPLICATION_RPC.start();
             let result = tokio::time::timeout(
                 rpc_timeout,
                 client
@@ -506,6 +547,7 @@ pub(super) async fn deliver_replication_stream(
             )
             .await
             .map(|result| result.map(Response::into_inner));
+            drop(rpc_timer);
             drop(active_budget);
             match result {
                 Ok(Ok(response))

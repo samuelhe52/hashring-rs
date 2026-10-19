@@ -26,6 +26,7 @@ pub struct NodeFile {
     pub replication_stream_queue_capacity: Option<NonZeroUsize>,
     pub required_ack_timeout_ms: Option<u64>,
     pub replication_rpc_timeout_ms: Option<u64>,
+    pub replication_batch_linger_ms: Option<u64>,
 }
 
 impl NodeFile {
@@ -37,6 +38,7 @@ impl NodeFile {
             replication_stream_queue_capacity: self.replication_stream_queue_capacity,
             required_ack_timeout_ms: self.required_ack_timeout_ms,
             replication_rpc_timeout_ms: self.replication_rpc_timeout_ms,
+            replication_batch_linger_ms: self.replication_batch_linger_ms,
         }
     }
 }
@@ -111,6 +113,10 @@ pub fn settings(flags: &NodeTuningArgs, file: &NodeTuningArgs) -> NodeSettings {
             .replication_rpc_timeout_ms
             .or(file.replication_rpc_timeout_ms)
             .map_or(defaults.replication_rpc_timeout, Duration::from_millis),
+        replication_batch_linger: flags
+            .replication_batch_linger_ms
+            .or(file.replication_batch_linger_ms)
+            .map_or(defaults.replication_batch_linger, Duration::from_millis),
     }
 }
 
@@ -124,6 +130,7 @@ pub fn options(settings: &NodeSettings) -> NodeOptions {
         replication_stream_queue_capacity: settings.replication_stream_queue_capacity,
         required_ack_timeout_ms: duration_ms(settings.required_ack_timeout),
         replication_rpc_timeout_ms: duration_ms(settings.replication_rpc_timeout),
+        replication_batch_linger_ms: duration_ms(settings.replication_batch_linger),
     }
 }
 

@@ -231,9 +231,12 @@ impl CoordinatorService {
     /// it `Complete`, and a failure backs its `next_attempt` off into the
     /// future -- so the loop terminates on its own and a cluster with more
     /// groups than fit in a batch converges in one pass instead of one batch
-    /// per recovery interval. `migration_timeout` bounds the pathological case
-    /// where it does not, and matches the deadline every other operation here
-    /// already uses.
+    /// per recovery interval.
+    ///
+    /// The pass holds `execution_lock`, so it stops launching groups once
+    /// `migration_timeout` has elapsed or a topology change has been planned,
+    /// and only drains the groups already in flight. Groups it did not launch
+    /// keep their durable `Pending` state for the next pass.
     pub async fn resume_replica_repairs(&self) -> Result<usize, Status> {
         let _execution = self.execution_lock.lock().await;
         let mut interrupt = self.repair_interrupt.subscribe();
@@ -247,10 +250,15 @@ impl CoordinatorService {
             }
             let work =
                 try_map_bounded(tasks, self.replica_repair_concurrency, |tasks| async move {
+                    // `try_map_bounded` starts each future as a slot frees up, so
+                    // this is the check before launching the group.
+                    if Instant::now() >= deadline || self.transition_active().await {
+                        return Ok::<_, Status>(None);
+                    }
                     // Keep other ranges available if one destination is down. Failed
                     // tasks retain durable Pending state for the next retry.
                     match self.seed_replica_group(&tasks).await {
-                        Ok(()) => Ok::<_, Status>(tasks.len()),
+                        Ok(()) => Ok(Some(tasks.len())),
                         Err(error) => {
                             self.record_repair_failure(&tasks, &error).await?;
                             tracing::warn!(
@@ -259,7 +267,7 @@ impl CoordinatorService {
                                 %error,
                                 "replica seed remains pending"
                             );
-                            Ok(0)
+                            Ok(Some(0))
                         }
                     }
                 });
@@ -273,17 +281,30 @@ impl CoordinatorService {
                     return Err(Status::internal("repair interruption channel closed"));
                 }
             };
-            seeded += results.into_iter().sum::<usize>();
-            if Instant::now() >= deadline {
-                let remaining = self.select_due_repair_groups().await?.len();
-                tracing::warn!(
-                    remaining_groups = remaining,
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "replica repair pass hit its time budget; remaining groups stay durable"
-                );
+            let skipped = results.iter().filter(|result| result.is_none()).count();
+            seeded += results.into_iter().flatten().sum::<usize>();
+            if skipped > 0 {
+                if Instant::now() >= deadline {
+                    tracing::warn!(
+                        skipped_groups = skipped,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "replica repair pass hit its time budget; remaining groups stay durable"
+                    );
+                }
                 return Ok(seeded);
             }
         }
+    }
+
+    /// Whether a topology change owns the replica state, in which case a repair
+    /// pass must not start more work.
+    async fn transition_active(&self) -> bool {
+        self.state
+            .read()
+            .await
+            .active_change
+            .as_ref()
+            .is_some_and(|change| !change.phase.is_terminal())
     }
 
     /// Groups whose owner and follower are both registered and whose repairs are
@@ -944,37 +965,18 @@ impl CoordinatorService {
 
 /// Orders the groups one repair pass will seed.
 ///
-/// `retry_count` alone cannot order this set: it is 0 for every healthy group,
-/// so it degenerates to the `BTreeMap` key order and the members that sort last
-/// by node id are the ones a bounded pass always defers. The remaining keys
-/// make the order total and demand-driven: the group whose oldest repair has
-/// been due longest goes first, then the group covering the most ranges, then
-/// the member pair purely so two passes over the same state agree.
+/// A pass seeds every due group unless it runs out of time, so the order only
+/// decides which groups are left for the next pass. Groups that have failed
+/// least go first, so a flapping follower cannot hold back healthy ones, then
+/// the groups covering the most ranges. The sort is stable, so ties keep the
+/// `(owner, follower)` order the groups were collected in.
 fn sort_due_repair_groups(groups: &mut [Vec<ReplicaRepair>]) {
-    let attempts = |group: &[ReplicaRepair]| {
-        group
+    groups.sort_by_key(|group| {
+        let attempts = group
             .iter()
             .map(|repair| repair.retry_count)
             .max()
-            .unwrap_or(0)
-    };
-    let longest_waited = |group: &[ReplicaRepair]| {
-        group
-            .iter()
-            .map(|repair| repair.next_attempt_unix_millis)
-            .min()
-            .unwrap_or(0)
-    };
-    let members = |group: &[ReplicaRepair]| -> Option<(String, String)> {
-        group
-            .first()
-            .map(|repair| (repair.owner_node_id.clone(), repair.node_id.clone()))
-    };
-    groups.sort_by(|a, b| {
-        attempts(a)
-            .cmp(&attempts(b))
-            .then_with(|| longest_waited(a).cmp(&longest_waited(b)))
-            .then_with(|| b.len().cmp(&a.len()))
-            .then_with(|| members(a).cmp(&members(b)))
+            .unwrap_or(0);
+        (attempts, std::cmp::Reverse(group.len()))
     });
 }

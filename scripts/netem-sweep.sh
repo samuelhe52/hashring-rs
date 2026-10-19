@@ -13,8 +13,9 @@
 #   and plotting throughput and latency against round-trip time.
 #
 #   Each point reports put throughput, put latency percentiles, whole-run CPU
-#   seconds and netem's packet drop count, as medians over REPS runs, because an
-#   unchanged binary varies by tens of percent run to run (see sweep.sh).
+#   seconds as medians over REPS runs, because an unchanged binary varies by
+#   tens of percent run to run (see sweep.sh), and netem's packet drop count as
+#   the maximum over them, because one lossy run is enough to disqualify a point.
 #
 # How the delay is applied
 # ------------------------
@@ -83,10 +84,10 @@
 #
 # Settings
 # --------
-#   The experiment runs with --config CONFIG plus --nodes/--keys/--concurrency,
-#   and a flag wins over the file, so the replication factor, acknowledgement
-#   policy, virtual nodes, seed and byte budgets stay the ones of that config and
-#   only the run size changes. That keeps the sweep on the same code path as the
+#   The experiment runs with --config CONFIG plus --mode correctness and
+#   --nodes/--keys/--concurrency, and a flag wins over the file, so the
+#   replication factor, acknowledgement policy, virtual nodes, seed and byte
+#   budgets stay the ones of that config and only the run size changes. That keeps the sweep on the same code path as the
 #   profiles in results/.
 #
 #   worker_threads defaults to CPUs / (nodes + 2), so it moves with the node
@@ -134,7 +135,7 @@ CONCS="${CONCS:-64}"
 # confound this axis.
 NODE_COUNTS="${NODE_COUNTS:-4}"
 KEYS="${KEYS:-100000}"
-CONFIG="${CONFIG:-experiments/experiment_cmach.yaml}"
+CONFIG="${CONFIG:-examples/experiment.yaml}"
 BINARY="${BINARY:-target/release/hashring-rs}"
 # netem's queue length in packets. A run holds far less than this at these
 # delays; a full queue drops, which is a different measurement.
@@ -357,11 +358,13 @@ for delay in $DELAYS; do
 
       for rep in $(seq 1 "$REPS"); do
         base="$OUT_DIR/logs/point$point-$rep"
-        # --nodes/--keys/--concurrency win over the config file, so the run keeps
-        # the config's replication factor, policy and byte budgets.
+        # --mode/--nodes/--keys/--concurrency win over the config file, so the
+        # run keeps the config's replication factor, policy and byte budgets. The
+        # mode is pinned because the columns read_run collects come from the
+        # correctness flow.
         TIMEFORMAT='%3R %3U %3S'
         { time "$BINARY" experiment \
-            --config "$CONFIG" --output "$base/run" \
+            --config "$CONFIG" --mode correctness --output "$base/run" \
             --nodes "$nodes" --keys "$KEYS" --concurrency "$conc" \
             >"$base.log" 2>&1; } 2>"$base.time" || true
         read -r real user sys < "$base.time" || true
@@ -454,6 +457,9 @@ for (point, nodes, rate, delay, conc), rs in points.items():
     for key in NUM:
         vals = [num(r, key) for r in ok]
         m[key] = statistics.median(vals) if vals else 0.0
+    # Drops are a verdict on the point, not a measurement to average: one lossy
+    # repetition contaminates the point, and a median would hide it.
+    m['drops'] = max((num(r, 'drops') for r in rs), default=0.0)
     if len(ok) > 1 and m['put_kps']:
         kps = [num(r, 'put_kps') for r in ok]
         m['put_kps_spread'] = (max(kps) - min(kps)) / m['put_kps'] * 100
@@ -529,7 +535,7 @@ for (nodes, conc), pts in groups.items():
     fits.append({'nodes': nodes, 'conc': conc, 'slope': slope, 'intercept': intercept,
                  'r': r, 'n': n})
 
-if len(groups) > 1:
+if fits:
     lines.append('Latency against measured RTT, least squares per node count:')
     lines.append(f"{'nodes':>5} {'conc':>4} {'intercept_us':>13} {'slope':>7} {'r':>7} {'n':>3}")
     for f in fits:
@@ -555,7 +561,9 @@ for m in medians:
 
 cross = []
 for (nodes, conc), pts in by_nodes.items():
-    loopback = [m for m in pts if m['delay'] in ('off', '0')]
+    # Only "0": "off" measures the absence of the instrument, not a zero-delay
+    # network, so it is a different system from the one the slope was fitted on.
+    loopback = [m for m in pts if m['delay'] == '0']
     if not loopback:
         continue
     local_ceiling = max(m['put_kps'] for m in loopback)

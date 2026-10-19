@@ -248,7 +248,7 @@ impl DataNodeService {
             topology,
             records: HashMap::new(),
             records_by_token: TokenIndex::default(),
-            record_expirations: BinaryHeap::new(),
+            record_expirations: BTreeSet::new(),
             next_sequence: 0,
             owner_stream_sequences: HashMap::new(),
             owner_stream_unacked: HashMap::new(),
@@ -524,15 +524,7 @@ impl DataNodeService {
             .owner_for_token(token)
             .map_err(|error| Status::internal(error.to_string()))?;
         if owner.node_id == self.node_id {
-            if state.lease.is_none_or(|(epoch, expires_at)| {
-                epoch != state.topology.epoch || Instant::now() >= expires_at
-            }) {
-                return Ok(Some(OperationError {
-                    current_epoch: state.topology.epoch,
-                    ..operation_error(ErrorCode::LeaseExpired, "owner lease has expired", true)
-                }));
-            }
-            return Ok(None);
+            return Ok(lease_error(state));
         }
         Ok(Some(OperationError {
             code: ErrorCode::Moved.into(),
@@ -544,6 +536,20 @@ impl DataNodeService {
             retry_after_millis: 0,
         }))
     }
+}
+
+/// Refuses an owner's answer once its lease for the current epoch has run out:
+/// by then the coordinator may have handed its ranges to another node.
+pub(super) fn lease_error(state: &NodeState) -> Option<OperationError> {
+    state
+        .lease
+        .is_none_or(|(epoch, expires_at)| {
+            epoch != state.topology.epoch || Instant::now() >= expires_at
+        })
+        .then(|| OperationError {
+            current_epoch: state.topology.epoch,
+            ..operation_error(ErrorCode::LeaseExpired, "owner lease has expired", true)
+        })
 }
 
 /// A node renews five times per lease, so a lease survives a lost renewal

@@ -10,27 +10,6 @@ pub(super) fn migration_record_size(record: &MigrationRecord) -> usize {
     record.key.len() + record.value.len() + record.mutation_id.len() + 128
 }
 
-/// The shape whose fingerprint the owner stored in the deduplication receipt of
-/// the mutation that produced this record. Reconstructing it from the record is
-/// what lets a destination, a follower and a retried client agree on the same
-/// receipt without the node ever keeping the request itself.
-///
-/// An expiry-only write carries the value it kept rather than an empty one,
-/// because a follower has to store it; `preserve_value` is what says that value
-/// was not the one the client sent, so the request value was empty.
-pub(super) fn migration_record_shape(record: &MigrationRecord) -> MutationShape<'_> {
-    MutationShape {
-        value: if record.preserve_value {
-            &[]
-        } else {
-            record.value.as_slice()
-        },
-        deleted: record.deleted,
-        preserve_value: record.preserve_value,
-        expires_at_unix_millis: record.expires_at_unix_millis,
-    }
-}
-
 pub(super) fn apply_record(
     records: &mut HashMap<Vec<u8>, Record>,
     record: MigrationRecord,
@@ -82,14 +61,28 @@ pub(super) fn compare_versions(left: &RecordVersion, right: &RecordVersion) -> O
         ))
 }
 
+/// Sorts `(token, key, _)` entries into the order [`range_digest`] requires.
+///
+/// The key comparison runs only when two tokens are equal, which for distinct
+/// keys means a 64-bit hash collision, so the sort still compares integers.
+pub(super) fn sort_into_token_order<T>(entries: &mut [(u64, &[u8], T)]) {
+    entries.sort_unstable_by(|(left_token, left_key, _), (right_token, right_key, _)| {
+        left_token
+            .cmp(right_token)
+            .then_with(|| left_key.cmp(right_key))
+    });
+}
+
 /// Digest of one range's records, taken in the order the caller supplies.
 ///
-/// The caller must supply **token order**, and that is part of this function's
-/// contract rather than an implementation detail: `RangeDigestResponse` is
-/// compared between a source and a destination, so both sides have to agree on
-/// the byte stream. Token order is the one ordering both sides can produce
-/// without re-sorting keys, because a token depends only on the key bytes and
-/// the committed seed, which the two nodes share.
+/// The caller must supply **token order, ties broken by key bytes**, and that
+/// is part of this function's contract rather than an implementation detail:
+/// `RangeDigestResponse` is compared between a source and a destination, so
+/// both sides have to agree on the byte stream. Token order is the one ordering
+/// both sides can produce without re-sorting keys, because a token depends only
+/// on the key bytes and the committed seed, which the two nodes share. The tie
+/// break is what the source's `TokenIndex` yields for keys whose tokens
+/// collide, and [`sort_into_token_order`] reproduces it on the destination.
 ///
 /// The previous version took a `HashMap`, sorted it by key bytes, and hashed
 /// the result. Two costs are gone now. `source_range_digest` no longer builds a
@@ -98,6 +91,10 @@ pub(super) fn compare_versions(left: &RecordVersion, right: &RecordVersion) -> O
 /// two largest items under `source_range_digest` and
 /// `destination_range_digest` (21.3% and 8.2% of the migration phase in
 /// results/flamegraph-correctness-20261015-005607).
+///
+/// The digest bytes differ from v2 because the order differs, so the domain
+/// separator is bumped: a digest from a node running the old code must never be
+/// compared against one from a node running this.
 ///
 /// Records now carry an expiry, so the digest covers it as well: a source and a
 /// destination that disagreed about a deadline would hand over keys that stop

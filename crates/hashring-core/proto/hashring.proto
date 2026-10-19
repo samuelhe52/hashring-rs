@@ -248,12 +248,15 @@ message MigrationRecord {
   bool deleted = 4;
   string mutation_id = 5;
   uint64 remaining_retention_millis = 6;
-  // The expiry the record carries once this record is applied.
+  // The deadline the record carries once applied: the owner's resolved
+  // result, never the request's "keep" or "clear" intent.
   optional uint64 expires_at_unix_millis = 7;
-  // Set when the mutation that produced this record changed only the expiry.
-  // `value` then holds the value the record kept, not one the client sent, so
-  // a rebuilt deduplication fingerprint uses an empty request value.
-  bool preserve_value = 8;
+  // The deduplication fingerprint of the request that produced this record,
+  // empty when `mutation_id` is. Carried rather than rebuilt from the record,
+  // because the record holds what the request resolved to, and two different
+  // requests (one keeping a deadline, one setting the same deadline) can
+  // resolve to the same record.
+  bytes request_fingerprint = 8;
 }
 
 message DeduplicationRecord {
@@ -407,10 +410,11 @@ message ReplicationEntry {
   bool deleted = 6;
   RecordVersion version = 7;
   string mutation_id = 8;
-  // The expiry the follower stores with the record. See PutRequest.
+  // The deadline the follower stores with the record, as the owner resolved
+  // it. See MigrationRecord.
   optional uint64 expires_at_unix_millis = 9;
-  // Set when the mutation changed only the expiry; see MigrationRecord.
-  bool preserve_value = 10;
+  // See MigrationRecord.request_fingerprint.
+  bytes request_fingerprint = 10;
 }
 
 message ReplicateMutationResponse {
@@ -493,6 +497,20 @@ message GetResponse {
   optional uint64 expires_at_unix_millis = 5;
 }
 
+// A condition the owner checks against the key's live record, under the same
+// lock that applies the mutation, so nothing can change the record between the
+// check and the write. A record that is deleted or past its deadline is not
+// live. A failed condition is a definite outcome: nothing was written and no
+// deduplication receipt was kept.
+message Precondition {
+  oneof expect {
+    // The key has no live record.
+    Empty absent = 1;
+    // The key's live record carries exactly this version.
+    RecordVersion version = 2;
+  }
+}
+
 message PutRequest {
   bytes key = 1;
   bytes value = 2;
@@ -504,9 +522,11 @@ message PutRequest {
   // expires and a retried mutation carries the deadline it was first sent with.
   optional uint64 expires_at_unix_millis = 5;
   // Replace only the expiry and keep the stored value. `value` must then be
-  // empty and `expires_at_unix_millis` must be set and non-zero; a key that
-  // does not exist is reported through PutResponse.key_missing.
+  // empty and `expires_at_unix_millis` must be set, 0 clearing the deadline; a
+  // key that does not exist is reported through PutResponse.key_missing.
   bool preserve_value = 6;
+  // Apply the write only if this holds; see PutResponse.condition_failed.
+  Precondition precondition = 7;
 }
 
 message PutResponse {
@@ -516,21 +536,64 @@ message PutResponse {
   // A `preserve_value` write whose key does not exist. Reported apart from an
   // error so the caller can tell "no such key" from a write that failed.
   bool key_missing = 4;
+  // The request's precondition did not hold, so nothing was written.
+  bool condition_failed = 5;
 }
 
 message DeleteRequest {
   bytes key = 1;
   uint64 topology_epoch = 2;
   string request_id = 3;
+  // Delete only if this holds; see DeleteResponse.condition_failed.
+  Precondition precondition = 4;
 }
 
 message DeleteResponse {
   uint64 current_epoch = 1;
   OperationError error = 2;
+  // The request's precondition did not hold, so nothing was written.
+  bool condition_failed = 3;
+}
+
+// One page of the live keys a node owns, in token order. A page ends only
+// between tokens, so where the next one starts is a token alone.
+//
+// A whole-node page jumps over the segments other nodes own, and the caller
+// names the epoch its walk started from: a node at a newer epoch answers
+// MOVED, because keys may have changed hands and the walk has to start over to
+// see them. A one-stretch page instead covers only the contiguous stretch this
+// node owns from start_token, ending where another node's segment begins, and
+// answers MOVED if this node does not own start_token. It is held to
+// ownership rather than to the caller's epoch, which is what lets a SCAN
+// cursor survive a topology change between calls.
+message ListKeysRequest {
+  uint64 topology_epoch = 1;
+  // Where the page starts: keys at or after this token.
+  uint64 start_token = 2;
+  // The page ends at whichever comes first: this many keys, this many key
+  // bytes, or a fixed number of entries examined.
+  uint32 max_keys = 3;
+  uint64 max_bytes = 4;
+  // Count the keys instead of returning them.
+  bool count_only = 5;
+  bool one_stretch = 6;
+}
+
+message ListKeysResponse {
+  repeated bytes keys = 1;
+  // How many live keys this page covered, whether or not they were returned.
+  uint64 count = 2;
+  // The page reached the end of the ring.
+  bool done = 3;
+  // Where the next page starts, when not done.
+  uint64 next_token = 4;
+  uint64 current_epoch = 5;
+  OperationError error = 6;
 }
 
 service DataNode {
   rpc Get(GetRequest) returns (GetResponse);
+  rpc ListKeys(ListKeysRequest) returns (ListKeysResponse);
   rpc Put(PutRequest) returns (PutResponse);
   rpc Delete(DeleteRequest) returns (DeleteResponse);
   rpc ReplicateMutation(ReplicationEntry) returns (ReplicateMutationResponse);

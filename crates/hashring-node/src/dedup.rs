@@ -12,6 +12,47 @@ pub(super) struct MutationShape<'a> {
     pub(super) deleted: bool,
     pub(super) preserve_value: bool,
     pub(super) expires_at_unix_millis: Option<u64>,
+    /// A retry has to carry the same condition: the receipt answers for a
+    /// write that was applied under it, not for one that would have checked
+    /// something else.
+    pub(super) condition: Condition<'a>,
+}
+
+/// A request's precondition, checked by [`Condition::holds`] against the live
+/// record under the write lock that applies the mutation.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Condition<'a> {
+    Always,
+    Absent,
+    Version(&'a RecordVersion),
+}
+
+impl<'a> Condition<'a> {
+    pub(super) fn from_proto(
+        precondition: Option<&'a proto::Precondition>,
+    ) -> Result<Self, OperationError> {
+        use proto::precondition::Expect;
+        match precondition.map(|precondition| precondition.expect.as_ref()) {
+            None => Ok(Self::Always),
+            Some(Some(Expect::Absent(_))) => Ok(Self::Absent),
+            Some(Some(Expect::Version(version))) => Ok(Self::Version(version)),
+            Some(None) => Err(operation_error(
+                ErrorCode::InvalidArgument,
+                "a precondition must say what it expects",
+                false,
+            )),
+        }
+    }
+
+    /// `live` is the key's record only if it is neither deleted nor past its
+    /// deadline: a condition compares against what a read would return.
+    pub(super) fn holds(self, live: Option<&Record>) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Absent => live.is_none(),
+            Self::Version(version) => live.is_some_and(|record| &record.version == version),
+        }
+    }
 }
 
 impl<'a> MutationShape<'a> {
@@ -25,6 +66,7 @@ impl<'a> MutationShape<'a> {
             deleted,
             preserve_value: false,
             expires_at_unix_millis,
+            condition: Condition::Always,
         }
     }
 
@@ -34,16 +76,21 @@ impl<'a> MutationShape<'a> {
             deleted: false,
             preserve_value: true,
             expires_at_unix_millis: Some(expires_at_unix_millis),
+            condition: Condition::Always,
         }
+    }
+
+    pub(super) fn with_condition(self, condition: Condition<'a>) -> Self {
+        Self { condition, ..self }
     }
 }
 
-/// The digest is versioned because an expiry-only write carries a shape the
+/// The digest is versioned because a conditional write carries a shape the
 /// earlier form could not express, so a receipt from a node running the old
 /// code must never be compared against one from a node running this.
 pub(super) fn mutation_fingerprint(key: &[u8], shape: MutationShape<'_>) -> [u8; 32] {
     let mut digest = blake3::Hasher::new();
-    digest.update(b"hashring-rs:mutation:v2\0");
+    digest.update(b"hashring-rs:mutation:v3\0");
     digest.update(&(key.len() as u64).to_be_bytes());
     digest.update(key);
     digest.update(&[u8::from(shape.deleted), u8::from(shape.preserve_value)]);
@@ -57,6 +104,21 @@ pub(super) fn mutation_fingerprint(key: &[u8], shape: MutationShape<'_>) -> [u8;
         }
         None => {
             digest.update(&[0]);
+        }
+    }
+    match shape.condition {
+        Condition::Always => {
+            digest.update(&[0]);
+        }
+        Condition::Absent => {
+            digest.update(&[1]);
+        }
+        Condition::Version(version) => {
+            digest.update(&[2]);
+            digest.update(&version.topology_epoch.to_be_bytes());
+            digest.update(&version.owner_sequence.to_be_bytes());
+            digest.update(&(version.owner_node_id.len() as u64).to_be_bytes());
+            digest.update(version.owner_node_id.as_bytes());
         }
     }
     *digest.finalize().as_bytes()
