@@ -56,6 +56,7 @@ pub struct ExperimentFile {
     pub worker_threads: Option<NonZeroUsize>,
     pub coordinator_worker_threads: Option<NonZeroUsize>,
     pub max_dedup_bytes: Option<usize>,
+    pub max_value_bytes: Option<usize>,
     pub max_pending_replication_bytes: Option<usize>,
     pub max_migration_journal_bytes: Option<usize>,
     pub replication_stream_queue_capacity: Option<NonZeroUsize>,
@@ -80,6 +81,7 @@ pub fn resolve(
         &args.node_tuning,
         &NodeTuningArgs {
             max_dedup_bytes: file.max_dedup_bytes,
+            max_value_bytes: file.max_value_bytes,
             max_pending_replication_bytes: file.max_pending_replication_bytes,
             max_migration_journal_bytes: file.max_migration_journal_bytes,
             replication_stream_queue_capacity: file.replication_stream_queue_capacity,

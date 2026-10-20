@@ -14,6 +14,8 @@ use serde::de::DeserializeOwned;
 
 pub mod coordinator;
 pub mod experiment;
+#[cfg(feature = "redis-lua-experimental")]
+pub mod experimental_gateway;
 pub mod gateway;
 pub mod node;
 
@@ -70,7 +72,14 @@ mod tests {
 
     #[test]
     fn every_flag_is_documented() {
-        for subcommand in ["coordinator", "node", "experiment", "redis-gateway"] {
+        for subcommand in [
+            "coordinator",
+            "node",
+            "experiment",
+            "redis-gateway",
+            #[cfg(feature = "redis-lua-experimental")]
+            "redis-lua-experimental-gateway",
+        ] {
             for flag in flags(subcommand) {
                 assert!(
                     CONFIGURATION_DOC.contains(&format!("`--{flag}`")),
@@ -86,11 +95,19 @@ mod tests {
         load::<node::NodeFile>(&example("node.yaml")).unwrap();
         load::<experiment::ExperimentFile>(&example("experiment.yaml")).unwrap();
         load::<gateway::GatewayFile>(&example("redis-gateway.yaml")).unwrap();
+        #[cfg(feature = "redis-lua-experimental")]
+        load::<experimental_gateway::GatewayFile>(&example("experimental-redis-gateway.yaml"))
+            .unwrap();
         for (subcommand, file) in [
             ("coordinator", "coordinator.yaml"),
             ("node", "node.yaml"),
             ("experiment", "experiment.yaml"),
             ("redis-gateway", "redis-gateway.yaml"),
+            #[cfg(feature = "redis-lua-experimental")]
+            (
+                "redis-lua-experimental-gateway",
+                "experimental-redis-gateway.yaml",
+            ),
         ] {
             let text = fs::read_to_string(example(file)).unwrap();
             for flag in flags(subcommand) {

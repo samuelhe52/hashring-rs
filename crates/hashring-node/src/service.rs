@@ -285,7 +285,7 @@ impl DataNodeService {
             pressure,
             refresh_lock: Arc::new(Mutex::new(())),
             max_key_bytes: DEFAULT_MAX_KEY_BYTES,
-            max_value_bytes: DEFAULT_MAX_VALUE_BYTES,
+            max_value_bytes: settings.max_value_bytes,
             max_journal_bytes: settings.max_migration_journal_bytes,
             max_dedup_bytes: settings.max_dedup_bytes,
             required_ack_timeout: settings.required_ack_timeout,

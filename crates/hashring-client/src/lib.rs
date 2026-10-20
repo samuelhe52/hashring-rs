@@ -16,7 +16,7 @@ use tonic::Code;
 use tonic::transport::{Channel, Endpoint};
 
 use hashring_core::{
-    limits::{DEFAULT_MAX_KEY_BYTES, DEFAULT_MAX_VALUE_BYTES, MAX_DATA_MESSAGE_BYTES},
+    limits::{DEFAULT_MAX_KEY_BYTES, MAX_DATA_MESSAGE_BYTES, MAX_VALUE_BYTES},
     migration::TopologyChange,
     proto::{
         self, BeginTopologyChangeRequest, DeleteRequest, ErrorCode, ExecuteTopologyChangeRequest,
@@ -638,9 +638,11 @@ impl HashringClient {
     ) -> Result<PutResult, ClientError> {
         let _operation_timer = hashring_core::rpc_profile::CLIENT_PUT_OPERATION.start();
         validate_key_size(&key)?;
-        if value.len() > DEFAULT_MAX_VALUE_BYTES {
+        // The transport, not the cluster's own settings, decides what one
+        // message may carry, so this is the ceiling any cluster can hold.
+        if value.len() > MAX_VALUE_BYTES {
             return Err(size_failure(format!(
-                "value exceeds {DEFAULT_MAX_VALUE_BYTES} bytes"
+                "value exceeds {MAX_VALUE_BYTES} bytes"
             )));
         }
         let deadline = self.mutation_deadline();

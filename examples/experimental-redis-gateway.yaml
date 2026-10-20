@@ -1,0 +1,21 @@
+# Purely experimental; build with --features redis-lua-experimental.
+# Settings for `hashring-rs redis-lua-experimental-gateway --config examples/experimental-redis-gateway.yaml`.
+# Every key is optional and named after a `redis-lua-experimental-gateway` flag (`_` for `-`).
+# A flag given on the command line wins over the same key here.
+listen: 127.0.0.1:6379
+coordinator: http://127.0.0.1:50050
+# How long one command may take against the cluster before it is reported as
+# not finished. Redis has no such deadline; a proxy in front of a migrating
+# cluster does.
+deadline_ms: 5000
+# Connections open at once before a new one is refused, as Redis's maxclients.
+# maxclients: 10000
+# Largest bulk string a connection may send, so the largest value the gateway
+# reads from a client. Raise it with the cluster's --max-value-bytes.
+# max_bulk_bytes: 16777216
+# worker_threads: 4   # default: one per available CPU
+
+# Require AUTH before a connection may read or write. Leave it unset here and
+# set HASHRING_GATEWAY_PASSWORD instead to keep the secret out of both the file
+# and the process list.
+# requirepass: change-me

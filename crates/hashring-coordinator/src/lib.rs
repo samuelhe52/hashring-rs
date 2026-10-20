@@ -24,7 +24,7 @@ use tonic::{
 };
 
 use hashring_core::{
-    limits::MAX_MIGRATION_PAGE_BYTES,
+    limits::DEFAULT_MIGRATION_PAGE_BYTES,
     migration::{
         MAX_MIGRATION_RANGES, MAX_REPLICA_OBLIGATIONS, MigrationError, MigrationPhase,
         RangeMigration, TopologyChange,

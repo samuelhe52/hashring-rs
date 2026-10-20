@@ -52,32 +52,105 @@ pub enum Change<T> {
     Nothing(T),
 }
 
+/// A private command store supplied by an extension. Implementations keep
+/// writes local and decide separately when to publish them. No remote client
+/// is exposed to a handler while an overlay is active.
+pub trait Overlay: Send + Sync {
+    fn read(&self, key: &[u8]) -> RedisResult<Option<Current>>;
+    fn write(&self, key: &[u8], value: Option<Current>) -> RedisResult<()>;
+}
+
 pub struct Store<'a> {
     client: &'a SharedClient,
     locks: &'a KeyLocks,
+    overlay: Option<&'a dyn Overlay>,
 }
 
 impl<'a> Store<'a> {
     pub fn new(client: &'a SharedClient, locks: &'a KeyLocks) -> Self {
-        Self { client, locks }
+        Self {
+            client,
+            locks,
+            overlay: None,
+        }
+    }
+
+    pub fn with_overlay(mut self, overlay: Option<&'a dyn Overlay>) -> Self {
+        self.overlay = overlay;
+        self
     }
 
     pub async fn client(&self) -> RedisResult<HashringClient> {
+        if self.overlay.is_some() {
+            return Err(RedisError::new(
+                "ERR",
+                "this command requires direct cluster access",
+            ));
+        }
         self.client.get().await
     }
 
     pub async fn read(&self, key: &[u8]) -> RedisResult<Option<Current>> {
-        read_with(&self.client().await?, key).await
+        match self.overlay {
+            Some(overlay) => overlay.read(key),
+            None => read_with(&self.client().await?, key).await,
+        }
     }
 
     /// An unconditional write, for commands whose result does not depend on
     /// what the key held: `SET`, `SETEX`, `MSET`.
     pub async fn put(&self, key: &[u8], value: Vec<u8>, expiry: Expiry) -> RedisResult<()> {
+        if let Some(overlay) = self.overlay {
+            let current = overlay.read(key)?;
+            let deadline = match expiry {
+                Expiry::Keep => current.as_ref().and_then(|value| value.deadline),
+                Expiry::At(deadline) => Some(deadline),
+                Expiry::Clear => None,
+            };
+            return overlay.write(
+                key,
+                Some(Current {
+                    value,
+                    deadline,
+                    version: current.map(|value| value.version).unwrap_or_default(),
+                }),
+            );
+        }
         self.client()
             .await?
             .put_with_expiry(key.to_vec(), value, expiry)
             .await?;
         Ok(())
+    }
+
+    /// Preserve the direct conditional-write path for ordinary commands,
+    /// while private stores evaluate the same condition locally.
+    pub async fn put_if_absent(&self, key: &[u8], value: &[u8]) -> RedisResult<bool> {
+        if self.overlay.is_some() {
+            return self
+                .update(key, |current| {
+                    Ok(match current {
+                        Some(_) => Change::Nothing(false),
+                        None => Change::Put {
+                            value: value.to_vec(),
+                            deadline: None,
+                            reply: true,
+                        },
+                    })
+                })
+                .await;
+        }
+        Ok(self
+            .client()
+            .await?
+            .put_if(
+                key.to_vec(),
+                value.to_vec(),
+                Expiry::Clear,
+                Precondition::Absent,
+            )
+            .await?
+            .is_some())
     }
 
     /// Reads `key`, asks `decide` what to do, and applies that only if the key
@@ -91,6 +164,32 @@ impl<'a> Store<'a> {
         key: &[u8],
         mut decide: impl FnMut(Option<&Current>) -> RedisResult<Change<T>>,
     ) -> RedisResult<T> {
+        if let Some(overlay) = self.overlay {
+            let current = overlay.read(key)?;
+            let (next, reply) = match decide(current.as_ref())? {
+                Change::Nothing(reply) => return Ok(reply),
+                Change::Put {
+                    value,
+                    deadline,
+                    reply,
+                } => (
+                    Some(Current {
+                        value,
+                        deadline,
+                        version: current.map(|value| value.version).unwrap_or_default(),
+                    }),
+                    reply,
+                ),
+                Change::Expire { deadline, reply } => {
+                    let mut current = current.expect("expiry needs a key");
+                    current.deadline = deadline;
+                    (Some(current), reply)
+                }
+                Change::Delete { reply } => (None, reply),
+            };
+            overlay.write(key, next)?;
+            return Ok(reply);
+        }
         let _guard = self.locks.lock(&[key]).await;
         let client = self.client().await?;
         loop {

@@ -1457,3 +1457,28 @@ async fn source_and_destination_digest_a_range_whose_orders_differ() {
          both must hash the same bytes in the same order"
     );
 }
+
+#[test]
+fn a_page_carries_at_least_one_of_the_largest_values_the_node_holds() {
+    use crate::migration::page_limit;
+
+    // What a coordinator asks for is what a default cluster needs; a node
+    // holding larger values still has to be able to move one of them.
+    let asked = hashring_core::limits::DEFAULT_MIGRATION_PAGE_BYTES as u64;
+    assert_eq!(
+        page_limit(asked, DEFAULT_MAX_VALUE_BYTES),
+        hashring_core::limits::DEFAULT_MIGRATION_PAGE_BYTES
+    );
+    assert_eq!(page_limit(asked, 64 * 1024 * 1024), 64 * 1024 * 1024);
+
+    // The request may not take a page past what the transport carries, nor
+    // below a page that can hold something.
+    assert_eq!(
+        page_limit(u64::MAX, DEFAULT_MAX_VALUE_BYTES),
+        MAX_MIGRATION_PAGE_BYTES
+    );
+    assert_eq!(
+        page_limit(0, DEFAULT_MAX_VALUE_BYTES),
+        DEFAULT_MAX_VALUE_BYTES
+    );
+}

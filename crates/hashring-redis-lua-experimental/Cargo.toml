@@ -1,0 +1,19 @@
+[package]
+name = "hashring-redis-lua-experimental"
+description = "Purely experimental Redis gateway with embedded Lua scripting"
+publish = false
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+futures = "0.3"
+hashring-client = { version = "0.1.0", path = "../hashring-client" }
+hashring-redis = { version = "0.1.0", path = "../hashring-redis" }
+hashring-core = { version = "0.1.0", path = "../hashring-core" }
+hex = "0.4.3"
+mlua = { version = "0.12.2", features = ["async", "lua54", "send", "vendored"] }
+sha1 = "0.11.0"
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

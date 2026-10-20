@@ -33,6 +33,7 @@ policy: first-successor
 
 # Forwarded to every data node the run starts; see the node flags.
 max_dedup_bytes: 134217728              # 128 MiB
+max_value_bytes: 8388608                # 8 MiB
 max_pending_replication_bytes: 67108864 # 64 MiB
 max_migration_journal_bytes: 16777216   # 16 MiB
 replication_stream_queue_capacity: 32

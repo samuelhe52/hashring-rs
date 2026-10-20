@@ -177,6 +177,28 @@ impl CommandInfo {
         self.has_keys() || self.keyspace
     }
 
+    /// Key arguments, using Redis's inclusive positive final-key position.
+    pub fn keys<'a>(&self, args: &'a [Vec<u8>]) -> Vec<&'a [u8]> {
+        if !self.has_keys() {
+            return Vec::new();
+        }
+        let first = usize::try_from(self.first_key).unwrap_or(0);
+        let end = if self.last_key < 0 {
+            args.len()
+                .saturating_sub(self.last_key.unsigned_abs() as usize - 1)
+        } else {
+            usize::try_from(self.last_key)
+                .unwrap_or(0)
+                .saturating_add(1)
+                .min(args.len())
+        };
+        let step = usize::try_from(self.step).unwrap_or(1).max(1);
+        (first..end)
+            .step_by(step)
+            .map(|at| args[at].as_slice())
+            .collect()
+    }
+
     pub fn to_reply(&self) -> Reply {
         Reply::Array(vec![
             Reply::bulk(self.name),
@@ -192,6 +214,20 @@ impl CommandInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_arguments_include_the_positive_final_position() {
+        let args = ["RENAME", "source", "destination"].map(|value| value.as_bytes().to_vec());
+        assert_eq!(
+            lookup("rename").unwrap().keys(&args),
+            vec![b"source".as_slice(), b"destination".as_slice()]
+        );
+        let args = ["MSET", "one", "value", "two", "value"].map(|value| value.as_bytes().to_vec());
+        assert_eq!(
+            lookup("mset").unwrap().keys(&args),
+            vec![b"one".as_slice(), b"two".as_slice()]
+        );
+    }
 
     #[test]
     fn only_the_handshake_runs_before_authentication() {

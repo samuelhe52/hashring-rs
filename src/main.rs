@@ -11,7 +11,7 @@ use hashring_coordinator::{
     CoordinatorRepository, CoordinatorService, RedbTopologyRepository, load_or_initialize,
 };
 use hashring_core::{
-    limits::MAX_CONTROL_MESSAGE_BYTES,
+    limits::{MAX_CONTROL_MESSAGE_BYTES, MAX_DATA_MESSAGE_BYTES},
     proto::{coordinator_server::CoordinatorServer, data_node_server::DataNodeServer},
     topology::{
         ClusterTimings, Member, TopologyConfig, TopologySnapshot, WriteAckPolicy,
@@ -67,6 +67,9 @@ enum Command {
     ExecuteChange(ExecuteChangeArgs),
     /// Serve the Redis protocol on a port, over this cluster.
     RedisGateway(GatewayArgs),
+    /// Run the purely experimental gateway with embedded Lua scripting.
+    #[cfg(feature = "redis-lua-experimental")]
+    RedisLuaExperimentalGateway(ExperimentalGatewayArgs),
     /// Run a reproducible separate-process correctness or performance experiment.
     Experiment(ExperimentArgs),
 }
@@ -175,6 +178,14 @@ struct NodeTuningArgs {
     /// applying them, with a retryable error. [default: 134217728 (128 MiB)]
     #[arg(long)]
     max_dedup_bytes: Option<usize>,
+    /// The largest value a node accepts. A larger one is refused before it is
+    /// written. Every node in a cluster may use its own; the wire and a
+    /// migration page are sized for the largest the cluster allows.
+    /// Raising it also raises what a replication batch and a journaled write
+    /// need, so raise `--max-pending-replication-bytes` and
+    /// `--max-migration-journal-bytes` with it. [default: 8388608 (8 MiB)]
+    #[arg(long)]
+    max_value_bytes: Option<usize>,
     /// Bytes of mutations queued for followers, and separately the bytes held
     /// by in-flight replication RPCs. [default: 67108864 (64 MiB)]
     #[arg(long)]
@@ -329,6 +340,17 @@ struct GatewayArgs {
     /// (affinity and cgroup limits included).
     #[arg(long)]
     worker_threads: Option<NonZeroUsize>,
+}
+
+#[cfg(feature = "redis-lua-experimental")]
+#[derive(Args)]
+struct ExperimentalGatewayArgs {
+    #[command(flatten)]
+    gateway: GatewayArgs,
+    /// Largest bulk string accepted by the experimental gateway.
+    /// [default: 16777216 (16 MiB)]
+    #[arg(long)]
+    max_bulk_bytes: Option<usize>,
 }
 
 #[derive(Args, Clone)]
@@ -497,6 +519,19 @@ fn main() -> Result<()> {
             return build_runtime(Some(settings.runtime_workers(cpus)))?
                 .block_on(run_redis_gateway(settings));
         }
+        #[cfg(feature = "redis-lua-experimental")]
+        Command::RedisLuaExperimentalGateway(args) => {
+            let file = args
+                .gateway
+                .config
+                .as_deref()
+                .map(config::load)
+                .transpose()?;
+            let settings = config::experimental_gateway::resolve(args, file)?;
+            init_tracing(false)?;
+            return build_runtime(Some(settings.gateway.runtime_workers(cpus)))?
+                .block_on(run_experimental_redis_gateway(settings));
+        }
         _ => {}
     }
     init_tracing(false)?;
@@ -541,6 +576,8 @@ async fn run(command: Command) -> Result<()> {
         Command::ChangeStatus(args) => run_change_status(args).await,
         Command::ReplicaStatus(args) => run_replica_status(args).await,
         Command::ExecuteChange(args) => run_execute_change(args).await,
+        #[cfg(feature = "redis-lua-experimental")]
+        Command::RedisLuaExperimentalGateway(_) => unreachable!("main runs the experiment"),
         Command::Coordinator(_)
         | Command::Node(_)
         | Command::Experiment(_)
@@ -550,26 +587,50 @@ async fn run(command: Command) -> Result<()> {
     }
 }
 
-/// Serves the Redis protocol until the process is asked to stop.
-///
-/// The coordinator is contacted when the first command arrives rather than
-/// before the port opens, so the gateway may be started before, with, or
-/// instead of the coordinator: clients get `-TRYAGAIN` until it answers.
-async fn run_redis_gateway(settings: config::gateway::GatewaySettings) -> Result<()> {
-    let (shutdown, mut stopped) = tokio::sync::watch::channel(false);
-    tokio::spawn(async move {
-        shutdown_signal().await;
-        let _ = shutdown.send(true);
-    });
-    let config = hashring_redis::GatewayConfig {
+fn gateway_config(settings: config::gateway::GatewaySettings) -> hashring_redis::GatewayConfig {
+    hashring_redis::GatewayConfig {
         coordinator: settings.coordinator,
         listen: settings.listen,
         operation_timeout: settings.operation_timeout,
         password: settings.password,
         max_connections: settings.max_connections.get(),
         ..Default::default()
-    };
-    hashring_redis::serve(config, stopped.clone()).await?;
+    }
+}
+
+async fn run_redis_gateway(settings: config::gateway::GatewaySettings) -> Result<()> {
+    run_gateway(gateway_config(settings), None).await
+}
+
+#[cfg(feature = "redis-lua-experimental")]
+async fn run_experimental_redis_gateway(
+    settings: config::experimental_gateway::GatewaySettings,
+) -> Result<()> {
+    let mut config = gateway_config(settings.gateway);
+    config.limits.max_bulk_bytes = settings.max_bulk_bytes;
+    run_gateway(
+        config,
+        Some(Arc::new(hashring_redis_lua_experimental::Scripts::default())),
+    )
+    .await
+}
+
+/// Both gateway commands use the same server, lifecycle and configuration.
+async fn run_gateway(
+    config: hashring_redis::GatewayConfig,
+    extension: Option<Arc<dyn hashring_redis::commands::CommandExtension>>,
+) -> Result<()> {
+    let (shutdown, mut stopped) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown.send(true);
+    });
+    match extension {
+        Some(extension) => {
+            hashring_redis::serve_with_extension(config, stopped.clone(), extension).await?
+        }
+        None => hashring_redis::serve(config, stopped.clone()).await?,
+    }
     stopped.changed().await.ok();
     Ok(())
 }
@@ -715,8 +776,8 @@ async fn run_node(config: NodeConfig, stop_response_delay_ms: u64) -> Result<()>
     Server::builder()
         .add_service(
             DataNodeServer::new(service)
-                .max_decoding_message_size(MAX_CONTROL_MESSAGE_BYTES)
-                .max_encoding_message_size(MAX_CONTROL_MESSAGE_BYTES),
+                .max_decoding_message_size(MAX_DATA_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_DATA_MESSAGE_BYTES),
         )
         .serve_with_shutdown(config.listen, async move {
             tokio::select! {

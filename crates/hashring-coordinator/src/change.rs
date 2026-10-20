@@ -628,7 +628,7 @@ impl CoordinatorService {
                     change_id: change.change_id.clone(),
                     range_id: range.range_id.clone(),
                     cursor,
-                    max_bytes: MAX_MIGRATION_PAGE_BYTES as u64,
+                    max_bytes: DEFAULT_MIGRATION_PAGE_BYTES as u64,
                 }),
             )
             .await?
@@ -660,7 +660,7 @@ impl CoordinatorService {
                     change_id: change.change_id.clone(),
                     range_id: range.range_id.clone(),
                     cursor: dedup_cursor,
-                    max_bytes: MAX_MIGRATION_PAGE_BYTES as u64,
+                    max_bytes: DEFAULT_MIGRATION_PAGE_BYTES as u64,
                 }),
             )
             .await?

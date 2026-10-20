@@ -1,0 +1,22 @@
+# Used by `cargo nextest run`. `cargo test` does not read this file.
+
+# These suites start a whole cluster of processes each — a coordinator, three
+# data nodes and a gateway — and pick their ports by binding, releasing, and
+# re-binding, which only stays race-free while one of them does it at a time.
+# They say so with an in-process lock, but nextest gives every test its own
+# process, so the lock cannot see the others. The group restores the same
+# guarantee across binaries.
+[test-groups]
+cluster = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(process_cluster)'
+test-group = "cluster"
+
+[[profile.default.overrides]]
+filter = 'binary(redis_gateway)'
+test-group = "cluster"
+
+[[profile.default.overrides]]
+filter = 'binary(experimental_redis_gateway)'
+test-group = "cluster"

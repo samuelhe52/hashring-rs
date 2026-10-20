@@ -129,7 +129,7 @@ pub(super) async fn replay_changelog(
                 change_id: change.change_id.clone(),
                 range_id: range.range_id.clone(),
                 after_watermark: watermark,
-                max_bytes: MAX_MIGRATION_PAGE_BYTES as u64,
+                max_bytes: DEFAULT_MIGRATION_PAGE_BYTES as u64,
             }),
         )
         .await?
@@ -183,8 +183,8 @@ impl CoordinatorService {
         // Channel clones share one reconnecting HTTP/2 connection. The caller's
         // rpc_before deadline bounds connection establishment and the RPC.
         Ok(DataNodeClient::new(channels[endpoint].clone())
-            .max_decoding_message_size(hashring_core::limits::MAX_CONTROL_MESSAGE_BYTES)
-            .max_encoding_message_size(hashring_core::limits::MAX_CONTROL_MESSAGE_BYTES))
+            .max_decoding_message_size(hashring_core::limits::MAX_DATA_MESSAGE_BYTES)
+            .max_encoding_message_size(hashring_core::limits::MAX_DATA_MESSAGE_BYTES))
     }
 }
 

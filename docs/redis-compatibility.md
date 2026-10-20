@@ -1,5 +1,9 @@
 # Redis compatibility
 
+This page describes the ordinary `redis-gateway` command. The separate
+[experimental Lua gateway](experimental-redis.md) adds scripting through the shared
+gateway's extension API; it requires an explicit feature and command selection.
+
 `redis-gateway` serves the Redis protocol on a TCP port over a hashring-rs
 cluster. A Redis client connects to it the way it would to a Redis server, so
 `redis-cli`, redis-py, Jedis, Lettuce and go-redis all work against it in

@@ -34,6 +34,8 @@ impl<'a> Args<'a> {
     }
 
     /// The next argument, or a syntax error when there is none.
+    // Required arguments report protocol errors rather than Iterator's Option.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> RedisResult<&'a [u8]> {
         self.next_optional().ok_or_else(RedisError::syntax)
     }
