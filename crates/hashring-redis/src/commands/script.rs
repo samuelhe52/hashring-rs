@@ -11,15 +11,20 @@
 //!   the gateway already makes it: a read-modify-write carries a precondition
 //!   to the node that owns the key.
 //! - A write the script makes is conditional on what the script read, so a
-//!   script that reads a key and then writes it cannot overwrite a write that
-//!   arrived in between, whichever gateway or client made it. The script is
+//!   script that reads its one key and then writes it cannot overwrite a write
+//!   that arrived in between, whichever gateway or client made it. The script is
 //!   then run again from the start, which is what a single-threaded Redis gets
 //!   by never letting anyone in. A script that has already changed something a
 //!   second run would change twice cannot be run again, and is failed instead:
 //!   its answer would otherwise be a number no run of it produced.
+//! - That guarantee covers a single key and no further, so a script declares at
+//!   most one key. Two keys may sit on two owners, and a read of one cannot be
+//!   made a precondition on a write to the other; a script that declares more
+//!   than one is refused rather than answered with an atomicity the cluster
+//!   cannot deliver. This is the same edge Redis's own cluster mode draws.
 //! - A script may only touch the keys it declared in `KEYS`, checked against
 //!   the command table's own key positions.
-//! - One script at a time per gateway, holding its declared keys for the whole
+//! - One script at a time per gateway, holding its declared key for the whole
 //!   run, and only the commands a script may run.
 //!
 //! `docs/redis-compatibility.md` describes this from the client's side.
@@ -282,6 +287,23 @@ async fn run(
     keys: Vec<Vec<u8>>,
     argv: Vec<Vec<u8>>,
 ) -> RedisResult<Reply> {
+    // A script is atomic here only over the one key it declared. The gateway
+    // makes each of its commands atomic by carrying a precondition to the node
+    // that owns the key, and a script that reads a key and then writes that
+    // same key is stitched into one unit by running it again when the key
+    // moved underneath it. That holds for a single key and no further: two keys
+    // may sit on two owners, and a read of one cannot be made a precondition on
+    // a write to the other. Rather than answer with a run whose atomicity the
+    // cluster cannot deliver, a script that declares more than one key is
+    // refused, which is the scope Redis's own cluster mode refuses too.
+    if keys.len() > 1 {
+        return Err(RedisError::new(
+            "ERR",
+            "a script may declare at most one key: the gateway runs a script atomically \
+             over a single key, and cannot make a script that touches several keys \
+             atomic when they may be owned by different nodes",
+        ));
+    }
     // One script at a time, then the keys it declared for as long as it runs.
     // The order is fixed so that two scripts cannot take each other's locks in
     // opposite orders.

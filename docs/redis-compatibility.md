@@ -239,10 +239,21 @@ What differs from Redis:
   undeclared keys would hold no lock on them. The check reads the same command
   table `COMMAND` answers with, so it is the key positions a client already
   knows, and a script naming a key it did not declare is refused by name.
+- **A script declares at most one key.** This is the honest edge of what the
+  gateway can make atomic. Each command a script runs is the gateway's own, so
+  it carries a precondition to the node that owns the key; and a script that
+  reads a key and then writes *that same key* is stitched into one unit by
+  being run again when the key moved underneath it. That guarantee holds for a
+  single key and stops there: two keys may sit on two owners, and a read of one
+  cannot be made a precondition on a write to the other. A script that declares
+  more than one key is therefore refused, which is the same edge Redis's own
+  cluster mode draws with `CROSSSLOT`. A cache claim and a rate limiter each
+  touch one key, so both work unmodified; see
+  [cross-key atomicity](#cross-key-atomicity-is-not-available-at-all).
 - **A script is atomic against every writer, not just one gateway's clients.**
   The commands a script runs go through the same conditional-write path `INCR`
   uses, so a write the script makes is conditional on what the script read: a
-  script that reads a key and then writes it cannot overwrite a write that
+  script that reads its one key and then writes it cannot overwrite a write that
   arrived in between, whichever gateway or client made it.
 - **A conflict runs the script again, or fails it.** When a conditional write
   finds the key changed underneath the script, the script is run again from the
@@ -251,10 +262,10 @@ What differs from Redis:
   cannot be run again, and is failed with `ERR` instead — its answer would
   otherwise be a number no run of it produced. This is the one place where a
   script and Redis differ in outcome rather than in reporting.
-- **One script at a time per gateway.** A script holds its declared keys for its
-  whole run, so no client of that gateway takes one of them between two of the
-  script's commands. Another gateway is serialized only by the conditional
-  writes above, which is the same guarantee `INCR` already has.
+- **One script at a time per gateway.** A script holds its declared key for its
+  whole run, so no client of that gateway takes it between two of the script's
+  commands. Another gateway is serialized only by the conditional writes above,
+  which is the same guarantee `INCR` already has.
 - **A script may not change the connection.** `AUTH`, `HELLO`, `RESET`,
   `SELECT`, `CLIENT`, `QUIT`, `EVAL`, `EVALSHA`, `SCRIPT`, `MULTI`, `EXEC`,
   `DISCARD` and `WATCH` are refused from a script, as in Redis.
@@ -405,8 +416,10 @@ returns nil, `EXISTS` returns 0, `TTL` returns -2.
   unmodified — `function`, `repeat`, generic `for`, and the `string`, `table`,
   `math`, `utf8` and `coroutine` libraries are all here. What it cannot do is
   reach the machine (`io`, `os`, `debug`, `package`, `load`, `require` are all
-  absent). See [scripts](#scripts). A script is bounded by the command deadline
-  and 10 000 000 Lua VM instructions, and one runs at a time per gateway.
+  absent), and a script declares **at most one key**, since that is the scope
+  the gateway can make atomic. See [scripts](#scripts). A script is bounded by
+  the command deadline and 10 000 000 Lua VM instructions, and one runs at a
+  time per gateway.
 - A value larger than the owning node's `--max-value-bytes` is refused with
   `OOM`, as Redis refuses one past its own limit. That default is 8 MiB and a
   node may be raised to 128 MiB, so it is the node's to set and not the

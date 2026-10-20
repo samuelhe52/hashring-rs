@@ -8,8 +8,9 @@
 //! cannot reach the filesystem, the clock, the environment or the process, and
 //! there is no `load`, `dofile`, `loadfile` or `require`, so it cannot pull in
 //! code it was not sent. A script also may only touch the keys it declared in
-//! `KEYS`, which is what lets the gateway hold those locks for the whole run
-//! instead of one call at a time.
+//! `KEYS`, and it declares at most one: the conditional-write path below makes
+//! a read-then-write of a single key atomic against every writer, and that
+//! guarantee does not extend to a script that would span two owners.
 
 use std::{
     sync::{

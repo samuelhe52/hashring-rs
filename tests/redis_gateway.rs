@@ -1614,6 +1614,25 @@ async fn a_script_is_run_the_way_a_client_library_sends_it() {
         error.to_string().contains("must be strings or integers"),
         "unexpected error: {error}"
     );
+
+    // A script that declares more than one key is refused: the gateway makes a
+    // script atomic over one key, and a script that touches several keys may
+    // reach nodes that own them separately, which no per-command precondition
+    // can stitch into one run. This is the scope Redis's own cluster mode
+    // refuses, and it is what keeps the single-key guarantee honest.
+    let error = redis::cmd("EVAL")
+        .arg("redis.call('SET', KEYS[1], 'a') redis.call('SET', KEYS[2], 'b') return 1")
+        .arg(2)
+        .arg("multi:one")
+        .arg("multi:two")
+        .query_async::<i64>(&mut connection)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("at most one key"),
+        "unexpected error: {error}"
+    );
+
     // A script may not change the connection, as in Redis.
     let error = redis::cmd("EVAL")
         .arg("return redis.call('SELECT', 1)")
