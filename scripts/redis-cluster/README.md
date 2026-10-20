@@ -58,11 +58,25 @@ processes is the cluster's number.
 
 A `redis-benchmark` process tops out around 130k requests per second, so the
 harness runs `--client-procs` processes per endpoint. Without that, the
-measurement would be of the client rather than of the server.
+measurement would be of the client rather than of the server. The `--clients`
+connections are split over all processes, so the total is the same on both
+sides whatever the number of endpoints.
+
+`redis-benchmark` expands only `__rand_int__` in a custom command, so the
+harness builds the `--value-bytes` value itself rather than using `__data__`
+and `-d`.
 
 `redis-benchmark` has no time limit, so every phase runs a pilot first and the
 measured phase is then long enough to cover the same wall-clock time on both
-systems. The pilot doubles as the warmup.
+systems. The pilot doubles as the warmup. Every process gets a request count
+in proportion to its role's pilot rate and its connections, so the processes
+of a phase finish together, and the throughput of a phase is all completed
+requests over the wall-clock time of the phase. `finish_spread` in
+`measurements.csv` is the slowest process's run time over the fastest's.
+
+The harness refuses to start when one of its ports is in use; it does not stop
+processes it did not start. `--keep` leaves the clusters of the last case
+running.
 
 The node-side handler times come from a separate run:
 

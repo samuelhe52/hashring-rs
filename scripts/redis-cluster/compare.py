@@ -20,15 +20,19 @@ run after the writes of the same repetition, so they hit keys that exist.
 
 redis-benchmark has no time limit, only a request count, so every phase runs a
 pilot first and then a measured phase long enough to cover the same wall-clock
-time on both systems. The pilot doubles as the warmup.
+time on both systems. The pilot doubles as the warmup. Each process gets a
+request count in proportion to its connections, so the processes of a phase
+finish together, and the throughput of a phase is the requests of all its
+processes over the wall-clock time of the phase.
 """
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import shutil
-import signal
+import socket
 import statistics
 import subprocess
 import sys
@@ -169,22 +173,17 @@ def run(cmd, **kwargs):
     return proc
 
 
-def kill_ports(ports):
-    """Kills whatever still listens on these ports."""
-    try:
-        listing = subprocess.run(["ss", "-ltnpH"], capture_output=True, text=True).stdout
-    except FileNotFoundError:
-        return
-    for line in listing.splitlines():
-        for port in ports:
-            if f":{port} " in line + " ":
-                for field in line.split("pid=")[1:]:
-                    pid = field.split(",")[0]
-                    if pid.isdigit():
-                        try:
-                            os.kill(int(pid), signal.SIGKILL)
-                        except (ProcessLookupError, PermissionError):
-                            pass
+def require_free_ports(ports):
+    """Fails if anything listens on these ports. A listener there is not ours
+    to stop, and a cluster that cannot bind its ports is a broken cluster."""
+    busy = []
+    for port in ports:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.5)
+            if sock.connect_ex(("127.0.0.1", port)) == 0:
+                busy.append(port)
+    if busy:
+        raise RuntimeError(f"ports already in use: {busy}; stop whatever listens there or choose other base ports")
 
 
 def parse_csv(text):
@@ -266,7 +265,9 @@ class RedisCluster:
 
     def start(self):
         total = self.case.redis_masters * (self.case.redis_replicas + 1)
-        kill_ports(range(self.base_port, self.base_port + total))
+        ports = range(self.base_port, self.base_port + total)
+        # Every node also listens on its cluster bus port, the port plus 10000.
+        require_free_ports([*ports, *(port + 10000 for port in ports)])
         # A fresh directory: a node that keeps the cluster configuration of an
         # earlier case is not empty, and the cluster cannot be created again.
         shutil.rmtree(self.dir, ignore_errors=True)
@@ -307,11 +308,14 @@ class HashringCluster:
         self.gateway_pids = []
         self.node_pids = []
         self.coordinator_pids = []
+        self.settings = {}
 
     def start(self):
-        kill_ports(range(self.base_node_port, self.base_node_port + self.case.nodes))
-        kill_ports(range(self.base_gateway_port, self.base_gateway_port + self.case.gateways))
-        kill_ports([50050])
+        require_free_ports([
+            *range(self.base_node_port, self.base_node_port + self.case.nodes),
+            *range(self.base_gateway_port, self.base_gateway_port + self.case.gateways),
+            50050,
+        ])
         # A fresh directory: the coordinator keeps its topology in a state
         # file, and a state file from an earlier case would keep that case's
         # replication factor and ignore the settings of this one.
@@ -333,6 +337,11 @@ class HashringCluster:
                 else:
                     self.coordinator_pids.append(pid)
         self.gateways = [self.base_gateway_port + g for g in range(self.case.gateways)]
+        with open(os.path.join(self.dir, "settings")) as f:
+            for line in f:
+                key, _, value = line.strip().partition("=")
+                if key:
+                    self.settings[key] = value
 
     def stop(self):
         run(["bash", HASHRING_SCRIPT, "stop", self.dir])
@@ -344,16 +353,28 @@ class HashringCluster:
 
 # ----------------------------------------------------------- benchmarks ----
 
-def aggregate(results):
+def aggregate(results, window):
+    """The numbers of one phase. results holds (role, requests, parsed) per
+    process. The rates are the completed requests over the wall-clock window
+    of the whole phase: a process that finishes early adds its requests to
+    that window and not a rate measured over its own shorter one."""
+    parsed = [r for _, _, r in results]
+    # How long each process ran, from its own request count and rate. A
+    # spread far above 1 means the processes did not overlap for the whole
+    # phase.
+    elapsed = [requests / r["rps"] for _, requests, r in results if r["rps"] > 0]
     return {
-        "rps": sum(r["rps"] for r in results),
+        "rps": sum(requests for _, requests, _ in results) / window,
+        "write_rps": sum(requests for role, requests, _ in results if role == "write") / window,
+        "read_rps": sum(requests for role, requests, _ in results if role == "read") / window,
+        "finish_spread": max(elapsed) / min(elapsed) if elapsed else 0,
         "worst": {
-            "p50_ms": max(r["p50_ms"] for r in results),
-            "p95_ms": max(r["p95_ms"] for r in results),
-            "p99_ms": max(r["p99_ms"] for r in results),
-            "max_ms": max(r["max_ms"] for r in results),
+            "p50_ms": max(r["p50_ms"] for r in parsed),
+            "p95_ms": max(r["p95_ms"] for r in parsed),
+            "p99_ms": max(r["p99_ms"] for r in parsed),
+            "max_ms": max(r["max_ms"] for r in parsed),
         },
-        "per_process": results,
+        "per_process": parsed,
     }
 
 
@@ -361,9 +382,26 @@ def aggregate(results):
 
 def git_revision():
     try:
-        return run(["git", "-C", REPO, "rev-parse", "HEAD"]).stdout.strip()
+        revision = run(["git", "-C", REPO, "rev-parse", "HEAD"]).stdout.strip()
+        dirty = run(["git", "-C", REPO, "status", "--porcelain", "--untracked-files=no"]).stdout.strip()
+        return revision, bool(dirty)
     except Exception:
-        return "unknown"
+        return "unknown", None
+
+
+def git_commit_time():
+    try:
+        return int(run(["git", "-C", REPO, "log", "-1", "--format=%ct"]).stdout.strip())
+    except Exception:
+        return None
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def tool_version(path):
@@ -389,7 +427,7 @@ def main():
     parser.add_argument("--redis-base-port", type=int, default=7100)
     parser.add_argument("--node-base-port", type=int, default=50051)
     parser.add_argument("--gateway-base-port", type=int, default=6399)
-    parser.add_argument("--keep", action="store_true", help="leave the clusters running")
+    parser.add_argument("--keep", action="store_true", help="leave the clusters of the last case running")
     args = parser.parse_args()
 
     names = [n.strip() for n in args.cases.split(",") if n.strip()]
@@ -404,11 +442,24 @@ def main():
     work = os.path.join(output, "work")
     os.makedirs(work, exist_ok=True)
 
+    # The binary carries no revision of its own, so the checkout's revision
+    # describes it only if it was built from that checkout. The digest and
+    # the build time identify the binary that actually ran.
+    hashring_bin = os.path.abspath(args.hashring_bin)
+    revision, dirty = git_revision()
+    binary_mtime = int(os.path.getmtime(hashring_bin))
+    commit_time = git_commit_time()
+    if commit_time is not None and binary_mtime < commit_time:
+        print(f"warning: {hashring_bin} is older than the checkout's last commit; "
+              f"checkout_revision may not describe it", file=sys.stderr, flush=True)
     metadata = {
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "host_cpus": os.cpu_count(),
-        "hashring_revision": git_revision(),
-        "hashring_binary": os.path.abspath(args.hashring_bin),
+        "checkout_revision": revision,
+        "checkout_dirty": dirty,
+        "hashring_binary": hashring_bin,
+        "hashring_binary_sha256": file_sha256(hashring_bin),
+        "hashring_binary_mtime": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(binary_mtime)),
         "redis_benchmark": tool_version(os.path.join(args.redis_bin, "redis-benchmark")),
         "redis_server": tool_version(os.path.join(args.redis_bin, "redis-server")),
         "settings": {
@@ -416,13 +467,25 @@ def main():
             "seconds_per_phase": args.seconds,
             "pilot_requests_per_process": args.pilot_requests,
             "total_clients": args.clients,
+            "client_procs_per_endpoint": args.client_procs,
             "keyspace": args.keyspace,
             "value_bytes": args.value_bytes,
+            "redis_base_port": args.redis_base_port,
+            "node_base_port": args.node_base_port,
+            "gateway_base_port": args.gateway_base_port,
+            "keep": args.keep,
             "cases": names,
         },
+        # What hashring-cluster.sh resolved for each case: worker threads and
+        # the node and gateway budgets, defaults or environment overrides.
+        "hashring_settings": {},
     }
-    with open(os.path.join(output, "metadata.json"), "w") as f:
-        json.dump(metadata, f, indent=2)
+
+    def write_metadata():
+        with open(os.path.join(output, "metadata.json"), "w") as f:
+            json.dump(metadata, f, indent=2)
+
+    write_metadata()
 
     rows = []
     for name in names:
@@ -433,6 +496,8 @@ def main():
         try:
             redis.start()
             hashring.start()
+            metadata["hashring_settings"][name] = hashring.settings
+            write_metadata()
             # A cluster with a process that is not running is a broken cluster,
             # and a benchmark against it measures the breakage.
             for role_name, pids in (("redis", redis.pids), ("hashring", hashring.pids)):
@@ -444,9 +509,14 @@ def main():
             # is redirected. On the hashring side the tag is part of the key
             # name only; the gateway routes by the ring.
 
+            # redis-benchmark expands only __rand_int__ in a custom command;
+            # __data__ and -d apply to its built-in tests, so the value is
+            # built here.
+            value = "v" * args.value_bytes
+
             def key_template(role, tag):
                 if role == "write":
-                    return ["set", f"k:{{{tag}}}:__rand_int__", "__data__"]
+                    return ["set", f"k:{{{tag}}}:__rand_int__", value]
                 return ["get", f"k:{{{tag}}}:__rand_int__"]
 
             def system_layout(system):
@@ -465,52 +535,67 @@ def main():
                     "-h", "127.0.0.1", "-p", str(port),
                     "-c", str(clients),
                     "-r", str(keyspace),
-                    "-d", str(args.value_bytes),
                     "-n", str(requests),
                     "--csv",
                 ] + list(key_template(role, tag))
                 return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-            def phase(system, workload, requests_each):
-                """Runs one phase on one system and returns its numbers."""
-                endpoints, tags, pids = system_layout(system)
+            def process_layout(system, workload):
+                """(port, tag, role, clients) per benchmark process.
+
+                One benchmark process per endpoint and role, and a few of them
+                per endpoint: a single redis-benchmark process tops out around
+                130k requests per second, so one process per endpoint would
+                measure the client instead of the server. The connections are
+                split so that the total is --clients on both systems, whatever
+                the number of endpoints; the remainder goes one connection at a
+                time, alternating between the roles."""
+                endpoints, tags, _ = system_layout(system)
+                if workload == "mixed":
+                    roles = ("write", "read")
+                else:
+                    roles = ("write" if workload == "write" else "read",)
+                slots = [
+                    (port, tag if tag is not None else "tag", role)
+                    for _ in range(args.client_procs)
+                    for port, tag in zip(endpoints, tags)
+                    for role in roles
+                ]
+                if args.clients < len(slots):
+                    raise RuntimeError(f"--clients {args.clients} is fewer than the {len(slots)} benchmark processes of {system} {workload}")
+                base, extra = divmod(args.clients, len(slots))
+                return [(port, tag, role, base + (1 if i < extra else 0)) for i, (port, tag, role) in enumerate(slots)]
+
+            def phase(system, workload, requests_for):
+                """Runs one phase on one system and returns its numbers.
+                requests_for(role, clients) is the request count of one
+                process."""
+                _, _, pids = system_layout(system)
+                layout = process_layout(system, workload)
                 sampler = Sampler(pids)
                 sampler.start()
                 started = time.time()
                 try:
-                    if workload == "mixed":
-                        roles = ("write", "read")
-                    else:
-                        roles = ("write" if workload == "write" else "read",)
-                    # One benchmark process per endpoint and role, and a few of
-                    # them per endpoint: a single redis-benchmark process tops
-                    # out around 130k requests per second, so one process per
-                    # endpoint would measure the client instead of the server.
-                    total_clients = args.clients // len(roles)
-                    clients = max(1, total_clients // (len(endpoints) * args.client_procs))
                     procs = []
-                    for port, master_tag in zip(endpoints, tags):
-                        for role in roles:
-                            tag = master_tag if master_tag is not None else "tag"
-                            for _ in range(args.client_procs):
-                                procs.append((role, start_process(port, role, tag, clients, keyspace_for(system), requests_each)))
-                    results = {"write": [], "read": []}
-                    for role, proc in procs:
+                    for port, tag, role, clients in layout:
+                        requests = requests_for(role, clients)
+                        procs.append((role, requests, start_process(port, role, tag, clients, keyspace_for(system), requests)))
+                    results = []
+                    for role, requests, proc in procs:
                         stdout, stderr = proc.communicate()
                         if proc.returncode != 0:
                             raise RuntimeError(f"redis-benchmark failed:\n{stdout}\n{stderr}")
                         parsed = parse_csv(stdout)
                         if parsed is None:
                             raise RuntimeError(f"no benchmark output:\n{stdout}\n{stderr}")
-                        results[role].append(parsed)
-                    out = aggregate(results["write"] + results["read"])
-                    out["write_rps"] = sum(r["rps"] for r in results["write"])
-                    out["read_rps"] = sum(r["rps"] for r in results["read"])
+                        results.append((role, requests, parsed))
+                    window = time.time() - started
+                    out = aggregate(results, window)
                 finally:
                     resources = sampler.finish()
                 out["resources"] = resources
-                out["elapsed_seconds"] = round(time.time() - started, 2)
-                out["requests_each"] = requests_each
+                out["elapsed_seconds"] = round(window, 2)
+                out["requests_total"] = sum(requests for _, requests, _ in results)
                 return out
 
             def record(system, workload, rep, result):
@@ -538,7 +623,8 @@ def main():
                     "p99_ms": result["worst"]["p99_ms"],
                     "max_ms": result["worst"]["max_ms"],
                     "elapsed_seconds": result["elapsed_seconds"],
-                    "requests_each": result["requests_each"],
+                    "finish_spread": round(result["finish_spread"], 3),
+                    "requests_total": result["requests_total"],
                     "cpu_seconds": round(result["resources"].get("cpu_seconds", 0), 2),
                     "gateway_cpu_seconds": round(gateway_cpu, 2),
                     "node_cpu_seconds": round(node_cpu, 2),
@@ -561,7 +647,7 @@ def main():
             pilots = {}
             for system in ("redis", "hashring"):
                 for workload in ("write", "read"):
-                    result = phase(system, workload, args.pilot_requests)
+                    result = phase(system, workload, lambda role, clients: args.pilot_requests)
                     pilots[(system, workload)] = result["rps"]
                     print(f"  pilot {system:8s} {workload:6s} rps={result['rps']:.0f}", flush=True)
 
@@ -569,28 +655,29 @@ def main():
                 order = ["redis", "hashring"] if rep % 2 == 1 else ["hashring", "redis"]
                 for workload in ("write", "read", "mixed"):
                     for system in order:
-                        endpoints = len(system_layout(system)[0])
-                        processes = endpoints * args.client_procs
-                        if workload == "mixed":
-                            # The pilot of the write phase sizes both roles.
-                            pilot_rps = pilots[(system, "write")]
-                        else:
-                            pilot_rps = pilots[(system, workload)]
-                        requests_each = max(1, int(pilot_rps * args.seconds / processes))
-                        result = phase(system, workload, requests_each)
+                        # A process gets the share of its role's pilot rate
+                        # that its connections are of all connections, so
+                        # every process, and in the mixed phase both roles,
+                        # runs for about --seconds.
+                        def requests_for(role, clients, system=system):
+                            return max(1, int(pilots[(system, role)] * args.seconds * clients / args.clients))
+                        result = phase(system, workload, requests_for)
                         record(system, workload, rep, result)
                         if workload == "write":
                             size = redis.dbsize() if system == "redis" else hashring.dbsize()
                             rows[-1]["keys_in_cluster"] = size
                             print(f"           keys in cluster: {size}", flush=True)
         finally:
-            if not args.keep:
+            # --keep leaves only the last case running: the next case needs
+            # the same ports, and its fresh directories would lose the PID
+            # files of the processes of this one.
+            if not (args.keep and name == names[-1]):
                 hashring.stop()
                 redis.stop()
 
     fields = [
         "case", "system", "workload", "rep", "rps", "write_rps", "read_rps",
-        "p50_ms", "p95_ms", "p99_ms", "max_ms", "elapsed_seconds", "requests_each",
+        "p50_ms", "p95_ms", "p99_ms", "max_ms", "elapsed_seconds", "finish_spread", "requests_total",
         "cpu_seconds", "gateway_cpu_seconds", "node_cpu_seconds", "max_rss_bytes",
         "keys_in_cluster",
     ]

@@ -62,11 +62,12 @@ The gateway routes by the ring, so the harness runs one benchmark process per
 gateway with the same key template, and the aggregate of those processes is the
 cluster's number.
 
-Three workloads, all with 128-byte values and a 300,000-key key space:
+Three workloads over a 300,000-key key space, with values of `--value-bytes`
+(128 by default):
 
 | Workload | Command | Meaning |
 | --- | --- | --- |
-| write | `set k:{tag}:__rand_int__ __data__` | a stream of writes over random keys |
+| write | `set k:{tag}:__rand_int__ <value>` | a stream of writes over random keys |
 | read | `get k:{tag}:__rand_int__` | a stream of reads of keys the write phase wrote |
 | mixed | a writer and a reader at the same time | half the clients write, half read |
 
@@ -103,6 +104,27 @@ all of them matter for anyone running this workload:
 | `--max-pending-replication-bytes` | 64 MiB per node | 512 MiB | The queue of mutations waiting for a follower, for the same reason. |
 
 ## Results
+
+> **These numbers predate four fixes to the harness and are to be replaced by
+> a rerun.** They are what was measured, but not under the method above:
+>
+> - **Every value was 8 bytes, not 128.** `redis-benchmark` expands only
+>   `__rand_int__` in a custom command, so every `SET` stored the literal
+>   `__data__`. The harness now builds the value itself.
+> - **The Redis side had fewer connections in most cases.** The connections
+>   were split by integer division: 60 on the Redis side against 64 through a
+>   single gateway in `3m`, `3m1r` and `6m`, 48 against 64 in the `6m` mixed
+>   phase, and 60 on both sides in `3m-gw3`. The harness now keeps the total
+>   at 64 on both sides.
+> - **The mixed rows overstate throughput.** The rate of a phase was the sum
+>   of the rates of its processes, each over its own run time, and the reads
+>   of the mixed phase were sized from the write pilot, so readers and
+>   writers did not finish together. The harness now sizes every process by
+>   its own role and its connections, and divides all completed requests by
+>   the wall-clock time of the phase.
+> - **About half of the profiled reads were misses** (see
+>   [the node-side profile](#where-the-time-goes)). The profile now writes
+>   every key before the read phase.
 
 Medians of three repetitions, 15 seconds each, alternating which system runs
 first between repetitions.
@@ -160,6 +182,9 @@ time with `HASHRING_PROFILE_RPC=1` while the gateway is driven
 | write | 0.543 ms | 12.3 µs | 68.9 µs | 558.3 µs |
 | read | 0.479 ms | 1.5 µs | 1.8 µs | 6.2 µs |
 
+This profile ran before the fixes noted above: its write phase covered about
+49% of the key space, so about half of the reads below were misses.
+
 For a read, 1.8 µs of a 479 µs command is the node's work; the rest is the
 transport, the extra hop through the gateway, and the scheduling in between.
 The write handler has a long tail, which is the handler waiting to be
@@ -196,24 +221,27 @@ the Redis gateway (`hashring-rs experiment --mode performance`, 3 nodes,
 
 These come from a different client and a different workload, so they are a
 reference and not a controlled comparison. They do show the size of the
-effect: the gateway path is in the same range as the native client path, so
-the gateway is not where the difference from Redis comes from. The gRPC hop to
-a node is what costs, and the gateway adds a cheap TCP hop on top of it.
+effect: the native client path is in the same range as the gateway path, so a
+client that skips the gateway does not close the gap to Redis. Both paths
+share the gRPC hop to a node; this reference does not measure what the
+gateway adds on top of it.
 
 ## What the numbers say
 
-1. **The Redis protocol path is the slow path.** Through the gateway the
-   cluster reaches 80,000 to 170,000 operations per second, against 440,000 to
-   707,000 for a Redis Cluster of the same shape. A client that can use the
-   native client library is not subject to this.
+1. **The cluster is several times slower than a Redis Cluster.** Through the
+   gateway the cluster reaches 80,000 to 170,000 operations per second,
+   against 440,000 to 707,000 for a Redis Cluster of the same shape. The
+   native client path is in the same range as the gateway (73,000 to 102,000
+   operations per second in the reference run), so switching clients does not
+   close the gap.
 2. **The cost is transport, not the cluster.** The node spends 1.8 µs on a
    read and a median of 12.3 µs on a write, while the client waits half a
    millisecond. The ring, the storage and the follower copy are not what the
    time is spent on.
 3. **The gateway is a single point of contention.** One gateway caps the
    cluster at about 100,000 operations per second, and more gateways lift that
-   cap. The cluster behind it has more to give: the native client path
-   reaches a comparable rate with the same three nodes.
+   cap. The cluster behind it has more to give: in `3m` the three nodes
+   together use 4.6 of their 12 workers.
 4. **The default deduplication budget limits sustained writes.** A node keeps
    one receipt per write for 60 seconds, and 128 MiB fills after about ten
    seconds of sustained writes at these rates. A deployment that writes
@@ -263,8 +291,9 @@ python3 scripts/redis-cluster/compare.py \
 ```
 
 The harness writes `measurements.csv` with one row per phase, `summary.json`
-with the medians, and `metadata.json` with the versions, the revision and
-every resolved setting. The node-side profile comes from:
+with the medians, and `metadata.json` with the versions, the checkout's
+revision, the digest of the binary that ran, and every resolved setting,
+including what `hashring-cluster.sh` resolved for each case. The node-side profile comes from:
 
 ```sh
 python3 scripts/redis-cluster/gateway-profile.py \

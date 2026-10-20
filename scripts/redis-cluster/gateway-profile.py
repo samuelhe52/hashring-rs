@@ -17,7 +17,6 @@ import argparse
 import collections
 import csv
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -83,6 +82,26 @@ def print_table(title, agg):
     print()
 
 
+def prefill(redis_bin, port, keyspace, value):
+    """Writes every key the read phase can ask for, so its reads are hits.
+
+    redis-benchmark draws __rand_int__ from [0, keyspace) and prints it as
+    twelve digits, so these are exactly the keys of the templates below."""
+    lines = []
+    for i in range(keyspace):
+        key = f"k:{{tag}}:{i:012d}"
+        lines.append(f"*3\r\n$3\r\nSET\r\n${len(key)}\r\n{key}\r\n${len(value)}\r\n{value}\r\n")
+    cli = os.path.join(redis_bin, "redis-cli")
+    proc = subprocess.run([cli, "-h", "127.0.0.1", "-p", str(port), "--pipe"],
+                          input="".join(lines), capture_output=True, text=True)
+    if proc.returncode != 0 or "errors: 0," not in proc.stdout:
+        raise RuntimeError(f"prefill failed:\n{proc.stdout}\n{proc.stderr}")
+    size = int(subprocess.run([cli, "-h", "127.0.0.1", "-p", str(port), "dbsize"],
+                              capture_output=True, text=True, check=True).stdout)
+    if size != keyspace:
+        raise RuntimeError(f"prefill left {size} keys, expected {keyspace}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--output", required=True)
@@ -97,9 +116,9 @@ def main():
     args = parser.parse_args()
 
     output = os.path.abspath(args.output)
-    if os.path.exists(output):
-        shutil.rmtree(output)
-    os.makedirs(output)
+    if os.path.exists(output) and os.listdir(output):
+        parser.error(f"{output} exists and is not empty")
+    os.makedirs(output, exist_ok=True)
     work = os.path.join(output, "work")
     os.makedirs(work)
     cluster_dir = os.path.join(work, "hashring")
@@ -110,16 +129,26 @@ def main():
         check=True, env=env,
     )
     benchmark = os.path.join(args.redis_bin, "redis-benchmark")
+    # redis-benchmark expands only __rand_int__ in a custom command; __data__
+    # and -d apply to its built-in tests, so the value is built here.
+    value = "v" * args.value_bytes
     try:
         for workload, command in (
-            ("write", ["set", "k:{tag}:__rand_int__", "__data__"]),
+            ("write", ["set", "k:{tag}:__rand_int__", value]),
             ("read", ["get", "k:{tag}:__rand_int__"]),
         ):
+            if workload == "read":
+                # The write phase leaves about 1 - e^(-requests/keyspace) of
+                # the key space written, half of it with the defaults.
+                prefill(args.redis_bin, 6399, args.keyspace, value)
+                # The nodes log their histograms every 500 ms; the prefill's
+                # writes must be in the snapshot before the phase.
+                time.sleep(1)
             before = read_profile(cluster_dir)
             started = time.time()
             proc = subprocess.run(
                 [benchmark, "-h", "127.0.0.1", "-p", "6399", "-c", "64", "-r", str(args.keyspace),
-                 "-d", str(args.value_bytes), "-n", str(args.requests), "--csv"] + command,
+                 "-n", str(args.requests), "--csv"] + command,
                 capture_output=True, text=True,
             )
             elapsed = time.time() - started

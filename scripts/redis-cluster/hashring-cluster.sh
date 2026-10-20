@@ -8,7 +8,8 @@
 #
 # The coordinator listens on 127.0.0.1:50050, node i on 127.0.0.1:(base_node_port+i-1)
 # and gateway g on 127.0.0.1:(base_gateway_port+g-1). Every process logs to
-# <dir>/<name>.log and keeps its PID in <dir>/<name>.pid.
+# <dir>/<name>.log and keeps its PID in <dir>/<name>.pid. The resolved worker
+# count and budgets are written to <dir>/settings.
 #
 # The node budgets below are set for a benchmark rather than for a default
 # deployment. A node keeps one deduplication receipt per write for the receipt
@@ -44,6 +45,16 @@ start)
     max_pending_bytes="${HASHRING_MAX_PENDING_REPLICATION_BYTES:-536870912}"
     gateway_deadline_ms="${HASHRING_GATEWAY_DEADLINE_MS:-60000}"
     mkdir -p "$dir"
+    # The resolved settings, for the harness to record with its results.
+    cat > "$dir/settings" <<SETTINGS
+nodes=$nodes
+rf=$rf
+gateways=$gateways
+worker_threads=$workers
+max_dedup_bytes=$max_dedup_bytes
+max_pending_replication_bytes=$max_pending_bytes
+gateway_deadline_ms=$gateway_deadline_ms
+SETTINGS
     echo "starting coordinator, $nodes node(s), rf=$rf, $gateways gateway(s), $workers worker(s) each"
     members=""
     for i in $(seq 1 "$nodes"); do
