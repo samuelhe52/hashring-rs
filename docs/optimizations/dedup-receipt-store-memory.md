@@ -51,6 +51,34 @@ The 20k-key FirstSuccessor *correctness* run at the standard 30-second logical d
 
 `Arc<str>` adds atomic reference counting when ID handles are cloned, in exchange for fewer string allocations and smaller handles. Successful required-ACK writes take a brief state write lock when releasing ACK metadata; owner-only writes retain the read-lock path. The byte estimates still include fixed allocator and hash-table allowances rather than measuring allocations exactly. Data records, replication buffers, migration staging, and allocator high-water behavior all contribute to RSS outside this receipt budget. The 60-second retry guarantee is unchanged.
 
+## The budget is also a sustained write rate limit
+
+The 128 MiB default is admission accounting for live receipts, and live
+receipts last for the receipt retention period, so the budget is a rate limit
+on continuous writing rather than only a memory bound.
+
+A receipt is charged about 270 to 400 bytes on the measured 64-bit target
+(the charge follows the key length, the request ID length and the ACK
+metadata), so 128 MiB holds roughly 330,000 to 470,000 live receipts per node.
+With the 60-second retention period, a node that writes continuously admits
+between 5,500 and 7,800 writes per second before the oldest receipts expire.
+Three nodes at that rate reach 16,000 to 23,000 writes per second, and a
+sustained load above it fills the store, and then the node rejects writes
+with a retryable error until the receipts expire.
+
+That was measured through the Redis gateway against a real Redis Cluster of
+the same shape: at 107,000 writes per second over three nodes the default
+budget is exhausted after about ten seconds of continuous writing, and the
+phase then ends in `TRYAGAIN` before the command deadline. The measurements
+and the method are in
+[redis-cluster-comparison.md](../redis-cluster-comparison.md); that run raised
+`--max-dedup-bytes` to 2 GiB per node so the numbers describe the data path.
+
+A deployment that writes continuously has three ways out: a larger
+`--max-dedup-bytes`, a shorter `--receipt-retention-ms`, or a workload whose
+write rate is below the budget. The budget is a node setting, so it can be
+raised per node without changing the topology.
+
 ## Follow-up
 
 The subsequent [replica ACK performance optimization](replica-ack-performance.md) removes the per-write cluster status query and batches activation persistence. Its measurements supersede the slow FirstSuccessor throughput and activation timings above; the comparisons above remain evidence for the earlier receipt-layout changes.
