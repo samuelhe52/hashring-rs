@@ -1016,7 +1016,8 @@ async fn unavailable_follower_backpressures_before_unbounded_queue_growth() {
         // in-flight replication batch that the delivery task drained before
         // blocking on the unavailable follower.
         assert!(
-            successful <= DEFAULT_REPLICATION_STREAM_QUEUE_CAPACITY + REPLICATION_BATCH_MAX_ENTRIES
+            successful <= DEFAULT_REPLICATION_STREAM_QUEUE_CAPACITY
+                + DEFAULT_REPLICATION_BATCH_MAX_ENTRIES
         );
     };
 
@@ -1566,6 +1567,7 @@ async fn unreachable_streams_do_not_copy_unbudgeted_payloads() {
             active.clone(),
             DEFAULT_REPLICATION_RPC_TIMEOUT,
             std::time::Duration::ZERO,
+            DEFAULT_REPLICATION_BATCH_MAX_ENTRIES,
             service.pressure.clone(),
             (1, "node-1".into(), follower),
             receiver,
@@ -1666,6 +1668,7 @@ async fn delivery_publishes_partial_ack_and_retries_suffix_after_capacity_return
         active.clone(),
         DEFAULT_REPLICATION_RPC_TIMEOUT,
         std::time::Duration::ZERO,
+        DEFAULT_REPLICATION_BATCH_MAX_ENTRIES,
         owner.pressure.clone(),
         (topology.epoch, "node-1".into(), "node-2".into()),
         receiver,
@@ -1791,6 +1794,7 @@ async fn collect_with_late_entries(
         first,
         &mut receiver,
         std::time::Duration::from_millis(linger_ms),
+        DEFAULT_REPLICATION_BATCH_MAX_ENTRIES,
     )
     .await;
     assert!(carry.is_none());
@@ -1828,6 +1832,41 @@ async fn batch_linger_never_delays_an_acknowledged_write() {
         collect_with_late_entries(5, false, &[(2, true), (3, false)]).await,
         (vec![1, 2, 3], ms(1))
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_batch_stops_at_the_configured_number_of_entries() {
+    let (sender, mut receiver) = mpsc::channel(8);
+    for sequence in 2..=6 {
+        sender
+            .send(linger_test_entry(sequence, false).await)
+            .await
+            .unwrap();
+    }
+    let first = linger_test_entry(1, false).await;
+    let (batch, _, carry) = collect_replication_batch(
+        first,
+        &mut receiver,
+        std::time::Duration::ZERO,
+        2,
+    )
+    .await;
+    let sequences: Vec<u64> = batch
+        .iter()
+        .map(|pending| pending.prepared.stream_sequence)
+        .collect();
+    assert_eq!(sequences, vec![1, 2]);
+    // The entries that did not fit stay in the queue, in order, for the next
+    // batch; only the byte budget moves one into the carry.
+    assert!(carry.is_none());
+    let next = receiver.recv().await.unwrap();
+    let (batch, _, _) = collect_replication_batch(next, &mut receiver, std::time::Duration::ZERO, 2)
+        .await;
+    let sequences: Vec<u64> = batch
+        .iter()
+        .map(|pending| pending.prepared.stream_sequence)
+        .collect();
+    assert_eq!(sequences, vec![3, 4]);
 }
 
 fn value_record(value: &[u8], version: &RecordVersion) -> Record {

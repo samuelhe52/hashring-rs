@@ -298,6 +298,7 @@ pub(super) fn start_replication_dispatch(
         stream_queue_capacity: settings.replication_stream_queue_capacity,
         rpc_timeout: settings.replication_rpc_timeout,
         batch_linger: settings.replication_batch_linger,
+        batch_max_entries: settings.replication_batch_max_entries,
         pressure,
     }
 }
@@ -374,6 +375,7 @@ impl ReplicationDispatcher {
                     self.active_rpc_budget.clone(),
                     self.rpc_timeout,
                     self.batch_linger,
+                    self.batch_max_entries,
                     self.pressure.clone(),
                     stream_key.clone(),
                     receiver,
@@ -436,18 +438,23 @@ pub(super) fn replication_mutation_bytes(mutation: &ReplicationMutation) -> usiz
 /// trip, which is one or two entries at moderate load. Waiting up to
 /// `batch_linger` for more trades follower lag for fewer RPCs, so it stops as
 /// soon as any entry in the batch has a write waiting for its ACK.
+///
+/// `max_entries` bounds how many mutations one RPC carries. The batch is
+/// also bounded by the bytes one message may hold, so a batch of large
+/// mutations is smaller than this.
 pub(super) async fn collect_replication_batch(
     first: PendingReplication,
     entries: &mut mpsc::Receiver<PendingReplication>,
     batch_linger: std::time::Duration,
+    max_entries: usize,
 ) -> (Vec<PendingReplication>, usize, Option<PendingReplication>) {
-    let mut batch: Vec<PendingReplication> = Vec::with_capacity(REPLICATION_BATCH_MAX_ENTRIES);
+    let mut batch: Vec<PendingReplication> = Vec::with_capacity(max_entries);
     let mut batch_bytes = replication_mutation_bytes(&first.prepared.mutation);
     let mut ack_awaited = first.prepared.ack_awaited;
     batch.push(first);
     let linger_until =
         (!batch_linger.is_zero()).then(|| tokio::time::Instant::now() + batch_linger);
-    while batch.len() < REPLICATION_BATCH_MAX_ENTRIES {
+    while batch.len() < max_entries {
         let next = match entries.try_recv() {
             Ok(next) => next,
             Err(mpsc::error::TryRecvError::Disconnected) => break,
@@ -479,6 +486,7 @@ pub(super) async fn deliver_replication_stream(
     active_rpc_budget: Arc<Semaphore>,
     rpc_timeout: std::time::Duration,
     batch_linger: std::time::Duration,
+    batch_max_entries: usize,
     pressure: Arc<NodePressureStats>,
     stream_key: ReplicationStreamKey,
     mut entries: mpsc::Receiver<PendingReplication>,
@@ -494,7 +502,7 @@ pub(super) async fn deliver_replication_stream(
             },
         };
         let (mut batch, mut batch_bytes, next_carry) =
-            collect_replication_batch(first, &mut entries, batch_linger).await;
+            collect_replication_batch(first, &mut entries, batch_linger, batch_max_entries).await;
         carry = next_carry;
         let epoch = batch[0].prepared.mutation.topology_epoch;
         let follower_node_id = batch[0].prepared.follower_node_id.clone();

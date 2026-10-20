@@ -45,7 +45,15 @@ use hashring_core::{
 
 pub const DEFAULT_MAX_MIGRATION_JOURNAL_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_PENDING_REPLICATION_BYTES: usize = 64 * 1024 * 1024;
-const REPLICATION_BATCH_MAX_ENTRIES: usize = 64;
+/// How many mutations one `ReplicateMutations` RPC carries by default. A
+/// batch is also bounded by the bytes one message may hold, so this is an
+/// upper bound rather than the size every batch reaches.
+pub const DEFAULT_REPLICATION_BATCH_MAX_ENTRIES: usize = 64;
+/// The largest batch size a node accepts. A batch of this many entries is
+/// still bounded by the bytes one message may hold, and the batch is applied
+/// by a follower under one lock, so a huge batch holds that lock for a long
+/// time.
+pub const MAX_REPLICATION_BATCH_MAX_ENTRIES: usize = 4_096;
 // Stay under the data-node client's encode limit so one batch fits a message.
 const REPLICATION_BATCH_MAX_BYTES: usize = MAX_DATA_MESSAGE_BYTES - 64 * 1024;
 pub const DEFAULT_REPLICATION_STREAM_QUEUE_CAPACITY: usize = 32;
@@ -403,6 +411,7 @@ struct ReplicationDispatcher {
     stream_queue_capacity: usize,
     rpc_timeout: std::time::Duration,
     batch_linger: std::time::Duration,
+    batch_max_entries: usize,
     pressure: Arc<NodePressureStats>,
 }
 
@@ -704,6 +713,10 @@ pub struct NodeSettings {
     /// How long a follower stream waits for more entries before sending a
     /// batch that no write is waiting on. Zero sends at once.
     pub replication_batch_linger: std::time::Duration,
+    /// How many mutations one replication RPC carries. A larger batch means
+    /// fewer RPCs for the same mutations, at the cost of a follower holding
+    /// its state lock for the whole batch.
+    pub replication_batch_max_entries: usize,
 }
 
 impl Default for NodeSettings {
@@ -717,6 +730,7 @@ impl Default for NodeSettings {
             required_ack_timeout: DEFAULT_REQUIRED_ACK_TIMEOUT,
             replication_rpc_timeout: DEFAULT_REPLICATION_RPC_TIMEOUT,
             replication_batch_linger: DEFAULT_REPLICATION_BATCH_LINGER,
+            replication_batch_max_entries: DEFAULT_REPLICATION_BATCH_MAX_ENTRIES,
         }
     }
 }
@@ -760,6 +774,12 @@ impl NodeSettings {
         anyhow::ensure!(
             !self.required_ack_timeout.is_zero() && !self.replication_rpc_timeout.is_zero(),
             "timeouts must be positive"
+        );
+        anyhow::ensure!(
+            self.replication_batch_max_entries > 0
+                && self.replication_batch_max_entries <= MAX_REPLICATION_BATCH_MAX_ENTRIES,
+            "replication_batch_max_entries must be positive and at most {}",
+            MAX_REPLICATION_BATCH_MAX_ENTRIES
         );
         Ok(())
     }

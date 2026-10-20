@@ -78,6 +78,7 @@ pub struct NodeOptions {
     pub required_ack_timeout_ms: u64,
     pub replication_rpc_timeout_ms: u64,
     pub replication_batch_linger_ms: u64,
+    pub replication_batch_max_entries: usize,
 }
 
 impl NodeOptions {
@@ -108,6 +109,10 @@ impl NodeOptions {
             (
                 "--replication-batch-linger-ms",
                 self.replication_batch_linger_ms.to_string(),
+            ),
+            (
+                "--replication-batch-max-entries",
+                self.replication_batch_max_entries.to_string(),
             ),
         ]
         .into_iter()

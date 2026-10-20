@@ -28,6 +28,7 @@ pub struct NodeFile {
     pub required_ack_timeout_ms: Option<u64>,
     pub replication_rpc_timeout_ms: Option<u64>,
     pub replication_batch_linger_ms: Option<u64>,
+    pub replication_batch_max_entries: Option<NonZeroUsize>,
 }
 
 impl NodeFile {
@@ -41,6 +42,7 @@ impl NodeFile {
             required_ack_timeout_ms: self.required_ack_timeout_ms,
             replication_rpc_timeout_ms: self.replication_rpc_timeout_ms,
             replication_batch_linger_ms: self.replication_batch_linger_ms,
+            replication_batch_max_entries: self.replication_batch_max_entries,
         }
     }
 }
@@ -123,6 +125,13 @@ pub fn settings(flags: &NodeTuningArgs, file: &NodeTuningArgs) -> NodeSettings {
             .replication_batch_linger_ms
             .or(file.replication_batch_linger_ms)
             .map_or(defaults.replication_batch_linger, Duration::from_millis),
+        replication_batch_max_entries: flags
+            .replication_batch_max_entries
+            .or(file.replication_batch_max_entries)
+            .map_or(
+                defaults.replication_batch_max_entries,
+                NonZeroUsize::get,
+            ),
     }
 }
 
@@ -138,6 +147,7 @@ pub fn options(settings: &NodeSettings) -> NodeOptions {
         required_ack_timeout_ms: duration_ms(settings.required_ack_timeout),
         replication_rpc_timeout_ms: duration_ms(settings.replication_rpc_timeout),
         replication_batch_linger_ms: duration_ms(settings.replication_batch_linger),
+        replication_batch_max_entries: settings.replication_batch_max_entries,
     }
 }
 
@@ -150,7 +160,10 @@ mod tests {
     use std::{fs, path::Path, path::PathBuf};
 
     use clap::Parser;
-    use hashring_node::{DEFAULT_MAX_DEDUP_BYTES, DEFAULT_REQUIRED_ACK_TIMEOUT, MAX_VALUE_BYTES};
+    use hashring_node::{
+        DEFAULT_MAX_DEDUP_BYTES, DEFAULT_REPLICATION_BATCH_MAX_ENTRIES,
+        DEFAULT_REQUIRED_ACK_TIMEOUT, MAX_VALUE_BYTES,
+    };
 
     use super::*;
     use crate::{Cli, Command, config::load};
@@ -193,6 +206,30 @@ mod tests {
             config.settings.required_ack_timeout,
             DEFAULT_REQUIRED_ACK_TIMEOUT
         );
+    }
+
+    #[test]
+    fn the_replication_batch_size_comes_from_the_flag_or_the_file() {
+        let config = resolve(&node_args(&["--id", "a", "--listen", "127.0.0.1:1"]), None).unwrap();
+        assert_eq!(
+            config.settings.replication_batch_max_entries,
+            DEFAULT_REPLICATION_BATCH_MAX_ENTRIES
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "id: node-1\nlisten: 127.0.0.1:50051\nreplication_batch_max_entries: 8\n",
+        );
+        let config = resolve(&node_args(&[]), Some(load(&path).unwrap())).unwrap();
+        assert_eq!(config.settings.replication_batch_max_entries, 8);
+
+        let config = resolve(
+            &node_args(&["--replication-batch-max-entries", "16"]),
+            Some(load(&path).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(config.settings.replication_batch_max_entries, 16);
     }
 
     #[test]

@@ -209,6 +209,11 @@ struct NodeTuningArgs {
     /// write waits for its ACK. 0 sends at once. [default: 2]
     #[arg(long)]
     replication_batch_linger_ms: Option<u64>,
+    /// How many mutations one replication RPC carries. A larger batch means
+    /// fewer RPCs for the same mutations, at the cost of a follower holding
+    /// its state lock for the whole batch. [default: 64]
+    #[arg(long)]
+    replication_batch_max_entries: Option<NonZeroUsize>,
 }
 
 #[derive(Args, Clone)]
