@@ -25,7 +25,6 @@ def load_rows(run):
     rows = []
     for line in lines[1:]:
         row = dict(zip(header, line.split(",")))
-        row["variant"] = row["variant"]
         for key in ("rps", "p50_ms", "p99_ms", "elapsed_seconds", "cpu_seconds",
                     "gateway_cpu_seconds", "node_cpu_seconds"):
             row[key] = float(row[key])
@@ -34,8 +33,46 @@ def load_rows(run):
     return rows, variants
 
 
+def pick(rows, case, workload, variant, system):
+    """The rows of one case, workload, variant and system, by repetition."""
+    return {
+        row["rep"]: row
+        for row in rows
+        if row["case"] == case
+        and row["workload"] == workload
+        and row["variant"] == variant
+        and row["system"] == system
+    }
+
+
+def ratio_of(rows, case, workload, variant, rep):
+    """The hashring rate of a repetition over the control of that repetition."""
+    control = pick(rows, case, workload, variant, "redis").get(rep)
+    measured = pick(rows, case, workload, variant, "hashring").get(rep)
+    if not control or not measured:
+        return None
+    return measured["rps"] / control["rps"]
+
+
+def us_per_op(picked):
+    """The CPU of the phase per request, and the gateway's and the nodes'."""
+    ops = sum(row["rps"] * row["elapsed_seconds"] for row in picked.values())
+    if ops <= 0:
+        return 0.0, 0.0, 0.0
+    return (
+        1e6 * sum(row["cpu_seconds"] for row in picked.values()) / ops,
+        1e6 * sum(row["gateway_cpu_seconds"] for row in picked.values()) / ops,
+        1e6 * sum(row["node_cpu_seconds"] for row in picked.values()) / ops,
+    )
+
+
 def main():
     runs = sys.argv[1:]
+    base = None
+    if "--base" in runs:
+        index = runs.index("--base")
+        base = runs[index + 1]
+        runs = runs[:index] + runs[index + 2:]
     if not runs:
         print(__doc__)
         return 1
@@ -51,64 +88,43 @@ def main():
         for case in cases:
             for workload in ("write", "read", "mixed"):
                 for variant in variants:
-                    picked = [
-                        row
-                        for row in rows
-                        if row["case"] == case
-                        and row["workload"] == workload
-                        and row["variant"] == variant
-                    ]
+                    picked = pick(rows, case, workload, variant, "hashring")
                     if not picked:
                         continue
                     # The ratio of the hashring side to the control of the
                     # same repetition. The control row itself is not part of
                     # the ratio.
-                    ratios = []
-                    for row in picked:
-                        if row["system"] != "hashring":
-                            continue
-                        control = next(
-                            (
-                                other["rps"]
-                                for other in rows
-                                if other["case"] == case
-                                and other["workload"] == workload
-                                and other["variant"] == variant
-                                and other["system"] == "redis"
-                                and other["rep"] == row["rep"]
-                            ),
-                            None,
-                        )
-                        if control:
-                            ratios.append(row["rps"] / control)
-                    rps = [row["rps"] for row in picked if row["system"] == "hashring"]
-                    p50 = [row["p50_ms"] for row in picked if row["system"] == "hashring"]
-                    if not rps:
-                        continue
-                    ops = sum(
-                        row["rps"] * row["elapsed_seconds"]
-                        for row in picked
-                        if row["system"] == "hashring"
-                    )
-                    cpu = sum(row["cpu_seconds"] for row in picked if row["system"] == "hashring")
-                    gw = sum(
-                        row["gateway_cpu_seconds"]
-                        for row in picked
-                        if row["system"] == "hashring"
-                    )
-                    node = sum(
-                        row["node_cpu_seconds"] for row in picked if row["system"] == "hashring"
-                    )
+                    ratios = [
+                        ratio_of(rows, case, workload, variant, rep)
+                        for rep in picked
+                    ]
+                    ratios = [r for r in ratios if r is not None]
+                    rps = [row["rps"] for row in picked.values()]
+                    p50 = [row["p50_ms"] for row in picked.values()]
+                    cpu, gw, node = us_per_op(picked)
                     ratio = f"{statistics.median(ratios):.4f}" if ratios else "-"
-                    print(
+                    line = (
                         f"  {case:8s} {workload:6s} {variant:12s} "
                         f"rps={statistics.median(rps):>9.0f} "
                         f"(min {min(rps):>9.0f} max {max(rps):>9.0f}) "
                         f"p50={statistics.median(p50):.3f}ms "
                         f"ratio={ratio} "
-                        f"cpu/op={1e6 * cpu / ops:.1f}us "
-                        f"(gw {1e6 * gw / ops:.1f} node {1e6 * node / ops:.1f})"
+                        f"cpu/op={cpu:.1f}us (gw {gw:.1f} node {node:.1f})"
                     )
+                    if base and variant != base and base in variants:
+                        deltas = []
+                        for rep in sorted(picked):
+                            mine = ratio_of(rows, case, workload, variant, rep)
+                            theirs = ratio_of(rows, case, workload, base, rep)
+                            if mine is not None and theirs is not None:
+                                deltas.append(mine - theirs)
+                        if deltas:
+                            line += (
+                                f"  vs {base}: "
+                                + " ".join(f"{d:+.4f}" for d in deltas)
+                                + f" median {statistics.median(deltas):+.4f}"
+                            )
+                    print(line)
     return 0
 
 
