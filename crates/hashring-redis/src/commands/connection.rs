@@ -418,13 +418,16 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use super::*;
-    use crate::{client::SharedClient, resp::Limits};
+    use crate::{
+        client::{ClientConfig, SharedClient},
+        resp::Limits,
+    };
 
     fn dispatcher(password: Option<&str>) -> Dispatcher {
         Dispatcher::new(
             Arc::new(SharedClient::new(
                 "http://127.0.0.1:1".into(),
-                Duration::from_millis(50),
+                ClientConfig::new(Duration::from_millis(50)),
             )),
             password.map(Arc::from),
             Limits::default(),

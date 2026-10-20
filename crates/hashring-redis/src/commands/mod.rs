@@ -306,6 +306,7 @@ impl Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::ClientConfig;
 
     struct Probe;
 
@@ -445,7 +446,7 @@ mod tests {
         Dispatcher::new(
             Arc::new(SharedClient::new(
                 "http://127.0.0.1:1".into(),
-                Duration::from_millis(50),
+                ClientConfig::new(Duration::from_millis(50)),
             )),
             password.map(Arc::from),
             Limits::default(),

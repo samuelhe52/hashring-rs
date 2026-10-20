@@ -226,6 +226,12 @@ pub struct ClientConfig {
     pub operation_timeout: Duration,
     pub topology_refresh_timeout: Duration,
     pub topology_poll_interval: Option<Duration>,
+    /// How many HTTP/2 connections this client opens to each data node.
+    ///
+    /// One is enough for correctness and is the default. More than one lets
+    /// concurrent requests to the same node spread over more than one
+    /// connection, instead of sharing the stream bookkeeping of a single one.
+    pub connection_pool_size: usize,
 }
 
 impl ClientConfig {
@@ -234,7 +240,15 @@ impl ClientConfig {
             operation_timeout,
             topology_refresh_timeout: operation_timeout,
             topology_poll_interval: Some(DEFAULT_TOPOLOGY_POLL_INTERVAL),
+            connection_pool_size: 1,
         }
+    }
+
+    /// Sets how many connections this client opens to each data node. A size
+    /// below one is treated as one.
+    pub fn with_connection_pool_size(mut self, size: usize) -> Self {
+        self.connection_pool_size = size.max(1);
+        self
     }
 }
 
@@ -248,7 +262,8 @@ struct ClientInner {
     /// Fixed for the cluster's lifetime, so it is read once at connect.
     receipt_retention: Duration,
     topology: RwLock<TopologySnapshot>,
-    channels: RwLock<HashMap<String, Channel>>,
+    channels: RwLock<HashMap<String, ChannelPool>>,
+    connection_pool_size: usize,
     operation_timeout: Duration,
     topology_refresh_timeout: Duration,
     refresh_lock: Mutex<()>,
@@ -256,6 +271,39 @@ struct ClientInner {
     background_refresh_running: AtomicBool,
     background_minimum_epoch: AtomicU64,
     background_trigger_generation: AtomicU64,
+}
+
+/// The connections to one data node.
+///
+/// A tonic `Channel` is a single HTTP/2 connection, so one channel means one
+/// connection and one stream table. Every request to the node shares it, and
+/// the requests that are in flight at the same time queue behind the same
+/// bookkeeping. A pool of channels spreads them over more than one
+/// connection, and the pool hands them out round-robin.
+struct ChannelPool {
+    channels: Vec<Channel>,
+    next: AtomicUsize,
+}
+
+impl ChannelPool {
+    fn new(channels: Vec<Channel>) -> Self {
+        Self {
+            channels,
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    /// The next connection to use. The counter wraps, so a pool of one always
+    /// returns the same connection.
+    fn next(&self) -> &Channel {
+        &self.channels[self.next_index()]
+    }
+
+    /// The index of the connection the next request uses. It wraps, so a pool
+    /// of one always uses the same connection.
+    fn next_index(&self) -> usize {
+        self.next.fetch_add(1, Ordering::Relaxed) % self.channels.len()
+    }
 }
 
 impl HashringClient {
@@ -282,6 +330,7 @@ impl HashringClient {
             receipt_retention: topology.timings.receipt_retention(),
             topology: RwLock::new(topology),
             channels: RwLock::new(HashMap::new()),
+            connection_pool_size: config.connection_pool_size,
             operation_timeout: config.operation_timeout,
             topology_refresh_timeout: config.topology_refresh_timeout,
             refresh_lock: Mutex::new(()),
@@ -1047,23 +1096,88 @@ impl HashringClient {
         endpoint: &str,
         deadline: Instant,
     ) -> Result<DataNodeClient<Channel>, ClientError> {
-        if let Some(channel) = self.inner.channels.read().await.get(endpoint).cloned() {
-            return Ok(configure_data_client(DataNodeClient::new(channel)));
+        if let Some(pool) = self.inner.channels.read().await.get(endpoint) {
+            return Ok(configure_data_client(DataNodeClient::new(pool.next().clone())));
         }
-        let transport = Endpoint::from_shared(endpoint.to_owned())
-            .map_err(anyhow::Error::from)
-            .map_err(ClientError::from)?;
-        let channel = tokio::time::timeout(remaining(deadline, false)?, transport.connect())
-            .await
-            .map_err(|_| ClientError::deadline(false))?
-            .map_err(anyhow::Error::from)
-            .map_err(ClientError::from)?;
-        self.inner
-            .channels
-            .write()
-            .await
-            .insert(endpoint.to_owned(), channel.clone());
-        Ok(configure_data_client(DataNodeClient::new(channel)))
+        let pool = self.connect_pool(endpoint, deadline).await?;
+        let mut channels = self.inner.channels.write().await;
+        // Another request may have opened the pool while this one connected,
+        // so the pool that is already in place wins and this one's extra
+        // connections are dropped.
+        let pool = channels
+            .entry(endpoint.to_owned())
+            .or_insert_with(|| pool);
+        Ok(configure_data_client(DataNodeClient::new(pool.next().clone())))
+    }
+
+    /// Opens the connections to one data node.
+    ///
+    /// The first connection must succeed, or the request fails as it did
+    /// before a pool existed. The rest are best effort: a node that answers
+    /// on one connection is usable, and a pool of fewer connections is still
+    /// better than failing a request that already has a working connection.
+    async fn connect_pool(
+        &self,
+        endpoint: &str,
+        deadline: Instant,
+    ) -> Result<ChannelPool, ClientError> {
+        let size = self.inner.connection_pool_size;
+        let mut channels = Vec::with_capacity(size);
+        for index in 0..size {
+            let transport = Endpoint::from_shared(endpoint.to_owned())
+                .map_err(anyhow::Error::from)
+                .map_err(ClientError::from)?;
+            let budget = match remaining(deadline, false) {
+                Ok(budget) => budget,
+                Err(error) => {
+                    if channels.is_empty() {
+                        return Err(error);
+                    }
+                    // The deadline ran out while the pool was growing. The
+                    // connections that are open still serve the node.
+                    tracing::warn!(
+                        %endpoint,
+                        index,
+                        "the deadline ran out while opening a data node connection; the pool stays \
+                         smaller"
+                    );
+                    break;
+                }
+            };
+            let connected = match tokio::time::timeout(budget, transport.connect()).await {
+                Ok(connected) => connected,
+                Err(_) => {
+                    if channels.is_empty() {
+                        return Err(ClientError::deadline(false));
+                    }
+                    // The deadline ran out while the pool was growing. The
+                    // connections that are open still serve the node.
+                    tracing::warn!(
+                        %endpoint,
+                        index,
+                        "the deadline ran out while opening a data node connection; the pool stays \
+                         smaller"
+                    );
+                    break;
+                }
+            };
+            match connected {
+                Ok(channel) => channels.push(channel),
+                Err(error) if channels.is_empty() => {
+                    return Err(anyhow::Error::from(error).into());
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %endpoint,
+                        index,
+                        error = %error,
+                        "a data node connection failed; the pool stays smaller"
+                    );
+                    break;
+                }
+            }
+        }
+        Ok(ChannelPool::new(channels))
     }
 }
 
@@ -1472,9 +1586,34 @@ mod tests {
         (endpoint, service, server)
     }
 
+    #[tokio::test]
+    async fn a_pool_hands_out_its_connections_in_turn() {
+        let pool = ChannelPool::new(vec![
+            Channel::from_static("http://127.0.0.1:1").connect_lazy(),
+            Channel::from_static("http://127.0.0.1:2").connect_lazy(),
+            Channel::from_static("http://127.0.0.1:3").connect_lazy(),
+        ]);
+        let order: Vec<usize> = (0..7).map(|_| pool.next_index()).collect();
+        assert_eq!(order, vec![0, 1, 2, 0, 1, 2, 0]);
+    }
+
+    #[tokio::test]
+    async fn a_pool_of_one_always_uses_the_same_connection() {
+        let pool = ChannelPool::new(vec![Channel::from_static("http://127.0.0.1:1").connect_lazy()]);
+        let order: Vec<usize> = (0..3).map(|_| pool.next_index()).collect();
+        assert_eq!(order, vec![0, 0, 0]);
+    }
+
     #[test]
-    fn write_ambiguity_is_sticky_across_later_permanent_errors() {
-        let unavailable = tonic::Status::unavailable("response was lost");
+    fn a_pool_size_below_one_is_treated_as_one() {
+        let config = ClientConfig::new(Duration::from_secs(1)).with_connection_pool_size(0);
+        assert_eq!(config.connection_pool_size, 1);
+        let config = ClientConfig::new(Duration::from_secs(1)).with_connection_pool_size(4);
+        assert_eq!(config.connection_pool_size, 4);
+    }
+
+    #[test]
+    fn write_ambiguity_is_sticky_across_later_permanent_errors() {        let unavailable = tonic::Status::unavailable("response was lost");
         let unimplemented = tonic::Status::unimplemented("wrong endpoint");
 
         let unknown = accumulated_write_ambiguity(false, &unavailable);
@@ -1696,6 +1835,7 @@ mod tests {
                 receipt_retention: topology.timings.receipt_retention(),
                 topology: RwLock::new(topology),
                 channels: RwLock::new(HashMap::new()),
+                connection_pool_size: 1,
                 operation_timeout,
                 topology_refresh_timeout: operation_timeout,
                 refresh_lock: Mutex::new(()),

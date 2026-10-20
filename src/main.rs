@@ -340,6 +340,11 @@ struct GatewayArgs {
     /// (affinity and cgroup limits included).
     #[arg(long)]
     worker_threads: Option<NonZeroUsize>,
+    /// How many HTTP/2 connections the gateway opens to each data node. More
+    /// than one lets concurrent requests to the same node spread over more
+    /// than one connection. [default: 1]
+    #[arg(long)]
+    client_connection_pool: Option<NonZeroUsize>,
 }
 
 #[cfg(feature = "redis-lua-experimental")]
@@ -594,6 +599,7 @@ fn gateway_config(settings: config::gateway::GatewaySettings) -> hashring_redis:
         operation_timeout: settings.operation_timeout,
         password: settings.password,
         max_connections: settings.max_connections.get(),
+        client_connection_pool: settings.client_connection_pool,
         ..Default::default()
     }
 }

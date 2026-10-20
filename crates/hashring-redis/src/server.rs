@@ -257,7 +257,7 @@ mod tests {
         Arc::new(Dispatcher::new(
             Arc::new(crate::client::SharedClient::new(
                 "http://127.0.0.1:1".into(),
-                Duration::from_millis(50),
+                crate::client::ClientConfig::new(Duration::from_millis(50)),
             )),
             None,
             crate::resp::Limits::default(),
@@ -380,7 +380,7 @@ mod tests {
         let dispatcher = Arc::new(Dispatcher::new(
             Arc::new(crate::client::SharedClient::new(
                 "http://127.0.0.1:1".into(),
-                Duration::from_millis(50),
+                crate::client::ClientConfig::new(Duration::from_millis(50)),
             )),
             Some(Arc::from("secret")),
             crate::resp::Limits::default(),
@@ -407,7 +407,7 @@ mod tests {
         let dispatcher = Arc::new(Dispatcher::new(
             Arc::new(crate::client::SharedClient::new(
                 "http://127.0.0.1:1".into(),
-                Duration::from_millis(50),
+                crate::client::ClientConfig::new(Duration::from_millis(50)),
             )),
             None,
             crate::resp::Limits {

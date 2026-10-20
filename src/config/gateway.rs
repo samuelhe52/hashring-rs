@@ -12,6 +12,8 @@ pub const DEFAULT_LISTEN: &str = "127.0.0.1:6379";
 pub const DEFAULT_COORDINATOR: &str = "http://127.0.0.1:50050";
 pub const DEFAULT_DEADLINE_MS: u64 = 5_000;
 pub const DEFAULT_MAXCLIENTS: usize = 10_000;
+/// How many HTTP/2 connections the gateway opens to each data node.
+pub const DEFAULT_CLIENT_CONNECTION_POOL: usize = 1;
 
 /// Read when neither the flag nor the file sets a password, so a deployment can
 /// keep the secret out of both the process list and the config file.
@@ -26,6 +28,7 @@ pub struct GatewayFile {
     pub requirepass: Option<String>,
     pub maxclients: Option<NonZeroUsize>,
     pub worker_threads: Option<NonZeroUsize>,
+    pub client_connection_pool: Option<NonZeroUsize>,
 }
 
 #[derive(Debug)]
@@ -37,6 +40,8 @@ pub struct GatewaySettings {
     pub max_connections: NonZeroUsize,
     /// `None` takes one worker per available CPU.
     pub worker_threads: Option<NonZeroUsize>,
+    /// How many HTTP/2 connections the gateway opens to each data node.
+    pub client_connection_pool: usize,
 }
 
 impl GatewaySettings {
@@ -80,6 +85,10 @@ pub fn resolve(
             .or(file.maxclients)
             .unwrap_or(NonZeroUsize::new(DEFAULT_MAXCLIENTS).expect("the default is positive")),
         worker_threads: args.worker_threads.or(file.worker_threads),
+        client_connection_pool: args
+            .client_connection_pool
+            .or(file.client_connection_pool)
+            .map_or(DEFAULT_CLIENT_CONNECTION_POOL, NonZeroUsize::get),
     })
 }
 
@@ -133,6 +142,27 @@ mod tests {
         assert_eq!(settings.operation_timeout, Duration::from_millis(1234));
         assert_eq!(settings.password.as_deref(), Some("from-flag"));
         assert_eq!(settings.runtime_workers(24), 3);
+    }
+
+    #[test]
+    fn the_connection_pool_size_comes_from_the_flag_or_the_file() {
+        let settings = resolve(&gateway_args(&[]), None).unwrap();
+        assert_eq!(settings.client_connection_pool, DEFAULT_CLIENT_CONNECTION_POOL);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "listen: 127.0.0.1:7000\nclient_connection_pool: 4\n",
+        );
+        let settings = resolve(&gateway_args(&[]), Some(load(&path).unwrap())).unwrap();
+        assert_eq!(settings.client_connection_pool, 4);
+
+        let settings = resolve(
+            &gateway_args(&["--client-connection-pool", "2"]),
+            Some(load(&path).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(settings.client_connection_pool, 2);
     }
 
     #[test]

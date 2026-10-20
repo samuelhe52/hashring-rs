@@ -6,7 +6,8 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use hashring_client::{ClientConfig, ClientError, HashringClient};
+pub use hashring_client::ClientConfig;
+use hashring_client::{ClientError, HashringClient};
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 
 use crate::error::{RedisError, RedisResult};
@@ -28,10 +29,10 @@ pub struct SharedClient {
 }
 
 impl SharedClient {
-    pub fn new(endpoint: String, operation_timeout: std::time::Duration) -> Self {
+    pub fn new(endpoint: String, config: ClientConfig) -> Self {
         Self {
             endpoint,
-            config: ClientConfig::new(operation_timeout),
+            config,
             client: RwLock::new(None),
             connecting: Mutex::new(()),
             failures: AtomicU64::new(0),

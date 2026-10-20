@@ -26,6 +26,7 @@ pub mod table;
 
 use client::SharedClient;
 use commands::Dispatcher;
+use hashring_client::ClientConfig;
 
 /// The version this gateway reports in `HELLO` and `INFO`. It is the
 /// hashring-rs version, not a Redis version, so a client that checks for Redis
@@ -50,6 +51,12 @@ pub struct GatewayConfig {
     /// Connections open at once; one more is answered with Redis's
     /// `max number of clients reached` and closed. Redis's `maxclients`.
     pub max_connections: usize,
+    /// How many HTTP/2 connections the gateway opens to each data node.
+    ///
+    /// One is enough for correctness and is the default. More than one lets
+    /// concurrent requests to the same node spread over more than one
+    /// connection instead of sharing the stream bookkeeping of a single one.
+    pub client_connection_pool: usize,
 }
 
 impl Default for GatewayConfig {
@@ -61,6 +68,7 @@ impl Default for GatewayConfig {
             password: None,
             limits: resp::Limits::default(),
             max_connections: 10_000,
+            client_connection_pool: 1,
         }
     }
 }
@@ -95,7 +103,8 @@ async fn serve_inner(
     let local = listener.local_addr()?;
     let client = Arc::new(SharedClient::new(
         config.coordinator.clone(),
-        config.operation_timeout,
+        ClientConfig::new(config.operation_timeout)
+            .with_connection_pool_size(config.client_connection_pool),
     ));
     let mut dispatcher = Dispatcher::new(
         client,
@@ -113,6 +122,7 @@ async fn serve_inner(
         operation_timeout_ms = config.operation_timeout.as_millis(),
         authentication = config.password.is_some(),
         max_connections = config.max_connections,
+        client_connection_pool = config.client_connection_pool,
         "redis gateway ready"
     );
     server::Gateway::new(dispatcher, shutdown, config.max_connections)
