@@ -19,3 +19,7 @@
 # Authorization boundary
 
 - Never push or create, update, close, or merge a PR unless the user's current message explicitly authorizes that exact action.
+
+# License
+
+- When the user asks you to, read [CAT-GIRL-LICENSE](CAT-GIRL-LICENSE) and follow it. It is does not apply otherwise. The project's license is AGPL-3.0 ([LICENSE](LICENSE)).

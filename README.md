@@ -115,21 +115,21 @@ its default and scope.
 
 ## Commands
 
-| Command | Purpose |
-| --- | --- |
-| `coordinator` | Run the topology coordinator |
-| `node` | Run an in-memory data node |
-| `put` / `get` / `delete` | Single-key operations |
-| `topology` | Print the committed topology |
-| `replica-status` | Print per-range replication, liveness, and write readiness |
-| `begin-change` | Stage a new membership |
-| `begin-policy-change` | Stage a new acknowledgement policy |
-| `begin-config-change` | Stage a new replication factor or write guard |
-| `execute-change` | Run the staged change through to publication |
-| `change-status` | Show the active change, if any |
-| `redis-gateway` | Serve the Redis protocol on a port, over this cluster |
+| Command                          | Purpose                                                                                              |
+| -------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `coordinator`                    | Run the topology coordinator                                                                         |
+| `node`                           | Run an in-memory data node                                                                           |
+| `put` / `get` / `delete`         | Single-key operations                                                                                |
+| `topology`                       | Print the committed topology                                                                         |
+| `replica-status`                 | Print per-range replication, liveness, and write readiness                                           |
+| `begin-change`                   | Stage a new membership                                                                               |
+| `begin-policy-change`            | Stage a new acknowledgement policy                                                                   |
+| `begin-config-change`            | Stage a new replication factor or write guard                                                        |
+| `execute-change`                 | Run the staged change through to publication                                                         |
+| `change-status`                  | Show the active change, if any                                                                       |
+| `redis-gateway`                  | Serve the Redis protocol on a port, over this cluster                                                |
 | `redis-lua-experimental-gateway` | Serve the shared gateway with experimental Lua support; requires `--features redis-lua-experimental` |
-| `experiment` | Run a reproducible multi-process experiment |
+| `experiment`                     | Run a reproducible multi-process experiment                                                          |
 
 Run `cargo run -- <command> --help` for each command's flags.
 For the Lua command, use
@@ -139,11 +139,11 @@ For the Lua command, use
 
 ### Acknowledgement policies
 
-| Policy | A write succeeds when… | If the owner crashes |
-| --- | --- | --- |
-| `OwnerOnly` (default) | the owner has applied it | **Acknowledged writes that the promoted follower had not yet applied are lost.** A key can revert to an older value. |
-| `FirstSuccessor` | the first clockwise follower has also applied it | No loss from a single owner failure. Correlated failures can still lose data. |
-| `AllReplicas` | every desired follower has applied it | Writes block unless the full placement is healthy. |
+| Policy                | A write succeeds when…                           | If the owner crashes                                                                                                 |
+| --------------------- | ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- |
+| `OwnerOnly` (default) | the owner has applied it                         | **Acknowledged writes that the promoted follower had not yet applied are lost.** A key can revert to an older value. |
+| `FirstSuccessor`      | the first clockwise follower has also applied it | No loss from a single owner failure. Correlated failures can still lose data.                                        |
+| `AllReplicas`         | every desired follower has applied it            | Writes block unless the full placement is healthy.                                                                   |
 
 Followers are always updated asynchronously in the background. The policy only
 decides how long the client waits.
@@ -187,17 +187,17 @@ only; it does not make data durable.
 
 ### Limits
 
-| Limit | Value |
-| --- | --- |
-| Key size | 64 KiB |
-| Value size | 8 MiB |
-| Members per cluster | 1,024 |
-| Virtual nodes per member | 4,096 |
-| Total token assignments | 1,048,576 |
-| Ranges moved per change | 16,384 |
-| Pending replication buffer per node | 64 MiB |
-| Deduplication receipt store per node | 128 MiB |
-| Migration journal per node (default) | 16 MiB |
+| Limit                                | Value     |
+| ------------------------------------ | --------- |
+| Key size                             | 64 KiB    |
+| Value size                           | 8 MiB     |
+| Members per cluster                  | 1,024     |
+| Virtual nodes per member             | 4,096     |
+| Total token assignments              | 1,048,576 |
+| Ranges moved per change              | 16,384    |
+| Pending replication buffer per node  | 64 MiB    |
+| Deduplication receipt store per node | 128 MiB   |
+| Migration journal per node (default) | 16 MiB    |
 
 ### Not provided
 
@@ -300,20 +300,20 @@ profiling, and how to compare runs.
 
 ## Repository layout
 
-| Path | Contents |
-| --- | --- |
-| `src/` | The `hashring-rs` binary (CLI) |
-| `crates/hashring-core` | Protobuf contract, topology and migration types, shared limits |
-| `crates/hashring-client` | Routing, deadlines, retries, client errors |
-| `crates/hashring-coordinator` | Durable cluster state and migration orchestration |
-| `crates/hashring-node` | In-memory storage, replication, and the data-node service |
-| `crates/hashring-redis` | The Redis-protocol gateway over the cluster |
-| `crates/hashring-experiment` | Multi-process experiment runner |
-| `docs/report/` | [Preliminary report](docs/report/preliminary-report.md) on the design and results |
-| `docs/configuration.md` | Every flag and config key, with defaults and scopes |
-| `docs/redis-compatibility.md` | What the Redis gateway answers, and where it differs |
-| `docs/rfcs/` | Design RFCs |
-| `docs/optimizations/` | Performance work, with measurements |
+| Path                          | Contents                                                                          |
+| ----------------------------- | --------------------------------------------------------------------------------- |
+| `src/`                        | The `hashring-rs` binary (CLI)                                                    |
+| `crates/hashring-core`        | Protobuf contract, topology and migration types, shared limits                    |
+| `crates/hashring-client`      | Routing, deadlines, retries, client errors                                        |
+| `crates/hashring-coordinator` | Durable cluster state and migration orchestration                                 |
+| `crates/hashring-node`        | In-memory storage, replication, and the data-node service                         |
+| `crates/hashring-redis`       | The Redis-protocol gateway over the cluster                                       |
+| `crates/hashring-experiment`  | Multi-process experiment runner                                                   |
+| `docs/report/`                | [Preliminary report](docs/report/preliminary-report.md) on the design and results |
+| `docs/configuration.md`       | Every flag and config key, with defaults and scopes                               |
+| `docs/redis-compatibility.md` | What the Redis gateway answers, and where it differs                              |
+| `docs/rfcs/`                  | Design RFCs                                                                       |
+| `docs/optimizations/`         | Performance work, with measurements                                               |
 
 The client, coordinator, and node crates depend on `hashring-core`, and none
 of them depend on each other.
@@ -324,3 +324,7 @@ of them depend on each other.
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+## License
+
+Copyright (C) 2026 Samuel He, Mingyuan Chen, and Yang Chen. Licensed under the [GNU Affero General Public License v3.0](LICENSE).
