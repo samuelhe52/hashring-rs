@@ -67,6 +67,7 @@ The examples list every key: [`coordinator.yaml`](../examples/coordinator.yaml),
 | `--required-ack-timeout-ms` | `required_ack_timeout_ms` | 2000 | per node | How long a write waits for its required follower ACKs before reporting an unknown outcome. |
 | `--replication-rpc-timeout-ms` | `replication_rpc_timeout_ms` | 2000 | per node | Bounds each replication connect and batch RPC; a timed-out batch is retried. |
 | `--replication-batch-linger-ms` | `replication_batch_linger_ms` | 2 | per node | How long a follower stream waits to fill a replication batch. It never waits once a write in the batch is waiting for that follower's ACK. Under `owner-only` it also delays the first copy of an acknowledged write by up to this long. 0 sends at once. See [replication-batch-linger.md](optimizations/replication-batch-linger.md). |
+| `--replication-batch-max-entries` | `replication_batch_max_entries` | 64 | per node | How many mutations one replication RPC carries. A larger batch means fewer RPCs for the same mutations, at the cost of a follower holding its state lock for the whole batch. A batch is also bounded by the bytes one message may hold, so a batch of large mutations is smaller. See [replication-batch-size.md](optimizations/replication-batch-size.md). |
 
 ## `redis-gateway`
 
@@ -84,6 +85,7 @@ not guarantee.
 | `--requirepass` | `requirepass` | none | process | Falls back to the `HASHRING_GATEWAY_PASSWORD` environment variable, which keeps the secret out of both the file and the process list. |
 | `--maxclients` | `maxclients` | 10000 | process | Connections open at once. One more is answered `-ERR max number of clients reached` and closed, as Redis does. |
 | `--worker-threads` | `worker_threads` | one per available CPU | process | |
+| `--client-connection-pool` | `client_connection_pool` | 1 | process | How many HTTP/2 connections the gateway opens to each data node. One is enough for correctness. More than one lets concurrent requests to the same node spread over more than one connection instead of sharing the stream bookkeeping of a single one. See [gateway-connection-pool.md](optimizations/gateway-connection-pool.md). |
 
 ## `redis-lua-experimental-gateway`
 
@@ -128,7 +130,7 @@ replaced during the run.
 | `--worker-threads` | `worker_threads` | CPUs / (nodes + 2), at least 2 | process | For the driver and each node. |
 | `--coordinator-worker-threads` | `coordinator_worker_threads` | one per available CPU | process | For the run's coordinator, which is not on the data path. |
 | `--seed`, `--virtual-nodes`, `--range-move-concurrency`, `--replica-repair-concurrency`, `--prepublication-failure-grace-ms`, `--desired-replication-factor`, `--minimum-admitted-copies`, `--minimum-healthy-followers`, `--max-replica-lag-ms`, `--receipt-retention-ms`, `--lease-duration-ms` | as for `coordinator` | as for `coordinator` | as for `coordinator` | Passed to the run's coordinator. |
-| `--max-dedup-bytes`, `--max-value-bytes`, `--max-pending-replication-bytes`, `--max-migration-journal-bytes`, `--replication-stream-queue-capacity`, `--required-ack-timeout-ms`, `--replication-rpc-timeout-ms`, `--replication-batch-linger-ms` | as for `node` | as for `node` | per node | Passed to every node of the run. |
+| `--max-dedup-bytes`, `--max-value-bytes`, `--max-pending-replication-bytes`, `--max-migration-journal-bytes`, `--replication-stream-queue-capacity`, `--required-ack-timeout-ms`, `--replication-rpc-timeout-ms`, `--replication-batch-linger-ms`, `--replication-batch-max-entries` | as for `node` | as for `node` | per node | Passed to every node of the run. |
 
 ## Client and admin commands
 
