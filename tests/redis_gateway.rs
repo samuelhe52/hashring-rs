@@ -1294,8 +1294,8 @@ async fn a_declined_command_says_so_instead_of_failing_obscurely() {
         "unexpected error: {error}"
     );
     // A script is answered, so the command a client reaches for when it cannot
-    // do something in one round trip is here; what the grammar does not have is
-    // refused by name rather than misread.
+    // do something in one round trip is here; the grammar is Lua's own, so what
+    // a client library writes runs unmodified.
     let value: i64 = redis::cmd("EVAL")
         .arg("return 1 + 2 * 3")
         .arg(0)
@@ -1303,14 +1303,27 @@ async fn a_declined_command_says_so_instead_of_failing_obscurely() {
         .await
         .unwrap();
     assert_eq!(value, 7);
+    // Generic `for ... in` is ordinary Lua and runs, rather than being refused
+    // by name as a subset of the grammar once did.
+    let summed: i64 = redis::cmd("EVAL")
+        .arg("local n = 0 for _, v in ipairs({1, 2, 3}) do n = n + v end return n")
+        .arg(0)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(summed, 6);
+    // What a script may not do is reach the machine it runs on, and that is
+    // refused by name so a script that needs it is told what it asked for.
     let error = redis::cmd("EVAL")
-        .arg("for k, v in pairs(t) do end")
+        .arg("return os.time()")
         .arg(0)
         .query_async::<i64>(&mut connection)
         .await
         .unwrap_err();
     assert!(
-        error.to_string().contains("for ... in"),
+        error
+            .to_string()
+            .contains("attempt to index a nil value (global 'os')"),
         "unexpected error: {error}"
     );
 
@@ -1601,7 +1614,6 @@ async fn a_script_is_run_the_way_a_client_library_sends_it() {
         error.to_string().contains("must be strings or integers"),
         "unexpected error: {error}"
     );
-
     // A script may not change the connection, as in Redis.
     let error = redis::cmd("EVAL")
         .arg("return redis.call('SELECT', 1)")

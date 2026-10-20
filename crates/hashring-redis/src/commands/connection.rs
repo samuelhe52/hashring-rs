@@ -418,8 +418,8 @@ mod tests {
     use super::*;
     use crate::{client::SharedClient, resp::Limits};
 
-    fn dispatcher(password: Option<&str>) -> Dispatcher {
-        Dispatcher::new(
+    fn dispatcher(password: Option<&str>) -> Arc<Dispatcher> {
+        Arc::new(Dispatcher::new(
             Arc::new(SharedClient::new(
                 "http://127.0.0.1:1".into(),
                 Duration::from_millis(50),
@@ -427,10 +427,14 @@ mod tests {
             password.map(Arc::from),
             Limits::default(),
             Duration::from_millis(200),
-        )
+        ))
     }
 
-    async fn run(dispatcher: &Dispatcher, connection: &mut Connection, parts: &[&str]) -> Response {
+    async fn run(
+        dispatcher: &Arc<Dispatcher>,
+        connection: &mut Connection,
+        parts: &[&str],
+    ) -> Response {
         let args: Vec<Vec<u8>> = parts.iter().map(|part| part.as_bytes().to_vec()).collect();
         dispatcher.execute(connection, &args).await
     }

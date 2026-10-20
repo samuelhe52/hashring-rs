@@ -277,13 +277,11 @@ pub fn encode(reply: &Reply, protocol: Protocol, out: &mut Vec<u8>) {
     match reply {
         Reply::Simple(text) => {
             out.push(b'+');
-            out.extend_from_slice(text.as_bytes());
-            out.extend_from_slice(b"\r\n");
+            push_line(out, text.as_bytes());
         }
         Reply::Error(message) => {
             out.push(b'-');
-            out.extend_from_slice(message.as_bytes());
-            out.extend_from_slice(b"\r\n");
+            push_line(out, message.as_bytes());
         }
         Reply::Integer(value) => {
             out.push(b':');
@@ -359,6 +357,32 @@ pub fn encode(reply: &Reply, protocol: Protocol, out: &mut Vec<u8>) {
             out.extend_from_slice(b"\r\n");
         }
     }
+}
+
+/// A simple string or error, as one line. RESP reads such a reply up to the
+/// next `\r\n`, so a CR or LF inside it would end the reply early and leave the
+/// rest for the client to read as the next one, desynchronising the stream.
+/// Redis never sends a multi-line simple string either. A run of line breaks is
+/// one space; everything else is written through unchanged.
+fn push_line(out: &mut Vec<u8>, bytes: &[u8]) {
+    let mut broke = false;
+    for byte in bytes {
+        match byte {
+            b'\r' | b'\n' => broke = true,
+            b' ' if broke => {}
+            _ => {
+                if broke {
+                    out.push(b' ');
+                    broke = false;
+                }
+                out.push(*byte);
+            }
+        }
+    }
+    if broke {
+        out.push(b' ');
+    }
+    out.extend_from_slice(b"\r\n");
 }
 
 /// RESP3 doubles reject the shapes Redis never emits, and `inf` and `nan` are
@@ -508,6 +532,25 @@ mod tests {
     fn a_missing_value_uses_the_protocol_null() {
         assert_eq!(encoded(&Reply::Nil, Protocol::Resp2), "$-1\r\n");
         assert_eq!(encoded(&Reply::Nil, Protocol::Resp3), "_\r\n");
+    }
+
+    /// A simple string and an error are one line each, so a reply carrying a
+    /// line break of its own would end early and leave the client reading the
+    /// rest of it as the next reply. A Lua traceback is the usual source, and
+    /// it reaches a client only as spaces.
+    #[test]
+    fn a_simple_string_and_an_error_stay_one_line() {
+        for protocol in [Protocol::Resp2, Protocol::Resp3] {
+            assert_eq!(encoded(&Reply::Simple("OK".into()), protocol), "+OK\r\n");
+            assert_eq!(
+                encoded(&Reply::Simple("a\nb\r\nc".into()), protocol),
+                "+a b c\r\n"
+            );
+            assert_eq!(
+                encoded(&Reply::Error("user_script: a\nb".into()), protocol),
+                "-user_script: a b\r\n"
+            );
+        }
     }
 
     #[test]

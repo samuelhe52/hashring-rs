@@ -130,7 +130,11 @@ impl Dispatcher {
     /// Runs one command. `connection` carries everything specific to the
     /// socket: the negotiated protocol, the name the client gave itself, and
     /// whether it has authenticated.
-    pub async fn execute(&self, connection: &mut Connection, args: &[Vec<u8>]) -> Response {
+    pub async fn execute(
+        self: &Arc<Self>,
+        connection: &mut Connection,
+        args: &[Vec<u8>],
+    ) -> Response {
         self.dispatch(connection, args, None).await
     }
 
@@ -139,7 +143,7 @@ impl Dispatcher {
     /// reads attached, which is what makes the script's writes conditional on
     /// what it saw.
     async fn dispatch(
-        &self,
+        self: &Arc<Self>,
         connection: &mut Connection,
         args: &[Vec<u8>],
         script: Option<&script::State>,
@@ -242,6 +246,7 @@ impl Dispatcher {
 }
 
 /// Everything about one client connection that survives between commands.
+#[derive(Clone)]
 pub struct Connection {
     pub id: u64,
     pub protocol: Protocol,
@@ -276,8 +281,8 @@ impl Connection {
 mod tests {
     use super::*;
 
-    fn dispatcher(password: Option<&str>) -> Dispatcher {
-        Dispatcher::new(
+    fn dispatcher(password: Option<&str>) -> Arc<Dispatcher> {
+        Arc::new(Dispatcher::new(
             Arc::new(SharedClient::new(
                 "http://127.0.0.1:1".into(),
                 Duration::from_millis(50),
@@ -285,14 +290,14 @@ mod tests {
             password.map(Arc::from),
             Limits::default(),
             Duration::from_millis(200),
-        )
+        ))
     }
 
     fn args(parts: &[&str]) -> Vec<Vec<u8>> {
         parts.iter().map(|part| part.as_bytes().to_vec()).collect()
     }
 
-    async fn error(dispatcher: &Dispatcher, parts: &[&str]) -> String {
+    async fn error(dispatcher: &Arc<Dispatcher>, parts: &[&str]) -> String {
         let mut connection = Connection::new(1, !dispatcher.requires_auth());
         match dispatcher
             .execute(&mut connection, &args(parts))

@@ -48,7 +48,8 @@ use crate::{
 /// rather than the data, and the ones that would start a script of their own
 /// while this one holds the gateway.
 const REFUSED: &[&str] = &[
-    "auth", "hello", "reset", "select", "client", "quit", "eval", "evalsha", "script",
+    "auth", "hello", "reset", "select", "client", "quit", "eval", "evalsha", "script", "multi",
+    "exec", "discard", "watch",
 ];
 
 /// How many scripts a gateway keeps for `EVALSHA`. A client's scripts are its
@@ -56,10 +57,11 @@ const REFUSED: &[&str] = &[
 /// scripts it never runs again cannot grow it without limit.
 const CACHED_SCRIPTS: usize = 512;
 
-/// Steps a script may take before it is stopped. A cache key claim is two
-/// statements and a rate limiter's `INCR` with its deadline is four more, so
-/// this is orders of magnitude above anything a client library sends.
-const MAX_STEPS: usize = 100_000;
+/// Virtual-machine instructions a script may execute before it is stopped. A
+/// cache key claim is two statements and a rate limiter's `INCR` with its
+/// deadline is four more, so this is orders of magnitude above anything a
+/// client library sends.
+const MAX_STEPS: usize = 10_000_000;
 
 /// The scripts this gateway has seen, and the lock that runs one at a time.
 #[derive(Default)]
@@ -68,6 +70,10 @@ pub struct Scripts {
     /// keys are locked, always in that order, so two scripts cannot deadlock.
     running: AsyncMutex<()>,
     sources: Mutex<Cached>,
+    /// The Lua state every script runs in, taken out for the length of a run
+    /// rather than borrowed, so holding it never waits on a lock that is held
+    /// across a `.await`.
+    runtime: Mutex<Option<script::Runtime>>,
 }
 
 #[derive(Default)]
@@ -89,7 +95,7 @@ impl Scripts {
         self.sources
             .lock()
             .expect("a script's own lock")
-            .remember(script::sha1::digest(source), source);
+            .remember(script::digest(source), source);
         Arc::from(source)
     }
 
@@ -98,6 +104,20 @@ impl Scripts {
             .lock()
             .expect("a script's own lock")
             .source(hash)
+    }
+
+    /// The Lua state for the length of one run. It is taken out rather than
+    /// borrowed so that no lock is held while the script runs.
+    pub(crate) fn take_runtime(&self) -> script::Runtime {
+        self.runtime
+            .lock()
+            .expect("a script's own lock")
+            .take()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn put_runtime(&self, runtime: script::Runtime) {
+        *self.runtime.lock().expect("a script's own lock") = Some(runtime);
     }
 }
 
@@ -195,7 +215,7 @@ impl State {
 /// `EVAL script numkeys key... arg...`, and `EVALSHA` with the hash in place of
 /// the script.
 pub async fn eval(
-    dispatcher: &Dispatcher,
+    dispatcher: &Arc<Dispatcher>,
     connection: &mut Connection,
     command: &CommandInfo,
     args: Args<'_>,
@@ -227,7 +247,7 @@ pub fn script_command(dispatcher: &Dispatcher, mut args: Args<'_>) -> RedisResul
         "load" => {
             let source = args.next_owned()?;
             args.finish()?;
-            let hash = script::sha1::hex(&source);
+            let hash = script::hash_hex(&source);
             cache.remember(hash_of(&hash)?, &source);
             Ok(Reply::bulk(hash))
         }
@@ -256,8 +276,8 @@ pub fn script_command(dispatcher: &Dispatcher, mut args: Args<'_>) -> RedisResul
 /// underneath it, which is the moment Redis's single thread would not have let
 /// happen.
 async fn run(
-    dispatcher: &Dispatcher,
-    connection: &mut Connection,
+    dispatcher: &Arc<Dispatcher>,
+    connection: &Connection,
     source: &[u8],
     keys: Vec<Vec<u8>>,
     argv: Vec<Vec<u8>>,
@@ -267,24 +287,40 @@ async fn run(
     // opposite orders.
     let _running = dispatcher.scripts().running.lock().await;
     let _held = dispatcher.lock_declared(&keys).await;
-    let state = State::default();
-    let limits = Limits {
+    let state = Arc::new(State::default());
+    // The budget is rebuilt for each run, since a script that is run again
+    // gets the whole of it, as it would have had the first time.
+    let limits = || Limits {
         max_steps: MAX_STEPS,
         timeout: dispatcher.command_timeout(),
     };
+    let mut runtime = dispatcher.scripts().take_runtime();
     loop {
         state.clear();
-        let mut host = Host {
-            dispatcher,
-            connection,
-            state: &state,
+        // A script is given a connection of its own: everything it may run keeps
+        // the connection as it found it, since the commands that would change
+        // it are refused.
+        let host = Host {
+            dispatcher: dispatcher.clone(),
+            connection: Connection {
+                authenticated: true,
+                ..connection.clone()
+            },
+            state: state.clone(),
         };
-        match script::run(&mut host, source, keys.clone(), argv.clone(), limits).await {
+        let answer = runtime
+            .run(host, source, keys.clone(), argv.clone(), limits())
+            .await;
+        dispatcher.scripts().put_runtime(runtime);
+        match answer {
             Ok(reply) => return Ok(reply),
             // The script can only be run again if nothing it did would happen
             // twice. A conflict after a repeated change is reported instead,
             // because the answer the client would get is one no run produced.
-            Err(error) if error.is_conflict() && !state.repeated() => continue,
+            Err(error) if error.is_conflict() && !state.repeated() => {
+                runtime = dispatcher.scripts().take_runtime();
+                continue;
+            }
             Err(error) => return Err(error),
         }
     }
@@ -315,17 +351,22 @@ fn keys_and_arguments(tail: &[Vec<u8>]) -> RedisResult<Split> {
 /// and against the command table, so what is left here is the gateway's own
 /// policy: a command that would change the connection, and a command whose
 /// effect a second run of this script would repeat.
-struct Host<'a> {
-    dispatcher: &'a Dispatcher,
-    connection: &'a mut Connection,
-    state: &'a State,
+struct Host {
+    dispatcher: Arc<Dispatcher>,
+    /// The connection a script sees, which is a copy of the client's rather
+    /// than the client's itself: nothing a script may run changes a connection,
+    /// so it has no business holding the real one while it runs.
+    connection: Connection,
+    state: Arc<State>,
 }
 
-impl script::Host for Host<'_> {
+impl script::Host for Host {
     fn call(&mut self, command: &[Vec<u8>]) -> impl Future<Output = RedisResult<Reply>> + Send {
-        let dispatcher = self.dispatcher;
-        let state = self.state;
-        let connection = &mut *self.connection;
+        let dispatcher = self.dispatcher.clone();
+        let state = self.state.clone();
+        // The connection is copied rather than borrowed, so the future owns what
+        // it needs and nothing is held across the call but the copy.
+        let mut connection = self.connection.clone();
         async move {
             let name = command
                 .first()
@@ -341,7 +382,7 @@ impl script::Host for Host<'_> {
                 state.mark_repeated();
             }
             dispatcher
-                .dispatch(connection, command, Some(state))
+                .dispatch(&mut connection, command, Some(&state))
                 .await
                 .reply
         }
@@ -428,8 +469,8 @@ mod tests {
     #[test]
     fn a_hash_is_read_the_way_a_client_sends_it() {
         let source = b"return 1";
-        let hex = script::sha1::hex(source);
-        assert_eq!(hash_of(&hex).unwrap(), script::sha1::digest(source));
+        let hex = script::hash_hex(source);
+        assert_eq!(hash_of(&hex).unwrap(), script::digest(source));
         assert!(hash_of("too short").is_err());
         assert!(hash_of(&"z".repeat(40)).is_err());
         // Redis reads either case, and so does this.

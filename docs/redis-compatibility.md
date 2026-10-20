@@ -215,20 +215,21 @@ interleave, a rate limiter adds one to a counter and reads its deadline, and
 neither can say that in plain commands. Both send a script, and both work
 against this gateway unmodified.
 
-The grammar is Lua's for the statements and expressions a client library writes,
-which is `local`, assignment, `if`/`elseif`/`else`, `while`, the numeric `for`,
-`return`, `break`, tables, indexing, field access, calls, and the operators. A
-script is given `KEYS`, `ARGV`, `redis.call`, `redis.pcall`,
-`redis.error_reply`, `redis.status_reply`, `redis.sha1hex`, `redis.log`, and
-the base functions `type`, `tonumber`, `tostring`, `error` and `assert`.
-`function`, `repeat`, the generic `for ... in`, and the `string`, `table`,
-`math` and `cjson` libraries are refused **by name**, so a script that needs one
-is told what it asked for rather than misread:
+The language is Lua itself, embedded as a real Lua 5.4 with the vendored
+standard interpreter, not a subset of it: what a client library sends is
+ordinary Lua, so a script gets the whole grammar and the `string`, `table`,
+`math`, `utf8` and `coroutine` libraries, plus the base functions (`type`,
+`pairs`, `ipairs`, `tostring`, `tonumber`, `error`, `assert`, `select`,
+`pcall`, `unpack`, and so on). A script is given `KEYS`, `ARGV`,
+`redis.call`, `redis.pcall`, `redis.error_reply`, `redis.status_reply` and
+`redis.sha1hex`.
 
-```
-127.0.0.1:6379> eval "for k, v in pairs(t) do end" 0
-(error) ERR user_script: 'for ... in' is not supported in this gateway; only the numeric form is
-```
+What a script does *not* get is anything a cache has no business doing. There
+is no `io`, `os`, `debug` or `package`, so a script cannot reach the
+filesystem, the clock, the environment or the process; and the doors to more
+code — `load`, `loadfile`, `dofile`, `require` — are closed, so a script cannot
+pull in code it was not sent. A runaway script is stopped by a budget of
+virtual-machine instructions rather than left to hold the gateway.
 
 What differs from Redis:
 
@@ -239,11 +240,10 @@ What differs from Redis:
   table `COMMAND` answers with, so it is the key positions a client already
   knows, and a script naming a key it did not declare is refused by name.
 - **A script is atomic against every writer, not just one gateway's clients.**
-  The commands a script runs are the gateway's own, so each carries a
-  precondition to the node that owns the key. A write the script makes is
-  conditional on what the script read: a script that reads a key and then
-  writes it cannot overwrite a write that arrived in between, whichever gateway
-  or client made it.
+  The commands a script runs go through the same conditional-write path `INCR`
+  uses, so a write the script makes is conditional on what the script read: a
+  script that reads a key and then writes it cannot overwrite a write that
+  arrived in between, whichever gateway or client made it.
 - **A conflict runs the script again, or fails it.** When a conditional write
   finds the key changed underneath the script, the script is run again from the
   start, which is what Redis' single thread gets by never letting anyone in.
@@ -256,12 +256,13 @@ What differs from Redis:
   script's commands. Another gateway is serialized only by the conditional
   writes above, which is the same guarantee `INCR` already has.
 - **A script may not change the connection.** `AUTH`, `HELLO`, `RESET`,
-  `SELECT`, `CLIENT`, `QUIT`, `EVAL`, `EVALSHA` and `SCRIPT` are refused from a
-  script, as in Redis.
+  `SELECT`, `CLIENT`, `QUIT`, `EVAL`, `EVALSHA`, `SCRIPT`, `MULTI`, `EXEC`,
+  `DISCARD` and `WATCH` are refused from a script, as in Redis.
 
-The budgets are the [command deadline](#limits-here) and a step count of
-100 000, whichever runs out first. A runaway script is reported as `BUSY` on the
-deadline, which is the code Redis uses for a script that outstayed `lua-time-limit`.
+The budgets are the [command deadline](#limits-here) and a count of
+10 000 000 virtual-machine instructions, whichever runs out first. A runaway
+script is stopped by its budget and reported as an error; the deadline uses the
+code Redis uses for a script that outstayed `lua-time-limit`.
 
 `MULTI`, `EXEC` and `WATCH` are still unknown here: see
 [cross-key atomicity](#cross-key-atomicity-is-not-available-at-all). A script
@@ -400,10 +401,12 @@ returns nil, `EXISTS` returns 0, `TTL` returns -2.
   so they cost as much as the keyspace is large.
 - No data structures, by decision; see
   [out of scope](#out-of-scope-data-structures). No transactions or Pub/Sub.
-- Scripting is Lua's grammar for what a client library writes, not all of Lua:
-  no functions, no `repeat`, no generic `for`, and no `string`, `table`, `math`
-  or `cjson` library. See [scripts](#scripts). A script is bounded by the
-  command deadline and 100 000 steps, and one runs at a time per gateway.
+- Scripting is real Lua (5.4), not a subset, so a client library's script runs
+  unmodified — `function`, `repeat`, generic `for`, and the `string`, `table`,
+  `math`, `utf8` and `coroutine` libraries are all here. What it cannot do is
+  reach the machine (`io`, `os`, `debug`, `package`, `load`, `require` are all
+  absent). See [scripts](#scripts). A script is bounded by the command deadline
+  and 10 000 000 Lua VM instructions, and one runs at a time per gateway.
 - A value larger than the owning node's `--max-value-bytes` is refused with
   `OOM`, as Redis refuses one past its own limit. That default is 8 MiB and a
   node may be raised to 128 MiB, so it is the node's to set and not the
@@ -491,6 +494,6 @@ how much each would cost:
 | | What it would take |
 | --- | --- |
 | `MULTI`, `EXEC`, `WATCH` | Would need server-side execution, and cross-key atomicity is unavailable underneath, so `EXEC` could not honestly promise atomicity across keys. |
-| Functions, `repeat`, generic `for`, the `string`, `table`, `math`, `cjson` and `bit` libraries | More of Lua in [`script`](../crates/hashring-redis/src/script), and the `bit` library needs 64-bit integers Lua numbers cannot hold. What is refused today is refused by name, so a script that needs one fails with a message naming it. |
+| `cjson` and `bit` libraries | Lua is real here (5.4), so `string`, `table`, `math`, `utf8` and `coroutine` are all present. `cjson` is not built in, and `bit` needs 64-bit integers Lua numbers cannot hold. The doors to more code — `io`, `os`, `debug`, `package`, `load`, `require` — stay closed, since a cache script has no business reaching the machine or loading code it was not sent. |
 | `SCRIPT DEBUG`, `FUNCTION` | The scripting debugger works against Redis' own interpreter state, which this gateway does not have. |
 | Durability | The cluster is in-memory by design; the gateway adds no storage. |

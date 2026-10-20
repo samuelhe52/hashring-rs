@@ -80,7 +80,7 @@ not guarantee.
 | `--config` | — | none | process | |
 | `--listen` | `listen` | `127.0.0.1:6379` | process | |
 | `--coordinator` | `coordinator` | `http://127.0.0.1:50050` | process | Contacted on the first command, so the gateway may start before the coordinator. |
-| `--deadline-ms` | `deadline_ms` | 5000 | process | How long one command may take against the cluster. Redis has no such deadline; a proxy in front of a migrating cluster needs one. `EVAL` is one command, so a script has this budget however many steps it takes, and is also stopped at 100 000 of them. |
+| `--deadline-ms` | `deadline_ms` | 5000 | process | How long one command may take against the cluster. Redis has no such deadline; a proxy in front of a migrating cluster needs one. `EVAL` is one command, so a script has this budget however many instructions it runs, and is also stopped at 10 000 000 Lua VM instructions. |
 | `--requirepass` | `requirepass` | none | process | Falls back to the `HASHRING_GATEWAY_PASSWORD` environment variable, which keeps the secret out of both the file and the process list. |
 | `--maxclients` | `maxclients` | 10000 | process | Connections open at once. One more is answered `-ERR max number of clients reached` and closed, as Redis does. |
 | `--max-bulk-bytes` | `max_bulk_bytes` | 16777216 (16 MiB) | process | Largest bulk string a connection may send, so the largest value the gateway reads from a client; `SET`, `APPEND` and `SETRANGE` stop at the same number. It is the gateway's own ceiling and does not change what a node accepts, so raise it with `--max-value-bytes`. |
