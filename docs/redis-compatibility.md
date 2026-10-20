@@ -48,6 +48,9 @@ path. Every request becomes client → gateway → node: two hops, two
 serializations of the value, and a central process that did not previously
 exist. That is the price of not changing the client.
 
+That price has been measured against a real Redis Cluster of the same shape:
+see [redis-cluster-comparison.md](redis-cluster-comparison.md).
+
 ## Supported commands
 
 `COMMAND` reports exactly this list, so a client that asks what the server

@@ -93,6 +93,9 @@ Expiry itself belongs to the cluster, not the gateway: a deadline is a field on
 the record, so it survives failover, migration and restart. `SET key value EX
 60` and `EXPIRE` work the same way whether or not a gateway is in front.
 
+How the gateway path compares with a real Redis Cluster of the same shape is
+measured in [docs/redis-cluster-comparison.md](docs/redis-cluster-comparison.md).
+
 The same settings can live in a YAML file instead. Keys use the flag names with
 `_` for `-`, except that `--member` becomes a `members` list of
 `{node_id, endpoint}`. A flag on the command line wins over the file (see
