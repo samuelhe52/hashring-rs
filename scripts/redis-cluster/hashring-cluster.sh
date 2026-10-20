@@ -44,6 +44,12 @@ start)
     max_dedup_bytes="${HASHRING_MAX_DEDUP_BYTES:-2147483648}"
     max_pending_bytes="${HASHRING_MAX_PENDING_REPLICATION_BYTES:-536870912}"
     gateway_deadline_ms="${HASHRING_GATEWAY_DEADLINE_MS:-60000}"
+    # How many HTTP/2 connections the gateway opens to each data node, and
+    # how many mutations one replication RPC carries. Both default to what the
+    # binary defaults to, so an unset environment measures the defaults.
+    connection_pool="${HASHRING_GATEWAY_CONNECTION_POOL:-1}"
+    batch_max_entries="${HASHRING_REPLICATION_BATCH_MAX_ENTRIES:-64}"
+    batch_linger_ms="${HASHRING_REPLICATION_BATCH_LINGER_MS:-2}"
     mkdir -p "$dir"
     # The resolved settings, for the harness to record with its results.
     cat > "$dir/settings" <<SETTINGS
@@ -56,6 +62,7 @@ max_pending_replication_bytes=$max_pending_bytes
 gateway_deadline_ms=$gateway_deadline_ms
 SETTINGS
     echo "starting coordinator, $nodes node(s), rf=$rf, $gateways gateway(s), $workers worker(s) each"
+    echo "gateway connection pool=$connection_pool, replication batch=$batch_max_entries entries, linger=${batch_linger_ms}ms"
     members=""
     for i in $(seq 1 "$nodes"); do
         port=$((base_node_port + i - 1))
@@ -77,6 +84,8 @@ SETTINGS
             --coordinator http://127.0.0.1:50050 --worker-threads "$workers" \
             --max-dedup-bytes "$max_dedup_bytes" \
             --max-pending-replication-bytes "$max_pending_bytes" \
+            --replication-batch-max-entries "$batch_max_entries" \
+            --replication-batch-linger-ms "$batch_linger_ms" \
             > "$dir/node-$i.log" 2>&1 &
         echo $! > "$dir/node-$i.pid"
     done
@@ -85,6 +94,7 @@ SETTINGS
         "$BIN" redis-gateway --listen "127.0.0.1:$port" \
             --coordinator http://127.0.0.1:50050 --worker-threads "$workers" \
             --deadline-ms "$gateway_deadline_ms" \
+            --client-connection-pool "$connection_pool" \
             > "$dir/gateway-$g.log" 2>&1 &
         echo $! > "$dir/gateway-$g.pid"
     done

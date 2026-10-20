@@ -9,6 +9,7 @@ in the system under test.
 | [`redis-cluster.sh`](redis-cluster.sh) | Starts, stops and inspects a local Redis Cluster. Every node is a `redis-server` process with its own port, directory and cluster configuration file, so no container runtime is needed. |
 | [`hashring-cluster.sh`](hashring-cluster.sh) | Starts, stops and inspects a hashring-rs cluster: one coordinator, N data nodes and one or more Redis gateways. |
 | [`compare.py`](compare.py) | Runs the comparison and writes `measurements.csv`, `summary.json` and `metadata.json`. |
+| [`paired-summary.py`](paired-summary.py) | Prints the comparison of the variants of a run, with each variant against the control of its own repetition. |
 | [`gateway-profile.py`](gateway-profile.py) | Drives writes and reads through the gateway with `HASHRING_PROFILE_RPC=1` and reports what the nodes spent inside their handlers, against what the client waited for. |
 
 ## Running it
@@ -84,6 +85,41 @@ The node-side handler times come from a separate run:
 python3 scripts/redis-cluster/gateway-profile.py \
   --output results/node-profile --redis-bin /path/to/redis/src
 ```
+
+## Comparing settings of the hashring side
+
+`--variants` measures the hashring side in more than one setting. Each variant
+is `name:connection-pool:batch-entries:linger-ms`:
+
+```sh
+python3 scripts/redis-cluster/compare.py \
+  --output results/ab-batch \
+  --cases 3m1r \
+  --variants "b64l2:1:64:2,b256l2:1:256:2,b16l2:1:16:2,b64l0:1:64:0" \
+  --reps 3 --seconds 15
+```
+
+The variants run in turn inside every repetition, and the Redis control is
+measured right next to each of them, so a load that arrives while the run is
+going hits every variant instead of only the one that happens to be running.
+The hashring cluster is restarted per variant, because these are process
+settings, and each variant runs its own pilot, so every measured phase covers
+the same wall-clock time.
+
+The number to compare is the ratio of the hashring throughput to the control
+of the same repetition: the host's load moves both systems, and the ratio
+moves with them. `paired-summary.py` prints that table:
+
+```sh
+python3 scripts/redis-cluster/paired-summary.py results/ab-batch
+```
+
+Two more flags make the structure of a phase visible:
+
+| Flag | What it does |
+| --- | --- |
+| `--profile-rpc` | Runs the hashring processes with `HASHRING_PROFILE_RPC=1` and writes `rpc_profile.csv`: the requests, the replication RPCs and the entries per replication batch of every process, per phase. |
+| `--settle-seconds` | Waits between the write phase and the read phase. The write phase leaves the replication behind, and without the wait the read phase measures a cluster that is still catching up. |
 
 ## Tuning the hashring-rs side
 

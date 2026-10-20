@@ -24,6 +24,12 @@ time on both systems. The pilot doubles as the warmup. Each process gets a
 request count in proportion to its connections, so the processes of a phase
 finish together, and the throughput of a phase is the requests of all its
 processes over the wall-clock time of the phase.
+
+The hashring side can be measured in more than one setting. The variants run
+in turn inside every repetition, and the Redis control is measured right next
+to each of them, so a load that arrives while the run is going hits every
+variant. The number to compare is the ratio of the hashring throughput to the
+control of the same repetition.
 """
 
 import argparse
@@ -186,6 +192,77 @@ def require_free_ports(ports):
         raise RuntimeError(f"ports already in use: {busy}; stop whatever listens there or choose other base ports")
 
 
+def wait_for_free_ports(ports, timeout=20.0):
+    """Waits for the ports of a cluster that was just stopped.
+
+    The cluster of the previous variant is ours, and its processes need a
+    moment to let go of their sockets. Nothing here stops a process that is
+    not ours: the wait ends in a failure that names the ports."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        busy = []
+        for port in ports:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(0.2)
+                if sock.connect_ex(("127.0.0.1", port)) == 0:
+                    busy.append(port)
+        if not busy:
+            return
+        time.sleep(0.2)
+    raise RuntimeError(f"ports still in use after {timeout:.0f}s: {busy}")
+
+
+def read_rpc_profile(log_dir):
+    """The last RPC profile counter of every process in a cluster directory.
+
+    The profiler prints one line per histogram every 500 ms:
+
+        rpc_profile <unix_ms> <role> <name> <count> <sum_ns> <bucket>:<count>,...
+
+    The counters are cumulative, so a phase is measured by the difference
+    between two readings. The reading is at most one print interval old, so a
+    phase is measured with a slack of up to 500 ms at either end.
+    """
+    counters = {}
+    if not os.path.isdir(log_dir):
+        return counters
+    for name in sorted(os.listdir(log_dir)):
+        if not name.endswith(".log"):
+            continue
+        try:
+            with open(os.path.join(log_dir, name), "r", errors="replace") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            continue
+        seen = set()
+        for line in reversed(lines):
+            if not line.startswith("rpc_profile "):
+                continue
+            parts = line.split()
+            if len(parts) < 6:
+                continue
+            role, histogram, count, sum_ns = parts[2], parts[3], parts[4], parts[5]
+            key = f"{name[:-4]}.{role}.{histogram}"
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                counters[key] = (int(count), int(sum_ns))
+            except ValueError:
+                continue
+    return counters
+
+
+def profile_delta(before, after):
+    """The difference of two RPC profile readings."""
+    delta = {}
+    for key in set(before) | set(after):
+        old_count, old_sum = before.get(key, (0, 0))
+        new_count, new_sum = after.get(key, (0, 0))
+        delta[key] = (new_count - old_count, new_sum - old_sum)
+    return delta
+
+
 def parse_csv(text):
     """The last CSV line redis-benchmark prints."""
     for line in reversed(text.strip().splitlines()):
@@ -309,22 +386,40 @@ class HashringCluster:
         self.node_pids = []
         self.coordinator_pids = []
         self.settings = {}
+        self.variant = None
 
-    def start(self):
-        require_free_ports([
+    def set_variant(self, variant):
+        """The settings the next start() gives the hashring side."""
+        self.variant = variant
+
+    def ports(self):
+        return [
             *range(self.base_node_port, self.base_node_port + self.case.nodes),
             *range(self.base_gateway_port, self.base_gateway_port + self.case.gateways),
             50050,
-        ])
+        ]
+
+    def start(self):
+        require_free_ports(self.ports())
         # A fresh directory: the coordinator keeps its topology in a state
         # file, and a state file from an earlier case would keep that case's
         # replication factor and ignore the settings of this one.
         shutil.rmtree(self.dir, ignore_errors=True)
+        env = {**os.environ, "HASHRING_BIN": self.args.hashring_bin}
+        if self.variant:
+            env["HASHRING_GATEWAY_CONNECTION_POOL"] = str(self.variant["pool"])
+            env["HASHRING_REPLICATION_BATCH_MAX_ENTRIES"] = str(self.variant["batch"])
+            env["HASHRING_REPLICATION_BATCH_LINGER_MS"] = str(self.variant["linger"])
+        if self.args.profile_rpc:
+            # The RPC profiler counts the requests and the replication batches
+            # of every process. Its counters say how the work was split up,
+            # which the throughput numbers alone do not.
+            env["HASHRING_PROFILE_RPC"] = "1"
         run([
             "bash", HASHRING_SCRIPT, "start", self.dir,
             str(self.case.nodes), str(self.case.rf), str(self.case.gateways),
             str(self.base_node_port), str(self.base_gateway_port),
-        ], env={**os.environ, "HASHRING_BIN": self.args.hashring_bin})
+        ], env=env)
         for pid_name in os.listdir(self.dir):
             if pid_name.endswith(".pid"):
                 with open(os.path.join(self.dir, pid_name)) as f:
@@ -345,7 +440,15 @@ class HashringCluster:
 
     def stop(self):
         run(["bash", HASHRING_SCRIPT, "stop", self.dir])
+        if self.pids:
+            # The processes of this cluster are ours, but they need a moment
+            # to let go of their sockets before the next variant binds the
+            # ports.
+            wait_for_free_ports(self.ports())
         self.pids = []
+        self.gateway_pids = []
+        self.node_pids = []
+        self.coordinator_pids = []
 
     def dbsize(self):
         return int(redis_cli(self.args.redis_bin, self.gateways[0], "dbsize"))
@@ -415,6 +518,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--output", required=True, help="output directory")
     parser.add_argument("--cases", default="3m,3m1r,3m-gw3", help="comma separated case names")
+    parser.add_argument(
+        "--variants",
+        default="base:1:64:2",
+        help="comma separated variants of the hashring side, each name:connection-pool:batch-entries:linger-ms",
+    )
     parser.add_argument("--reps", type=int, default=3)
     parser.add_argument("--seconds", type=int, default=20, help="measured seconds per phase")
     parser.add_argument("--pilot-requests", type=int, default=100000, help="requests per process in the pilot")
@@ -428,12 +536,48 @@ def main():
     parser.add_argument("--node-base-port", type=int, default=50051)
     parser.add_argument("--gateway-base-port", type=int, default=6399)
     parser.add_argument("--keep", action="store_true", help="leave the clusters of the last case running")
+    parser.add_argument(
+        "--settle-seconds",
+        type=int,
+        default=0,
+        help="seconds to wait between the write phase and the read phase, so the read phase measures a cluster whose replication has caught up",
+    )
+    parser.add_argument(
+        "--profile-rpc",
+        action="store_true",
+        help="count the requests and the replication batches of the hashring processes",
+    )
     args = parser.parse_args()
 
     names = [n.strip() for n in args.cases.split(",") if n.strip()]
     for name in names:
         if name not in CASES:
             parser.error(f"unknown case {name}; known: {', '.join(CASES)}")
+
+    variants = []
+    for spec in args.variants.split(","):
+        spec = spec.strip()
+        if not spec:
+            continue
+        parts = spec.split(":")
+        if len(parts) != 4:
+            parser.error(f"a variant is name:connection-pool:batch-entries:linger-ms; got {spec}")
+        name, pool, batch, linger = parts
+        try:
+            variant = {
+                "name": name,
+                "pool": int(pool),
+                "batch": int(batch),
+                "linger": int(linger),
+            }
+        except ValueError:
+            parser.error(f"a variant's numbers are not numbers: {spec}")
+        if variant["pool"] < 1 or variant["batch"] < 1 or variant["linger"] < 0:
+            parser.error(f"a variant's numbers are out of range: {spec}")
+        variants.append(variant)
+    if not variants:
+        parser.error("no variants")
+    args.variants = variants
 
     output = os.path.abspath(args.output)
     if os.path.exists(output) and os.listdir(output):
@@ -474,7 +618,10 @@ def main():
             "node_base_port": args.node_base_port,
             "gateway_base_port": args.gateway_base_port,
             "keep": args.keep,
+            "settle_seconds": args.settle_seconds,
+            "profile_rpc": args.profile_rpc,
             "cases": names,
+            "variants": variants,
         },
         # What hashring-cluster.sh resolved for each case: worker threads and
         # the node and gateway budgets, defaults or environment overrides.
@@ -488,6 +635,7 @@ def main():
     write_metadata()
 
     rows = []
+    profile_rows = []
     for name in names:
         case = CASES[name]
         print(f"=== case {case.describe()}", flush=True)
@@ -495,15 +643,12 @@ def main():
         hashring = HashringCluster(args, case, work, args.node_base_port, args.gateway_base_port)
         try:
             redis.start()
-            hashring.start()
-            metadata["hashring_settings"][name] = hashring.settings
-            write_metadata()
             # A cluster with a process that is not running is a broken cluster,
-            # and a benchmark against it measures the breakage.
-            for role_name, pids in (("redis", redis.pids), ("hashring", hashring.pids)):
-                dead = [pid for pid in pids if not os.path.exists(f"/proc/{pid}")]
-                if dead:
-                    raise RuntimeError(f"{role_name} processes not running: {dead}")
+            # and a benchmark against it measures the breakage. The hashring
+            # cluster is started per variant, so it is checked there.
+            dead = [pid for pid in redis.pids if not os.path.exists(f"/proc/{pid}")]
+            if dead:
+                raise RuntimeError(f"redis processes not running: {dead}")
             # Key templates. On the Redis side each master gets its own hash
             # tag, so the key belongs to that master's slot range and no client
             # is redirected. On the hashring side the tag is part of the key
@@ -575,6 +720,7 @@ def main():
                 sampler = Sampler(pids)
                 sampler.start()
                 started = time.time()
+                profile_before = read_rpc_profile(hashring.dir) if system == "hashring" else {}
                 try:
                     procs = []
                     for port, tag, role, clients in layout:
@@ -593,12 +739,14 @@ def main():
                     out = aggregate(results, window)
                 finally:
                     resources = sampler.finish()
+                profile_after = read_rpc_profile(hashring.dir) if system == "hashring" else {}
+                out["rpc_profile"] = profile_delta(profile_before, profile_after)
                 out["resources"] = resources
                 out["elapsed_seconds"] = round(window, 2)
                 out["requests_total"] = sum(requests for _, requests, _ in results)
                 return out
 
-            def record(system, workload, rep, result):
+            def record(system, workload, rep, result, variant):
                 # The CPU of the gateway and of the data nodes is split, so the
                 # cost of the proxy in front of the cluster is visible.
                 per_pid = result["resources"].get("cpu_seconds_per_pid", {})
@@ -612,6 +760,7 @@ def main():
                     server_cpu = sum(per_pid.values())
                 row = {
                     "case": name,
+                    "variant": variant["name"],
                     "system": system,
                     "workload": workload,
                     "rep": rep,
@@ -631,8 +780,19 @@ def main():
                     "max_rss_bytes": result["resources"].get("max_rss_bytes", 0),
                 }
                 rows.append(row)
+                for metric, (count, sum_ns) in sorted(result.get("rpc_profile", {}).items()):
+                    profile_rows.append({
+                        "case": name,
+                        "variant": variant["name"],
+                        "system": system,
+                        "workload": workload,
+                        "rep": rep,
+                        "metric": metric,
+                        "count": count,
+                        "sum_ns": sum_ns,
+                    })
                 print(
-                    f"  {system:8s} {workload:6s} rep{rep} "
+                    f"  {variant['name']:10s} {system:8s} {workload:6s} rep{rep} "
                     f"rps={row['rps']:>10.0f} p50={row['p50_ms']:.3f}ms "
                     f"p99={row['p99_ms']:.3f}ms {row['elapsed_seconds']:.1f}s "
                     f"cpu={row['cpu_seconds']:.1f}s "
@@ -644,29 +804,63 @@ def main():
             # Pilot: measures the throughput of one request count, so the
             # measured phase can run for the same wall-clock time on both
             # systems. It also warms the key space up.
+            #
+            # The Redis side is measured once per case. The hashring side is
+            # measured per variant, because a variant changes how fast that
+            # side answers, and a phase that runs for a different time than
+            # the pilot measured is not the phase the pilot sized.
             pilots = {}
-            for system in ("redis", "hashring"):
-                for workload in ("write", "read"):
-                    result = phase(system, workload, lambda role, clients: args.pilot_requests)
-                    pilots[(system, workload)] = result["rps"]
-                    print(f"  pilot {system:8s} {workload:6s} rps={result['rps']:.0f}", flush=True)
+            for workload in ("write", "read"):
+                result = phase("redis", workload, lambda role, clients: args.pilot_requests)
+                pilots[("redis", workload)] = result["rps"]
+                print(f"  pilot redis    {workload:6s} rps={result['rps']:.0f}", flush=True)
 
             for rep in range(1, args.reps + 1):
                 order = ["redis", "hashring"] if rep % 2 == 1 else ["hashring", "redis"]
-                for workload in ("write", "read", "mixed"):
-                    for system in order:
-                        # A process gets the share of its role's pilot rate
-                        # that its connections are of all connections, so
-                        # every process, and in the mixed phase both roles,
-                        # runs for about --seconds.
-                        def requests_for(role, clients, system=system):
-                            return max(1, int(pilots[(system, role)] * args.seconds * clients / args.clients))
-                        result = phase(system, workload, requests_for)
-                        record(system, workload, rep, result)
-                        if workload == "write":
-                            size = redis.dbsize() if system == "redis" else hashring.dbsize()
-                            rows[-1]["keys_in_cluster"] = size
-                            print(f"           keys in cluster: {size}", flush=True)
+                # The variants run in turn inside one repetition, so a load
+                # that arrives while the run is going hits every variant
+                # instead of only the one that happened to be running.
+                for variant in args.variants:
+                    if hashring.pids:
+                        # The cluster of the previous variant is ours; it has
+                        # to let go of its ports before the next one binds
+                        # them.
+                        hashring.stop()
+                    hashring.set_variant(variant)
+                    hashring.start()
+                    metadata["hashring_settings"][f"{name}/{variant['name']}"] = hashring.settings
+                    write_metadata()
+                    dead = [pid for pid in hashring.pids if not os.path.exists(f"/proc/{pid}")]
+                    if dead:
+                        raise RuntimeError(f"hashring processes not running: {dead}")
+                    for workload in ("write", "read"):
+                        result = phase("hashring", workload, lambda role, clients: args.pilot_requests)
+                        pilots[("hashring", workload)] = result["rps"]
+                        print(
+                            f"  pilot {variant['name']:10s} {workload:6s} rps={result['rps']:.0f}",
+                            flush=True,
+                        )
+                    for workload in ("write", "read", "mixed"):
+                        if workload == "read" and args.settle_seconds:
+                            # The read phase follows the write phase, and the
+                            # write phase leaves the replication behind. The
+                            # wait gives the replication the time to catch up,
+                            # so the read phase measures a cluster at rest
+                            # instead of a cluster that is still copying.
+                            time.sleep(args.settle_seconds)
+                        for system in order:
+                            # A process gets the share of its role's pilot
+                            # rate that its connections are of all
+                            # connections, so every process, and in the mixed
+                            # phase both roles, runs for about --seconds.
+                            def requests_for(role, clients, system=system):
+                                return max(1, int(pilots[(system, role)] * args.seconds * clients / args.clients))
+                            result = phase(system, workload, requests_for)
+                            record(system, workload, rep, result, variant)
+                            if workload == "write":
+                                size = redis.dbsize() if system == "redis" else hashring.dbsize()
+                                rows[-1]["keys_in_cluster"] = size
+                                print(f"           keys in cluster: {size}", flush=True)
         finally:
             # --keep leaves only the last case running: the next case needs
             # the same ports, and its fresh directories would lose the PID
@@ -676,7 +870,7 @@ def main():
                 redis.stop()
 
     fields = [
-        "case", "system", "workload", "rep", "rps", "write_rps", "read_rps",
+        "case", "variant", "system", "workload", "rep", "rps", "write_rps", "read_rps",
         "p50_ms", "p95_ms", "p99_ms", "max_ms", "elapsed_seconds", "finish_spread", "requests_total",
         "cpu_seconds", "gateway_cpu_seconds", "node_cpu_seconds", "max_rss_bytes",
         "keys_in_cluster",
@@ -687,6 +881,17 @@ def main():
         for row in rows:
             writer.writerow(row)
 
+    if profile_rows:
+        with open(os.path.join(output, "rpc_profile.csv"), "w", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=["case", "variant", "system", "workload", "rep", "metric",
+                            "count", "sum_ns"],
+            )
+            writer.writeheader()
+            for row in profile_rows:
+                writer.writerow(row)
+
     summary = summarize(rows)
     with open(os.path.join(output, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
@@ -694,13 +899,15 @@ def main():
 
 
 def summarize(rows):
-    """Median numbers per case, workload and system, plus the ratio."""
+    """Median numbers per case, workload, variant and system, plus the ratio."""
     groups = {}
     for row in rows:
-        groups.setdefault((row["case"], row["workload"], row["system"]), []).append(row)
+        groups.setdefault(
+            (row["case"], row["workload"], row["variant"], row["system"]), []
+        ).append(row)
     summary = {}
-    for (case, workload, system), items in sorted(groups.items()):
-        entry = summary.setdefault(case, {}).setdefault(workload, {})
+    for (case, workload, variant, system), items in sorted(groups.items()):
+        entry = summary.setdefault(case, {}).setdefault(workload, {}).setdefault(variant, {})
         rps = [i["rps"] for i in items]
         entry[system] = {
             "reps": len(items),
@@ -716,11 +923,12 @@ def summarize(rows):
             "max_rss_bytes_median": int(statistics.median([i["max_rss_bytes"] for i in items])),
         }
     for case, workloads in summary.items():
-        for workload, systems in workloads.items():
-            if "redis" in systems and "hashring" in systems:
-                systems["hashring_over_redis"] = round(
-                    systems["hashring"]["rps_median"] / systems["redis"]["rps_median"], 4
-                )
+        for workload, variants in workloads.items():
+            for variant, systems in variants.items():
+                if "redis" in systems and "hashring" in systems:
+                    systems["hashring_over_redis"] = round(
+                        systems["hashring"]["rps_median"] / systems["redis"]["rps_median"], 4
+                    )
     return summary
 
 
