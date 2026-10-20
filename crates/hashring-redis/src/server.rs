@@ -266,7 +266,7 @@ mod tests {
     }
 
     async fn run(
-        dispatcher: &Arc<Dispatcher>,
+        dispatcher: &Dispatcher,
         connection: &mut Connection,
         parts: &[&[u8]],
     ) -> (Option<Reply>, bool) {

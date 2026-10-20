@@ -16,3 +16,7 @@ test-group = "cluster"
 [[profile.default.overrides]]
 filter = 'binary(redis_gateway)'
 test-group = "cluster"
+
+[[profile.default.overrides]]
+filter = 'binary(experimental_redis_gateway)'
+test-group = "cluster"

@@ -71,11 +71,23 @@ cargo run -- redis-gateway --listen 127.0.0.1:6379 \
 It answers the string and key commands, the connection handshake, and the
 expiry commands, and declines the rest with a clear error rather than a wrong
 answer. It is **not** Redis and not Redis Cluster: there are no data structures,
-no transactions or scripting, no keyspace enumeration, and no atomicity
-across keys. Read-modify-write commands such as `INCR` are conditional writes the
+no transactions or scripting, and no atomicity across keys. Keyspace commands
+include `KEYS`, `SCAN`, `DBSIZE` and `RANDOMKEY`.
+Read-modify-write commands such as `INCR` are conditional writes the
 owning node checks, so they stay atomic however many gateways are running.
 [docs/redis-compatibility.md](docs/redis-compatibility.md) documents every
 command, every difference, and what each limitation would cost to close.
+
+Lua scripting is available separately in the purely experimental
+[`hashring-redis-lua-experimental`](docs/experimental-redis.md) crate:
+
+```sh
+cargo run --features redis-lua-experimental -- redis-lua-experimental-gateway \
+  --config examples/experimental-redis-gateway.yaml
+```
+
+The feature enables this additional command; `redis-gateway` continues to run
+without scripting, even in a build with the feature enabled.
 
 Expiry itself belongs to the cluster, not the gateway: a deadline is a field on
 the record, so it survives failover, migration and restart. `SET key value EX
@@ -116,9 +128,12 @@ its default and scope.
 | `execute-change` | Run the staged change through to publication |
 | `change-status` | Show the active change, if any |
 | `redis-gateway` | Serve the Redis protocol on a port, over this cluster |
+| `redis-lua-experimental-gateway` | Serve the shared gateway with experimental Lua support; requires `--features redis-lua-experimental` |
 | `experiment` | Run a reproducible multi-process experiment |
 
 Run `cargo run -- <command> --help` for each command's flags.
+For the Lua command, use
+`cargo run --features redis-lua-experimental -- redis-lua-experimental-gateway --help`.
 
 ## Replication and guarantees
 

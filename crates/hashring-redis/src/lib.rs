@@ -21,7 +21,6 @@ pub mod client;
 pub mod commands;
 pub mod error;
 pub mod resp;
-pub mod script;
 pub mod server;
 pub mod table;
 
@@ -75,18 +74,39 @@ pub async fn serve(
     config: GatewayConfig,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
+    serve_inner(config, shutdown, None).await
+}
+
+/// Serve the same protocol and connection handling with additional commands.
+pub async fn serve_with_extension(
+    config: GatewayConfig,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    extension: Arc<dyn commands::CommandExtension>,
+) -> std::io::Result<()> {
+    serve_inner(config, shutdown, Some(extension)).await
+}
+
+async fn serve_inner(
+    config: GatewayConfig,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    extension: Option<Arc<dyn commands::CommandExtension>>,
+) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let local = listener.local_addr()?;
     let client = Arc::new(SharedClient::new(
         config.coordinator.clone(),
         config.operation_timeout,
     ));
-    let dispatcher = Arc::new(Dispatcher::new(
+    let mut dispatcher = Dispatcher::new(
         client,
         config.password.clone(),
         config.limits,
         config.operation_timeout,
-    ));
+    );
+    if let Some(extension) = extension {
+        dispatcher = dispatcher.with_extension(extension);
+    }
+    let dispatcher = Arc::new(dispatcher);
     tracing::info!(
         listen = %local,
         coordinator = %config.coordinator,

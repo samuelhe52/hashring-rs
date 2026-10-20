@@ -10,7 +10,7 @@ use super::{
 use crate::{
     error::{RedisError, RedisResult},
     resp::{Protocol, Reply},
-    table::{self, CommandInfo},
+    table::CommandInfo,
 };
 
 impl Dispatcher {
@@ -35,7 +35,7 @@ impl Dispatcher {
             "auth" => self.auth(connection, args),
             "select" => select(args),
             "reset" => self.reset(connection, args),
-            "command" => command_command(args),
+            "command" => command_command(self, args),
             "info" => self.info(args),
             "config" => config(args),
             other => Err(RedisError::unsupported(&other.to_ascii_uppercase())),
@@ -298,13 +298,13 @@ fn client_subcommand(
     }
 }
 
-fn command_command(mut args: Args<'_>) -> RedisResult<Reply> {
+fn command_command(dispatcher: &Dispatcher, mut args: Args<'_>) -> RedisResult<Reply> {
     match args.next_keyword().as_deref() {
         None => Ok(Reply::Array(
-            table::COMMANDS.iter().map(CommandInfo::to_reply).collect(),
+            dispatcher.commands().map(CommandInfo::to_reply).collect(),
         )),
         Some("count") => Ok(Reply::Array(vec![Reply::Integer(
-            table::COMMANDS.len() as i64
+            dispatcher.commands().count() as i64,
         )])),
         // Documentation is for commands this gateway does not implement, so
         // there is none to send.
@@ -312,10 +312,12 @@ fn command_command(mut args: Args<'_>) -> RedisResult<Reply> {
         Some("info") => Ok(Reply::Array(
             args.remaining()
                 .iter()
-                .map(|name| match table::lookup(&String::from_utf8_lossy(name)) {
-                    Some(command) => command.to_reply(),
-                    None => Reply::Nil,
-                })
+                .map(
+                    |name| match dispatcher.command(&String::from_utf8_lossy(name)) {
+                        Some(command) => command.to_reply(),
+                        None => Reply::Nil,
+                    },
+                )
                 .collect(),
         )),
         Some("getkeys") | Some("getkeysandflags") => {
@@ -418,8 +420,8 @@ mod tests {
     use super::*;
     use crate::{client::SharedClient, resp::Limits};
 
-    fn dispatcher(password: Option<&str>) -> Arc<Dispatcher> {
-        Arc::new(Dispatcher::new(
+    fn dispatcher(password: Option<&str>) -> Dispatcher {
+        Dispatcher::new(
             Arc::new(SharedClient::new(
                 "http://127.0.0.1:1".into(),
                 Duration::from_millis(50),
@@ -427,14 +429,10 @@ mod tests {
             password.map(Arc::from),
             Limits::default(),
             Duration::from_millis(200),
-        ))
+        )
     }
 
-    async fn run(
-        dispatcher: &Arc<Dispatcher>,
-        connection: &mut Connection,
-        parts: &[&str],
-    ) -> Response {
+    async fn run(dispatcher: &Dispatcher, connection: &mut Connection, parts: &[&str]) -> Response {
         let args: Vec<Vec<u8>> = parts.iter().map(|part| part.as_bytes().to_vec()).collect();
         dispatcher.execute(connection, &args).await
     }

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use hashring_client::{Expiry, Precondition};
+use hashring_client::Expiry;
 
 use super::{
     args::{Args, DeadlineMode, TimeUnit, TtlForm, float, parse_integer, positive_deadline},
@@ -466,17 +466,9 @@ pub async fn msetnx(store: &Store<'_>, args: Args<'_>) -> RedisResult<Reply> {
              docs/redis-compatibility.md",
         ));
     };
-    let applied = store
-        .client()
-        .await?
-        .put_if(
-            key.to_vec(),
-            value.to_vec(),
-            Expiry::Clear,
-            Precondition::Absent,
-        )
-        .await?;
-    Ok(Reply::Integer(applied.is_some() as i64))
+    Ok(Reply::Integer(i64::from(
+        store.put_if_absent(key, value).await?,
+    )))
 }
 
 /// Redis's `GETRANGE` index rules: a negative index counts from the end, and

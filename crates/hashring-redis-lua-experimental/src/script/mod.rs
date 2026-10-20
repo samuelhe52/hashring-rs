@@ -7,10 +7,9 @@
 //! business doing. There is no `io`, `os`, `debug` or `package`, so a script
 //! cannot reach the filesystem, the clock, the environment or the process, and
 //! there is no `load`, `dofile`, `loadfile` or `require`, so it cannot pull in
-//! code it was not sent. A script also may only touch the keys it declared in
-//! `KEYS`, and it declares at most one: the conditional-write path below makes
-//! a read-then-write of a single key atomic against every writer, and that
-//! guarantee does not extend to a script that would span two owners.
+//! code it was not sent. The host enforces access to its one declared key and
+//! commits private state conditionally. Resource isolation and Redis Lua
+//! compatibility are incomplete; see `docs/experimental-redis.md`.
 
 use std::{
     sync::{
@@ -81,8 +80,8 @@ const CHECK_INTERVAL: u64 = 1_000;
 ///
 /// Creating a state and loading its libraries is the expensive part, and a
 /// gateway runs one script at a time, so there is nothing to contend. Each run
-/// gets its own environment table and drops it afterwards, so a script cannot
-/// see what an earlier one left behind. What a state does keep is the memory
+/// gets its own environment table, but nested library tables are shared in
+/// this experimental implementation. The state also keeps the memory
 /// its largest script needed, which is the same thing Redis keeps.
 #[derive(Default)]
 pub struct Runtime {
@@ -397,7 +396,7 @@ fn argument_text(value: Value) -> mlua::Result<Vec<u8>> {
             for index in 1..=table.raw_len() {
                 joined.push(argument_text(table.raw_get::<Value>(index)?)?);
             }
-            Ok(joined.join(&[b' '][..]))
+            Ok(joined.join(&b" "[..]))
         }
         other => Err(mlua::Error::runtime(format!(
             "Lua redis lib command arguments must be strings or integers (got {})",
@@ -564,8 +563,7 @@ fn text(value: mlua::LuaString) -> String {
 /// through rather than named twice.
 fn script_failure(error: mlua::Error) -> RedisError {
     // A failure the cluster reported crosses into Lua as itself and comes back
-    // out unchanged, so a conflict still reads as one: the caller runs the
-    // script again rather than handing the client a mangled error. Only a
+    // out unchanged, including whether a write may have applied. Only a
     // failure that began in Lua is given the script's own wording.
     if let Some(inner) = error.downcast_ref::<RedisError>() {
         return inner.clone();
@@ -630,17 +628,15 @@ fn internal(message: impl Into<String>) -> RedisError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
     use super::*;
 
-    /// A cluster that answers from a script, and remembers what it was asked.
-    /// A key the script is told changed underneath it answers with the conflict
-    /// the gateway would report, so a test can watch it cross the interpreter.
+    /// A host that records commands and supplies replies or typed errors.
     #[derive(Default)]
     struct Canned {
         answers: HashMap<String, Reply>,
-        conflicts: HashSet<Vec<u8>>,
+        failures: HashMap<Vec<u8>, RedisError>,
         asked: Vec<String>,
     }
 
@@ -669,19 +665,12 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join(" "),
             );
-            // A write to a key that changed underneath the script is the
-            // conflict the gateway turns into a re-run; it must reach the
-            // caller as that conflict and not as a reworded script error.
-            let key = command
+            let failure = command
                 .get(1)
-                .filter(|key| self.conflicts.contains(key.as_slice()));
+                .and_then(|key| self.failures.get(key))
+                .cloned();
             let answer = self.answers.get(&name).cloned().unwrap_or(Reply::Nil);
-            async move {
-                match key {
-                    Some(key) => Err(RedisError::conflict(key)),
-                    None => Ok(answer),
-                }
-            }
+            async move { failure.map_or(Ok(answer), Err) }
         }
     }
 
@@ -977,14 +966,13 @@ mod tests {
         );
     }
 
-    /// A write that found the key changed underneath the script must reach the
-    /// caller as that conflict, so the gateway runs the script again instead of
-    /// handing the client a reworded error. Redis's single thread gets this by
-    /// never letting anyone in; here it is the conditional write's own answer.
     #[tokio::test]
-    async fn a_conflict_crosses_the_interpreter_as_itself() {
+    async fn a_host_error_preserves_its_code_and_write_outcome() {
         let mut host = Canned::default();
-        host.conflicts.insert(b"alpha".to_vec());
+        host.failures.insert(
+            b"alpha".to_vec(),
+            RedisError::outcome_unknown("lost response"),
+        );
         let error = evaluate(
             host,
             "redis.call('SET', KEYS[1], 'x') return 1",
@@ -993,10 +981,9 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(error.is_conflict(), "{error:?}");
-        // The conflict is not dressed up as a script failure, so its wording
-        // still names the key that moved.
-        assert!(error.message.contains("alpha"), "{error:?}");
+        assert_eq!(error.code, "ERR");
+        assert!(error.may_have_applied);
+        assert!(error.message.contains("lost response"), "{error}");
     }
 
     /// `redis.error_reply` and `redis.status_reply` answer with a table that

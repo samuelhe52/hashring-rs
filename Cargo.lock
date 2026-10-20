@@ -667,15 +667,26 @@ dependencies = [
  "futures",
  "hashring-client",
  "hashring-core",
- "hex",
- "mlua",
  "redis",
- "sha1",
  "tempfile",
  "thiserror",
  "tokio",
  "tonic",
  "tracing",
+]
+
+[[package]]
+name = "hashring-redis-lua-experimental"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "hashring-client",
+ "hashring-core",
+ "hashring-redis",
+ "hex",
+ "mlua",
+ "sha1",
+ "tokio",
 ]
 
 [[package]]
@@ -690,6 +701,7 @@ dependencies = [
  "hashring-experiment",
  "hashring-node",
  "hashring-redis",
+ "hashring-redis-lua-experimental",
  "hex",
  "redis",
  "serde",

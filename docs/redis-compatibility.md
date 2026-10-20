@@ -1,5 +1,9 @@
 # Redis compatibility
 
+This page describes the ordinary `redis-gateway` command. The separate
+[experimental Lua gateway](experimental-redis.md) adds scripting through the shared
+gateway's extension API; it requires an explicit feature and command selection.
+
 `redis-gateway` serves the Redis protocol on a TCP port over a hashring-rs
 cluster. A Redis client connects to it the way it would to a Redis server, so
 `redis-cli`, redis-py, Jedis, Lettuce and go-redis all work against it in
@@ -150,14 +154,6 @@ the gateway before the reply is sent, hence its limit.
 | `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT` | Accepts one of `NX`, `XX`, `GT`, `LT`. A key with no deadline counts as never expiring, so `LT` sets one and `GT` does not. A deadline that is not in the future, including a negative timeout, deletes the key. |
 | `PERSIST` | Clears the deadline without rewriting the value. |
 
-### Scripting
-
-| Command | Notes |
-| --- | --- |
-| `EVAL` | See [scripts](#scripts). |
-| `EVALSHA` | Answers `NOSCRIPT` for a script the gateway does not have, which is the code a client watches for to send `EVAL` instead. |
-| `SCRIPT LOAD`, `SCRIPT EXISTS`, `SCRIPT FLUSH` | |
-
 ## Declined commands
 
 These are answered with a clear error rather than a wrong answer:
@@ -176,7 +172,7 @@ Anything not in this document is answered with Redis' own unknown-command error.
 A data structure command (`HSET`, `ZADD`, `LPUSH`, …) is unknown here, because
 this gateway stores byte strings and nothing else, and will go on doing so; see
 [out of scope](#out-of-scope-data-structures). So are `MULTI`, `EXEC`,
-`WATCH`, and the `SUBSCRIBE` family.
+`WATCH`, `EVAL`, `SCRIPT`, and the `SUBSCRIBE` family.
 
 If a workload needs any of those, this is not a Redis substitute.
 
@@ -206,79 +202,6 @@ keeps colliding is bounded by the [command deadline](#limits-here).
 
 A plain `SET`, `SETEX`, `PSETEX` or `MSET` has nothing to compute and is one
 unconditional write. A read-modify-write that raced it simply reads again.
-
-### Scripts
-
-`EVAL` runs a script on the gateway. It is here because clients do not have an
-alternative: a cache client claims a key with a read and a write that must not
-interleave, a rate limiter adds one to a counter and reads its deadline, and
-neither can say that in plain commands. Both send a script, and both work
-against this gateway unmodified.
-
-The language is Lua itself, embedded as a real Lua 5.4 with the vendored
-standard interpreter, not a subset of it: what a client library sends is
-ordinary Lua, so a script gets the whole grammar and the `string`, `table`,
-`math`, `utf8` and `coroutine` libraries, plus the base functions (`type`,
-`pairs`, `ipairs`, `tostring`, `tonumber`, `error`, `assert`, `select`,
-`pcall`, `unpack`, and so on). A script is given `KEYS`, `ARGV`,
-`redis.call`, `redis.pcall`, `redis.error_reply`, `redis.status_reply` and
-`redis.sha1hex`.
-
-What a script does *not* get is anything a cache has no business doing. There
-is no `io`, `os`, `debug` or `package`, so a script cannot reach the
-filesystem, the clock, the environment or the process; and the doors to more
-code — `load`, `loadfile`, `dofile`, `require` — are closed, so a script cannot
-pull in code it was not sent. A runaway script is stopped by a budget of
-virtual-machine instructions rather than left to hold the gateway.
-
-What differs from Redis:
-
-- **A script may only touch the keys it declared in `KEYS`.** A single-threaded
-  Redis lets a script reach any key in its process. This cluster cannot know
-  where a key lives without the client saying so, and a script free to touch
-  undeclared keys would hold no lock on them. The check reads the same command
-  table `COMMAND` answers with, so it is the key positions a client already
-  knows, and a script naming a key it did not declare is refused by name.
-- **A script declares at most one key.** This is the honest edge of what the
-  gateway can make atomic. Each command a script runs is the gateway's own, so
-  it carries a precondition to the node that owns the key; and a script that
-  reads a key and then writes *that same key* is stitched into one unit by
-  being run again when the key moved underneath it. That guarantee holds for a
-  single key and stops there: two keys may sit on two owners, and a read of one
-  cannot be made a precondition on a write to the other. A script that declares
-  more than one key is therefore refused, which is the same edge Redis's own
-  cluster mode draws with `CROSSSLOT`. A cache claim and a rate limiter each
-  touch one key, so both work unmodified; see
-  [cross-key atomicity](#cross-key-atomicity-is-not-available-at-all).
-- **A script is atomic against every writer, not just one gateway's clients.**
-  The commands a script runs go through the same conditional-write path `INCR`
-  uses, so a write the script makes is conditional on what the script read: a
-  script that reads its one key and then writes it cannot overwrite a write that
-  arrived in between, whichever gateway or client made it.
-- **A conflict runs the script again, or fails it.** When a conditional write
-  finds the key changed underneath the script, the script is run again from the
-  start, which is what Redis' single thread gets by never letting anyone in.
-  A script that has already changed something a second run would change twice
-  cannot be run again, and is failed with `ERR` instead — its answer would
-  otherwise be a number no run of it produced. This is the one place where a
-  script and Redis differ in outcome rather than in reporting.
-- **One script at a time per gateway.** A script holds its declared key for its
-  whole run, so no client of that gateway takes it between two of the script's
-  commands. Another gateway is serialized only by the conditional writes above,
-  which is the same guarantee `INCR` already has.
-- **A script may not change the connection.** `AUTH`, `HELLO`, `RESET`,
-  `SELECT`, `CLIENT`, `QUIT`, `EVAL`, `EVALSHA`, `SCRIPT`, `MULTI`, `EXEC`,
-  `DISCARD` and `WATCH` are refused from a script, as in Redis.
-
-The budgets are the [command deadline](#limits-here) and a count of
-10 000 000 virtual-machine instructions, whichever runs out first. A runaway
-script is stopped by its budget and reported as an error; the deadline uses the
-code Redis uses for a script that outstayed `lua-time-limit`.
-
-`MULTI`, `EXEC` and `WATCH` are still unknown here: see
-[cross-key atomicity](#cross-key-atomicity-is-not-available-at-all). A script
-does not provide them either — it is one operation on one gateway, not a
-transaction spanning clients.
 
 ### Cross-key atomicity is not available at all
 
@@ -411,21 +334,8 @@ returns nil, `EXISTS` returns 0, `TTL` returns -2.
 - No `FLUSHALL`. `KEYS` and `DBSIZE` walk every key on every owner,
   so they cost as much as the keyspace is large.
 - No data structures, by decision; see
-  [out of scope](#out-of-scope-data-structures). No transactions or Pub/Sub.
-- Scripting is real Lua (5.4), not a subset, so a client library's script runs
-  unmodified — `function`, `repeat`, generic `for`, and the `string`, `table`,
-  `math`, `utf8` and `coroutine` libraries are all here. What it cannot do is
-  reach the machine (`io`, `os`, `debug`, `package`, `load`, `require` are all
-  absent), and a script declares **at most one key**, since that is the scope
-  the gateway can make atomic. See [scripts](#scripts). A script is bounded by
-  the command deadline and 10 000 000 Lua VM instructions, and one runs at a
-  time per gateway.
-- A value larger than the owning node's `--max-value-bytes` is refused with
-  `OOM`, as Redis refuses one past its own limit. That default is 8 MiB and a
-  node may be raised to 128 MiB, so it is the node's to set and not the
-  gateway's; see [configuration](configuration.md#node). Above the gateway's
-  own `--max-bulk-bytes` (16 MiB by default) a value is refused before it is
-  parsed, with an `ERR Protocol error` on that connection.
+  [out of scope](#out-of-scope-data-structures). No transactions, scripting or
+  Pub/Sub.
 - The gateway keeps nothing, so it holds no expiry state, no keys and no
   replication state. Losing it loses no data; losing the *cluster* loses every
   value on every node, as the cluster's own guarantees describe.
@@ -482,13 +392,12 @@ linearizability, but:
   the whole hash to the owner and then to every follower, and a write that loses
   a [conditional-write](#read-modify-write-is-a-conditional-write) race sends
   it again.
-- **A structure is capped at the value limit**, 8 MiB by default and whatever
-  `--max-value-bytes` allows, up to 128 MiB. How many members that
+- **A structure is capped at 8 MiB**, the value limit. How many members that
   holds depends on their size: about 50 000 of 150 bytes each, about 8 000 of
   1 KiB. The rewrite cost bites well before that.
 - **It would not buy the libraries that need structures.** Job queues and locks
-  such as Sidekiq, Celery, BullMQ and Redlock also need blocking pops and Lua.
-  Lua is here; blocking pops are not, and cross-key atomicity is
+  such as Sidekiq, Celery, BullMQ and Redlock also need blocking pops and Lua,
+  and honest scripting needs atomicity across keys, which is
   [not available](#cross-key-atomicity-is-not-available-at-all).
 
 Lists and streams fit worst of all: `LPOP` and consumer groups want element
@@ -507,6 +416,4 @@ how much each would cost:
 | | What it would take |
 | --- | --- |
 | `MULTI`, `EXEC`, `WATCH` | Would need server-side execution, and cross-key atomicity is unavailable underneath, so `EXEC` could not honestly promise atomicity across keys. |
-| `cjson` and `bit` libraries | Lua is real here (5.4), so `string`, `table`, `math`, `utf8` and `coroutine` are all present. `cjson` is not built in, and `bit` needs 64-bit integers Lua numbers cannot hold. The doors to more code — `io`, `os`, `debug`, `package`, `load`, `require` — stay closed, since a cache script has no business reaching the machine or loading code it was not sent. |
-| `SCRIPT DEBUG`, `FUNCTION` | The scripting debugger works against Redis' own interpreter state, which this gateway does not have. |
 | Durability | The cluster is in-memory by design; the gateway adds no storage. |

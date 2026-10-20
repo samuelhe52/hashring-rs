@@ -1,33 +1,10 @@
-//! Scripts, as a client reaches them: `EVAL`, `EVALSHA` and `SCRIPT`.
+//! Experimental `EVAL`, `EVALSHA` and `SCRIPT` support.
 //!
-//! A script is the one thing a Redis client cannot do without. A cache client
-//! claims a key with a read and a write that must not interleave, a rate
-//! limiter adds one to a counter and reads its deadline, and neither client
-//! library offers a way to say that in plain commands. Both send a script.
-//!
-//! What the gateway gives a script, and where it stops:
-//!
-//! - The script's commands are the gateway's own, so each is atomic in the way
-//!   the gateway already makes it: a read-modify-write carries a precondition
-//!   to the node that owns the key.
-//! - A write the script makes is conditional on what the script read, so a
-//!   script that reads its one key and then writes it cannot overwrite a write
-//!   that arrived in between, whichever gateway or client made it. The script is
-//!   then run again from the start, which is what a single-threaded Redis gets
-//!   by never letting anyone in. A script that has already changed something a
-//!   second run would change twice cannot be run again, and is failed instead:
-//!   its answer would otherwise be a number no run of it produced.
-//! - That guarantee covers a single key and no further, so a script declares at
-//!   most one key. Two keys may sit on two owners, and a read of one cannot be
-//!   made a precondition on a write to the other; a script that declares more
-//!   than one is refused rather than answered with an atomicity the cluster
-//!   cannot deliver. This is the same edge Redis's own cluster mode draws.
-//! - A script may only touch the keys it declared in `KEYS`, checked against
-//!   the command table's own key positions.
-//! - One script at a time per gateway, holding its declared key for the whole
-//!   run, and only the commands a script may run.
-//!
-//! `docs/redis-compatibility.md` describes this from the client's side.
+//! Each attempt runs against a private snapshot of its one declared key.
+//! Commands see their own staged writes. The final state is committed once,
+//! conditional on the original version; a failed condition discards the attempt
+//! and reruns the entire script. No intermediate write reaches the cluster.
+//! See `docs/experimental-redis.md` for the experimental scope and limitations.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -35,13 +12,26 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use hashring_core::proto::RecordVersion;
+use hashring_client::{Expiry, HashringClient, Precondition};
+use hashring_core::{
+    limits::MAX_VALUE_BYTES,
+    proto::{ErrorCode, RecordVersion},
+};
 use tokio::sync::Mutex as AsyncMutex;
 
-use super::{
-    Connection, Dispatcher,
-    args::{Args, keyword, parse_integer},
+use futures::future::BoxFuture;
+use hashring_redis::commands::{
+    Args, CommandExtension, Connection, Dispatcher, keyword, parse_integer,
+    store::{Current, Overlay},
 };
+
+fn expiry(deadline: Option<u64>) -> Expiry {
+    deadline.map_or(Expiry::Clear, Expiry::At)
+}
+
+fn no_such_script() -> RedisError {
+    RedisError::new("NOSCRIPT", "No matching script. Please use EVAL.")
+}
 use crate::{
     error::{RedisError, RedisResult},
     resp::Reply,
@@ -53,9 +43,79 @@ use crate::{
 /// rather than the data, and the ones that would start a script of their own
 /// while this one holds the gateway.
 const REFUSED: &[&str] = &[
-    "auth", "hello", "reset", "select", "client", "quit", "eval", "evalsha", "script", "multi",
-    "exec", "discard", "watch",
+    "auth",
+    "hello",
+    "reset",
+    "select",
+    "client",
+    "quit",
+    "eval",
+    "evalsha",
+    "script",
+    "multi",
+    "exec",
+    "discard",
+    "watch",
+    "keys",
+    "scan",
+    "dbsize",
+    "randomkey",
 ];
+
+const COMMANDS: &[CommandInfo] = &[
+    CommandInfo {
+        name: "eval",
+        arity: -3,
+        flags: &["write"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        declined: false,
+        keyspace: false,
+    },
+    CommandInfo {
+        name: "evalsha",
+        arity: -3,
+        flags: &["write"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        declined: false,
+        keyspace: false,
+    },
+    CommandInfo {
+        name: "script",
+        arity: -2,
+        flags: &["admin"],
+        first_key: 0,
+        last_key: 0,
+        step: 0,
+        declined: false,
+        keyspace: false,
+    },
+];
+
+impl CommandExtension for Scripts {
+    fn commands(&self) -> &'static [CommandInfo] {
+        COMMANDS
+    }
+
+    fn execute<'a>(
+        &'a self,
+        dispatcher: &'a Dispatcher,
+        connection: &'a mut Connection,
+        command: &'a CommandInfo,
+        arguments: &'a [Vec<u8>],
+    ) -> BoxFuture<'a, RedisResult<Reply>> {
+        Box::pin(async move {
+            let args = Args::new(command.name, arguments);
+            match command.name {
+                "script" => script_command(self, args),
+                _ => eval(self, dispatcher, connection, command, args).await,
+            }
+        })
+    }
+}
 
 /// How many scripts a gateway keeps for `EVALSHA`. A client's scripts are its
 /// own few texts, so the cache is small; it is bounded so that a client loading
@@ -71,8 +131,8 @@ const MAX_STEPS: usize = 10_000_000;
 /// The scripts this gateway has seen, and the lock that runs one at a time.
 #[derive(Default)]
 pub struct Scripts {
-    /// One script at a time, as Redis runs them. Taken before the declared
-    /// keys are locked, always in that order, so two scripts cannot deadlock.
+    /// One script at a time per extension. Cross-gateway exclusion is supplied
+    /// by the final conditional commit, rather than a local key lock.
     running: AsyncMutex<()>,
     sources: Mutex<Cached>,
     /// The Lua state every script runs in, taken out for the length of a run
@@ -154,73 +214,98 @@ impl Cached {
     }
 }
 
-/// What a script read, so that the writes it makes can be conditional on it.
-///
-/// The lock inside is what lets this reach the [`super::store::Store`] that
-/// every command handler takes by shared reference: a script's own reads and
-/// writes happen on one task, and a lock that is never held across an await
-/// costs nothing.
-#[derive(Default)]
+/// One attempt's private view of its declared key. The original version is
+/// immutable; staged writes only replace `current`.
 pub struct State {
-    inner: Mutex<Read>,
+    key: Option<Vec<u8>>,
+    inner: Mutex<Snapshot>,
 }
 
-#[derive(Default)]
-struct Read {
-    /// Each key's version when the script read it; `None` is a key the script
-    /// read as absent.
-    versions: HashMap<Vec<u8>, Option<RecordVersion>>,
-    /// Whether the script has changed something a second run would change
-    /// again.
-    repeated: bool,
+#[derive(Clone)]
+struct Snapshot {
+    expected: Option<RecordVersion>,
+    current: Option<Current>,
+    dirty: bool,
 }
 
 impl State {
-    /// What the script saw of a key, or `None` when it never read it.
-    pub fn version(&self, key: &[u8]) -> Option<Option<RecordVersion>> {
-        self.inner
+    fn new(key: Option<Vec<u8>>, current: Option<Current>) -> Self {
+        Self {
+            key,
+            inner: Mutex::new(Snapshot {
+                expected: current.as_ref().map(|value| value.version.clone()),
+                current,
+                dirty: false,
+            }),
+        }
+    }
+
+    fn check_key(&self, key: &[u8]) -> RedisResult<()> {
+        if self.key.as_deref() != Some(key) {
+            return Err(RedisError::new(
+                "ERR",
+                "a script may only touch its declared key",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn read(&self, key: &[u8]) -> RedisResult<Option<Current>> {
+        self.check_key(key)?;
+        Ok(self
+            .inner
             .lock()
             .expect("a script's own lock")
-            .versions
-            .get(key)
-            .cloned()
+            .current
+            .clone())
     }
 
-    /// Notes what a key held, so a later write can require that it still does.
-    pub fn record(&self, key: &[u8], version: Option<RecordVersion>) {
-        self.inner
-            .lock()
-            .expect("a script's own lock")
-            .versions
-            .insert(key.to_vec(), version);
+    /// Only this operation can publish a script's changes. A failed condition
+    /// writes nothing, so the complete attempt can safely be repeated.
+    async fn commit(&self, client: &HashringClient) -> RedisResult<bool> {
+        let snapshot = self.inner.lock().expect("a script's own lock").clone();
+        if !snapshot.dirty {
+            return Ok(true);
+        }
+        let key = self.key.clone().expect("a staged write has a declared key");
+        let expected = snapshot
+            .expected
+            .map_or(Precondition::Absent, Precondition::Version);
+        Ok(match snapshot.current {
+            Some(current) => client
+                .put_if(key, current.value, expiry(current.deadline), expected)
+                .await?
+                .is_some(),
+            None => client.delete_if(key, expected).await?.is_some(),
+        })
+    }
+}
+
+impl Overlay for State {
+    fn read(&self, key: &[u8]) -> RedisResult<Option<Current>> {
+        State::read(self, key)
     }
 
-    /// Notes a write that landed, for the write that follows it on the same key.
-    pub fn written(&self, key: &[u8], version: RecordVersion) {
-        self.record(key, Some(version));
-    }
-
-    /// A command whose effect a second run of this script would not repeat.
-    pub fn mark_repeated(&self) {
-        self.inner.lock().expect("a script's own lock").repeated = true;
-    }
-
-    pub fn repeated(&self) -> bool {
-        self.inner.lock().expect("a script's own lock").repeated
-    }
-
-    /// Starts the next run of the same script, which starts from nothing.
-    pub fn clear(&self) {
-        let mut inner = self.inner.lock().expect("a script's own lock");
-        inner.versions.clear();
-        inner.repeated = false;
+    fn write(&self, key: &[u8], value: Option<Current>) -> RedisResult<()> {
+        self.check_key(key)?;
+        if value
+            .as_ref()
+            .is_some_and(|current| current.value.len() > MAX_VALUE_BYTES)
+        {
+            return Err(RedisError::new("ERR", "value exceeds the cluster ceiling"));
+        }
+        let mut snapshot = self.inner.lock().expect("a script's own lock");
+        snapshot.current = value;
+        snapshot.dirty = true;
+        Ok(())
     }
 }
 
 /// `EVAL script numkeys key... arg...`, and `EVALSHA` with the hash in place of
 /// the script.
 pub async fn eval(
-    dispatcher: &Arc<Dispatcher>,
+    scripts: &Scripts,
+    dispatcher: &Dispatcher,
     connection: &mut Connection,
     command: &CommandInfo,
     args: Args<'_>,
@@ -231,23 +316,20 @@ pub async fn eval(
     };
     let source = match command.name {
         "evalsha" => {
-            let source = dispatcher
-                .scripts()
-                .cached(digest(script)?)
-                .ok_or_else(RedisError::no_such_script)?;
-            dispatcher.remember(&source);
+            let source = scripts.cached(digest(script)?).ok_or_else(no_such_script)?;
+            scripts.remember(&source);
             source
         }
-        _ => dispatcher.remember(script),
+        _ => scripts.remember(script),
     };
     let (keys, argv) = keys_and_arguments(tail)?;
-    run(dispatcher, connection, &source, keys, argv).await
+    run(scripts, dispatcher, connection, &source, keys, argv).await
 }
 
 /// `SCRIPT LOAD`, `SCRIPT EXISTS` and `SCRIPT FLUSH`.
-pub fn script_command(dispatcher: &Dispatcher, mut args: Args<'_>) -> RedisResult<Reply> {
+pub fn script_command(scripts: &Scripts, mut args: Args<'_>) -> RedisResult<Reply> {
     let subcommand = args.next_keyword().ok_or_else(RedisError::syntax)?;
-    let mut cache = dispatcher.scripts().cache();
+    let mut cache = scripts.cache();
     match subcommand.as_str() {
         "load" => {
             let source = args.next_owned()?;
@@ -277,51 +359,51 @@ pub fn script_command(dispatcher: &Dispatcher, mut args: Args<'_>) -> RedisResul
     }
 }
 
-/// Runs one script, and runs it again if a write it made found the key changed
-/// underneath it, which is the moment Redis's single thread would not have let
-/// happen.
+/// Run a private single-key attempt and publish its final state once.
 async fn run(
-    dispatcher: &Arc<Dispatcher>,
+    scripts: &Scripts,
+    dispatcher: &Dispatcher,
     connection: &Connection,
     source: &[u8],
     keys: Vec<Vec<u8>>,
     argv: Vec<Vec<u8>>,
 ) -> RedisResult<Reply> {
-    // A script is atomic here only over the one key it declared. The gateway
-    // makes each of its commands atomic by carrying a precondition to the node
-    // that owns the key, and a script that reads a key and then writes that
-    // same key is stitched into one unit by running it again when the key
-    // moved underneath it. That holds for a single key and no further: two keys
-    // may sit on two owners, and a read of one cannot be made a precondition on
-    // a write to the other. Rather than answer with a run whose atomicity the
-    // cluster cannot deliver, a script that declares more than one key is
-    // refused, which is the scope Redis's own cluster mode refuses too.
     if keys.len() > 1 {
         return Err(RedisError::new(
             "ERR",
-            "a script may declare at most one key: the gateway runs a script atomically \
-             over a single key, and cannot make a script that touches several keys \
-             atomic when they may be owned by different nodes",
+            "a script may declare at most one key",
         ));
     }
-    // One script at a time, then the keys it declared for as long as it runs.
-    // The order is fixed so that two scripts cannot take each other's locks in
-    // opposite orders.
-    let _running = dispatcher.scripts().running.lock().await;
-    let _held = dispatcher.lock_declared(&keys).await;
-    let state = Arc::new(State::default());
-    // The budget is rebuilt for each run, since a script that is run again
-    // gets the whole of it, as it would have had the first time.
-    let limits = || Limits {
-        max_steps: MAX_STEPS,
-        timeout: dispatcher.command_timeout(),
-    };
-    let mut runtime = dispatcher.scripts().take_runtime();
+    let _running = scripts.running.lock().await;
+
+    let deadline = tokio::time::Instant::now() + dispatcher.command_timeout();
     loop {
-        state.clear();
-        // A script is given a connection of its own: everything it may run keeps
-        // the connection as it found it, since the commands that would change
-        // it are refused.
+        let client = match keys.first() {
+            Some(_) => Some(dispatcher.client.get().await?),
+            None => None,
+        };
+        let current = match keys.first() {
+            Some(key) => match client
+                .as_ref()
+                .expect("a declared key has a client")
+                .get(key.clone())
+                .await
+            {
+                Ok(value) => Some(Current {
+                    value: value.value,
+                    deadline: value.expires_at_unix_millis,
+                    version: value.version,
+                }),
+                Err(hashring_client::ClientError::Operation(failure))
+                    if failure.code == ErrorCode::NotFound =>
+                {
+                    None
+                }
+                Err(error) => return Err(error.into()),
+            },
+            None => None,
+        };
+        let state = Arc::new(State::new(keys.first().cloned(), current));
         let host = Host {
             dispatcher: dispatcher.clone(),
             connection: Connection {
@@ -330,21 +412,24 @@ async fn run(
             },
             state: state.clone(),
         };
+        let limits = Limits {
+            max_steps: MAX_STEPS,
+            timeout: deadline.saturating_duration_since(tokio::time::Instant::now()),
+        };
+        let mut runtime = scripts.take_runtime();
         let answer = runtime
-            .run(host, source, keys.clone(), argv.clone(), limits())
+            .run(host, source, keys.clone(), argv.clone(), limits)
             .await;
-        dispatcher.scripts().put_runtime(runtime);
-        match answer {
-            Ok(reply) => return Ok(reply),
-            // The script can only be run again if nothing it did would happen
-            // twice. A conflict after a repeated change is reported instead,
-            // because the answer the client would get is one no run produced.
-            Err(error) if error.is_conflict() && !state.repeated() => {
-                runtime = dispatcher.scripts().take_runtime();
-                continue;
-            }
-            Err(error) => return Err(error),
+        scripts.put_runtime(runtime);
+        // Like Redis, an error after successful commands does not roll those
+        // commands back. Their staged effects still publish in one commit.
+        if let Some(client) = client
+            && !state.commit(&client).await?
+        {
+            tokio::task::yield_now().await;
+            continue;
         }
+        return answer;
     }
 }
 
@@ -371,10 +456,10 @@ fn keys_and_arguments(tail: &[Vec<u8>]) -> RedisResult<Split> {
 ///
 /// The interpreter has already checked the command against the script's `KEYS`
 /// and against the command table, so what is left here is the gateway's own
-/// policy: a command that would change the connection, and a command whose
-/// effect a second run of this script would repeat.
+/// policy: commands that change the connection or bypass the private snapshot
+/// are refused.
 struct Host {
-    dispatcher: Arc<Dispatcher>,
+    dispatcher: Dispatcher,
     /// The connection a script sees, which is a copy of the client's rather
     /// than the client's itself: nothing a script may run changes a connection,
     /// so it has no business holding the real one while it runs.
@@ -400,35 +485,12 @@ impl script::Host for Host {
                     format!("This command is not allowed from a script: {name}"),
                 ));
             }
-            if !is_idempotent(&name) {
-                state.mark_repeated();
-            }
             dispatcher
-                .dispatch(&mut connection, command, Some(&state))
+                .execute_with_store(&mut connection, command, Some(state.as_ref()))
                 .await
                 .reply
         }
     }
-}
-
-/// Commands whose effect a second run of the same script would not repeat.
-/// Everything else a script may run writes what it writes again unchanged, so
-/// a conflict can be answered by running the script once more.
-fn is_idempotent(name: &str) -> bool {
-    !matches!(
-        name,
-        "incr"
-            | "decr"
-            | "incrby"
-            | "decrby"
-            | "incrbyfloat"
-            | "append"
-            | "setrange"
-            | "getset"
-            | "getdel"
-            | "rename"
-            | "renamenx"
-    )
 }
 
 /// The SHA-1 of a script as forty hex characters, read back into the twenty
@@ -500,15 +562,5 @@ mod tests {
             hash_of(&hex.to_uppercase()).unwrap(),
             hash_of(&hex).unwrap()
         );
-    }
-
-    #[test]
-    fn the_commands_a_second_run_would_repeat_are_named() {
-        for name in ["incr", "append", "getdel", "rename"] {
-            assert!(!is_idempotent(name), "{name}");
-        }
-        for name in ["get", "set", "setnx", "del", "expire", "ttl"] {
-            assert!(is_idempotent(name), "{name}");
-        }
     }
 }
