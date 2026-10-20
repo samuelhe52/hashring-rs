@@ -1,6 +1,35 @@
 use super::*;
 
 #[tokio::test]
+async fn followers_accept_cluster_values_above_their_local_write_limit() {
+    let topology = replication_topology(3);
+    let key = key_with_placement(&topology, |replicas| replicas[1..].contains(&"node-2"));
+    let mut service = service_for("node-2", topology.clone());
+    service.max_value_bytes = 8;
+    let value = b"larger-than-eight";
+    let entry = replication_entry(&topology, key.clone(), 1, 1, value, false, None);
+    let applied = service
+        .replicate_mutation(Request::new(entry))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(applied.applied_stream_sequence, 1);
+    assert_eq!(
+        service.state.read().await.records[key.as_slice()]
+            .value
+            .as_ref(),
+        value
+    );
+    let next = replication_entry(&topology, key, 2, 2, b"next", false, None);
+    let applied = service
+        .replicate_mutation(Request::new(next))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(applied.applied_stream_sequence, 2);
+}
+
+#[tokio::test]
 async fn replication_progress_reports_owner_ack_only_when_known() {
     let topology = replication_topology(3);
     let service = service_for("node-1", topology.clone());

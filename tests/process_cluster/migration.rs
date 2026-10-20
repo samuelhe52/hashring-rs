@@ -1,6 +1,76 @@
 use super::*;
 
 #[tokio::test]
+async fn migration_carries_a_value_above_the_control_message_limit() {
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("large-value.redb");
+    let ports = unused_ports(3);
+    let endpoint = format!("http://127.0.0.1:{}", ports[0]);
+    let members = vec![("node-1".to_owned(), ports[1])];
+    let mut args = coordinator_arguments(ports[0], &state, &members);
+    args.extend(["--desired-replication-factor".into(), "1".into()]);
+    let _coordinator = spawn_process(&args);
+    wait_for_listener(ports[0]);
+    let node_args = |id: &str, port: u16| {
+        vec![
+            "node".into(),
+            "--id".into(),
+            id.into(),
+            "--listen".into(),
+            format!("127.0.0.1:{port}"),
+            "--coordinator".into(),
+            endpoint.clone(),
+            "--max-value-bytes".into(),
+            (128 * 1024 * 1024).to_string(),
+            "--max-pending-replication-bytes".into(),
+            (256 * 1024 * 1024).to_string(),
+            "--max-migration-journal-bytes".into(),
+            (256 * 1024 * 1024).to_string(),
+        ]
+    };
+    let _source = spawn_process(&node_args("node-1", ports[1]));
+    wait_for_listener(ports[1]);
+    let client = HashringClient::connect(&endpoint, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let plan = client
+        .begin_topology_change(vec![
+            Member {
+                node_id: "node-1".into(),
+                endpoint: format!("http://127.0.0.1:{}", ports[1]),
+            },
+            Member {
+                node_id: "node-2".into(),
+                endpoint: format!("http://127.0.0.1:{}", ports[2]),
+            },
+        ])
+        .await
+        .unwrap();
+    let key = (0_u64..10_000)
+        .map(|index| index.to_be_bytes().to_vec())
+        .find(|key| plan.target_topology.owner(key).unwrap().node_id == "node-2")
+        .unwrap();
+    let value = vec![7; 96 * 1024 * 1024];
+    client.put(key.clone(), value.clone()).await.unwrap();
+    let _destination = spawn_process(&node_args("node-2", ports[2]));
+    wait_for_listener(ports[2]);
+    client
+        .execute_topology_change(&plan.change_id, plan.base_epoch, plan.target_topology.epoch)
+        .await
+        .unwrap();
+    client.refresh_topology().await.unwrap();
+    assert_eq!(
+        client.topology().await.owner(&key).unwrap().node_id,
+        "node-2"
+    );
+    assert!(
+        client.get(key).await.unwrap().value == value,
+        "migration changed the large value"
+    );
+}
+
+#[tokio::test]
 async fn separate_processes_route_bytes_and_survive_coordinator_restart() {
     let _guard = process_test_lock().lock().await;
     let directory = tempfile::tempdir().unwrap();

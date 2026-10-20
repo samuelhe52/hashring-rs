@@ -11,7 +11,7 @@ use hashring_coordinator::{
     CoordinatorRepository, CoordinatorService, RedbTopologyRepository, load_or_initialize,
 };
 use hashring_core::{
-    limits::MAX_CONTROL_MESSAGE_BYTES,
+    limits::{MAX_CONTROL_MESSAGE_BYTES, MAX_DATA_MESSAGE_BYTES},
     proto::{coordinator_server::CoordinatorServer, data_node_server::DataNodeServer},
     topology::{
         ClusterTimings, Member, TopologyConfig, TopologySnapshot, WriteAckPolicy,
@@ -731,8 +731,8 @@ async fn run_node(config: NodeConfig, stop_response_delay_ms: u64) -> Result<()>
     Server::builder()
         .add_service(
             DataNodeServer::new(service)
-                .max_decoding_message_size(MAX_CONTROL_MESSAGE_BYTES)
-                .max_encoding_message_size(MAX_CONTROL_MESSAGE_BYTES),
+                .max_decoding_message_size(MAX_DATA_MESSAGE_BYTES)
+                .max_encoding_message_size(MAX_DATA_MESSAGE_BYTES),
         )
         .serve_with_shutdown(config.listen, async move {
             tokio::select! {

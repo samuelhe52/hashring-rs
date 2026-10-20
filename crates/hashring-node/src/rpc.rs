@@ -43,9 +43,9 @@ fn apply_replication_entry(
     if entry.key.is_empty() || entry.key.len() > node.max_key_bytes {
         return Err(Status::invalid_argument("replication key size is invalid"));
     }
-    if entry.value.len() > node.max_value_bytes {
+    if entry.value.len() > MAX_VALUE_BYTES {
         return Err(Status::resource_exhausted(
-            "replication value exceeds the node limit",
+            "replication value exceeds the cluster ceiling",
         ));
     }
     if entry.deleted && !entry.value.is_empty() {

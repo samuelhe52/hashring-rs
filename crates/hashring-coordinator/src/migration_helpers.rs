@@ -183,8 +183,8 @@ impl CoordinatorService {
         // Channel clones share one reconnecting HTTP/2 connection. The caller's
         // rpc_before deadline bounds connection establishment and the RPC.
         Ok(DataNodeClient::new(channels[endpoint].clone())
-            .max_decoding_message_size(hashring_core::limits::MAX_CONTROL_MESSAGE_BYTES)
-            .max_encoding_message_size(hashring_core::limits::MAX_CONTROL_MESSAGE_BYTES))
+            .max_decoding_message_size(hashring_core::limits::MAX_DATA_MESSAGE_BYTES)
+            .max_encoding_message_size(hashring_core::limits::MAX_DATA_MESSAGE_BYTES))
     }
 }
 
