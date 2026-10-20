@@ -15,6 +15,15 @@ the same repetition, so the comparison survives the host's background load.
 unchanged on writes and reads and lower on the mixed workload in all three
 repetitions, while the gateway's CPU per request and the p50 latency go up.
 
+> **These numbers are being replaced.** They were measured with the harness
+> before the fixes of
+> [9e65434](https://github.com/samuelhe52/hashring-rs/commit/9e65434c8d44cf6b1503105e4787a5a9352226ed)
+> (the values were 8 bytes instead of 128, the two systems had a different
+> number of client connections, and the mixed phase's rate was not the
+> requests over the phase's wall-clock time). The run below is a first look
+> at the question; the numbers in this file come from a rerun with the fixed
+> harness.
+
 ## Change
 
 `ClientConfig::connection_pool_size` says how many HTTP/2 connections the
