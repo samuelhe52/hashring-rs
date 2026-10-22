@@ -647,6 +647,7 @@ impl CoordinatorService {
             source_cleaned: false,
             snapshot_records: 0,
             changelog_watermark: 0,
+            changelog_replay_ms: 0,
             verified: false,
         };
         let change = TopologyChange {
@@ -664,6 +665,7 @@ impl CoordinatorService {
             failed_node_id: None,
             activation_ready: false,
             direct_merge: false,
+            timings: MigrationTimings::default(),
         };
         let deadline = Instant::now() + self.migration_timeout;
         let mut source = self.connect_node(&range.source_endpoint, deadline).await?;

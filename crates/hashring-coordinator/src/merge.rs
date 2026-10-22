@@ -331,11 +331,14 @@ impl CoordinatorService {
             return Err(error);
         }
         let deadline = Instant::now() + self.migration_timeout;
+        let pause_started = Instant::now();
         self.set_phase(MigrationPhase::PausingWrites).await?;
         change.phase = MigrationPhase::PausingWrites;
         let result = async {
             self.set_direct_merge_fence(&change, true, true, deadline)
                 .await?;
+            change.timings.pause_writes_ms = millis(pause_started.elapsed());
+            let verify_started = Instant::now();
             self.set_phase(MigrationPhase::Verifying).await?;
             change.phase = MigrationPhase::Verifying;
             let snapshot = self.state.read().await.clone();
@@ -353,7 +356,10 @@ impl CoordinatorService {
                     Instant::now(),
                 )?;
             }
+            let proof_started = Instant::now();
             let (required, candidates) = merge_proof(&snapshot, &change)?;
+            change.timings.merge_proof_ms = millis(proof_started.elapsed());
+            let catch_up_started = Instant::now();
             let mut caught_up = BTreeSet::new();
             for pair in &required {
                 loop {
@@ -388,6 +394,9 @@ impl CoordinatorService {
                 .filter(|(_, pairs)| pairs.is_subset(&caught_up))
                 .map(|(admission, _)| admission)
                 .collect();
+            change.timings.catch_up_ms = millis(catch_up_started.elapsed());
+            change.timings.verify_ms = millis(verify_started.elapsed());
+            let publish_started = Instant::now();
             self.set_phase(MigrationPhase::ReadyToPublish).await?;
             change.phase = MigrationPhase::ReadyToPublish;
             if !self.pre_publish_delay.is_zero() {
@@ -415,6 +424,7 @@ impl CoordinatorService {
                     admissions: carried,
                 },
             )?;
+            change.timings.publish_ms = millis(publish_started.elapsed());
             Ok::<(), Status>(())
         }
         .await;
@@ -428,7 +438,10 @@ impl CoordinatorService {
         if !self.post_publish_delay.is_zero() {
             tokio::time::sleep(self.post_publish_delay).await;
         }
-        self.finish_direct_merge(change).await
+        let activation_started = Instant::now();
+        let mut completed = self.finish_direct_merge(change).await?;
+        completed.timings.activation_ms = millis(activation_started.elapsed());
+        Ok(completed)
     }
 
     pub(super) async fn finish_direct_merge(

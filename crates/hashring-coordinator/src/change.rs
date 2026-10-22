@@ -95,6 +95,7 @@ impl CoordinatorService {
         }
 
         let deadline = Instant::now() + self.migration_timeout;
+        let copy_started = Instant::now();
         self.set_phase(MigrationPhase::CopyingSnapshot).await?;
         change.phase = MigrationPhase::CopyingSnapshot;
         let change_ref = &change;
@@ -119,9 +120,12 @@ impl CoordinatorService {
         for progress in progresses {
             replace_range_progress(&mut change, progress);
         }
+        change.timings.snapshot_copy_ms = millis(copy_started.elapsed());
+        change.timings.changelog_replay_ms = replay_millis(&change);
 
         self.set_phase(MigrationPhase::ReplayingChangelog).await?;
         change.phase = MigrationPhase::ReplayingChangelog;
+        let pause_started = Instant::now();
         self.set_phase(MigrationPhase::PausingWrites).await?;
         change.phase = MigrationPhase::PausingWrites;
         let change_ref = &change;
@@ -142,7 +146,9 @@ impl CoordinatorService {
                     .await;
             }
         };
+        change.timings.pause_writes_ms = millis(pause_started.elapsed());
 
+        let verify_started = Instant::now();
         if let Err(error) = self.set_phase(MigrationPhase::Verifying).await {
             return self
                 .abort_after_error(&change, error, retry_transient)
@@ -175,7 +181,10 @@ impl CoordinatorService {
         for progress in progresses {
             replace_range_progress(&mut change, progress);
         }
+        change.timings.verify_ms = millis(verify_started.elapsed());
+        change.timings.changelog_replay_ms = replay_millis(&change);
 
+        let publish_started = Instant::now();
         self.set_phase(MigrationPhase::ReadyToPublish).await?;
         change.phase = MigrationPhase::ReadyToPublish;
         if !self.pre_publish_delay.is_zero() {
@@ -226,10 +235,14 @@ impl CoordinatorService {
         }
         tracing::debug!(change_id = %change.change_id, epoch = change.target_topology.epoch, moved_ranges = change.ranges.len(), replica_obligations = change.replica_obligations.len(), "topology published; activation pending");
         change.phase = MigrationPhase::Published;
+        change.timings.publish_ms = millis(publish_started.elapsed());
         if !self.post_publish_delay.is_zero() {
             tokio::time::sleep(self.post_publish_delay).await;
         }
-        self.finish_published_change(change, deadline).await
+        let activation_started = Instant::now();
+        let mut completed = self.finish_published_change(change, deadline).await?;
+        completed.timings.activation_ms = millis(activation_started.elapsed());
+        Ok(completed)
     }
 
     pub(super) async fn set_recovery_block_reason(&self, reason: String) -> Result<(), Status> {
@@ -682,6 +695,7 @@ impl CoordinatorService {
             }
         }
 
+        let replay_started = Instant::now();
         let watermark = replay_changelog(
             &mut source,
             &mut destination,
@@ -697,6 +711,7 @@ impl CoordinatorService {
         progress.destination_process_instance_id = destination_process_instance_id;
         progress.snapshot_records = snapshot_records;
         progress.changelog_watermark = watermark;
+        progress.changelog_replay_ms = millis(replay_started.elapsed());
         Ok(progress)
     }
 
@@ -757,6 +772,7 @@ impl CoordinatorService {
         let mut destination = self
             .connect_node(&range.destination_endpoint, deadline)
             .await?;
+        let replay_started = Instant::now();
         let watermark = replay_changelog(
             &mut source,
             &mut destination,
@@ -795,6 +811,9 @@ impl CoordinatorService {
 
         let mut progress = range.clone();
         progress.changelog_watermark = final_watermark;
+        progress.changelog_replay_ms = range
+            .changelog_replay_ms
+            .saturating_add(millis(replay_started.elapsed()));
         progress.verified = true;
         Ok((progress, source_digest.digest))
     }

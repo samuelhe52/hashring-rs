@@ -877,6 +877,7 @@ mod tests {
             source_cleaned: false,
             snapshot_records: u64::MAX,
             changelog_watermark: u64::MAX,
+            changelog_replay_ms: 0,
             verified: true,
         };
         let change = crate::migration::TopologyChange {
@@ -894,6 +895,7 @@ mod tests {
             failed_node_id: None,
             activation_ready: false,
             direct_merge: false,
+            timings: crate::migration::MigrationTimings::default(),
         };
         let wire = crate::proto::TopologyChangeSnapshot::from(&change);
         assert!(wire.encoded_len() <= crate::limits::MAX_CONTROL_MESSAGE_BYTES);

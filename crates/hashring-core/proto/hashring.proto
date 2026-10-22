@@ -150,6 +150,22 @@ message RangeMigration {
   string source_process_instance_id = 11;
   string destination_process_instance_id = 12;
   bool source_cleaned = 13;
+  // Time this range spent replaying its changelog, summed over every replay.
+  uint64 changelog_replay_ms = 14;
+}
+
+// Wall-clock cost of the coordinator's work steps. Concurrent range work is
+// counted once per phase, so `changelog_replay_ms` is a sum over ranges and can
+// exceed the phase it ran in.
+message MigrationTimings {
+  uint64 snapshot_copy_ms = 1;
+  uint64 changelog_replay_ms = 2;
+  uint64 pause_writes_ms = 3;
+  uint64 verify_ms = 4;
+  uint64 publish_ms = 5;
+  uint64 activation_ms = 6;
+  uint64 merge_proof_ms = 7;
+  uint64 catch_up_ms = 8;
 }
 
 message TopologyChangeSnapshot {
@@ -167,6 +183,7 @@ message TopologyChangeSnapshot {
   TopologySnapshot base_topology = 12;
   string supersedes_change_id = 13;
   bool direct_merge = 14;
+  MigrationTimings timings = 15;
 }
 
 message ReplicaObligation {
