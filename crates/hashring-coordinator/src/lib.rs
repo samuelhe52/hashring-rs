@@ -1,7 +1,3 @@
-// Public tonic and redb APIs use concrete error types whose context is more
-// useful here than erasing or boxing them solely to reduce enum size.
-#![allow(clippy::result_large_err)]
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
@@ -393,7 +389,7 @@ pub enum RepositoryError {
     #[error("database error: {0}")]
     Database(#[from] redb::DatabaseError),
     #[error("transaction error: {0}")]
-    Transaction(#[from] redb::TransactionError),
+    Transaction(#[source] Box<redb::TransactionError>),
     #[error("table error: {0}")]
     Table(#[from] redb::TableError),
     #[error("storage error: {0}")]
@@ -412,6 +408,12 @@ pub enum RepositoryError {
     MissingBootstrap,
     #[error("configured bootstrap topology differs from durable topology")]
     BootstrapMismatch,
+}
+
+impl From<redb::TransactionError> for RepositoryError {
+    fn from(error: redb::TransactionError) -> Self {
+        Self::Transaction(Box::new(error))
+    }
 }
 
 pub trait CoordinatorRepository: Send + Sync {

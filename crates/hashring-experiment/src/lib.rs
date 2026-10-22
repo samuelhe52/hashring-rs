@@ -28,6 +28,21 @@ use tonic::transport::Channel;
 mod latency;
 mod scaling;
 
+/// The cluster a mode runs against and the outputs it fills in.
+pub(crate) struct RunContext<'a> {
+    pub config: &'a ExperimentConfig,
+    pub members: &'a [Member],
+    pub initial_count: usize,
+    pub ports: &'a [u16],
+    pub coordinator_endpoint: &'a str,
+    pub admin_client: &'a HashringClient,
+    pub workload_client: &'a HashringClient,
+    pub processes: &'a mut ProcessGroup,
+    pub events: &'a EventLog,
+    pub measurements: &'a mut BTreeMap<String, Measurement>,
+    pub observations: &'a mut BTreeMap<String, Value>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExperimentMode {
@@ -857,39 +872,10 @@ async fn run_cluster(
         }),
     )?;
 
-    if matches!(config.mode, ExperimentMode::Availability) {
-        return run_availability(
+    {
+        let context = RunContext {
             config,
-            &members,
-            &ports,
-            &coordinator_endpoint,
-            &admin_client,
-            &mut processes,
-            events,
-            measurements,
-            observations,
-        )
-        .await;
-    }
-
-    if matches!(config.mode, ExperimentMode::Latency) {
-        return run_latency(
-            config,
-            &members,
-            &admin_client,
-            &workload_client,
-            &mut processes,
-            events,
-            measurements,
-            observations,
-        )
-        .await;
-    }
-
-    if matches!(config.mode, ExperimentMode::Scaling) {
-        return scaling::run(scaling::RunContext {
-            config,
-            peak_members: &members,
+            members: &members,
             initial_count,
             ports: &ports,
             coordinator_endpoint: &coordinator_endpoint,
@@ -899,8 +885,16 @@ async fn run_cluster(
             events,
             measurements,
             observations,
-        })
-        .await;
+        };
+        if matches!(context.config.mode, ExperimentMode::Availability) {
+            return run_availability(context).await;
+        }
+        if matches!(context.config.mode, ExperimentMode::Latency) {
+            return run_latency(context).await;
+        }
+        if matches!(context.config.mode, ExperimentMode::Scaling) {
+            return scaling::run(context).await;
+        }
     }
 
     if matches!(config.mode, ExperimentMode::Correctness) {
@@ -1140,18 +1134,19 @@ async fn wait_for_full_rf(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_availability(
-    config: &ExperimentConfig,
-    members: &[Member],
-    ports: &[u16],
-    coordinator_endpoint: &str,
-    admin_client: &HashringClient,
-    processes: &mut ProcessGroup,
-    events: &EventLog,
-    measurements: &mut BTreeMap<String, Measurement>,
-    observations: &mut BTreeMap<String, Value>,
-) -> Result<u64> {
+async fn run_availability(context: RunContext<'_>) -> Result<u64> {
+    let RunContext {
+        config,
+        members,
+        ports,
+        coordinator_endpoint,
+        admin_client,
+        processes,
+        events,
+        measurements,
+        observations,
+        ..
+    } = context;
     let topology = admin_client.refresh_topology().await?;
     let owner_keys: Vec<_> = (0..config.key_count)
         .filter(|key| {
@@ -1401,17 +1396,18 @@ struct NodeCounters {
 
 /// Runs the `latency` mode: one stage per target rate, and a check of the key
 /// space the load left behind.
-#[allow(clippy::too_many_arguments)]
-async fn run_latency(
-    config: &ExperimentConfig,
-    members: &[Member],
-    admin_client: &HashringClient,
-    workload_client: &HashringClient,
-    processes: &mut ProcessGroup,
-    events: &EventLog,
-    measurements: &mut BTreeMap<String, Measurement>,
-    observations: &mut BTreeMap<String, Value>,
-) -> Result<u64> {
+async fn run_latency(context: RunContext<'_>) -> Result<u64> {
+    let RunContext {
+        config,
+        members,
+        admin_client,
+        workload_client,
+        processes,
+        events,
+        measurements,
+        observations,
+        ..
+    } = context;
     ensure!(
         !config.target_rates.is_empty(),
         "the latency mode needs at least one target rate"

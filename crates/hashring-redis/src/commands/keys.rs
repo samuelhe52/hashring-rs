@@ -43,7 +43,7 @@ pub async fn exists(store: &Store<'_>, args: Args<'_>) -> RedisResult<Reply> {
 }
 
 pub async fn key_type(store: &Store<'_>, mut args: Args<'_>) -> RedisResult<Reply> {
-    let key = args.next()?;
+    let key = args.next_required()?;
     Ok(match store.read(key).await? {
         // Every value this gateway stores is a byte string.
         Some(_) => Reply::Simple("string".into()),
@@ -61,8 +61,8 @@ pub async fn rename(
     mut args: Args<'_>,
     only_if_absent: bool,
 ) -> RedisResult<Reply> {
-    let from = args.next()?;
-    let to = args.next()?;
+    let from = args.next_required()?;
+    let to = args.next_required()?;
     let Some(source) = store.read(from).await? else {
         return Err(RedisError::no_such_key());
     };
@@ -147,7 +147,7 @@ impl ExpiryGuard {
 /// `EXPIRE`, `PEXPIRE`, `EXPIREAT` and `PEXPIREAT`. A deadline that is not in
 /// the future deletes the key, as Redis does, whichever form named it.
 pub async fn expire(store: &Store<'_>, mut args: Args<'_>, form: TtlForm) -> RedisResult<Reply> {
-    let key = args.next()?;
+    let key = args.next_required()?;
     let amount = args.next_integer()?;
     let guard = ExpiryGuard::parse(&mut args)?;
     let requested = form
@@ -174,7 +174,7 @@ pub async fn expire(store: &Store<'_>, mut args: Args<'_>, form: TtlForm) -> Red
 }
 
 pub async fn persist(store: &Store<'_>, mut args: Args<'_>) -> RedisResult<Reply> {
-    let key = args.next()?;
+    let key = args.next_required()?;
     store
         .update(key, |current| {
             Ok(match current {
@@ -189,7 +189,7 @@ pub async fn persist(store: &Store<'_>, mut args: Args<'_>) -> RedisResult<Reply
 }
 
 pub async fn ttl(store: &Store<'_>, mut args: Args<'_>, unit: TimeUnit) -> RedisResult<Reply> {
-    let key = args.next()?;
+    let key = args.next_required()?;
     Ok(match store.read(key).await? {
         // -2 is no key at all, -1 a key with no deadline.
         None => Reply::Integer(-2),

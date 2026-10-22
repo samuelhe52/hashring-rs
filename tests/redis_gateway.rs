@@ -10,9 +10,8 @@ use std::{collections::HashMap, time::Duration};
 
 use hashring_core::topology::Member;
 
-#[allow(dead_code)]
 #[path = "support/redis_gateway.rs"]
-mod gateway_support;
+pub mod gateway_support;
 use gateway_support::*;
 
 /// Every key of a cluster that is spread over more than one owner, so a

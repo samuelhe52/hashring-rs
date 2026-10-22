@@ -28,14 +28,14 @@ fn too_large() -> RedisError {
 }
 
 pub async fn get(store: &Store<'_>, mut args: Args<'_>) -> RedisResult<Reply> {
-    let key = args.next()?;
+    let key = args.next_required()?;
     Ok(bulk_or_nil(
         store.read(key).await?.map(|current| current.value),
     ))
 }
 
 pub async fn strlen(store: &Store<'_>, mut args: Args<'_>) -> RedisResult<Reply> {
-    let key = args.next()?;
+    let key = args.next_required()?;
     let length = store
         .read(key)
         .await?
@@ -44,7 +44,7 @@ pub async fn strlen(store: &Store<'_>, mut args: Args<'_>) -> RedisResult<Reply>
 }
 
 pub async fn getrange(store: &Store<'_>, mut args: Args<'_>) -> RedisResult<Reply> {
-    let key = args.next()?;
+    let key = args.next_required()?;
     let start = args.next_integer()?;
     let end = args.next_integer()?;
     let value = store
@@ -56,7 +56,7 @@ pub async fn getrange(store: &Store<'_>, mut args: Args<'_>) -> RedisResult<Repl
 }
 
 pub async fn getdel(store: &Store<'_>, mut args: Args<'_>) -> RedisResult<Reply> {
-    let key = args.next()?;
+    let key = args.next_required()?;
     store
         .update(key, |current| {
             Ok(match current {
@@ -72,7 +72,7 @@ pub async fn getdel(store: &Store<'_>, mut args: Args<'_>) -> RedisResult<Reply>
 /// `GETEX key [EX s | PX ms | EXAT ts | PXAT ts | PERSIST]`. Without an option
 /// it is a `GET`; with one it changes only the deadline.
 pub async fn getex(store: &Store<'_>, mut args: Args<'_>) -> RedisResult<Reply> {
-    let key = args.next()?;
+    let key = args.next_required()?;
     let mut change: Option<Option<u64>> = None;
     while let Some(option) = args.next_keyword() {
         if change.is_some() {
@@ -183,7 +183,7 @@ impl SetOptions {
 }
 
 pub async fn set(store: &Store<'_>, mut args: Args<'_>) -> RedisResult<Reply> {
-    let key = args.next()?;
+    let key = args.next_required()?;
     let value = args.next_owned()?;
     let options = SetOptions::parse(&mut args)?;
     if options.condition.is_none() && !options.get {
@@ -225,7 +225,7 @@ pub async fn set_with_ttl(
     mut args: Args<'_>,
     unit: TimeUnit,
 ) -> RedisResult<Reply> {
-    let key = args.next()?;
+    let key = args.next_required()?;
     let amount = args.next_integer()?;
     let value = args.next_owned()?;
     let deadline = positive_deadline(
@@ -238,7 +238,7 @@ pub async fn set_with_ttl(
 }
 
 pub async fn setnx(store: &Store<'_>, mut args: Args<'_>) -> RedisResult<Reply> {
-    let key = args.next()?;
+    let key = args.next_required()?;
     let value = args.next_owned()?;
     store
         .update(key, |current| {
@@ -255,7 +255,7 @@ pub async fn setnx(store: &Store<'_>, mut args: Args<'_>) -> RedisResult<Reply> 
 }
 
 pub async fn getset(store: &Store<'_>, mut args: Args<'_>) -> RedisResult<Reply> {
-    let key = args.next()?;
+    let key = args.next_required()?;
     let value = args.next_owned()?;
     store
         .update(key, |current| {
@@ -275,9 +275,9 @@ pub async fn setrange(
     mut args: Args<'_>,
     max_value: usize,
 ) -> RedisResult<Reply> {
-    let key = args.next()?;
+    let key = args.next_required()?;
     let offset = args.next_integer()?;
-    let patch = args.next()?;
+    let patch = args.next_required()?;
     let offset = usize::try_from(offset).map_err(|_| RedisError::out_of_range())?;
     if patch.is_empty() {
         // Redis neither creates nor pads a key for an empty patch; it only
@@ -310,8 +310,8 @@ pub async fn setrange(
 }
 
 pub async fn append(store: &Store<'_>, mut args: Args<'_>, max_value: usize) -> RedisResult<Reply> {
-    let key = args.next()?;
-    let suffix = args.next()?;
+    let key = args.next_required()?;
+    let suffix = args.next_required()?;
     store
         .update(key, |current| {
             let mut value = value_of(current).unwrap_or_default();
@@ -336,7 +336,7 @@ pub async fn incr_by(
     mut args: Args<'_>,
     step: Option<i64>,
 ) -> RedisResult<Reply> {
-    let key = args.next()?;
+    let key = args.next_required()?;
     let delta = match step {
         Some(step) => step,
         None => {
@@ -371,7 +371,7 @@ pub async fn incr_by(
 }
 
 pub async fn incrbyfloat(store: &Store<'_>, mut args: Args<'_>) -> RedisResult<Reply> {
-    let key = args.next()?;
+    let key = args.next_required()?;
     let delta = args.next_float()?;
     store
         .update(key, |current| {

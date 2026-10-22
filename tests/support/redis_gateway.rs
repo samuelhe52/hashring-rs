@@ -7,10 +7,10 @@ use std::{
     time::Duration,
 };
 
-pub(crate) struct Process(Child);
+pub struct Process(Child);
 
 impl Process {
-    pub(crate) fn stop(&mut self) {
+    pub fn stop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
@@ -24,12 +24,12 @@ impl Drop for Process {
 
 /// One test at a time: every case starts a coordinator, three nodes and a
 /// gateway, and they are all reached over the loopback interface.
-pub(crate) fn test_lock() -> &'static tokio::sync::Mutex<()> {
+pub fn test_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-pub(crate) fn unused_ports(count: usize) -> Vec<u16> {
+pub fn unused_ports(count: usize) -> Vec<u16> {
     let listeners: Vec<_> = (0..count)
         .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
         .collect();
@@ -39,7 +39,7 @@ pub(crate) fn unused_ports(count: usize) -> Vec<u16> {
         .collect()
 }
 
-pub(crate) fn spawn(arguments: &[String]) -> Process {
+pub fn spawn(arguments: &[String]) -> Process {
     Process(
         Command::new(env!("CARGO_BIN_EXE_hashring-rs"))
             .args(arguments)
@@ -51,7 +51,7 @@ pub(crate) fn spawn(arguments: &[String]) -> Process {
     )
 }
 
-pub(crate) fn wait_for_listener(port: u16) {
+pub fn wait_for_listener(port: u16) {
     let address = format!("127.0.0.1:{port}").parse().unwrap();
     for _ in 0..600 {
         if std::net::TcpStream::connect_timeout(&address, Duration::from_millis(20)).is_ok() {
@@ -64,20 +64,20 @@ pub(crate) fn wait_for_listener(port: u16) {
 
 /// A coordinator, three data nodes and a gateway, kept alive as long as the
 /// value is held.
-pub(crate) struct Cluster {
-    pub(crate) processes: Vec<Process>,
-    pub(crate) coordinator: String,
-    pub(crate) port: u16,
+pub struct Cluster {
+    pub processes: Vec<Process>,
+    pub coordinator: String,
+    pub port: u16,
     password: Option<String>,
     gateway_command: &'static str,
 }
 
 impl Cluster {
-    pub(crate) fn start(state: &Path, password: Option<&str>) -> Self {
+    pub fn start(state: &Path, password: Option<&str>) -> Self {
         Self::start_with_gateway(state, password, "redis-gateway")
     }
 
-    pub(crate) fn start_with_gateway(
+    pub fn start_with_gateway(
         state: &Path,
         password: Option<&str>,
         gateway_command: &'static str,
@@ -147,7 +147,7 @@ impl Cluster {
         }
     }
 
-    pub(crate) fn url(&self, password: Option<&str>) -> String {
+    pub fn url(&self, password: Option<&str>) -> String {
         match password {
             Some(password) => format!("redis://:{password}@127.0.0.1:{}", self.port),
             None => format!("redis://127.0.0.1:{}", self.port),
@@ -156,7 +156,7 @@ impl Cluster {
 
     /// Another gateway in front of the same cluster, as a second process
     /// behind a load balancer would be. Its URL, and the process to keep alive.
-    pub(crate) fn second_gateway(&self) -> (Process, String) {
+    pub fn second_gateway(&self) -> (Process, String) {
         let port = unused_ports(1)[0];
         let mut arguments = vec![
             self.gateway_command.to_owned(),
@@ -175,11 +175,11 @@ impl Cluster {
         (process, format!("redis://127.0.0.1:{port}"))
     }
 
-    pub(crate) fn authenticated_url(&self) -> String {
+    pub fn authenticated_url(&self) -> String {
         self.url(self.password.as_deref())
     }
 
-    pub(crate) async fn try_connect(
+    pub async fn try_connect(
         &self,
         url: &str,
     ) -> redis::RedisResult<redis::aio::MultiplexedConnection> {
@@ -188,17 +188,17 @@ impl Cluster {
             .await
     }
 
-    pub(crate) async fn connect(&self, url: &str) -> redis::aio::MultiplexedConnection {
+    pub async fn connect(&self, url: &str) -> redis::aio::MultiplexedConnection {
         self.try_connect(url)
             .await
             .expect("a redis client could not connect to the gateway")
     }
 
-    pub(crate) async fn client(&self) -> redis::aio::MultiplexedConnection {
+    pub async fn client(&self) -> redis::aio::MultiplexedConnection {
         self.connect(&self.authenticated_url()).await
     }
 
-    pub(crate) async fn cluster_client(&self) -> HashringClient {
+    pub async fn cluster_client(&self) -> HashringClient {
         for _ in 0..100 {
             if let Ok(client) =
                 HashringClient::connect(&self.coordinator, Duration::from_secs(2)).await

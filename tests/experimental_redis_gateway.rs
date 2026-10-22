@@ -3,9 +3,8 @@
 
 use std::time::Duration;
 
-#[allow(dead_code)]
 #[path = "support/redis_gateway.rs"]
-mod gateway_support;
+pub mod gateway_support;
 use gateway_support::*;
 
 #[tokio::test]

@@ -26,7 +26,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use super::{
-    EventLog, ExperimentConfig, Measurement, ProcessGroup, ScalingScenario, deterministic_value,
+    EventLog, ExperimentConfig, ProcessGroup, ScalingScenario, deterministic_value,
     latency::LatencyHistogram, measurement, spawn_node, wait_for_listener,
 };
 
@@ -586,24 +586,10 @@ impl Drop for TaskHandles {
     }
 }
 
-pub(crate) struct RunContext<'a> {
-    pub config: &'a ExperimentConfig,
-    pub peak_members: &'a [Member],
-    pub initial_count: usize,
-    pub ports: &'a [u16],
-    pub coordinator_endpoint: &'a str,
-    pub admin_client: &'a HashringClient,
-    pub workload_client: &'a HashringClient,
-    pub processes: &'a mut ProcessGroup,
-    pub events: &'a EventLog,
-    pub measurements: &'a mut BTreeMap<String, Measurement>,
-    pub observations: &'a mut BTreeMap<String, serde_json::Value>,
-}
-
-pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
-    let RunContext {
+pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
+    let crate::RunContext {
         config,
-        peak_members,
+        members: peak_members,
         initial_count,
         ports,
         coordinator_endpoint,

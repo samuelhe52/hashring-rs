@@ -653,13 +653,15 @@ impl DataNode for DataNodeService {
         };
         let replications = match prepare_replication_entries(
             &mut state,
-            &request.key,
-            &record,
-            fingerprint,
-            request.request_id,
-            token,
-            self.replication_dispatch.max_pending_bytes(),
-            &ready_followers,
+            ReplicationWrite {
+                key: &request.key,
+                record: &record,
+                request_fingerprint: fingerprint,
+                mutation_id: request.request_id,
+                token,
+                max_pending_bytes: self.replication_dispatch.max_pending_bytes(),
+                ack_awaited_followers: &ready_followers,
+            },
         ) {
             Ok(replications) => replications,
             Err(()) => {
@@ -1015,13 +1017,15 @@ impl DataNode for DataNodeService {
         };
         let replications = match prepare_replication_entries(
             &mut state,
-            &request.key,
-            &tombstone,
-            fingerprint,
-            request.request_id,
-            token,
-            self.replication_dispatch.max_pending_bytes(),
-            &ready_followers,
+            ReplicationWrite {
+                key: &request.key,
+                record: &tombstone,
+                request_fingerprint: fingerprint,
+                mutation_id: request.request_id,
+                token,
+                max_pending_bytes: self.replication_dispatch.max_pending_bytes(),
+                ack_awaited_followers: &ready_followers,
+            },
         ) {
             Ok(replications) => replications,
             Err(()) => {

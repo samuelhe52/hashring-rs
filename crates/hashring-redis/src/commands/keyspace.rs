@@ -109,7 +109,7 @@ fn too_many_keys(
 }
 
 pub async fn keys(store: &Store<'_>, mut args: Args<'_>) -> RedisResult<Reply> {
-    let matcher = Matcher::new(Some(args.next()?));
+    let matcher = Matcher::new(Some(args.next_required()?));
     let keys = store
         .client()
         .await?
@@ -122,7 +122,7 @@ pub async fn keys(store: &Store<'_>, mut args: Args<'_>) -> RedisResult<Reply> {
 
 /// `SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]`.
 pub async fn scan(store: &Store<'_>, mut args: Args<'_>) -> RedisResult<Reply> {
-    let cursor = std::str::from_utf8(args.next()?)
+    let cursor = std::str::from_utf8(args.next_required()?)
         .ok()
         .and_then(|cursor| cursor.parse::<u64>().ok())
         .ok_or_else(|| RedisError::new("ERR", "invalid cursor"))?;
@@ -131,9 +131,9 @@ pub async fn scan(store: &Store<'_>, mut args: Args<'_>) -> RedisResult<Reply> {
     let mut strings_only = true;
     while let Some(option) = args.next_keyword() {
         match option.as_str() {
-            "match" => pattern = Some(args.next()?),
+            "match" => pattern = Some(args.next_required()?),
             "count" => {
-                count = parse_integer(args.next()?)
+                count = parse_integer(args.next_required()?)
                     .ok_or_else(RedisError::not_an_integer)?
                     .try_into()
                     .ok()
@@ -142,7 +142,7 @@ pub async fn scan(store: &Store<'_>, mut args: Args<'_>) -> RedisResult<Reply> {
             }
             // Every key here is a string, so naming any other type, one Redis
             // knows or not, selects nothing. Redis too accepts any name.
-            "type" => strings_only = keyword(args.next()?) == "string",
+            "type" => strings_only = keyword(args.next_required()?) == "string",
             _ => return Err(RedisError::syntax()),
         }
     }

@@ -1,0 +1,5 @@
+# tonic's `Status` is 176 bytes and is part of every generated service
+# signature. Boxing it would add an allocation to every RPC error path without
+# making the error cheaper to handle, so the lint threshold is raised just
+# above that concrete type instead of suppressing the lint per crate.
+large-error-threshold = 177

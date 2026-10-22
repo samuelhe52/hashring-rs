@@ -1,6 +1,3 @@
-// tonic service signatures intentionally return its concrete Status type.
-#![allow(clippy::result_large_err)]
-
 use std::{
     cmp::{Ordering, Reverse},
     collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque},
@@ -388,7 +385,11 @@ struct ReplicationReservation {
     budget: Arc<ReplicationBudget>,
 }
 
-struct ReplicationBudget(#[allow(dead_code)] OwnedSemaphorePermit);
+struct ReplicationBudget {
+    /// Held for the lifetime of the pending entry so the retained bytes stay
+    /// counted against the budget; it is intentionally never read.
+    _permit: OwnedSemaphorePermit,
+}
 
 type ReplicationStreamKey = (u64, String, String);
 

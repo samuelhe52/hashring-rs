@@ -34,9 +34,10 @@ impl<'a> Args<'a> {
     }
 
     /// The next argument, or a syntax error when there is none.
-    // Required arguments report protocol errors rather than Iterator's Option.
-    #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> RedisResult<&'a [u8]> {
+    ///
+    /// Unlike [`Iterator::next`], a missing required argument is a protocol
+    /// error rather than the end of the argument list.
+    pub fn next_required(&mut self) -> RedisResult<&'a [u8]> {
         self.next_optional().ok_or_else(RedisError::syntax)
     }
 
@@ -47,7 +48,7 @@ impl<'a> Args<'a> {
     }
 
     pub fn next_owned(&mut self) -> RedisResult<Vec<u8>> {
-        self.next().map(<[u8]>::to_vec)
+        self.next_required().map(<[u8]>::to_vec)
     }
 
     /// The next argument as an option keyword, lower case.
@@ -56,12 +57,12 @@ impl<'a> Args<'a> {
     }
 
     pub fn next_integer(&mut self) -> RedisResult<i64> {
-        let value = self.next()?;
+        let value = self.next_required()?;
         integer(value, self.name)
     }
 
     pub fn next_float(&mut self) -> RedisResult<f64> {
-        float(self.next()?)
+        float(self.next_required()?)
     }
 
     /// Ends the command: anything left is a syntax error.
@@ -201,7 +202,7 @@ mod tests {
     fn a_leftover_argument_is_a_syntax_error() {
         let rest = owned(&[b"a", b"b"]);
         let mut args = Args::new("echo", &rest);
-        args.next().unwrap();
+        args.next_required().unwrap();
         assert!(args.finish().is_err());
     }
 

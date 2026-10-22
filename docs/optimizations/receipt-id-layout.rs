@@ -3,21 +3,19 @@ use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[allow(dead_code)]
-struct RecordVersion {
-    topology_epoch: u64,
-    owner_sequence: u64,
-    owner_node_id: String,
+pub struct RecordVersion {
+    pub topology_epoch: u64,
+    pub owner_sequence: u64,
+    pub owner_node_id: String,
 }
-#[allow(dead_code)]
-struct DedupEntry {
-    key: Arc<[u8]>,
-    fingerprint: [u8; 32],
-    version: RecordVersion,
-    deleted: bool,
-    retained_bytes: usize,
-    expires_at: Instant,
-    required_acks: Vec<(u64, String, u64)>,
+pub struct DedupEntry {
+    pub key: Arc<[u8]>,
+    pub fingerprint: [u8; 32],
+    pub version: RecordVersion,
+    pub deleted: bool,
+    pub retained_bytes: usize,
+    pub expires_at: Instant,
+    pub required_acks: Vec<(u64, String, u64)>,
 }
 
 fn entry(i: usize, expires_at: Instant) -> DedupEntry {
