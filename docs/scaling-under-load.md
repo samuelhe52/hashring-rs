@@ -1,6 +1,6 @@
 # 扩缩容期间读写实验（方案 v4）
 
-> 状态：方案已固定，按本文实现 `scaling` 模式；实验完成后再在文末补结果与限制。
+> 状态：`scaling` 模式已实现；§0.1 是单次试点，正式三次重复矩阵待跑。
 > 本文整合了三轮评审意见，只保留中高价值项。
 
 ## 0. 结论先行
@@ -13,30 +13,41 @@
 
 ## 0.1 实现状态
 
-第一阶段已实现并通过两次试运行。
+方案条目已全部实现，新入口均通过小规模试运行。正式结果尚未产生：下面是单次试点，没有对照组。
 
-5 节点、5,000 键的小试点（debug）：
+已实现：
 
-```sh
-cargo run -- experiment --mode scaling --scaling-scenario round-trip \
-  --nodes 5 --keys 5000 --concurrency 16 \
-  --scaling-write-rate 20 --scaling-pool-seconds 30 \
-  --warmup-seconds 3 --scaling-post-seconds 3 \
-  --output results/scaling-pilot
-```
+- 场景：`round-trip` / `grow` / `shrink` / `replace`（S3 等成员数替换）/ `churn`（S4 多节点连续迁移）/ `control`（S0 无迁移对照）。
+- 开环复核组：`--scaling-load-mode open --scaling-open-rate <rate>`，固定总速率，GET:PUT:DELETE = 80:15:5，超过 `--max-in-flight` 的请求丢弃并计 `late`；每秒采样与汇总都记录 `issued`、`late`、`in_flight`。
+- 四类 cohort、按速率发放、局部 drain、S1 后中间校验、最终全量校验、读己之写/删、发布后复读、按阶段与每秒指标、按原因的重试计数。
+- coordinator 工作步骤计时：`snapshot_copy_ms`、`changelog_replay_ms`、`pause_writes_ms`、`verify_ms`、`publish_ms`、`activation_ms`、`merge_proof_ms`、`catch_up_ms`，随 change 快照返回并写入 `work_steps_ms`。
+- 100 万键规模：`--keys 1000000` 可直接运行，池、预载和校验按该规模计算。
 
-默认规模的一次试运行（release，9→10→9，100k 键，RF=3，`OwnerOnly`）：
+单次试点（release，100k 键，9→10→9，RF=3，`OwnerOnly`，闭环）：
 
 ```sh
 target/release/hashring-rs experiment --mode scaling \
   --output results/scaling-pilot-100k-v2
 ```
 
-结果：成功；总耗时 50.0 s；扩容 2.34 s（`direct_merge=false`），缩容 0.29 s（`direct_merge=true`）；约 507 万次操作；全量校验与探针 0 违规；扩容/缩容分别观察到 24/16 次 `range_busy` 重试。同一环境的前一次试运行扩容耗时 22.94 s，单次试运行方差很大。这是单次试运行，没有对照组，也不是正式结果。
+结果：成功；总耗时 50.0 s；扩容 2.34 s（`direct_merge=false`），缩容 0.29 s（`direct_merge=true`）；约 507 万次操作；全量校验与探针 0 违规；扩容/缩容分别观察到 24/16 次 `range_busy` 重试。同一环境的前一次试运行扩容耗时 22.94 s，单次试运行方差很大。
 
-- 已实现：`round-trip` / `grow` / `shrink`、四类 cohort、按速率发放、局部 drain、S1 后中间校验、最终全量校验、读己之写/删、发布后复读、按阶段与每秒指标、按原因的重试计数。
-- 尚未实现：开环复核组、S0 对照的运行入口、S3/S4、100 万键规模、coordinator 工作步骤计时（按 §10 第 5 条延后）、正式三次重复矩阵。
-- 试点结论只能说明机制跑通，不作为正式结果。
+单次试点（release，100 万键，9→10→9，RF=3，`OwnerOnly`，闭环）：
+
+```sh
+target/release/hashring-rs experiment --mode scaling --keys 1000000 \
+  --output results/scaling-pilot-1m
+```
+
+结果：成功；总耗时 110.5 s；预载 100 万键 28.65 s（34,902 ops/s）；扩容 3.30 s（`direct_merge=false`，`snapshot_copy_ms=1381`、`changelog_replay_ms=7711`、`verify_ms=1046`、`activation_ms=824`），缩容 0.74 s（`direct_merge=true`，`pause_writes_ms=11`、`verify_ms=50`、`activation_ms=91`）；约 493 万次负载操作；全量校验与探针 0 违规；`range_busy` 39/15，`late=0`。
+
+S0/S3/S4 与开环入口只用小规模 debug 运行验证了机制：`control`（3 节点，分别闭环和开环 200 ops/s）、`replace`（5 节点、20k 键、4→4 成员）、`churn`（6 节点、30k 键、3→6→3）均成功完成校验。这些不是正式结果。
+
+矩阵脚本在脏树上以 `REPS=1` 预跑了 `main` / `control` / `policy` 三组，100k 键、闭环，均成功：main 49.4 s（grow 2.31 s、shrink 0.27 s）、control 25.4 s、policy grow 5.71 s（其中 `activation_ms=4079`，明显高于 OwnerOnly 的 590 ms）。这次预跑没有 `--require-clean-source`，不能作为正式矩阵。
+
+开环入口在 6000 ops/s、100k 键的预跑中达到了 offered load（约 6000 请求/秒，`late=0`），但 S1 的毫秒级暂停窗口内没有写请求被 `RangeBusy` 拒绝，按 §8 判 invalid。这说明开环组的有效性检查依赖写请求是否恰好命中暂停区间，正式运行需要先确定容量基线，并可能需要提高速率或延长暂停窗口后重跑。
+
+尚未完成：正式三次重复矩阵（脚本见 `scripts/scaling-matrix.sh`）、开环容量基线与 60% 目标速率的实测选择、正式 S0/S3/S4 组、以及 `docs/TODO.md` 第 3 项的正式验收结论。上述试点只能说明机制跑通，不作为正式结果。
 
 ---
 
@@ -82,9 +93,9 @@ S2 是否真的走 `direct_merge` 还取决于 `can_direct_merge` 的 `merge_pro
 |---|---|---|---|
 | **S1 扩容** | 9 → 10，新增 node-10 | 复制：快照 + changelog 回放 | 读连续性；切写时 `RangeBusy` 的比例与持续时长；复制与负载争用；发布后 RF 修复 |
 | **S2 缩容** | 10 → 9，移除 node-10 | 主配置下预期 `direct_merge`：无快照复制，但仍有 `PausingWrites`/`Verifying`；所有旧成员写栅栏，停写覆盖全集群 | 全集群写停顿长度（主要在 `Verifying` 追平旧复制流）；未迁移键是否也被停写；在途请求结果；被移除节点退出；键是否丢失/复活 |
-| S3 替换（延后） | 10 → 10，移除 node-10、加入 node-11 | **一定走复制路径**，被移除节点的区间也要复制 | 只在主线稳定后做；峰值是 11 个同时存活的数据进程 |
-| S4 连续迁移（延后） | 6 → 9 → 6 | 多区间并发迁移 | 背靠背 change、epoch 抖动、累计影响 |
-| **S0 对照** | 不变 | 无 | 相同负载与时长下的自然波动，作为 S1/S2 的基线 |
+| S3 替换（已实现） | 10 → 10，移除 node-10、加入 node-11 | **一定走复制路径**，被移除节点的区间也要复制 | 正式运行待排；峰值是 11 个同时存活的数据进程 |
+| S4 连续迁移（已实现） | 6 → 9 → 6 | 多区间并发迁移 | 正式运行待排；背靠背 change、epoch 抖动、累计影响 |
+| **S0 对照（已实现）** | 不变 | 无 | 相同负载与时长下的自然波动，作为 S1/S2 的基线 |
 
 S1 与 S2 在**同一个集群生命周期内连续执行**：预载一次、负载不中断，先扩容再缩容。这样与 TODO #3 的 9→10→9 一致，也避免两套环境差异。S3/S4 单独运行。
 
@@ -181,9 +192,9 @@ S1 与 S2 在**同一个集群生命周期内连续执行**：预载一次、负
 | 形态 | 参数 | 用途 |
 |---|---|---|
 | **闭环（主）** | 并发 64，完整 30 s 期限与重试 | 回答“是否持续服务”。注意：一遇停顿闭环就会少发请求，**并不能免除协调遗漏**，只能减轻。 |
-| **开环（复核）** | 固定速率；目标速率 = 特定策略/拓扑/混合比例下测得的稳态容量的 60%，`max_in_flight=4096` | 回答“给定 offered load 下的真实尾延迟”。必须写明容量基线来自哪组配置。 |
+| **开环（复核）** | `--scaling-load-mode open --scaling-open-rate <rate>`；固定速率；目标速率 = 特定策略/拓扑/混合比例下测得的稳态容量的 60%，`--max-in-flight 4096` | 回答“给定 offered load 下的真实尾延迟”。必须写明容量基线来自哪组配置。 |
 
-开环的 `late`（驱动发不出去）与 `errors`（集群返回失败）分开报告，不能混为一谈。
+开环按总量 80:15:5 发放 GET:PUT:DELETE，PUT 再分 60/25/15；池按 `--scaling-pool-seconds` 与该写入速率生成。`late`（驱动发不出去）与 `errors`（集群返回失败）分开报告，不能混为一谈；延迟从请求到期时刻开始计，不从事后实际发出的时刻开始。
 
 **复用边界**：`latency.rs` 只复用直方图和固定速率调度器；不能复用请求执行器，因为它随机选键、PUT 固定写 round 0、删除键可能被重复选中、GET 返回值被丢弃，不满足台账要求。迁移观察必须挂在**同一段不中断的负载**上，不能按阶段重置统计或排空请求。
 
@@ -229,7 +240,7 @@ S1 与 S2 在**同一个集群生命周期内连续执行**：预载一次、负
 | 阶段 | S1 扩容 | S2 缩容（direct merge） | 应看到的证据 |
 |---|---|---|---|
 | `CopyingSnapshot` | 适用 | 不适用 | 读成功；写成功或可重试拒绝 |
-| `ReplayingChangelog` | 瞬时，基本观测不到 | 不适用 | 不单独判定；回放耗时暂无法单独测，试点后再决定是否加 coordinator 工作步骤计时 |
+| `ReplayingChangelog` | 瞬时，基本观测不到 | 不适用 | 不单独判定；回放耗时由 coordinator 工作步骤计时的 `changelog_replay_ms` 给出 |
 | `PausingWrites` | 适用 | 适用 | **写请求尝试并被 `RangeBusy` 拒绝**，不要求成功写 |
 | `Verifying` | 适用 | **适用** | 写被 `RangeBusy` 拒绝、读成功；S2 的停写主要耗时在这里（等旧复制流追平） |
 | `ReadyToPublish` | 适用（delay=0） | 适用（delay=0） | 读成功；S2 的写仍被栅栏拒绝 |
@@ -237,7 +248,20 @@ S1 与 S2 在**同一个集群生命周期内连续执行**：预载一次、负
 
 停写窗口的正确证据是“有写尝试且被拒绝”，不是“有大量成功写”；S2 不走复制路径，不能要求 `CopyingSnapshot` 有样本，但 `Verifying` 必须适用。
 
-若要拆分复制、回放、校验各自的成本，**光看 phase 不够**：需要 coordinator 在各工作步骤内计时（快照复制、changelog 追赶、watermark 暂停、finalize/digest、activation）。该计时有生产代码成本，**放到试点之后单独做**（见 §10 第 5 条）；在此之前成本结论只到阶段级别。
+若要拆分复制、回放、校验各自的成本，**光看 phase 不够**。协调器现在在每次 change 上记录工作步骤耗时，随 `TopologyChangeSnapshot.timings` 返回，实验写进 `<label>_transition.work_steps_ms`：
+
+| 字段 | 含义 |
+|---|---|
+| `snapshot_copy_ms` | `CopyingSnapshot` 阶段墙钟，含该阶段内的初次 changelog 追赶 |
+| `changelog_replay_ms` | 所有 range 的 changelog 回放耗时之和；并发迁移时可能大于所在阶段 |
+| `pause_writes_ms` | `PausingWrites` 阶段墙钟（direct merge 时含加栅栏） |
+| `verify_ms` | `Verifying` 阶段墙钟（复制路径含最终回放、digest 与提交） |
+| `publish_ms` | 从 `ReadyToPublish` 到提交新拓扑，含 `pre_publish_delay` |
+| `activation_ms` | 提交后到 `Complete`，含 activation/RF repair 屏障与清理 |
+| `merge_proof_ms` | direct merge 的 coverage/proof 计算 |
+| `catch_up_ms` | direct merge 等旧复制流追平的循环 |
+
+这些是 coordinator 侧的墙钟，不含客户端重试等待，也不含 `wait_for_full_rf` 在 `Complete` 之后的收敛时间。字段为 0 表示该路径不经过这一步（例如 S2 direct merge 的 `snapshot_copy_ms`/`changelog_replay_ms`）。
 
 ### 7.2 负载指标
 
@@ -296,10 +320,12 @@ S1 与 S2 在**同一个集群生命周期内连续执行**：预载一次、负
 | 诊断 | S1→S2 往返 | OwnerOnly | 闭环 | 100k | 1 | `pre_publish_delay=250`，只诊断 |
 | 策略对照 | S1→S2 往返 | FirstSuccessor | 闭环 | 100k | 1 | 量化等待 follower 的代价 |
 | 尾延迟 | S1→S2 往返 | OwnerOnly | 开环 60% 容量 | 100k | 1–3 | 注明容量基线配置 |
-| 延后 | S3 / S4 / 1M | OwnerOnly | 闭环 | — | — | 主线稳定后再做 |
+| 替换 | S3 替换 | OwnerOnly | 闭环 | 100k | 1 | 峰值 11 个数据进程 |
+| 连续迁移 | S4 6→9→6 | OwnerOnly | 闭环 | 100k | 1 | 多区间并发迁移 |
+| 大规模 | S1→S2 往返 | OwnerOnly | 闭环 | 1M | 1 | 已有单次试点，未进正式统计 |
 
-- 每次运行全新集群、独立输出目录；正式运行 `--require-clean-source`；主组 seed=1，方差大时补 seed=2。
-- **主组 `pre_publish_delay=0` 是运行前提**；不满足的运行不进入主组统计。250 ms 诊断组单独比较。
+- 每次运行全新集群、独立输出目录；正式运行 `--require-clean-source`；主组 seed=1，方差大时补 seed=2。矩阵入口是 `scripts/scaling-matrix.sh`。
+- 100k 键、闭环 200 写/秒时每个 transition 只有 25k 可写键，`--scaling-pool-seconds` 取 120 留出约 1.4 倍余量；开环高得多的写速率要用更短的池窗口（脚本默认 20 s），否则池在 change 完成前就会耗尽并判 invalid。
 - worker 线程预算按**同时存活的数据进程峰值**计算：S1/S2 是 10，S3 是 11。端口也一样。
 - 机器上不跑其他负载；对照组的节点数、线程预算与主组一致。
 - cohort 池按“预计最长时长 × 安全系数”生成；最后一次 `Complete` 前耗尽即判该次运行 invalid，不进入统计。
@@ -319,7 +345,7 @@ S1 与 S2 在**同一个集群生命周期内连续执行**：预载一次、负
    - 阶段观察与每秒采样。
 3. 复用 `latency.rs` 的直方图与开环调度器；新写满足台账要求的执行器。
 4. 客户端增加**按原因/通道的重试计数**与应用层错误分类，拓扑刷新单独计数；保留 `MutationOutcome` 区分。
-5. coordinator **工作步骤计时**（快照复制、changelog 追赶、暂停、finalize/digest、activation）**放到试点之后单独做**。它会改生产代码，且没有它也能先把结论回答到阶段级别；届时再决定是否值得引入。
+5. coordinator **工作步骤计时**已落地：每次 change 在 coordinator 内记录快照复制、changelog 回放、暂停、finalize/digest、发布与 activation 的墙钟，写入 `TopologyChangeSnapshot.timings`；experiment 将其写入 `<label>_transition.work_steps_ms`。`changelog_replay_ms` 是各 range 之和，并发时会大于所在阶段。
 6. `wait_for_full_rf` 增加目标 epoch 检查；汇总五个时间点。
 7. 更新 `docs/experiments.md`；实验完成后把配置、结果、限制写入 Git 跟踪文档（如 `docs/scaling-under-load.md`），并回链 `docs/TODO.md` 第 3 项；原始 `results/` 不纳入 Git。
 8. 为 §4.2 期望状态表、分层选择、S1→S2 状态衔接和 drain 协议补单元测试。
@@ -330,10 +356,11 @@ S1 与 S2 在**同一个集群生命周期内连续执行**：预载一次、负
 
 - **S2 全集群写栅栏**：未迁移的键也可能停写，`unchanged` 层不是安全对照；必须实际测量，而不是假设。
 - **S3 一定复制**，且峰值 11 个数据进程；预算和端口按 11 算，不能按 10 算。
-- **阶段轮询分辨率**：`ReplayingChangelog` 看不到，边界只能精确到轮询间隔；coordinator 工作步骤计时上线前，回放/校验成本只能回答到阶段级别。S2 的停写时长以客户端观测到的 `RangeBusy` 为准，不以阶段边界为准。
+- **阶段轮询分辨率**：`ReplayingChangelog` 看不到，边界只能精确到轮询间隔；coordinator 工作步骤计时已提供更细的回放/校验成本，但 `changelog_replay_ms` 是并发 range 之和，不能当作墙钟。S2 的停写时长以客户端观测到的 `RangeBusy` 为准，不以阶段边界为准。
 - **单机共享 CPU**：复制、digest 与负载争用；worker 预算固定。
 - **客户端重试掩盖停顿**：逻辑延迟包含重试等待；原始 owner RPC 探针用于分离真实阻塞。
 - **开环 `late` vs `errors`**：容量不足导致的丢弃不等于集群错误。
+- **开环下 `range_busy` 可能为 0**：S1 的停写窗口只有几毫秒，固定速率下若没有写请求命中暂停区间，§8 的有效性检查会判 invalid；这不代表迁移错误，重跑或调整速率/写比例后再判断。
 - **统计功效**：小样本零失败不能证明低失败率；可用性只作观察值。
 - **协调器单点**：本实验不验证协调器 HA。
 
@@ -345,4 +372,4 @@ S1 与 S2 在**同一个集群生命周期内连续执行**：预载一次、负
 2. **闭环为主、开环复核**；按 §5/§8 修正措辞和统计口径。
 3. 直接在现有 correctness 迁移流程上扩展实现 `scaling`，不先做手工原型。
 
-下一步：按本方案实现 `scaling` 模式与最小试点（S1→S2 各一次），校准阈值后再跑正式矩阵。
+下一步：用 `scripts/scaling-matrix.sh` 跑正式矩阵（主组、S0、诊断、策略对照、开环各三次），先 100k 再 1M；把每次的配置、结果与限制写回本文 §0.1，并回链 `docs/TODO.md` 第 3 项。

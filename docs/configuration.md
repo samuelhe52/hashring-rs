@@ -132,11 +132,13 @@ replaced during the run.
 | `--mix` | `mix` | `90:9:1` | experiment | `latency` mode only: the `GET:PUT:DELETE` share of the requests. |
 | `--key-distribution` | `key_distribution` | `zipf:0.99` | experiment | `latency` and `scaling` modes: `uniform`, `zipf:<theta>`, or `hotspot:<key share>:<traffic share>`. |
 | `--max-in-flight` | `max_in_flight` | 4096 | experiment | `latency` mode only: how many requests may be in flight at once. A request over the limit is dropped and counted as late. |
-| `--scaling-scenario` | `scaling_scenario` | `round-trip` | experiment | `scaling` mode only: `round-trip` (grow then shrink), `grow`, or `shrink`. |
-| `--initial-nodes` | `initial_nodes` | peak - 1 for grow/round-trip, peak for shrink | experiment | `scaling` mode only: the nodes the run starts with. |
-| `--scaling-write-rate` | `scaling_write_rate` | 200 | experiment | `scaling` mode only: one-shot write and delete operations per second. Reads are not paced. |
+| `--scaling-scenario` | `scaling_scenario` | `round-trip` | experiment | `scaling` mode only: `round-trip` (grow one, then shrink), `grow`, `shrink`, `replace` (swap one member for a spare), `churn` (grow by three, then shrink), or `control` (no membership change). |
+| `--scaling-load-mode` | `scaling_load_mode` | `closed` | experiment | `scaling` mode only: `closed` for a fixed number of workers, `open` for requests offered at `--scaling-open-rate`. |
+| `--scaling-open-rate` | `scaling_open_rate` | 0 | experiment | `scaling` mode only: total operations per second in open mode. Reads are 80%; writes are 12% rewrite, 5% fresh write, and 3% delete. The pools are sized from this rate. |
+| `--initial-nodes` | `initial_nodes` | peak - 1 for grow/round-trip/replace, peak for shrink/control, peak - 3 for churn | experiment | `scaling` mode only: the nodes the run starts with. |
+| `--scaling-write-rate` | `scaling_write_rate` | 200 | experiment | `scaling` mode only: closed-loop one-shot write and delete operations per second. Reads are not paced. |
 | `--scaling-pool-seconds` | `scaling_pool_seconds` | 120 | experiment | `scaling` mode only: how long the one-shot pools of one transition must last. |
-| `--scaling-post-seconds` | `scaling_post_seconds` | 10 | experiment | `scaling` mode only: how long the load keeps running after a change. |
+| `--scaling-post-seconds` | `scaling_post_seconds` | 10 | experiment | `scaling` mode only: how long the load keeps running after a change. In `control` it is the measured baseline window. |
 | `--worker-threads` | `worker_threads` | CPUs / (nodes + 2), at least 2 | process | For the driver and each node. |
 | `--coordinator-worker-threads` | `coordinator_worker_threads` | one per available CPU | process | For the run's coordinator, which is not on the data path. |
 | `--seed`, `--virtual-nodes`, `--range-move-concurrency`, `--replica-repair-concurrency`, `--prepublication-failure-grace-ms`, `--desired-replication-factor`, `--minimum-admitted-copies`, `--minimum-healthy-followers`, `--max-replica-lag-ms`, `--receipt-retention-ms`, `--lease-duration-ms` | as for `coordinator` | as for `coordinator` | as for `coordinator` | Passed to the run's coordinator. |

@@ -377,15 +377,31 @@ completes makes the run invalid rather than changing the mix halfway through.
   and one uninterrupted load.
 - `grow`: one scale-out.
 - `shrink`: one scale-in, starting with every peak node.
+- `replace`: swap the last initial member for one spare peak member, keeping
+  the member count. This always copies ranges and starts one extra process.
+- `churn`: grow by three nodes at once, then shrink back, so multiple ranges
+  move in each change.
+- `control`: change no membership and measure the same load for
+  `--scaling-post-seconds` after the warmup. This is the S0 baseline for a
+  round-trip run.
 
-The runner starts with `--initial-nodes` (default: peak - 1 for grow and
-round-trip, peak for shrink), warms up for `--warmup-seconds`, stages the
-change, starts any new node, executes the change, polls its phases, waits for
-the target epoch to reach full replication, and keeps the load running for
-`--scaling-post-seconds`. It then stops that transition's write cohorts, drains
-them, and verifies the cohorts before the next transition. Reads continue
-across the whole run. `--pre-publish-delay-ms` defaults to 0 here, because the
-delay runs after writes are paused and would be measured as migration latency.
+`--scaling-load-mode` selects how the load is offered. `closed` (the default)
+runs `--concurrency` read workers and paced write workers. `open` offers a
+total of `--scaling-open-rate` operations per second: 80% GET, 12% rewrite,
+5% fresh write, and 3% delete. A request that cannot be sent within
+`--max-in-flight` is dropped and counted as `late`, and its latency starts at
+the time it was due. The per-second `metrics_sampled` events report `issued`,
+`late`, and `in_flight` alongside the phase, and the summary has their totals.
+
+The runner starts with `--initial-nodes` (default: peak - 1 for grow,
+round-trip, and replace; peak for shrink and control; peak - 3 for churn),
+warms up for `--warmup-seconds`, stages the change, starts any new node,
+executes the change, polls its phases, waits for the target epoch to reach
+full replication, and keeps the load running for `--scaling-post-seconds`. It
+then stops that transition's write cohorts, drains them, and verifies the
+cohorts before the next transition. Reads continue across the whole run.
+`--pre-publish-delay-ms` defaults to 0 here, because the delay runs after
+writes are paused and would be measured as migration latency.
 
 A successful write or delete is followed by a GET of the same key, and keys
 changed before publication are read again after it. Those probe GETs have
@@ -393,13 +409,23 @@ their own metrics and are not mixed into the main GET histogram.
 
 `summary.json` holds one `<label>_transition` measurement and observation per
 change (change duration, target epoch, retries by reason, pool sizes, touched
-strata, direct-merge flag). `observations.scaling_metrics` holds the per-phase
-operation and latency totals, and `events.jsonl` holds one `metrics_sampled`
-event per second plus the phase transitions. The full protocol, cohorts, and
-pass criteria are in [scaling-under-load.md](scaling-under-load.md).
+strata, direct-merge flag, and the coordinator's `work_steps_ms`). The work
+steps are `snapshot_copy_ms`, `changelog_replay_ms`, `pause_writes_ms`,
+`verify_ms`, `publish_ms`, `activation_ms`, `merge_proof_ms`, and
+`catch_up_ms`. `changelog_replay_ms` is the sum over ranges, so it can exceed
+the phase it ran in; the other fields are wall-clock phase costs, and
+`activation_ms` includes RF repair to `Complete` but not the later
+`wait_for_full_rf` convergence. `observations.scaling_metrics` holds the
+per-phase operation and latency totals, and `events.jsonl` holds one
+`metrics_sampled` event per second plus the phase transitions. The full
+protocol, cohorts, and pass criteria are in
+[scaling-under-load.md](scaling-under-load.md).
 
 The mode runs every process on one host and is a local measurement, not a
 service-level guarantee. `--require-clean-source` marks a formal run.
+`scripts/scaling-matrix.sh` runs the formal groups (main, S0 control,
+250 ms diagnostic, FirstSuccessor policy, open loop, and optionally replace
+and churn) with a fresh output directory per repetition.
 
 ## Diagnostics and profiling
 
