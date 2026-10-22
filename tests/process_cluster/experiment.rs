@@ -462,6 +462,8 @@ async fn scaling_round_trip_defers_s1_verification_and_records_the_stop_window()
     );
 
     // The write stop is defined by what the client saw, not by the phases.
+    // Publication, completion, and the RF convergence after completion are
+    // separate time points.
     for transition in [grow, shrink] {
         let window = &transition["stop_window"];
         let first = window["first_range_busy_ms"].as_f64().unwrap();
@@ -472,6 +474,14 @@ async fn scaling_round_trip_defers_s1_verification_and_records_the_stop_window()
         assert!(
             window["observed_ms"].as_f64().unwrap() > 0.0,
             "{window}"
+        );
+        let published = transition["published_ms"].as_f64().unwrap();
+        let complete = transition["complete_ms"].as_f64().unwrap();
+        assert!(published > 0.0, "{transition}");
+        assert!(complete >= published, "{transition}");
+        assert!(
+            transition["full_rf_seconds"].as_f64().unwrap() >= 0.0,
+            "{transition}"
         );
     }
 

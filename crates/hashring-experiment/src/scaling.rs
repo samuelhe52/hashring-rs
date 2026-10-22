@@ -1279,6 +1279,8 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
         let started = Instant::now();
         metrics.set_phase(Phase::Pre);
         let mut stop_window: Option<StopWindow> = None;
+        let mut published_ms: Option<f64> = None;
+        let mut complete_ms: Option<f64> = None;
         let completed = if let Some(staged) = &staged {
             ledger.begin_publish_window();
             let mut last_phase = Phase::Pre;
@@ -1304,6 +1306,9 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                 if let Ok(Some(current)) = observer.topology_change().await {
                     let phase = phase_of(current.phase);
                     if phase != last_phase {
+                        if phase == Phase::Published {
+                            published_ms = Some(started.elapsed().as_secs_f64() * 1_000.0);
+                        }
                         metrics.set_phase(phase);
                         events.record(
                             "migration_phase_changed",
@@ -1332,6 +1337,7 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                 transition.label,
                 completed.phase
             );
+            complete_ms = Some(started.elapsed().as_secs_f64() * 1_000.0);
             // The first write after the last rejection can complete after
             // Complete, so keep sampling until the window closes.
             let window_deadline = Instant::now() + Duration::from_secs(2);
@@ -1396,7 +1402,9 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
         }
 
         let target_epoch = target_topology.epoch;
+        let mut full_rf_seconds: Option<f64> = None;
         if completed.is_some() {
+            let rf_started = Instant::now();
             wait_for_full_rf_at_epoch(
                 &observer,
                 config.desired_replication_factor,
@@ -1405,6 +1413,7 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                 processes,
             )
             .await?;
+            full_rf_seconds = Some(rf_started.elapsed().as_secs_f64());
 
             // Keep the load running while the post-change window is measured.
             if config.scaling_post_seconds > 0 {
@@ -1489,6 +1498,9 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
             format!("{}_transition", transition.label),
             json!({
                 "change_seconds": change_seconds.as_secs_f64(),
+                "published_ms": published_ms,
+                "complete_ms": complete_ms,
+                "full_rf_seconds": full_rf_seconds,
                 "post_seconds": config.scaling_post_seconds,
                 "control": completed.is_none(),
                 "direct_merge": completed.as_ref().is_some_and(|change| change.direct_merge),
@@ -1509,6 +1521,9 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
             json!({
                 "label": transition.label,
                 "seconds": change_seconds.as_secs_f64(),
+                "published_ms": published_ms,
+                "complete_ms": complete_ms,
+                "full_rf_seconds": full_rf_seconds,
                 "target_epoch": target_epoch,
                 "retries_by_reason": retry_delta,
                 "work_steps_ms": completed.as_ref().map(|change| json!(change.timings)),
