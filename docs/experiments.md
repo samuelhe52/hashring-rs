@@ -398,8 +398,10 @@ round-trip, and replace; peak for shrink and control; peak - 3 for churn),
 warms up for `--warmup-seconds`, stages the change, starts any new node,
 executes the change, polls its phases, waits for the target epoch to reach
 full replication, and keeps the load running for `--scaling-post-seconds`. It
-then stops that transition's write cohorts, drains them, and verifies the
-cohorts before the next transition. Reads continue across the whole run.
+then stops that transition's write cohorts, drains those writes, and verifies
+the cohorts before the next transition. Reads continue across the whole run,
+so the local drain waits for the write batches only; the final drain after the
+read senders stop waits for everything.
 `--pre-publish-delay-ms` defaults to 0 here, because the delay runs after
 writes are paused and would be measured as migration latency.
 
@@ -408,16 +410,27 @@ changed before publication are read again after it. Those probe GETs have
 their own metrics and are not mixed into the main GET histogram.
 
 `summary.json` holds one `<label>_transition` measurement and observation per
-change (change duration, target epoch, retries by reason, pool sizes, touched
-strata, direct-merge flag, and the coordinator's `work_steps_ms`). The work
-steps are `snapshot_copy_ms`, `changelog_replay_ms`, `pause_writes_ms`,
-`verify_ms`, `publish_ms`, `activation_ms`, `merge_proof_ms`, and
-`catch_up_ms`. `changelog_replay_ms` is the sum over ranges, so it can exceed
-the phase it ran in; the other fields are wall-clock phase costs, and
-`activation_ms` includes RF repair to `Complete` but not the later
-`wait_for_full_rf` convergence. `observations.scaling_metrics` holds the
-per-phase operation and latency totals, and `events.jsonl` holds one
-`metrics_sampled` event per second plus the phase transitions. The full
+change: `published_ms` and `complete_ms` from the start of the change,
+`full_rf_seconds` from `Complete` to the target epoch reaching full
+replication, `stop_window`, retries by reason, pool sizes, touched strata, the
+direct-merge flag, and the coordinator's `work_steps_ms`. The work steps are
+`snapshot_copy_ms`, `changelog_replay_ms`, `pause_writes_ms`, `verify_ms`,
+`publish_ms`, `activation_ms`, `merge_proof_ms`, and `catch_up_ms`.
+`changelog_replay_ms` is the sum over ranges, so it can exceed the phase it
+ran in; the other fields are wall-clock phase costs, and `activation_ms`
+includes RF repair to `Complete` but not the later `wait_for_full_rf`
+convergence, which `full_rf_seconds` reports separately.
+
+`stop_window` is what the client saw rather than the phase timeline. During a
+change the runner samples the client's cumulative `RangeBusy` count and
+successful write count every 5 ms, and reports `first_range_busy_ms`,
+`last_range_busy_ms`, `first_write_ok_ms`, `observed_ms`, and `poll_ms`. A
+node only fences a range when it receives the command, so the phase boundary
+is not the stop; a transition with no rejection leaves the window empty.
+
+`observations.scaling_metrics` holds the per-phase operation and latency
+totals, and `events.jsonl` holds one `metrics_sampled` event per second plus
+the phase transitions. The full
 protocol, cohorts, and pass criteria are in
 [scaling-under-load.md](scaling-under-load.md).
 
