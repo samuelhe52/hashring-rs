@@ -20,7 +20,7 @@ use hdrhistogram::Histogram;
 use rand::Rng;
 use serde_json::json;
 
-use crate::{EventLog, LatencySummary, deterministic_value};
+use crate::{EventLog, LatencyStageMeasurement, LatencySummary, deterministic_value};
 
 /// The operations the load issues.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,17 +217,9 @@ impl KeyDistribution {
     }
 }
 
-/// A latency histogram over microseconds.
-///
-/// The histogram keeps every sample, so the percentiles of a stage are the
-/// percentiles of all its requests and not of a sample of them.
-///
-/// A sample longer than the histogram's range is recorded in the top bucket,
-/// so it is counted but not measured: the histogram's `max` is then the upper
-/// bound of that bucket and not the length of the slowest request. The
-/// longest sample and the number of the samples that were too long are kept
-/// beside it, so a reader can tell a truncated sample from one that was near
-/// the bound.
+/// HDR histogram over all completed requests, with three significant figures.
+/// Out-of-range samples go in the top bucket; their actual maximum and count
+/// are retained separately.
 pub struct LatencyHistogram {
     inner: Histogram<u64>,
     highest_micros: u64,
@@ -290,43 +282,73 @@ impl LatencyHistogram {
     }
 }
 
-/// What one second of the load produced.
-struct WindowState {
-    /// The samples of the window that is running.
-    current: Vec<LatencyHistogram>,
-    /// The samples of the whole stage.
-    total: Vec<LatencyHistogram>,
-    /// The operations of the window that is running.
+type MetricSnapshot = (
+    BTreeMap<String, u64>,
+    BTreeMap<String, u64>,
+    BTreeMap<String, LatencySummary>,
+);
+
+struct OperationMetrics {
+    histograms: Vec<LatencyHistogram>,
     completed: [u64; 3],
-    /// The operations of the whole stage.
-    total_completed: [u64; 3],
-    /// The errors of the window that is running.
     errors: BTreeMap<String, u64>,
-    /// The errors of the whole stage.
-    total_errors: BTreeMap<String, u64>,
+}
+
+impl OperationMetrics {
+    fn new(highest_micros: u64) -> Result<Self> {
+        Ok(Self {
+            histograms: (0..3)
+                .map(|_| LatencyHistogram::new(highest_micros))
+                .collect::<Result<_>>()?,
+            completed: [0; 3],
+            errors: BTreeMap::new(),
+        })
+    }
+
+    fn reset(&mut self) {
+        for histogram in &mut self.histograms {
+            histogram.reset();
+        }
+        self.completed = [0; 3];
+        self.errors.clear();
+    }
+
+    fn snapshot(&self) -> MetricSnapshot {
+        let ops = Operation::ALL
+            .into_iter()
+            .map(|op| (op.name().to_owned(), self.completed[op.index()]))
+            .collect();
+        let latency = Operation::ALL
+            .into_iter()
+            .map(|op| (op.name().to_owned(), self.histograms[op.index()].summary()))
+            .collect();
+        (ops, self.errors.clone(), latency)
+    }
+}
+
+struct WindowState {
+    current: OperationMetrics,
+    total: OperationMetrics,
 }
 
 impl WindowState {
-    /// Moves the open window into the totals of the stage.
-    ///
-    /// The stage reports the totals, so a window whose counters are left
-    /// behind reports those requests as never having happened. The sampler
-    /// folds every second of a phase, and the last fold of a phase is this
-    /// one: the requests that were still in flight when the sampler stopped
-    /// finish before it runs, and belong to the stage all the same.
+    /// Include every completed request, including those drained after the final window.
     fn fold(&mut self) {
-        for index in 0..self.current.len() {
-            self.total[index].merge(&self.current[index]);
-            self.current[index].reset();
+        for (total, current) in self
+            .total
+            .histograms
+            .iter_mut()
+            .zip(&self.current.histograms)
+        {
+            total.merge(current);
         }
-        for operation in Operation::ALL {
-            let index = operation.index();
-            self.total_completed[index] += self.completed[index];
-            self.completed[index] = 0;
+        for (total, current) in self.total.completed.iter_mut().zip(self.current.completed) {
+            *total += current;
         }
-        for (reason, count) in std::mem::take(&mut self.errors) {
-            *self.total_errors.entry(reason).or_insert(0) += count;
+        for (reason, count) in &self.current.errors {
+            *self.total.errors.entry(reason.clone()).or_insert(0) += count;
         }
+        self.current.reset();
     }
 }
 
@@ -336,11 +358,7 @@ struct Metrics {
     in_flight: AtomicUsize,
     issued: AtomicU64,
     late: AtomicU64,
-    /// How far behind its own schedule the sender is, over the whole phase.
-    ///
-    /// This is the sender's lag, and it is not the lag of a window: it is
-    /// what the stage's `sender_saturated` is decided by, and the sampler
-    /// publishes it beside the lag of the window it reports.
+    /// Phase-level lag at the last sender window boundary, not a running maximum.
     sender_lag: AtomicU64,
     /// Set when the stage is over, so a sender that is still running stops.
     stopped: AtomicBool,
@@ -348,20 +366,10 @@ struct Metrics {
 
 impl Metrics {
     fn new(highest_micros: u64) -> Result<Self> {
-        let mut current = Vec::with_capacity(3);
-        let mut total = Vec::with_capacity(3);
-        for _ in 0..3 {
-            current.push(LatencyHistogram::new(highest_micros)?);
-            total.push(LatencyHistogram::new(highest_micros)?);
-        }
         Ok(Self {
             state: Mutex::new(WindowState {
-                current,
-                total,
-                completed: [0; 3],
-                total_completed: [0; 3],
-                errors: BTreeMap::new(),
-                total_errors: BTreeMap::new(),
+                current: OperationMetrics::new(highest_micros)?,
+                total: OperationMetrics::new(highest_micros)?,
             }),
             in_flight: AtomicUsize::new(0),
             issued: AtomicU64::new(0),
@@ -373,14 +381,14 @@ impl Metrics {
 
     fn record_success(&self, operation: Operation, latency_micros: u64) {
         let mut state = self.state.lock().expect("the metrics lock is not poisoned");
-        state.current[operation.index()].record(latency_micros);
-        state.completed[operation.index()] += 1;
+        state.current.histograms[operation.index()].record(latency_micros);
+        state.current.completed[operation.index()] += 1;
     }
 
     fn record_error(&self, operation: Operation, reason: &'static str, latency_micros: u64) {
         let mut state = self.state.lock().expect("the metrics lock is not poisoned");
-        state.current[operation.index()].record(latency_micros);
-        *state.errors.entry(reason.to_owned()).or_insert(0) += 1;
+        state.current.histograms[operation.index()].record(latency_micros);
+        *state.current.errors.entry(reason.to_owned()).or_insert(0) += 1;
     }
 }
 
@@ -454,25 +462,6 @@ impl LoadPlan {
     }
 }
 
-/// What one stage measured.
-#[derive(Clone, Debug)]
-pub struct StageOutcome {
-    pub name: String,
-    pub target_rate: u64,
-    pub achieved_rate: f64,
-    pub seconds: f64,
-    pub sender_saturated: bool,
-    pub issued: u64,
-    pub late: u64,
-    pub ops: BTreeMap<String, u64>,
-    pub errors: BTreeMap<String, u64>,
-    /// The internal retries the client made while the stage ran.
-    pub retries: u64,
-    pub latency_us: BTreeMap<String, LatencySummary>,
-    /// The windows in which the driver did not keep up with its own schedule.
-    pub saturated_windows: u64,
-}
-
 /// The load of one stage, warmup first and then the measured window.
 pub struct LoadRunner {
     client: HashringClient,
@@ -501,39 +490,25 @@ impl LoadRunner {
         Ok(())
     }
 
-    /// Runs the window of a stage that its statistics come from.
+    /// Return the measured stage and its number of saturated sender windows.
     pub async fn run_measured(
         &self,
         stage: &StageSettings,
         events: &EventLog,
-    ) -> Result<StageOutcome> {
+    ) -> Result<(LatencyStageMeasurement, u64)> {
         self.run_phase(stage, events, stage.duration_seconds, false)
             .await
     }
 
-    /// Forgets everything the previous phase counted, so a phase reports only
-    /// what it ran itself.
-    ///
-    /// The totals accumulate over the samples the phase recorded, and a phase
-    /// that started with the totals of the phase before it would report both.
-    /// The warmup's samples are discarded by the same call: the measured
-    /// phase begins by forgetting them.
+    /// Reset both current and total metrics between warmup and measured phases.
     fn forget(&self) {
         let mut state = self
             .metrics
             .state
             .lock()
             .expect("the metrics lock is not poisoned");
-        for histogram in state.current.iter_mut() {
-            histogram.reset();
-        }
-        for histogram in state.total.iter_mut() {
-            histogram.reset();
-        }
-        state.completed = [0; 3];
-        state.total_completed = [0; 3];
-        state.errors.clear();
-        state.total_errors.clear();
+        state.current.reset();
+        state.total.reset();
         self.metrics.issued.store(0, Ordering::Relaxed);
         self.metrics.late.store(0, Ordering::Relaxed);
     }
@@ -544,17 +519,13 @@ impl LoadRunner {
         events: &EventLog,
         seconds: u64,
         warmup: bool,
-    ) -> Result<StageOutcome> {
+    ) -> Result<(LatencyStageMeasurement, u64)> {
         let start = Instant::now();
         let end = start + Duration::from_secs(seconds);
         // The sender of the previous phase has stopped; this one starts fresh.
         self.metrics.stopped.store(false, Ordering::Relaxed);
-        // Every phase counts only its own requests. The measured phase picks
-        // up the warmup's counters here, and the warmup of the next stage
-        // picks up the measured phase's.
+        // Exclude warmup and preceding stages.
         self.forget();
-        // The client's retries are cumulative, so the phase starts from the
-        // count it has now.
         let retries_before = self.client.retry_count();
         let sampler = tokio::spawn(sample_windows(
             Arc::clone(&self.metrics),
@@ -567,12 +538,7 @@ impl LoadRunner {
             retries_before,
         ));
         let (issued, late, saturated_windows) = self.drive(stage, start, end).await?;
-        // A measured stage that sent nothing is not a measurement of the
-        // cluster. The accounting below would accept it, because no request
-        // was issued and none came back, so a stage that offered no load
-        // would be published as a stage that offered nothing. A warmup is
-        // not measured, and a warmup that sent nothing does not fail the
-        // run.
+        // Empty warmup is allowed; an empty measured phase is invalid.
         if !warmup {
             ensure!(
                 issued > 0,
@@ -580,22 +546,18 @@ impl LoadRunner {
                 stage.name
             );
         }
-        // The sampler writes the window that ends with the phase, so it is
-        // waited for rather than stopped: a window that is dropped would leave
-        // its samples out of the stage.
+        // Keep the final window, then fold requests completed during draining.
         let _ = sampler.await;
-        // The requests that were still in flight when the window closed
-        // belong to the stage, even though no window reports them.
-        self.merge_pending();
-        // The totals are read here and not in the sender, because the last
-        // window is folded in only now. A stage that read them earlier
-        // would miss it, and its rate would be short by a second's worth of
-        // requests.
-        let (ops, errors, latency_us) = self.totals();
+        let (ops, errors, latency_us) = {
+            let mut state = self
+                .metrics
+                .state
+                .lock()
+                .expect("the metrics lock is not poisoned");
+            state.fold();
+            state.total.snapshot()
+        };
         let completed: u64 = ops.values().sum();
-        // Every request the sender sent came back, and every request that
-        // came back was recorded. A stage that does not add up is reported as
-        // a failure instead of a rate that is quietly short.
         let failed: u64 = errors.values().sum();
         if completed + failed != issued {
             bail!(
@@ -605,29 +567,26 @@ impl LoadRunner {
             );
         }
         let seconds = end.duration_since(start).as_secs_f64();
-        Ok(StageOutcome {
-            name: stage.name.clone(),
-            target_rate: stage.target_rate,
-            achieved_rate: completed as f64 / seconds.max(f64::EPSILON),
-            seconds,
-            sender_saturated: saturated_windows > 0,
-            issued,
-            late,
-            ops,
-            // Every reason, the ones that did not occur at zero.
-            errors: complete_errors(&errors),
-            retries: self.client.retry_count().saturating_sub(retries_before),
-            latency_us,
+        Ok((
+            LatencyStageMeasurement {
+                target_rate: stage.target_rate,
+                achieved_rate: completed as f64 / seconds.max(f64::EPSILON),
+                seconds,
+                sender_saturated: saturated_windows > 0,
+                issued,
+                late,
+                ops,
+                errors: complete_errors(&errors),
+                retries: self.client.retry_count().saturating_sub(retries_before),
+                latency_us,
+                load_balance: Default::default(),
+            },
             saturated_windows,
-        })
+        ))
     }
 
-    /// The open loop: every request is due at a fixed offset from the start
-    /// of the phase, and is sent then or not at all.
-    ///
-    /// Returns how many requests it sent, how many it had to drop, and how
-    /// many windows it did not keep up with. The samples are read by the
-    /// caller, after the sampler has folded its last window in.
+    /// Run the sender and drain outstanding requests. Return issued, dropped,
+    /// and saturated-window counts.
     async fn drive(
         &self,
         stage: &StageSettings,
@@ -652,11 +611,7 @@ impl LoadRunner {
         let (issued, late, saturated_windows) = match reported {
             Ok(counts) => counts,
             Err(error) => {
-                // The sender thread ended without reporting how many requests
-                // it sent, because it panicked. A stage that reported zero
-                // would look like a stage that offered no load, and the
-                // accounting below would let it pass, so the run fails here
-                // instead of publishing a rate of nothing.
+                // A sender panic must fail the phase, not report an empty load.
                 let message = thread
                     .take()
                     .and_then(|thread| thread.join().err())
@@ -667,9 +622,7 @@ impl LoadRunner {
                 bail!("{message}");
             }
         };
-        // Let the requests that are still in flight finish, so the stage
-        // reports every request it sent. A request cannot take longer than
-        // the operation deadline, so the wait is bounded.
+        // Drain every issued request within the operation deadline plus margin.
         let deadline = Instant::now() + self.plan.drain_timeout;
         while self.metrics.in_flight.load(Ordering::Acquire) > 0 {
             if Instant::now() >= deadline {
@@ -682,49 +635,12 @@ impl LoadRunner {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         self.metrics.stopped.store(true, Ordering::Relaxed);
-        // The thread has sent its counts, so it is about to end. A panic
-        // after that would still be a panic, and a stage that does not
-        // describe the load it offered is not a measurement.
         if let Some(thread) = thread.take()
             && let Some(message) = thread.join().err().map(panic_message)
         {
             bail!("the sender thread panicked: {message}");
         }
         Ok((issued, late, saturated_windows))
-    }
-
-    /// Moves the samples the stage still holds in its open window into its
-    /// totals. The sampler has stopped, so this is the phase's last fold.
-    fn merge_pending(&self) {
-        let mut state = self
-            .metrics
-            .state
-            .lock()
-            .expect("the metrics lock is not poisoned");
-        state.fold();
-    }
-
-    /// The operations, errors, and latencies the stage recorded.
-    fn totals(
-        &self,
-    ) -> (
-        BTreeMap<String, u64>,
-        BTreeMap<String, u64>,
-        BTreeMap<String, LatencySummary>,
-    ) {
-        let state = self
-            .metrics
-            .state
-            .lock()
-            .expect("the metrics lock is not poisoned");
-        let mut ops = BTreeMap::new();
-        let mut latency_us = BTreeMap::new();
-        for operation in Operation::ALL {
-            let index = operation.index();
-            ops.insert(operation.name().to_owned(), state.total_completed[index]);
-            latency_us.insert(operation.name().to_owned(), state.total[index].summary());
-        }
-        (ops, state.total_errors.clone(), latency_us)
     }
 }
 
@@ -744,16 +660,8 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-/// Waits until `due` as closely as the host's timer allows.
-///
-/// The kernel's timer is coarse, so the wait has two parts: a sleep that ends
-/// a little before the deadline, and a spin for the rest. The margin is the
-/// overshoot the last sleep showed, so the spin stays short and the request
-/// goes out on time.
-///
-/// A runtime timer is not used here. It wakes up about a millisecond late,
-/// which is longer than the latencies this mode measures, so every request
-/// would carry a millisecond of the sender's own delay.
+/// Sleep until just before the absolute deadline, then spin. Adapt the margin
+/// to the kernel's last overshoot; Tokio's millisecond timer is too coarse.
 fn wait_until(due: Instant, margin: &mut Duration) {
     let coarse = due.checked_sub(*margin).unwrap_or(due);
     let now = Instant::now();
@@ -814,11 +722,8 @@ fn send_requests(
         index += 1;
         let now = Instant::now();
         if now >= window_end {
-            // The schedule says how many requests were due by now. A sender
-            // that is behind it did not keep up, and the stage's numbers are
-            // not usable. The lag is the sender's own, over the whole phase:
-            // it is not the lag of the window the sampler reports, which is
-            // a different number with a different meaning.
+            // Measure phase-level lag separately from the sampler's per-window lag.
+            // More than 50 ms of unscheduled requests invalidates this phase.
             let expected = ((now.duration_since(start).as_secs_f64()) * rate).floor() as u64 + 1;
             let sender_lag = expected.saturating_sub(issued + late);
             metrics.sender_lag.store(sender_lag, Ordering::Relaxed);
@@ -893,11 +798,7 @@ fn classify(operation: Operation, outcome: Result<(), ClientError>) -> Result<()
     }
 }
 
-/// Every reason an operation can be reported under.
-///
-/// A run reports all of them in its `errors` maps, with a zero for the ones
-/// that did not occur, so a reader compares the same fields in every window
-/// of every run instead of guessing which ones a map is missing.
+/// Stable error categories, including zero-count reasons.
 pub const ERROR_REASONS: [&str; 6] = [
     "deadline",
     "not_found",
@@ -907,7 +808,6 @@ pub const ERROR_REASONS: [&str; 6] = [
     "topology",
 ];
 
-/// The errors with every reason in them, the ones that did not occur at zero.
 fn complete_errors(errors: &BTreeMap<String, u64>) -> BTreeMap<String, u64> {
     let mut complete: BTreeMap<String, u64> = ERROR_REASONS
         .iter()
@@ -919,11 +819,7 @@ fn complete_errors(errors: &BTreeMap<String, u64>) -> BTreeMap<String, u64> {
     complete
 }
 
-/// Writes one `metrics_sampled` event per second of the phase.
-///
-/// The arguments are the phase's own inputs, one per line, because the
-/// sampler has to name all of them to write a window: grouping them into a
-/// struct would hide which of them a window is built from.
+/// Write one event per second, including warmup.
 #[allow(clippy::too_many_arguments)]
 async fn sample_windows(
     metrics: Arc<Metrics>,
@@ -945,43 +841,17 @@ async fn sample_windows(
                 .state
                 .lock()
                 .expect("the metrics lock is not poisoned");
-            let mut latency_us = serde_json::Map::new();
-            for operation in Operation::ALL {
-                latency_us.insert(
-                    operation.name().to_owned(),
-                    serde_json::to_value(state.current[operation.index()].summary())
-                        .expect("a latency summary is serializable"),
-                );
-            }
-            // What the window produced is read before the fold takes it.
-            let completed = state.completed;
-            let errors = state.errors.clone();
+            let (completed, errors, latency_us) = state.current.snapshot();
             state.fold();
             let issued = metrics.issued.swap(0, Ordering::AcqRel);
             let late = metrics.late.swap(0, Ordering::AcqRel);
             (issued, late, completed, errors, latency_us)
         };
-        let mut ops = serde_json::Map::new();
-        for operation in Operation::ALL {
-            ops.insert(
-                operation.name().to_owned(),
-                serde_json::Value::from(completed[operation.index()]),
-            );
-        }
-        // The window's share of the schedule. A sender that is behind it did
-        // not keep up, and the window's numbers do not describe the cluster.
-        // A request the in-flight limit dropped is not behind: the sender
-        // dealt with it, and the cluster is the one that could not.
+        // Dropped requests count as scheduled; only unscheduled requests are behind.
         let length = window_end.min(end).saturating_duration_since(window_start);
         let expected = (length.as_secs_f64() * stage.target_rate as f64).floor() as u64;
         let behind = expected.saturating_sub(issued + late);
-        // The sender's own lag, over the phase so far. It is not the lag of
-        // this window: it is what the stage's `sender_saturated` is decided
-        // by, and it is published here so a reader can see why.
         let sender_lag = metrics.sender_lag.load(Ordering::Relaxed);
-        // The retries the client made in this window, and the epoch it routed
-        // with. A retry is a request the client had to try again, so a window
-        // with retries is a window the cluster was not answering at once.
         let retries_now = client.retry_count();
         let retries = retries_now.saturating_sub(retries_seen);
         retries_seen = retries_now;
@@ -995,9 +865,7 @@ async fn sample_windows(
             "late": late,
             "behind": behind,
             "sender_lag": sender_lag,
-            "ops": ops,
-            // Every reason, the ones that did not occur at zero, so a reader
-            // finds the same keys in every window of every run.
+            "ops": completed,
             "errors": complete_errors(&errors),
             "retries": retries,
             "epoch": epoch,
@@ -1191,17 +1059,17 @@ mod tests {
             // A failed request is in the errors and in the latencies, and the
             // two of them are what it takes to account for every request the
             // phase issued.
-            assert_eq!(state.total_completed, [2, 0, 0]);
-            assert_eq!(state.total_errors.get("deadline"), Some(&1));
-            assert_eq!(state.total[0].summary().samples, 2);
-            assert_eq!(state.total[1].summary().samples, 1);
+            assert_eq!(state.total.completed, [2, 0, 0]);
+            assert_eq!(state.total.errors.get("deadline"), Some(&1));
+            assert_eq!(state.total.histograms[0].summary().samples, 2);
+            assert_eq!(state.total.histograms[1].summary().samples, 1);
             // The window is empty once it is folded, so folding it again
             // reports the same totals instead of counting them twice.
             state.fold();
         }
         let state = metrics.state.lock().unwrap();
-        assert_eq!(state.total_completed, [2, 0, 0]);
-        assert_eq!(state.total_errors.get("deadline"), Some(&1));
-        assert_eq!(state.total[0].summary().samples, 2);
+        assert_eq!(state.total.completed, [2, 0, 0]);
+        assert_eq!(state.total.errors.get("deadline"), Some(&1));
+        assert_eq!(state.total.histograms[0].summary().samples, 2);
     }
 }

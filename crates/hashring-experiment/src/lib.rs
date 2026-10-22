@@ -226,8 +226,8 @@ pub struct LoadBalanceNode {
     pub owned_keys: u64,
     /// The operations the node served.
     pub ops_handled: u64,
-    /// The share of one core the node used.
-    pub cpu_percent: f64,
+    /// The share of one core the node used, or None when CPU sampling is unavailable.
+    pub cpu_percent: Option<f64>,
 }
 
 /// How evenly the keys and the requests were spread over the nodes.
@@ -293,35 +293,7 @@ struct RuntimeSource {
     git_dirty: Option<bool>,
     git_status_porcelain: Option<String>,
     git_diff: Option<String>,
-    /// The files that were not in the commit.
-    ///
-    /// `git diff` holds the files that were tracked and changed, and not the
-    /// files that were never added to the index. A run of a tree that was
-    /// never committed is only reproducible if the tree itself is kept, so
-    /// the untracked files go into the manifest: the path, the size and the
-    /// digest of each, and the content of the text files that are small
-    /// enough to keep.
-    git_untracked: Vec<UntrackedFile>,
     source_tree_blake3: Option<String>,
-}
-
-/// A file that was not in the commit the run was built from.
-///
-/// The manifest holds the path, the size and the digest of the file, and the
-/// content of the file when it is text and small enough to keep. A file that
-/// could not be read is held with the error and without a digest, so it is
-/// never recorded as an empty file.
-#[derive(Serialize)]
-struct UntrackedFile {
-    path: String,
-    /// The size of the file, when it could be read.
-    bytes: Option<u64>,
-    /// The digest of the file, when it could be read.
-    blake3: Option<String>,
-    /// The content of the file, when it is text and small enough to keep.
-    content: Option<String>,
-    /// The error that stopped the file from being read, when there was one.
-    error: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -524,7 +496,7 @@ pub async fn run_experiment(
         runtime_tree_hash.as_deref(),
     );
     let manifest = ExperimentManifest {
-        schema_version: 7,
+        schema_version: 8,
         started_unix_ms: unix_ms(),
         executable_path: executable.display().to_string(),
         executable_blake3: file_digest(&executable)?,
@@ -547,7 +519,6 @@ pub async fn run_experiment(
                 "git",
                 &["diff", "--binary", "HEAD"],
             ),
-            git_untracked: untracked_files(build_source_root),
             source_tree_blake3: runtime_tree_hash,
         },
         source_reproducible,
@@ -1099,19 +1070,8 @@ async fn record_node_pressure(
 ) -> Result<()> {
     let mut nodes = BTreeMap::new();
     for member in members {
-        let result = tokio::time::timeout(Duration::from_secs(2), async {
-            let mut client =
-                configure_data_node_client(DataNodeClient::connect(member.endpoint.clone()).await?);
-            Ok::<_, anyhow::Error>(
-                client
-                    .get_process_info(hashring_core::proto::Empty {})
-                    .await?
-                    .into_inner(),
-            )
-        })
-        .await;
-        let value = match result {
-            Ok(Ok(info)) => json!({
+        let value = match query_node_info(&member.endpoint).await {
+            Ok(info) => json!({
                 "owner_write_timing": state_write_timing_json(info.owner_write_timing),
                 "follower_write_timing": state_write_timing_json(info.follower_write_timing),
                 "ack_write_timing": state_write_timing_json(info.ack_write_timing),
@@ -1131,8 +1091,7 @@ async fn record_node_pressure(
                 "replication_rpc_retries": info.replication_rpc_retries,
                 "replication_stream_peak_pending": info.replication_stream_peak_pending,
             }),
-            Ok(Err(error)) => json!({ "error": error.to_string() }),
-            Err(_) => json!({ "error": "node pressure request timed out" }),
+            Err(error) => json!({ "error": error.to_string() }),
         };
         nodes.insert(member.node_id.clone(), value);
     }
@@ -1437,7 +1396,7 @@ async fn record_topology(events: &EventLog, client: &HashringClient) -> Result<T
 #[derive(Clone, Copy, Debug, Default)]
 struct NodeCounters {
     ops_handled: u64,
-    cpu_seconds: f64,
+    cpu_seconds: Option<f64>,
 }
 
 /// Runs the `latency` mode: one stage per target rate, and a check of the key
@@ -1508,33 +1467,31 @@ async fn run_latency(
             duration_seconds: config.duration_seconds,
         };
         runner.run_warmup(&stage, events).await?;
-        let before = sample_node_counters(members, &pids).await;
-        let outcome = runner.run_measured(&stage, events).await?;
-        let after = sample_node_counters(members, &pids).await;
-        saturated_windows.insert(outcome.name.clone(), json!(outcome.saturated_windows));
-        measurements.insert(
-            outcome.name.clone(),
-            Measurement::LatencyStage(LatencyStageMeasurement {
-                target_rate: outcome.target_rate,
-                achieved_rate: outcome.achieved_rate,
-                seconds: outcome.seconds,
-                sender_saturated: outcome.sender_saturated,
-                issued: outcome.issued,
-                late: outcome.late,
-                ops: outcome.ops,
-                errors: outcome.errors,
-                retries: outcome.retries,
-                latency_us: outcome.latency_us,
-                load_balance: load_balance(&owned_keys, &before, &after, outcome.seconds),
-            }),
-        );
+        let before = sample_node_counters(members, &pids).await?;
+        let (mut measurement, saturated) = runner.run_measured(&stage, events).await?;
+        let after = sample_node_counters(members, &pids).await?;
+        measurement.load_balance = load_balance(&owned_keys, &before, &after, measurement.seconds)?;
+        saturated_windows.insert(stage.name.clone(), json!(saturated));
+        measurements.insert(stage.name, Measurement::LatencyStage(measurement));
     }
     observations.insert(
         "latency_saturated_windows".into(),
         Value::from(saturated_windows),
     );
-    let verified = verify_latency_keyspace(workload_client, &plan, config.concurrency).await?;
-    observations.insert("latency_verified_keys".into(), json!(verified));
+    let expected = (0..key_space)
+        .map(|key| (!plan.is_deleted(key)).then_some(0))
+        .collect::<Vec<_>>();
+    verify_dataset(
+        workload_client,
+        Workload {
+            key_count: key_space,
+            value_bytes: config.value_bytes,
+            concurrency: config.concurrency,
+        },
+        &expected,
+    )
+    .await?;
+    observations.insert("latency_verified_keys".into(), json!(key_space));
     processes.ensure_running()?;
     let topology = admin_client.refresh_topology().await?;
     events.record(
@@ -1609,14 +1566,16 @@ fn owned_key_counts(topology: &TopologySnapshot, key_space: u64) -> BTreeMap<Str
 async fn sample_node_counters(
     members: &[Member],
     pids: &BTreeMap<String, u32>,
-) -> BTreeMap<String, NodeCounters> {
+) -> Result<BTreeMap<String, NodeCounters>> {
     let mut counters = BTreeMap::new();
     for member in members {
-        let ops_handled = query_node_ops(&member.endpoint).await.unwrap_or(0);
+        let ops_handled = query_node_info(&member.endpoint)
+            .await
+            .with_context(|| format!("sampling operations of {}", member.node_id))?
+            .ops_handled;
         let cpu_seconds = pids
             .get(&member.node_id)
-            .and_then(|pid| process_cpu_seconds(*pid))
-            .unwrap_or(0.0);
+            .and_then(|pid| process_cpu_seconds(*pid));
         counters.insert(
             member.node_id.clone(),
             NodeCounters {
@@ -1625,25 +1584,20 @@ async fn sample_node_counters(
             },
         );
     }
-    counters
+    Ok(counters)
 }
 
-/// The number of operations a node served since it started.
-async fn query_node_ops(endpoint: &str) -> Option<u64> {
-    let result = tokio::time::timeout(Duration::from_secs(2), async {
-        let mut client = configure_data_node_client(
-            DataNodeClient::connect(endpoint.to_owned())
-                .await
-                .map_err(|error| anyhow::anyhow!("{error}"))?,
-        );
-        let info = client
+async fn query_node_info(endpoint: &str) -> Result<hashring_core::proto::NodeInfoResponse> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut client =
+            configure_data_node_client(DataNodeClient::connect(endpoint.to_owned()).await?);
+        Ok(client
             .get_process_info(hashring_core::proto::Empty {})
-            .await
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
-        Ok::<_, anyhow::Error>(info.into_inner().ops_handled)
+            .await?
+            .into_inner())
     })
-    .await;
-    result.ok().and_then(|value| value.ok())
+    .await
+    .context("node information request timed out")?
 }
 
 /// How the keys and the requests were spread over the nodes.
@@ -1652,19 +1606,21 @@ fn load_balance(
     before: &BTreeMap<String, NodeCounters>,
     after: &BTreeMap<String, NodeCounters>,
     seconds: f64,
-) -> LoadBalanceMeasurement {
+) -> Result<LoadBalanceMeasurement> {
     let mut per_node = BTreeMap::new();
     let mut owned = Vec::new();
     let mut handled = Vec::new();
     for (node, keys) in owned_keys {
-        let start = before.get(node).copied().unwrap_or_default();
-        let end = after.get(node).copied().unwrap_or_default();
-        let ops_handled = end.ops_handled.saturating_sub(start.ops_handled);
-        let cpu_percent = if seconds > 0.0 {
-            (end.cpu_seconds - start.cpu_seconds) / seconds * 100.0
-        } else {
-            0.0
-        };
+        let start = before.get(node).context("missing initial node counters")?;
+        let end = after.get(node).context("missing final node counters")?;
+        let ops_handled = end
+            .ops_handled
+            .checked_sub(start.ops_handled)
+            .context("node operations counter decreased during the stage")?;
+        let cpu_percent = start
+            .cpu_seconds
+            .zip(end.cpu_seconds)
+            .and_then(|(a, b)| (seconds > 0.0 && b >= a).then_some((b - a) / seconds * 100.0));
         owned.push(*keys as f64);
         handled.push(ops_handled as f64);
         per_node.insert(
@@ -1676,13 +1632,13 @@ fn load_balance(
             },
         );
     }
-    LoadBalanceMeasurement {
+    Ok(LoadBalanceMeasurement {
         per_node,
         owned_keys_max_over_mean: max_over_mean(&owned),
         owned_keys_cv: coefficient_of_variation(&owned),
         ops_handled_max_over_mean: max_over_mean(&handled),
         ops_handled_cv: coefficient_of_variation(&handled),
-    }
+    })
 }
 
 /// The largest value divided by the mean of the values.
@@ -1712,50 +1668,6 @@ fn coefficient_of_variation(values: &[f64]) -> f64 {
         .sum::<f64>()
         / values.len() as f64;
     variance.sqrt() / mean
-}
-
-/// Checks the key space the load left behind.
-///
-/// Every key the load did not delete must still hold the value the preload
-/// wrote, and every key it did delete must be gone. The load deletes from a
-/// pool of its own, so no delete raced another operation on the same key and
-/// the expected state of every key is known.
-async fn verify_latency_keyspace(
-    client: &HashringClient,
-    plan: &latency::LoadPlan,
-    concurrency: usize,
-) -> Result<u64> {
-    let present = AtomicU64::new(0);
-    let absent = AtomicU64::new(0);
-    stream::iter(0..plan.key_space)
-        .map(Ok::<_, anyhow::Error>)
-        .try_for_each_concurrent(Some(concurrency), |key| {
-            let client = client.clone();
-            let plan = plan.clone();
-            let present = &present;
-            let absent = &absent;
-            async move {
-                let deleted = plan.is_deleted(key);
-                match client.get(key.to_be_bytes().to_vec()).await {
-                    Ok(output) => {
-                        ensure!(
-                            output.value == deterministic_value(key, 0, plan.value_bytes),
-                            "key {key} holds a value the load did not write"
-                        );
-                        ensure!(!deleted, "key {key} was deleted but is still present");
-                        present.fetch_add(1, AtomicOrdering::Relaxed);
-                    }
-                    Err(ClientError::Operation(failure)) if failure.code == ErrorCode::NotFound => {
-                        ensure!(deleted, "key {key} is missing but was never deleted");
-                        absent.fetch_add(1, AtomicOrdering::Relaxed);
-                    }
-                    Err(error) => return Err(error.into()),
-                }
-                Ok(())
-            }
-        })
-        .await?;
-    Ok(present.load(AtomicOrdering::Relaxed) + absent.load(AtomicOrdering::Relaxed))
 }
 
 /// The CPU time a process has used, in seconds.
@@ -2406,88 +2318,6 @@ fn command_output(cwd: Option<&Path>, program: &str, arguments: &[&str]) -> Opti
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-/// The largest untracked file whose content the manifest keeps.
-const MAX_UNTRACKED_FILE_BYTES: usize = 4 * 1024 * 1024;
-
-/// The files that are not in the commit.
-///
-/// A run of a tree that was never committed is only reproducible if the tree
-/// itself is kept, and `git diff` does not hold the files that were never
-/// added to the index. The untracked files go into the manifest, so the
-/// source a run was built from is in the run's own output.
-///
-/// The content of a file is kept when the file is text and small enough.
-/// The size and the digest are kept for every file that could be read, and a
-/// file that could not be read is kept with its error, so a file that is not
-/// there is never recorded as an empty one.
-fn untracked_files(root: &Path) -> Vec<UntrackedFile> {
-    let Some(listing) = command_output(
-        Some(root),
-        "git",
-        &["ls-files", "--others", "--exclude-standard", "-z"],
-    ) else {
-        return Vec::new();
-    };
-    listing
-        .split('\0')
-        .filter(|path| !path.is_empty())
-        .map(|path| untracked_file(root, path))
-        .collect()
-}
-
-/// Reads one untracked file, and keeps what can be kept of it.
-///
-/// The size comes from the metadata and the digest from the file itself, so
-/// a file that is too large to keep is hashed in chunks and never loaded
-/// into memory.
-fn untracked_file(root: &Path, path: &str) -> UntrackedFile {
-    let full = root.join(path);
-    let bytes = match fs::metadata(&full) {
-        Ok(metadata) => metadata.len(),
-        Err(error) => return unreadable_file(path, error),
-    };
-    if bytes > MAX_UNTRACKED_FILE_BYTES as u64 {
-        // The file is too large to keep, so it is hashed in chunks and
-        // dropped.
-        return match file_digest(&full) {
-            Ok(blake3) => UntrackedFile {
-                path: path.to_owned(),
-                bytes: Some(bytes),
-                blake3: Some(blake3),
-                content: None,
-                error: None,
-            },
-            Err(error) => unreadable_file(path, error),
-        };
-    }
-    let contents = match fs::read(&full) {
-        Ok(contents) => contents,
-        Err(error) => return unreadable_file(path, error),
-    };
-    let blake3 = blake3::hash(&contents).to_hex().to_string();
-    UntrackedFile {
-        path: path.to_owned(),
-        bytes: Some(bytes),
-        blake3: Some(blake3),
-        content: String::from_utf8(contents).ok(),
-        error: None,
-    }
-}
-
-/// The entry of a file that could not be read.
-///
-/// It holds the error and nothing else, because a file that was not read has
-/// no size and no digest that can be trusted.
-fn unreadable_file(path: &str, error: impl std::fmt::Display) -> UntrackedFile {
-    UntrackedFile {
-        path: path.to_owned(),
-        bytes: None,
-        blake3: None,
-        content: None,
-        error: Some(error.to_string()),
-    }
-}
-
 fn source_is_reproducible(
     build_git_dirty: &str,
     build_git_commit: &str,
@@ -2567,6 +2397,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn load_balance_preserves_missing_cpu_and_rejects_missing_or_reset_counters() {
+        let owned = BTreeMap::from([("node-1".to_owned(), 10)]);
+        let before = BTreeMap::from([(
+            "node-1".to_owned(),
+            NodeCounters {
+                ops_handled: 20,
+                cpu_seconds: Some(1.0),
+            },
+        )]);
+        let mut after = BTreeMap::from([(
+            "node-1".to_owned(),
+            NodeCounters {
+                ops_handled: 40,
+                cpu_seconds: None,
+            },
+        )]);
+        let result = load_balance(&owned, &before, &after, 2.0).unwrap();
+        assert_eq!(result.per_node["node-1"].ops_handled, 20);
+        assert!(
+            serde_json::to_value(result).unwrap()["per_node"]["node-1"]["cpu_percent"].is_null()
+        );
+        after.get_mut("node-1").unwrap().cpu_seconds = Some(2.0);
+        assert_eq!(
+            load_balance(&owned, &before, &after, 2.0).unwrap().per_node["node-1"].cpu_percent,
+            Some(50.0)
+        );
+        after.get_mut("node-1").unwrap().ops_handled = 10;
+        assert!(load_balance(&owned, &before, &after, 2.0).is_err());
+        assert!(load_balance(&owned, &BTreeMap::new(), &after, 2.0).is_err());
+    }
+
+    #[tokio::test]
+    async fn node_operations_sampling_propagates_connection_failure() {
+        assert!(query_node_info("http://127.0.0.1:0").await.is_err());
+    }
+
+    #[test]
     fn deterministic_values_include_key_round_and_requested_length() {
         assert_eq!(deterministic_value(7, 3, 13).len(), 13);
         assert_eq!(deterministic_value(7, 3, 13), deterministic_value(7, 3, 13));
@@ -2597,67 +2464,6 @@ mod tests {
             Measurement::Throughput(measurement) => assert_eq!(measurement.operations, 10),
             other => panic!("expected a throughput measurement, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn the_untracked_files_are_kept_with_their_content() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        let git = |arguments: &[&str]| {
-            let status = Command::new("git")
-                .current_dir(root)
-                .args(arguments)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .unwrap();
-            assert!(status.success(), "git {arguments:?} failed");
-        };
-        git(&["init"]);
-        git(&["config", "user.email", "test@example.com"]);
-        git(&["config", "user.name", "test"]);
-        fs::write(root.join("tracked.txt"), "tracked\n").unwrap();
-        git(&["add", "tracked.txt"]);
-        git(&["commit", "-m", "first"]);
-        // A file that was never added to the index. `git diff` does not hold
-        // it, so the manifest has to.
-        fs::write(root.join("new.rs"), "fn main() {}\n").unwrap();
-        // A file that cannot be read. A broken symlink is the case that
-        // fails for every user, root included.
-        std::os::unix::fs::symlink(root.join("missing.rs"), root.join("broken.rs")).unwrap();
-
-        let files = untracked_files(root);
-        assert_eq!(files.len(), 2);
-
-        let readable = files
-            .iter()
-            .find(|file| file.path == "new.rs")
-            .expect("the readable file is listed");
-        assert_eq!(readable.bytes, Some(13));
-        assert_eq!(readable.content.as_deref(), Some("fn main() {}\n"));
-        assert_eq!(readable.blake3.as_deref().unwrap().len(), 64);
-        assert!(readable.error.is_none());
-
-        // The file that could not be read is listed with the error, and not
-        // as an empty file.
-        let broken = files
-            .iter()
-            .find(|file| file.path == "broken.rs")
-            .expect("the unreadable file is listed");
-        assert_eq!(broken.content, None);
-        assert_eq!(broken.bytes, None);
-        assert_eq!(broken.blake3, None);
-        assert!(
-            broken.error.is_some(),
-            "the unreadable file holds its error"
-        );
-
-        // The manifest holds the error, and no size and no digest.
-        let entry = serde_json::to_value(broken).unwrap();
-        assert!(entry["bytes"].is_null());
-        assert!(entry["blake3"].is_null());
-        assert!(entry["content"].is_null());
-        assert!(entry["error"].as_str().is_some());
     }
 
     #[test]

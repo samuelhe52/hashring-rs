@@ -43,7 +43,7 @@ async fn experiment_runner_preserves_reproducibility_artifacts() {
             .unwrap();
     assert_eq!(manifest["config"]["node_count"], 4);
     assert_eq!(manifest["config"]["key_count"], 300);
-    assert_eq!(manifest["schema_version"], 7);
+    assert_eq!(manifest["schema_version"], 8);
     // Every node is started with the run's tuning, so it must parse.
     assert_eq!(manifest["config"]["node"]["max_dedup_bytes"], 33_554_432);
     assert_eq!(manifest["executable_blake3"].as_str().unwrap().len(), 64);
@@ -64,28 +64,6 @@ async fn experiment_runner_preserves_reproducibility_artifacts() {
         manifest["source_reproducible"],
         expected_source_reproducible
     );
-    // The source of a tree that was never committed is in the manifest: the
-    // files that were not added to the index are held with their content,
-    // because `git diff` does not hold them. A file that could not be read
-    // holds its error and no digest, so the fields may be absent.
-    let untracked = manifest["runtime_source"]["git_untracked"]
-        .as_array()
-        .expect("the manifest holds the untracked files");
-    for file in untracked {
-        assert!(file.get("path").and_then(|value| value.as_str()).is_some());
-        // A file that could not be read holds its error and no digest, so
-        // the size and the digest are absent.
-        assert!(file.get("blake3").is_none_or(
-            |value| value.is_null() || value.as_str().is_some_and(|digest| digest.len() == 64)
-        ));
-        assert!(
-            file.get("bytes")
-                .is_none_or(|value| value.is_null() || value.is_u64())
-        );
-        if let Some(error) = file.get("error").and_then(|value| value.as_str()) {
-            assert!(!error.is_empty());
-        }
-    }
     let summary: serde_json::Value =
         serde_json::from_slice(&std::fs::read(output_directory.join("summary.json")).unwrap())
             .unwrap();
@@ -232,10 +210,9 @@ async fn latency_experiment_measures_one_stage_per_target_rate() {
     // The histogram keeps the longest sample and the number of the samples
     // that were longer than its range, so a reader can tell a truncated
     // sample from one that was near the bound.
-    assert_eq!(
-        stage["latency_us"]["get"]["max_observed"].as_u64().unwrap(),
-        stage["latency_us"]["get"]["max"].as_u64().unwrap()
-    );
+    let observed = stage["latency_us"]["get"]["max_observed"].as_u64().unwrap();
+    let bucket = stage["latency_us"]["get"]["max"].as_u64().unwrap();
+    assert!(bucket >= observed && bucket - observed <= bucket / 1_000 + 1);
     assert_eq!(
         stage["latency_us"]["get"]["over_range"].as_u64().unwrap(),
         0
