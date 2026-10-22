@@ -417,6 +417,12 @@ struct NodePressureStats {
     replication_reservation_rejections: AtomicU64,
     replication_rpc_retries: AtomicU64,
     replication_stream_peak_pending: AtomicU64,
+    /// Operations this node served as the owner of a key. The load-balance
+    /// report of the `latency` mode reads them to show where the requests of
+    /// a skewed workload went.
+    ops_get: AtomicU64,
+    ops_put: AtomicU64,
+    ops_delete: AtomicU64,
 }
 
 struct NodeState {

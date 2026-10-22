@@ -256,6 +256,9 @@ struct ClientInner {
     background_refresh_running: AtomicBool,
     background_minimum_epoch: AtomicU64,
     background_trigger_generation: AtomicU64,
+    /// Every internal retry this client made. A load driver reads it to tell
+    /// a slow cluster apart from a client that had to try again.
+    retries: AtomicU64,
 }
 
 impl HashringClient {
@@ -289,6 +292,7 @@ impl HashringClient {
             background_refresh_running: AtomicBool::new(false),
             background_minimum_epoch: AtomicU64::new(0),
             background_trigger_generation: AtomicU64::new(0),
+            retries: AtomicU64::new(0),
         });
         if let Some(interval) = config
             .topology_poll_interval
@@ -301,6 +305,24 @@ impl HashringClient {
 
     pub async fn topology(&self) -> TopologySnapshot {
         self.inner.topology.read().await.clone()
+    }
+
+    /// The epoch of the topology the client is routing with.
+    ///
+    /// A caller that only wants the epoch should read it here rather than
+    /// clone the whole snapshot.
+    pub async fn epoch(&self) -> u64 {
+        self.inner.topology.read().await.epoch
+    }
+
+    /// How many internal retries this client has made.
+    ///
+    /// A retry is one attempt a client made after a retryable failure, of a
+    /// request or of a topology refresh. The count is cumulative over the
+    /// client's lifetime, so a caller that wants the retries of one phase
+    /// reads it before and after.
+    pub fn retry_count(&self) -> u64 {
+        self.inner.retries.load(Ordering::Relaxed)
     }
 
     // Request routing needs only the epoch and selected endpoint. Keep them
@@ -906,7 +928,7 @@ impl HashringClient {
                     )
                     .await?;
                 }
-                retry_delay_with_hint(
+                self.retry_delay_with_hint(
                     deadline,
                     attempt,
                     unknown_write_outcome,
@@ -1039,7 +1061,19 @@ impl HashringClient {
         attempt: &mut u32,
         unknown_write_outcome: bool,
     ) -> Result<(), ClientError> {
+        self.inner.retries.fetch_add(1, Ordering::Relaxed);
         retry_delay(deadline, attempt, unknown_write_outcome).await
+    }
+
+    async fn retry_delay_with_hint(
+        &self,
+        deadline: Instant,
+        attempt: &mut u32,
+        unknown_write_outcome: bool,
+        minimum_delay: Duration,
+    ) -> Result<(), ClientError> {
+        self.inner.retries.fetch_add(1, Ordering::Relaxed);
+        retry_delay_with_hint(deadline, attempt, unknown_write_outcome, minimum_delay).await
     }
 
     async fn data_node_client(
@@ -1118,10 +1152,10 @@ async fn refresh_topology_for_inner(
                     return Ok(current.clone());
                 }
                 drop(current);
-                retry_delay(deadline, &mut attempt, unknown_write_outcome).await?;
+                refresh_retry_delay(inner, deadline, &mut attempt, unknown_write_outcome).await?;
             }
             Ok(Err(error)) if error.is_retryable() => {
-                retry_delay(deadline, &mut attempt, unknown_write_outcome).await?;
+                refresh_retry_delay(inner, deadline, &mut attempt, unknown_write_outcome).await?;
             }
             Ok(Err(error)) => {
                 return Err(ClientError::TopologyRefresh {
@@ -1142,6 +1176,22 @@ async fn retry_delay(
     unknown_write_outcome: bool,
 ) -> Result<(), ClientError> {
     retry_delay_with_hint(deadline, attempt, unknown_write_outcome, Duration::ZERO).await
+}
+
+/// Waits before the next attempt of a topology refresh, and counts it.
+///
+/// A refresh that has to try again is a retry of the client, like a request
+/// that has to try again, so it is counted with them. A counter that left
+/// these out would count a client that never had to try a request twice as a
+/// client that never had to try anything twice.
+async fn refresh_retry_delay(
+    inner: &ClientInner,
+    deadline: Instant,
+    attempt: &mut u32,
+    unknown_write_outcome: bool,
+) -> Result<(), ClientError> {
+    inner.retries.fetch_add(1, Ordering::Relaxed);
+    retry_delay(deadline, attempt, unknown_write_outcome).await
 }
 
 async fn retry_delay_with_hint(
@@ -1529,6 +1579,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refresh_that_has_to_try_again_counts_as_a_retry() {
+        let (endpoint, service, server) = start_fake_coordinator(Duration::ZERO).await;
+        let mut config = ClientConfig::new(Duration::from_secs(1));
+        config.topology_poll_interval = None;
+        let client = HashringClient::connect_with_config(endpoint, config)
+            .await
+            .unwrap();
+        // The first fetch of the refresh fails with a failure that can be
+        // tried again, so the client has to try a second time.
+        *service.topology_error.lock().unwrap() = Some(Code::Unavailable);
+        service
+            .topology_failures_remaining
+            .store(1, Ordering::SeqCst);
+
+        let before = client.retry_count();
+        client.refresh_topology().await.unwrap();
+        // The retry of a refresh is a retry of the client, like the retry of
+        // a request. A counter that left it out would report a client that
+        // had to try a request twice as one that never had to try anything
+        // twice.
+        assert_eq!(client.retry_count(), before + 1);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn idle_polling_fetches_topology_only_after_the_epoch_advances() {
         let (endpoint, service, server) = start_fake_coordinator(Duration::ZERO).await;
         let mut config = ClientConfig::new(Duration::from_secs(1));
@@ -1703,6 +1778,7 @@ mod tests {
                 background_refresh_running: AtomicBool::new(false),
                 background_minimum_epoch: AtomicU64::new(0),
                 background_trigger_generation: AtomicU64::new(0),
+                retries: AtomicU64::new(0),
             }),
         }
     }
