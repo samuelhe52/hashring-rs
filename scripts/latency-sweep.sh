@@ -82,10 +82,14 @@ EXTRACT="${EXTRACT:-$PROJECT_ROOT/docs/data/latency-acceptance/extract.py}"
 OUT_DIR="${OUT_DIR:-results/latency-acceptance-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$OUT_DIR"
 DATA_OUT="$DATA_DIR/$(basename "$OUT_DIR")"
-mkdir -p "$DATA_OUT"
 
 # The host the numbers were measured on. A latency number without the host it
-# came from is not a measurement.
+# came from is not a measurement. It is written into the run's own output
+# directory, which is under `results/` and out of git, and copied into the
+# data directory after the last run: a file in the tracked data directory
+# before the first run would be untracked source that every run records in
+# its manifest, and every manifest of the campaign would then report
+# `source_reproducible: false` for the script's own output.
 {
   echo "date: $(date -Is)"
   echo "uname: $(uname -a)"
@@ -98,8 +102,8 @@ mkdir -p "$DATA_OUT"
   echo "git_changed_files: $(git status --porcelain | wc -l)"
   echo "cargo: $(cargo --version)"
   echo "rustc: $(rustc --version)"
-} > "$DATA_OUT/host.txt"
-cat "$DATA_OUT/host.txt"
+} > "$OUT_DIR/host.txt"
+cat "$OUT_DIR/host.txt"
 
 run_experiment() {
   local out="$1"
@@ -236,6 +240,9 @@ for vnodes in $VNODES; do
 done
 
 echo "== extracting"
+# The data directory is written now that every run is over, so no run saw it.
+mkdir -p "$DATA_OUT"
+cp "$OUT_DIR/host.txt" "$DATA_OUT/host.txt"
 python3 "$EXTRACT" "$OUT_DIR" > "$DATA_OUT/stages.tsv"
 python3 "$EXTRACT" --medians "$OUT_DIR" > "$DATA_OUT/medians.tsv"
 cp "$DATA_OUT/host.txt" "$DATA_DIR/host.txt"
