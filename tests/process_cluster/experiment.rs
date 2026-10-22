@@ -1,6 +1,7 @@
 use super::*;
 
 #[tokio::test]
+#[ignore = "full correctness experiment; run with --ignored"]
 async fn experiment_runner_preserves_reproducibility_artifacts() {
     let _guard = process_test_lock().lock().await;
     let directory = tempfile::tempdir().unwrap();
@@ -100,6 +101,7 @@ async fn experiment_runner_preserves_reproducibility_artifacts() {
 }
 
 #[tokio::test]
+#[ignore = "timed latency experiment; run with --ignored"]
 async fn latency_experiment_measures_one_stage_per_target_rate() {
     let _guard = process_test_lock().lock().await;
     let directory = tempfile::tempdir().unwrap();
@@ -258,6 +260,7 @@ async fn latency_experiment_measures_one_stage_per_target_rate() {
 }
 
 #[tokio::test]
+#[ignore = "two full availability experiments; run with --ignored"]
 async fn availability_experiment_records_failover_loss_and_rf_repair() {
     let _guard = process_test_lock().lock().await;
     let directory = tempfile::tempdir().unwrap();

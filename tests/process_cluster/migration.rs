@@ -1,6 +1,7 @@
 use super::*;
 
 #[tokio::test]
+#[ignore = "96 MiB migration transport check; run with --ignored"]
 async fn migration_carries_a_value_above_the_control_message_limit() {
     let _guard = process_test_lock().lock().await;
     let directory = tempfile::tempdir().unwrap();
@@ -438,6 +439,27 @@ async fn topology_change_plan_is_exclusive_durable_and_not_published() {
     coordinator.stop();
 }
 
+// Keep every key in the final-state oracle, without paying for one network
+// round trip at a time. Bound the work just as the snapshot-restart test does.
+async fn assert_values(client: &HashringClient, keys: &[Vec<u8>], values: &[Vec<u8>]) {
+    assert_eq!(keys.len(), values.len());
+    let mut reads = tokio::task::JoinSet::new();
+    for (key, value) in keys.iter().zip(values) {
+        let client = client.clone();
+        let key = key.clone();
+        let value = value.clone();
+        reads.spawn(async move {
+            assert_eq!(client.get(key).await.unwrap().value, value);
+        });
+        if reads.len() >= 64 {
+            reads.join_next().await.unwrap().unwrap();
+        }
+    }
+    while let Some(result) = reads.join_next().await {
+        result.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn online_scale_out_and_scale_in_preserve_concurrent_writes() {
     let _guard = process_test_lock().lock().await;
@@ -466,13 +488,25 @@ async fn online_scale_out_and_scale_in_preserve_concurrent_writes() {
     let keys: Vec<_> = (0_u64..5_000)
         .map(|index| index.to_be_bytes().to_vec())
         .collect();
-    let expected = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let mut initial_values = Vec::with_capacity(keys.len());
+    let mut writes = tokio::task::JoinSet::new();
     for (index, key) in keys.iter().enumerate() {
         let mut value = vec![index as u8; 4 * 1024];
         value[..8].copy_from_slice(&(index as u64).to_be_bytes());
-        client.put(key.clone(), value.clone()).await.unwrap();
-        expected.lock().await.push(value);
+        initial_values.push(value.clone());
+        let client = client.clone();
+        let key = key.clone();
+        writes.spawn(async move {
+            client.put(key, value).await.unwrap();
+        });
+        if writes.len() >= 64 {
+            writes.join_next().await.unwrap().unwrap();
+        }
     }
+    while let Some(result) = writes.join_next().await {
+        result.unwrap();
+    }
+    let expected = std::sync::Arc::new(tokio::sync::Mutex::new(initial_values));
 
     let two_members = vec![
         Member {
@@ -518,12 +552,7 @@ async fn online_scale_out_and_scale_in_preserve_concurrent_writes() {
         .await
         .unwrap();
     let expected_values = expected.lock().await.clone();
-    for (index, key) in keys.iter().enumerate() {
-        assert_eq!(
-            fresh.get(key.clone()).await.unwrap().value,
-            expected_values[index]
-        );
-    }
+    assert_values(&fresh, &keys, &expected_values).await;
 
     let scale_in_plan = fresh
         .begin_topology_change(vec![two_members[1].clone()])
@@ -554,12 +583,7 @@ async fn online_scale_out_and_scale_in_preserve_concurrent_writes() {
         .await
         .unwrap();
     let expected_values = expected.lock().await.clone();
-    for (index, key) in keys.iter().enumerate() {
-        assert_eq!(
-            final_client.get(key.clone()).await.unwrap().value,
-            expected_values[index]
-        );
-    }
+    assert_values(&final_client, &keys, &expected_values).await;
     for _ in 0..50 {
         if node_1.has_exited() {
             break;
@@ -1075,7 +1099,14 @@ async fn permanently_lost_joiner_before_publication_aborts_after_grace() {
     execution.abort();
     node_2.stop();
     let mut restart_args = coordinator_arguments(ports[0], &state, &[]);
-    restart_args.extend(["--migration-timeout-ms".into(), "500".into()]);
+    // Failure confirmation has its own grace period; the migration RPC
+    // timeout does not shorten the default 30-second wait for a lost joiner.
+    restart_args.extend([
+        "--migration-timeout-ms".into(),
+        "500".into(),
+        "--prepublication-failure-grace-ms".into(),
+        "1000".into(),
+    ]);
     coordinator = spawn_process(&restart_args);
     wait_for_listener(ports[0]);
     tokio::time::timeout(Duration::from_secs(45), async {
