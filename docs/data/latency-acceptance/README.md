@@ -11,7 +11,6 @@ big, and every one of them is reproducible from the script.
 | `host.txt` | The machine the numbers were measured on. |
 | `stages.tsv` | One row per stage of every run. |
 | `medians.tsv` | One row per stage, over the repetitions of it. |
-| `source.patch` | The source the campaign was built from, as one patch. |
 | `<run>/` | The tables of one campaign, in the directory the run wrote. |
 
 The `stages.tsv` columns are the run's own numbers, renamed to fit a table:
@@ -26,7 +25,7 @@ went past the capacity, and `vnode` is the virtual node comparison.
 key write in every run. It is the run's measure of how fast the machine was
 while it ran, and it is the column to look at first: the machine is shared,
 and its speed moves between campaigns. It moved by a factor of 1.8 between
-two of them, and by 5% within the one the report is written from.
+two of them, and by 6.8% within the one the report is written from.
 
 ## How to reproduce
 
@@ -40,28 +39,33 @@ rates from it, runs the campaign, the ladder and the virtual node comparison,
 and writes the tables back here. `scripts/latency-sweep.sh` documents every
 knob it takes.
 
-The campaign was run from a working tree that had not been committed, so the
-`manifest.json` of every run holds the diff of the files that were tracked
-and changed. It does not hold the files that were never added to the index,
-because `git diff` does not hold them, and the mode itself was one of those.
-`source.patch` is the whole change, the tracked diff as the manifest recorded
-it and the files that were not in the index as new files, and it is the source
-the campaign was built from:
+## The source of the run
+
+The campaign was run from the commit it was built from, `52adf85`, with no
+tracked file changed. Every run's `manifest.json` holds that commit, an empty
+`git diff`, and the same source tree digest at build time and at run time,
+so the source is a checkout away:
 
 ```sh
-git worktree add --detach /tmp/campaign 079b218
-cd /tmp/campaign && git apply /path/to/source.patch
+git checkout 52adf85
 ```
 
-The patched tree has the source tree digest the run recorded in every
-manifest, `52875185bd69bc52c9a8460da2e94650c134b4de57155fcb5e825475d5daf817`.
-The digest is the part of the source that does not depend on where the tree
-is built. The binary's bytes do: the absolute build root is compiled into
-them, so the hash in `host.txt` comes back only from a build at the same
-absolute path, with the same target directory layout. The manifest now keeps
-the files that were not in the index, with the content of the ones that are
-text and small enough, so a run of an uncommitted tree carries its own
-source; that came after this campaign, which is why this one needed the
-patch.
+The manifests of this run do report `source_reproducible: false`, for one
+reason that was the script's own: it wrote the `host.txt` into `<run>/`
+before the first run started, so `git status` of every run saw that one
+untracked file. The diff of every manifest is empty and nothing in the
+source tree differs from the commit. The script writes the `host.txt` after
+the last run now, so a run of a clean tree reports
+`source_reproducible: true` — which needs the tables of the run before it
+committed, because they live in this tracked directory too.
 
-The `host.txt` holds the hash of the binary.
+A run of a tree that was never committed carries its source too: the manifest
+keeps the files that are not in the index, with the content of the ones that
+are text and small enough. The campaign the report replaces needed a patch
+file for exactly that reason — its mode and its script were never added to
+the index — and the patch was dropped when the campaign was.
+
+The `host.txt` holds the hash of the binary. The build is deterministic at a
+fixed path, but the absolute build root is compiled into the binary, so the
+hash comes back only from a build at the same path with the same target
+directory layout; the source tree digest comes back from any path.

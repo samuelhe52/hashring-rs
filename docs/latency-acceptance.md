@@ -27,25 +27,21 @@ produced them.
 | Repetitions | 3 per point |
 | Distributions | `uniform`, `zipf:0.99` |
 | Host | 24 cores, 32 GB, Linux 7.2.11-zen1-1-zen |
-| Run | `latency-acceptance-20261022-022215`, 39 minutes |
-| Binary | `5c864840`, commit `079b218`, 21 changed files |
+| Run | `latency-acceptance-20261022-172621`, 39 minutes |
+| Binary | `e3cf261f`, commit `52adf85`, clean source |
 
 The hash above is the hash of the binary that ran, recorded by the run
 itself in [`host.txt`](data/latency-acceptance/host.txt) and in the
 `manifest.json` of every run. The build is deterministic at a fixed path —
 two `cargo build --release` runs of the same source at the same path give
-the same bytes — and the source the run was built from is in
-[`source.patch`](data/latency-acceptance/source.patch), which reproduces the
-source tree digest the run recorded. The digest comes back from any path; the
-binary's hash does not, because the absolute build root is compiled into the
-binary. The tree has changed since: a doc comment and a clippy attribute
-were added to `latency.rs`, and the mode was changed afterwards to fix what
-the review of this report found.
+the same bytes — and the source of the run is the commit it was built from,
+`52adf85`. The source tree digest comes back from any path; the binary's
+hash does not, because the absolute build root is compiled into the binary.
 
 The target rates are a share of the capacity the cluster showed in
-`performance` mode, which measured **80,615 operations per second** for the
+`performance` mode, which measured **84,054 operations per second** for the
 write path on the same host with the same configuration. The rates are 0.25,
-0.5, 0.75 and 0.9 of that: **20,153**, **40,307**, **60,461** and **72,553**
+0.5, 0.75 and 0.9 of that: **21,013**, **42,027**, **63,040** and **75,648**
 operations per second.
 
 A run past the capacity was added, because the capacity is a *write* capacity
@@ -55,10 +51,11 @@ capacity and shows where the mode gives up.
 The host is a shared machine, so every table carries the speed of the host the
 run landed on: the preload writes the same 100,000 keys with the same 64
 tasks before the load starts, and it is the run's own measure of how fast the
-machine was. During this campaign that speed was **80,749 to 84,775
-operations per second, a spread of 5%** — the campaign ran between two and
-three in the morning, when the machine had little else to do. That is what
-makes the comparison between the two distributions below worth reading; an
+machine was. During this campaign that speed was **80,993 to 86,500
+operations per second, a spread of 6.8%**. The run started at 17:26 with 14.6
+of the machine's 32 GB of memory free and a load average of 2.24, so it was
+not an empty machine: 6.8% is what that cost, and it is still small enough to
+make the comparison between the two distributions below worth reading. An
 earlier campaign on a busier machine moved by a factor of 1.8 and could not
 support it.
 
@@ -69,30 +66,30 @@ microseconds, and the speed of the host that run landed on.
 
 | Run | Distribution | Rate | Host | p50 | p95 | p99 | p999 | max |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| uniform-rep1 | uniform | 20,153 | 84,775 | 57 us | 78 us | 94 us | 197 us | 11,047 us |
-| uniform-rep1 | uniform | 40,307 | 84,775 | 58 us | 82 us | 107 us | 211 us | 1,663 us |
-| uniform-rep1 | uniform | 60,461 | 84,775 | 58 us | 92 us | 154 us | 476 us | 21,711 us |
-| uniform-rep1 | uniform | 72,553 | 84,775 | 62 us | 114 us | 365 us | 1,247 us | 3,775 us |
-| uniform-rep2 | uniform | 20,153 | 84,160 | 57 us | 77 us | 93 us | 220 us | 10,719 us |
-| uniform-rep2 | uniform | 40,307 | 84,160 | 58 us | 81 us | 105 us | 185 us | 1,456 us |
-| uniform-rep2 | uniform | 60,461 | 84,160 | 59 us | 96 us | 180 us | 655 us | 21,791 us |
-| uniform-rep2 | uniform | 72,553 | 84,160 | 63 us | 122 us | 429 us | 1,788 us | 8,359 us |
-| uniform-rep3 | uniform | 20,153 | 84,430 | 57 us | 77 us | 93 us | 191 us | 10,671 us |
-| uniform-rep3 | uniform | 40,307 | 84,430 | 58 us | 82 us | 107 us | 208 us | 3,689 us |
-| uniform-rep3 | uniform | 60,461 | 84,430 | 58 us | 94 us | 166 us | 652 us | 20,239 us |
-| uniform-rep3 | uniform | 72,553 | 84,430 | 63 us | 124 us | 434 us | 1,525 us | 5,403 us |
-| zipf-0-99-rep1 | zipf:0.99 | 20,153 | 80,748 | 57 us | 79 us | 95 us | 216 us | 10,463 us |
-| zipf-0-99-rep1 | zipf:0.99 | 40,307 | 80,748 | 57 us | 79 us | 101 us | 185 us | 8,271 us |
-| zipf-0-99-rep1 | zipf:0.99 | 60,461 | 80,748 | 58 us | 92 us | 156 us | 482 us | 19,887 us |
-| zipf-0-99-rep1 | zipf:0.99 | 72,553 | 80,748 | 62 us | 112 us | 293 us | 1,050 us | 19,087 us |
-| zipf-0-99-rep2 | zipf:0.99 | 20,153 | 83,268 | 56 us | 78 us | 94 us | 201 us | 10,375 us |
-| zipf-0-99-rep2 | zipf:0.99 | 40,307 | 83,268 | 58 us | 82 us | 106 us | 198 us | 8,759 us |
-| zipf-0-99-rep2 | zipf:0.99 | 60,461 | 83,268 | 58 us | 95 us | 165 us | 506 us | 20,655 us |
-| zipf-0-99-rep2 | zipf:0.99 | 72,553 | 83,268 | 62 us | 115 us | 383 us | 1,627 us | 19,423 us |
-| zipf-0-99-rep3 | zipf:0.99 | 20,153 | 84,024 | 56 us | 77 us | 93 us | 195 us | 10,303 us |
-| zipf-0-99-rep3 | zipf:0.99 | 40,307 | 84,024 | 57 us | 79 us | 101 us | 178 us | 8,567 us |
-| zipf-0-99-rep3 | zipf:0.99 | 60,461 | 84,024 | 58 us | 92 us | 155 us | 505 us | 20,255 us |
-| zipf-0-99-rep3 | zipf:0.99 | 72,553 | 84,024 | 62 us | 114 us | 346 us | 1,234 us | 19,759 us |
+| uniform-rep1 | uniform | 21,013 | 81,605 | 56 us | 78 us | 95 us | 240 us | 10,543 us |
+| uniform-rep1 | uniform | 42,027 | 81,605 | 57 us | 81 us | 108 us | 280 us | 3,665 us |
+| uniform-rep1 | uniform | 63,040 | 81,605 | 57 us | 95 us | 181 us | 645 us | 20,975 us |
+| uniform-rep1 | uniform | 75,648 | 81,605 | 62 us | 134 us | 548 us | 1,892 us | 5,711 us |
+| uniform-rep2 | uniform | 21,013 | 84,872 | 56 us | 76 us | 92 us | 187 us | 10,695 us |
+| uniform-rep2 | uniform | 42,027 | 84,872 | 58 us | 82 us | 106 us | 202 us | 1,622 us |
+| uniform-rep2 | uniform | 63,040 | 84,872 | 59 us | 98 us | 196 us | 673 us | 21,247 us |
+| uniform-rep2 | uniform | 75,648 | 84,872 | 63 us | 135 us | 592 us | 2,633 us | 8,423 us |
+| uniform-rep3 | uniform | 21,013 | 82,558 | 57 us | 78 us | 95 us | 209 us | 10,591 us |
+| uniform-rep3 | uniform | 42,027 | 82,558 | 57 us | 82 us | 107 us | 215 us | 3,653 us |
+| uniform-rep3 | uniform | 63,040 | 82,558 | 58 us | 97 us | 190 us | 676 us | 19,823 us |
+| uniform-rep3 | uniform | 75,648 | 82,558 | 62 us | 123 us | 440 us | 1,652 us | 5,795 us |
+| zipf-0-99-rep1 | zipf:0.99 | 21,013 | 86,500 | 56 us | 78 us | 95 us | 243 us | 10,311 us |
+| zipf-0-99-rep1 | zipf:0.99 | 42,027 | 86,500 | 57 us | 82 us | 110 us | 266 us | 9,327 us |
+| zipf-0-99-rep1 | zipf:0.99 | 63,040 | 86,500 | 57 us | 93 us | 172 us | 510 us | 20,815 us |
+| zipf-0-99-rep1 | zipf:0.99 | 75,648 | 86,500 | 62 us | 120 us | 439 us | 2,381 us | 19,503 us |
+| zipf-0-99-rep2 | zipf:0.99 | 21,013 | 80,993 | 57 us | 79 us | 95 us | 213 us | 10,767 us |
+| zipf-0-99-rep2 | zipf:0.99 | 42,027 | 80,993 | 58 us | 82 us | 109 us | 233 us | 8,151 us |
+| zipf-0-99-rep2 | zipf:0.99 | 63,040 | 80,993 | 58 us | 97 us | 188 us | 576 us | 20,671 us |
+| zipf-0-99-rep2 | zipf:0.99 | 75,648 | 80,993 | 63 us | 127 us | 524 us | 3,187 us | 20,399 us |
+| zipf-0-99-rep3 | zipf:0.99 | 21,013 | 84,556 | 57 us | 78 us | 96 us | 234 us | 10,783 us |
+| zipf-0-99-rep3 | zipf:0.99 | 42,027 | 84,556 | 56 us | 77 us | 98 us | 197 us | 9,447 us |
+| zipf-0-99-rep3 | zipf:0.99 | 63,040 | 84,556 | 57 us | 92 us | 173 us | 582 us | 20,031 us |
+| zipf-0-99-rep3 | zipf:0.99 | 75,648 | 84,556 | 62 us | 112 us | 304 us | 1,157 us | 19,631 us |
 
 **The achieved rate was the target rate in every one of these 24 stages.** Not
 one request was dropped for want of an in-flight slot, not one failed, the
@@ -100,35 +97,35 @@ client never had to try a request twice, and no window was marked as one the
 sender did not keep up with. Every number in this table describes the cluster
 and not the driver.
 
-The retry counter of that run counted the retries of the requests. The
-retries of a topology refresh were not counted by it — the counter was
-widened after this campaign — so "never had to try a request twice" is what
-the counter of this run measured, and the refreshes it made are not in it.
+The retry counter of this run counts the retries of the requests and the
+retries of the topology refreshes behind them — the counter was widened
+before this run — and it read zero in every measured window of every run.
 The client polls the coordinator for the topology every five seconds, so it
-did make refreshes during the run; none of them is in the counter, and none
-of them is in the `errors` of any window either.
+did make refreshes during the run; none of them needed a retry, and no
+window of any run carries a non-zero retry count.
 
 **The median does not move.** The p50 is between 56 and 63 us across a factor
 of 3.6 of load. A load generator that reported only a median would have shown
 a flat line and called it a stable cluster.
 
 **The tail moves, and the top of the campaign is where it starts.** The p99
-holds at 93 to 107 us through half the capacity, reaches 154 to 180 us at
-0.75, and is at 293 to 434 us at 0.9. The p999 stays under 1.8 ms
-throughout. The maximum does not behave: the stage whose p999 was 655 us
-still had a request that waited 21,791 us, which is the tail of a shared
+holds at 92 to 110 us through half the capacity, reaches 172 to 196 us at
+0.75, and is at 304 to 592 us at 0.9. The p999 stays under 3.2 ms
+throughout. The maximum does not behave: the stage whose p999 was 673 us
+still had a request that waited 21,247 us, which is the tail of a shared
 machine rather than a queue — a queue shows up in the p999 as well.
 
-**The two distributions cost the same latency.** The second repetition of
-each is the matched pair, at 84,160 and 83,269 operations per second of
-preload, within 1.1% of each other. Under `zipf:0.99` the p50 was 56 to 63 us
-against the uniform run's 57 to 63, and the p99 was 94 to 383 us against 93
-to 429. An earlier campaign, run on a machine that moved by a factor of 1.8
-during it, suggested the skewed load was faster; at this host speed the two
-are the same within the noise of the machine.
+**The two distributions cost the same latency.** The three uniform runs
+landed at 81,605, 82,558 and 84,872 operations per second of preload and the
+three `zipf:0.99` runs at 80,993, 84,556 and 86,500, so the two medians are
+2.4% apart — inside the campaign's own 6.8% spread. Under `zipf:0.99` the p50
+was 56 to 63 us against the uniform run's 56 to 63, and the p99 was 95 to
+524 us against 92 to 592. An earlier campaign, run on a machine that moved by
+a factor of 1.8 during it, suggested the skewed load was faster; at this host
+speed the two are the same within the noise of the machine.
 
 **What the skew does cost is the busiest node.** See the next table: the same
-top rate puts the busiest node at 35.1% of a core under `uniform` and 47.1%
+top rate puts the busiest node at 36.3% of a core under `uniform` and 48.8%
 under `zipf:0.99`. The cluster has the headroom for it, which is why the
 latency does not show it.
 
@@ -139,18 +136,18 @@ the key space is divided by the ring, and the requests land on the keys. The
 table is the median over the three repetitions, whose individual numbers are
 in the data directory: the key space columns are identical in all three,
 because the ring is built the same way every time, and the operations column
-moves by at most 0.008 between them.
+moves by at most 0.014 between them.
 
 | Distribution | Rate | Owned keys, max over mean | Owned keys, cv | Operations, max over mean | Operations, cv | Busiest node's CPU |
 | --- | --- | --- | --- | --- | --- | --- |
-| uniform | 20,153 | 1.116 | 0.088 | 1.142 | 0.089 | 10.2% |
-| uniform | 40,307 | 1.116 | 0.088 | 1.145 | 0.089 | 19.8% |
-| uniform | 60,461 | 1.116 | 0.088 | 1.145 | 0.089 | 29.1% |
-| uniform | 72,553 | 1.116 | 0.088 | 1.142 | 0.089 | 35.1% |
-| zipf:0.99 | 20,153 | 1.116 | 0.088 | 1.863 | 0.339 | 14.0% |
-| zipf:0.99 | 40,307 | 1.116 | 0.088 | 1.859 | 0.338 | 26.3% |
-| zipf:0.99 | 60,461 | 1.116 | 0.088 | 1.860 | 0.338 | 39.1% |
-| zipf:0.99 | 72,553 | 1.116 | 0.088 | 1.860 | 0.338 | 47.1% |
+| uniform | 21,013 | 1.116 | 0.088 | 1.143 | 0.089 | 10.7% |
+| uniform | 42,027 | 1.116 | 0.088 | 1.145 | 0.089 | 20.5% |
+| uniform | 63,040 | 1.116 | 0.088 | 1.142 | 0.088 | 30.1% |
+| uniform | 75,648 | 1.116 | 0.088 | 1.144 | 0.089 | 36.3% |
+| zipf:0.99 | 21,013 | 1.116 | 0.088 | 1.861 | 0.339 | 14.6% |
+| zipf:0.99 | 42,027 | 1.116 | 0.088 | 1.859 | 0.338 | 28.1% |
+| zipf:0.99 | 63,040 | 1.116 | 0.088 | 1.859 | 0.338 | 40.2% |
+| zipf:0.99 | 75,648 | 1.116 | 0.088 | 1.859 | 0.338 | 48.8% |
 
 **The key space is divided evenly, and it does not depend on the load.** The
 128 virtual nodes give every node 1.116 times the mean number of keys, a
@@ -172,15 +169,15 @@ distribution the requests are skewed. A ring cannot spread a hot key.
 
 The same load at four virtual node counts, at the lowest and the third rate
 of the campaign; the table shows the lower of the two, which the higher one
-agrees with to within 0.006. The key space is what the ring divides, so this
+agrees with to within 0.008. The key space is what the ring divides, so this
 is the measurement of how evenly 100,000 keys fall on 10 nodes.
 
 | Virtual nodes | Owned keys, max over mean | Owned keys, cv | Operations, max over mean | Operations, cv |
 | --- | --- | --- | --- | --- |
-| 16 | 1.200 | 0.177 | 1.204 | 0.182 |
-| 64 | 1.255 | 0.139 | 1.240 | 0.135 |
-| 128 | 1.116 | 0.088 | 1.145 | 0.088 |
-| 256 | 1.087 | 0.048 | 1.065 | 0.048 |
+| 16 | 1.200 | 0.177 | 1.206 | 0.183 |
+| 64 | 1.255 | 0.139 | 1.242 | 0.134 |
+| 128 | 1.116 | 0.088 | 1.147 | 0.089 |
+| 256 | 1.087 | 0.048 | 1.066 | 0.049 |
 
 **More virtual nodes divide the key space more evenly.** The coefficient of
 variation falls from 0.177 at 16 virtual nodes to 0.048 at 256, and the
@@ -197,7 +194,7 @@ rule that follows from it: 64 virtual nodes are enough to divide 100,000 keys
 evenly on 10 nodes, and the default of 128 costs nothing but a larger ring.
 
 **The request distribution follows the key space and does not move.** It is
-1.07 to 1.25 times the mean with a coefficient of variation of 0.048 to 0.182
+1.07 to 1.24 times the mean with a coefficient of variation of 0.049 to 0.183
 at every virtual node count, because it is the key space that decides where a
 request goes.
 
@@ -206,39 +203,52 @@ request goes.
 The capacity run measures the write path, so the campaign's top rate is well
 below the knee of the read-heavy load. The ladder offers more than the
 capacity, in one run so that the host's speed is the same for every row. It
-ran at 82,419 operations per second of preload.
+ran at 85,497 operations per second of preload.
 
 | Target rate | Achieved | p50 | p95 | p99 | p999 | Late | Sender saturated |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 80,615 (1x) | 80,615 | 64 us | 104 us | 359 us | 1,913 us | 0 | no |
-| 120,922 (1.5x) | 120,922 | 656 us | 2,361 us | 3,437 us | 5,079 us | 0 | no |
-| 161,230 (2x) | 100,590 | 39,007 us | 73,023 us | 87,103 us | 102,207 us | 606,396 | no |
-| 241,845 (3x) | 100,606 | 39,103 us | 74,047 us | 88,383 us | 103,423 us | 1,412,393 | no |
+| 84,054 (1x) | 84,054 | 64 us | 111 us | 341 us | 2,341 us | 0 | no |
+| 126,081 (1.5x) | 103,522 | 35,391 us | 71,103 us | 86,463 us | 100,031 us | 225,590 | no |
+| 168,108 (2x) | 100,937 | 39,199 us | 72,511 us | 86,143 us | 97,727 us | 671,713 | no |
+| 252,162 (3x) | 100,619 | 39,359 us | 72,703 us | 86,591 us | 101,951 us | 1,515,428 | no |
 
-**The knee is between 0.9 and 1.5 times the write capacity.** The campaign's
+**The knee is between 1 and 1.5 times the write capacity.** The campaign's
 top rate, 0.9 of the capacity, still has a p50 of 62 to 63 us and a p99 of
-365 to 434 us. At 1.5 times the capacity the median has grown tenfold to
-656 us and the p99 is 3.4 ms, though nothing is dropped. Past that the mode
-breaks down, and it breaks down in the way it was built to break down:
+304 to 592 us, and one times the capacity is still flat: a p50 of 64 us and a
+p99 of 341 us with nothing dropped. At 1.5 times the capacity the median has
+grown to 35 ms and 225,590 requests were dropped for want of an in-flight
+slot. Past that the mode breaks down, and it breaks down in the way it was
+built to break down:
 
-- The requests that could not be sent were **dropped**, 606,396 of them at 2x
-  and 1,412,393 at 3x, not queued.
-- The p50 of 39 ms is the queueing delay inside the in-flight window. 4,096
-  requests in flight at the 100,590 operations per second the cluster was
-  doing is 40.7 ms of waiting, and the measured median is 39.0 ms: the
-  window, not the cluster, is what sets the throughput above the knee, which
-  is why the last two rows report the same achieved rate. A larger
-  `--max-in-flight` would raise it and lengthen the queue all the same.
+- The requests that could not be sent were **dropped**, 225,590 of them at
+  1.5x, 671,713 at 2x and 1,515,428 at 3x, not queued.
+- The p50 of 35 to 39 ms is the queueing delay inside the in-flight window.
+  4,096 requests in flight at the 100,619 to 103,522 operations per second
+  the cluster was doing is 39.6 to 40.7 ms of waiting, and the measured
+  median is 35.4 to 39.4 ms: the window, not the cluster, is what sets the
+  throughput above the knee, which is why the last three rows report
+  achieved rates within 3% of each other while the offered rate doubles. A
+  larger `--max-in-flight` would raise it and lengthen the queue all the
+  same.
 - The sender was **not** the problem. `sender_saturated` is false in every
-  window of every run, and the per-window `behind` count never went above 223
-  requests out of the 241,845 the schedule called for in that second, 0.1% of
-  it. The mode says the cluster could not keep up, and it says which of the
-  two it was.
-- Not one request **failed** and not one **retried**, anywhere in the
-  campaign: 93,025,331 operations came back with zero `deadline`, zero
+  window of every run, the `sender_lag` the event log now carries never went
+  above 1 request in a measured window, and the per-window `behind` count
+  never went above 67 requests in a measured window of the campaign or of
+  the virtual node runs — 67 out of the 75,648 the schedule called for that
+  second, 0.09% of it. The worst window of the ladder was 3,589 out of
+  252,162, 1.4%, in the stage that was already dropping most of its own
+  schedule. The mode says the cluster could not keep up, and it says which
+  of the two it was.
+- Not one request **failed** and not one **retried**, anywhere in these 11
+  runs: 96,686,119 operations came back with zero `deadline`, zero
   `rpc`, zero `operation`, zero `topology`, zero `protocol` and zero
   `not_found`, even at three times past the capacity. What the cluster could
   not take was never sent to it.
+
+The ceiling itself is a property of this host at this time, not a constant
+of the cluster: the three stages above the knee are limited by the window to
+about 100,000 operations per second, and a machine with the nodes to
+themselves would put the knee somewhere else.
 
 ## How the numbers were checked
 
@@ -251,11 +261,12 @@ ops + errors == issued        (issued excludes the requests the in-flight limit 
 ```
 
 and it fails with an error rather than publish a rate that is quietly short.
-All 36 stages of this campaign pass it, and the 24 campaign stages also
+All 36 stages of this run pass it, and the 24 campaign stages also
 report an achieved rate equal to their target.
 
-The check earned its place. It found two bugs in the measurement while this
-report was being written, both of which would have gone unnoticed:
+The check earned its place before this run: it found two bugs in the
+measurement during the campaign this report replaces, both of which would
+have gone unnoticed, and both were fixed before this run:
 
 - The totals of a stage were not reset before the warmup that followed it, so
   a warmup reported the measured phase of the stage before it as its own.
@@ -281,39 +292,50 @@ misread them:
   fell in, not the length of that request, and the histogram's range ends at
   the operation deadline plus a second. A request longer than that is
   recorded in the top bucket and counted, so it is not lost, but the
-  histogram does not measure it. The largest `max` of this campaign is
-  21.8 ms against a range of 31 s, so nothing was truncated and every `max`
-  here is a bucket.
-- The `behind` of a window is that window's lag, and it is not the number
-  that decides `sender_saturated`: that is the sender's lag over the phase,
-  which the event log calls `sender_lag`. The field was added to the event
-  after this campaign, so the events of this run hold only `behind`. The
-  stage-level `sender_saturated` of every stage here is the same decision,
-  taken on the sender's lag.
+  histogram does not measure it. The largest `max` anywhere in these runs is
+  125.1 ms, in the ladder's three-times stage, and the largest of the
+  campaign's own stages is 21.2 ms, against a range of 31 s: nothing was
+  truncated and every `max` here is a bucket.
+- The `sender_lag` of a window is the sender's lag over the phase up to that
+  window's boundary, and it is what the stage-level `sender_saturated` is
+  decided on. The field was added after the campaign this report replaces,
+  so it is in every window event of this run, and a reader can check the
+  decision instead of taking it. The per-window `behind` is a different
+  number with a different meaning: it is that window's own share of the
+  schedule.
 
 ## The source of the run
 
-The run was built from a tree that was never committed: 21 files were
-changed, and the commit it was built on was `079b218`. The `manifest.json` of
-every run holds the diff of the files that were tracked and changed, which is
-16 of the 21. The other five paths were not in the index, and `git diff` does
-not hold a file that was never added to it, so the manifest of this campaign
-does not have their content: the mode itself,
-`crates/hashring-experiment/src/latency.rs`, was one of them.
+The run was built from a committed tree. The commit is `52adf85`, and no
+tracked file differed from it: every `manifest.json` holds an empty
+`git diff`, a build recorded `git_dirty: false`, and the same source tree
+digest at build time and at run time,
+`97aaff0f9123ef7004cfd55a394adf8e252e93c7cce380cd09914daabf3d3a38`.
+Reproducing the source is therefore a checkout:
 
-[`docs/data/latency-acceptance/source.patch`](data/latency-acceptance/source.patch)
-is the whole change, and applying it to `079b218` reproduces the tree the run
-was built from. The run recorded the digest of that tree in every manifest,
-`52875185bd69bc52c9a8460da2e94650c134b4de57155fcb5e825475d5daf817`, and the
-patched tree has that digest. The patch holds the tracked diff exactly as
-the manifest recorded it, and the three of the five that existed when the
-run started as new files: the mode, the script that ran it, and the
-measurement of the sender's own timing. The report and its tables were
-written after the run and are not in it.
+```sh
+git checkout 52adf85
+```
 
-The manifest now keeps the files that were not in the index with their
-content, so a run of an uncommitted tree carries its own source. That change
-came after this campaign, which is why this one needed the patch.
+No patch is needed, and the patch that the earlier campaign needed is not
+kept any more. That campaign ran from a tree that was never committed, and
+the manifest of its runs could hold only the files git already tracked; the
+manifest now also keeps the files that were never added to the index, with
+the content of the ones that are text and small enough, so a run of an
+uncommitted tree carries its own source. This run was a clean run that was
+still not reported as `source_reproducible`, and the only reason was
+the script: it wrote its `host.txt` into
+`docs/data/latency-acceptance/<run>/` before the first run started, so
+`git status` of every run saw that one untracked file — 457 bytes, held in
+the manifest with its content — and the `git_changed_files: 1` of
+`host.txt` counts it. Nothing in the source tree differed from the commit.
+The script writes the `host.txt` after the last run now, so the next run of
+a clean tree reports `source_reproducible: true`.
+
+The digest is the part of the source that does not depend on where the tree
+is built. The binary's bytes do: the absolute build root is compiled into
+them, so the hash in `host.txt` comes back only from a build at the same
+absolute path, with the same target directory layout.
 
 ## What the acceptance asked for
 
@@ -329,14 +351,14 @@ came after this campaign, which is why this one needed the patch.
 
 **They are not the numbers of a machine that is only doing this.** The
 driver, the coordinator and the ten nodes shared 24 cores with a desktop and
-with other tenants. The spread was 5% during this campaign, which is small
+with other tenants. The spread was 6.8% during this campaign, which is small
 enough to compare the two distributions, and it is still a spread: the
 latencies would be lower on a machine with the nodes to themselves. The load
 balance is not affected by the host at all.
 
 **Three repetitions is a small sample, and the ladder has one.** The maximum
-of a stage moved between 1,456 and 21,791 us while its p999 stayed under
-1.8 ms: the worst case is one or two requests out of the millions in a
+of a campaign stage moved between 1,622 and 21,247 us while its p999 stayed
+under 3.2 ms: the worst case is one or two requests out of the millions in a
 stage, and on a machine shared with a desktop three repetitions cannot say
 how often the host was doing something else. The ladder is a single run per
 point, so its rows are one sample each; they locate the knee, they do not
