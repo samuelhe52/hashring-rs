@@ -218,6 +218,7 @@ impl DataNode for DataNodeService {
                 ..Default::default()
             }));
         };
+        self.pressure.ops_get.fetch_add(1, AtomicOrdering::Relaxed);
         Ok(Response::new(GetResponse {
             value: record.value.to_vec(),
             version: Some(record.version.clone()),
@@ -705,6 +706,7 @@ impl DataNode for DataNodeService {
         }
         let record_key: Arc<[u8]> = Arc::from(request.key.as_slice());
         state.insert_record(record_key.clone(), record.clone());
+        self.pressure.ops_put.fetch_add(1, AtomicOrdering::Relaxed);
         for source in state
             .sources
             .values_mut()
@@ -1067,6 +1069,9 @@ impl DataNode for DataNodeService {
         // One allocation shared by the record, its index entry and the receipt.
         let record_key: Arc<[u8]> = Arc::from(request.key.as_slice());
         state.apply_record(record_key.clone(), tombstone);
+        self.pressure
+            .ops_delete
+            .fetch_add(1, AtomicOrdering::Relaxed);
         for source in state
             .sources
             .values_mut()
@@ -1421,6 +1426,13 @@ impl DataNode for DataNodeService {
         _request: Request<proto::Empty>,
     ) -> Result<Response<NodeInfoResponse>, Status> {
         let state = self.state.read().await;
+        // The three counters are read once, so the sum is the sum of the
+        // three numbers this same message reports. Reading them twice could
+        // add an operation that landed between the reads to one of them and
+        // not to the other.
+        let ops_get = self.pressure.ops_get.load(AtomicOrdering::Relaxed);
+        let ops_put = self.pressure.ops_put.load(AtomicOrdering::Relaxed);
+        let ops_delete = self.pressure.ops_delete.load(AtomicOrdering::Relaxed);
         Ok(Response::new(NodeInfoResponse {
             node_id: self.node_id.clone(),
             process_instance_id: self.process_instance_id.clone(),
@@ -1456,6 +1468,10 @@ impl DataNode for DataNodeService {
                 .pressure
                 .replication_stream_peak_pending
                 .load(AtomicOrdering::Relaxed),
+            ops_get,
+            ops_put,
+            ops_delete,
+            ops_handled: ops_get + ops_put + ops_delete,
         }))
     }
 

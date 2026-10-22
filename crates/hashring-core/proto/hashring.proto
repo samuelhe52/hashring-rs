@@ -314,6 +314,14 @@ message NodeInfoResponse {
   StateWriteTiming ack_write_timing = 13;
   ReceiptCleanupTiming receipt_cleanup_timing = 14;
   StateWriteTiming ack_completion_write_timing = 15;
+  // Operations this node served as the owner of a key, counted per kind. A
+  // request the node rejected or that found no key is not counted, so the
+  // totals match the operations a client saw succeed.
+  uint64 ops_get = 16;
+  uint64 ops_put = 17;
+  uint64 ops_delete = 18;
+  // The three counters above, summed.
+  uint64 ops_handled = 19;
 }
 
 // Cumulative per-process timings. Wait totals can overlap across tasks.

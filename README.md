@@ -285,6 +285,10 @@ target/release/hashring-rs experiment --mode performance --require-clean-source 
 # Kill an owner, measure failover, data loss, and repair time.
 target/release/hashring-rs experiment --mode availability --policy first-successor \
   --output results/availability
+
+# Offer a fixed rate and measure the latency of that load, one stage per rate.
+target/release/hashring-rs experiment --mode latency --target-rates 5000,10000,20000 \
+  --output results/latency
 ```
 
 Experiment settings can also come from a YAML file whose keys are the flag

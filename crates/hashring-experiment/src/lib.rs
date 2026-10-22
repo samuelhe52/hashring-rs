@@ -7,7 +7,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering as AtomicOrdering},
+        atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -18,12 +18,14 @@ use hashring_client::{ClientError, HashringClient};
 use hashring_core::{
     migration::{MigrationPhase, TopologyChange},
     proto::{ErrorCode, PutRequest, data_node_client::DataNodeClient},
-    topology::{Member, WriteAckPolicy},
+    topology::{Member, TopologySnapshot, WriteAckPolicy},
     transport::configure_data_node_client,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tonic::transport::Channel;
+
+mod latency;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,6 +33,7 @@ pub enum ExperimentMode {
     Correctness,
     Performance,
     Availability,
+    Latency,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -63,6 +66,21 @@ pub struct ExperimentConfig {
     pub receipt_retention_ms: u64,
     pub lease_duration_ms: u64,
     pub write_ack_policy: WriteAckPolicy,
+    /// The keys the `latency` mode writes before its load starts, and the key
+    /// space its load reads and writes. `None` in the other modes.
+    pub preload_keys: Option<u64>,
+    /// The target rates of the `latency` mode, one stage each.
+    pub target_rates: Vec<u64>,
+    /// The seconds at the start of every stage that are not counted.
+    pub warmup_seconds: u64,
+    /// The seconds of every stage that are counted.
+    pub duration_seconds: u64,
+    /// The `GET:PUT:DELETE` share of the `latency` mode's requests.
+    pub mix: String,
+    /// How the `latency` mode picks the key of a request.
+    pub key_distribution: String,
+    /// How many requests the `latency` mode may have in flight at once.
+    pub max_in_flight: usize,
     /// Forwarded to every data node the run starts.
     pub node: NodeOptions,
 }
@@ -126,11 +144,88 @@ pub struct ExperimentSummary {
     pub observations: BTreeMap<String, Value>,
 }
 
+/// One entry of a run's `measurements`.
+///
+/// A throughput stage reports the operations it ran and the rate they ran at.
+/// A `latency` stage reports one target rate, so it carries that rate's
+/// latency distribution, its errors, and its load balance.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Measurement {
+#[serde(untagged)]
+pub enum Measurement {
+    Throughput(ThroughputMeasurement),
+    LatencyStage(LatencyStageMeasurement),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ThroughputMeasurement {
     pub operations: u64,
     pub seconds: f64,
     pub operations_per_second: f64,
+}
+
+/// The percentiles of one operation's latency, in microseconds.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct LatencySummary {
+    pub p50: u64,
+    pub p95: u64,
+    pub p99: u64,
+    pub p999: u64,
+    /// The upper bound of the bucket the largest sample fell in, which is a
+    /// little above the largest sample itself.
+    pub max: u64,
+    /// The largest sample, in microseconds, whether or not it was inside the
+    /// histogram's range.
+    #[serde(default)]
+    pub max_observed: u64,
+    /// The samples that were longer than the histogram's range, which are
+    /// recorded in its top bucket and are not measured by it.
+    #[serde(default)]
+    pub over_range: u64,
+    pub samples: u64,
+}
+
+/// What one node did during a stage.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct LoadBalanceNode {
+    /// The keys the node owns.
+    pub owned_keys: u64,
+    /// The operations the node served.
+    pub ops_handled: u64,
+    /// The share of one core the node used, or None when CPU sampling is unavailable.
+    pub cpu_percent: Option<f64>,
+}
+
+/// How evenly the keys and the requests were spread over the nodes.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct LoadBalanceMeasurement {
+    pub per_node: BTreeMap<String, LoadBalanceNode>,
+    pub owned_keys_max_over_mean: f64,
+    pub owned_keys_cv: f64,
+    pub ops_handled_max_over_mean: f64,
+    pub ops_handled_cv: f64,
+}
+
+/// One target rate of the `latency` mode.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LatencyStageMeasurement {
+    pub target_rate: u64,
+    pub achieved_rate: f64,
+    pub seconds: f64,
+    /// Whether the driver kept up with its own schedule. A stage the driver
+    /// could not keep up with does not describe the cluster.
+    pub sender_saturated: bool,
+    /// The requests the driver sent.
+    pub issued: u64,
+    /// The requests the driver did not send because too many were in flight.
+    pub late: u64,
+    /// The operations that succeeded, by kind.
+    pub ops: BTreeMap<String, u64>,
+    /// The operations that failed, by reason.
+    pub errors: BTreeMap<String, u64>,
+    /// The internal retries the client made during the stage.
+    pub retries: u64,
+    pub latency_us: BTreeMap<String, LatencySummary>,
+    pub load_balance: LoadBalanceMeasurement,
 }
 
 #[derive(Serialize)]
@@ -308,6 +403,14 @@ impl ProcessGroup {
         }
     }
 
+    /// The process ids of the started processes, by name.
+    fn pids(&self) -> BTreeMap<String, u32> {
+        self.processes
+            .iter()
+            .map(|process| (process.name.clone(), process.child.id()))
+            .collect()
+    }
+
     fn kill(&mut self, name: &str) -> Result<(String, Instant)> {
         let index = self
             .processes
@@ -358,7 +461,7 @@ pub async fn run_experiment(
         runtime_tree_hash.as_deref(),
     );
     let manifest = ExperimentManifest {
-        schema_version: 5,
+        schema_version: 8,
         started_unix_ms: unix_ms(),
         executable_path: executable.display().to_string(),
         executable_blake3: file_digest(&executable)?,
@@ -476,7 +579,7 @@ async fn run_cluster(
         .collect();
     let initial_count = match config.mode {
         ExperimentMode::Correctness => config.node_count - 1,
-        ExperimentMode::Performance => config.node_count,
+        ExperimentMode::Performance | ExperimentMode::Latency => config.node_count,
         ExperimentMode::Availability => 3,
     };
     let initial_members = &members[..initial_count];
@@ -568,6 +671,7 @@ async fn run_cluster(
         "initial_full_rf_seconds".into(),
         json!(rf_started.elapsed().as_secs_f64()),
     );
+    record_topology(events, &admin_client).await?;
     if config.write_ack_policy != WriteAckPolicy::OwnerOnly {
         let change = admin_client
             .begin_write_policy_change(config.write_ack_policy)
@@ -583,6 +687,7 @@ async fn run_cluster(
             "ack_policy_activated",
             json!({ "policy": config.write_ack_policy }),
         )?;
+        record_topology(events, &admin_client).await?;
     }
 
     let workload = Workload {
@@ -628,15 +733,18 @@ async fn run_cluster(
             .await?;
         latencies_us.push(started.elapsed().as_micros() as u64);
     }
+    // The workload is over and the cluster is idle, so these figures are the
+    // latency of an idle cluster and not the latency under load. The name
+    // says so, and the `latency` mode measures the other one.
     observations.insert(
-        "client_put_latency_us".into(),
+        "idle_client_put_latency_us".into(),
         latency_summary(&mut latencies_us),
     );
     events.record(
         "client_put_latency_sampled",
         json!({
             "samples": sample_count, "policy": config.write_ack_policy,
-            "latency_us": observations["client_put_latency_us"]
+            "latency_us": observations["idle_client_put_latency_us"]
         }),
     )?;
     let sample_topology = admin_client.refresh_topology().await?;
@@ -695,14 +803,14 @@ async fn run_cluster(
         owner_rpc_latencies_us.push(started.elapsed().as_micros() as u64);
     }
     observations.insert(
-        "owner_rpc_put_latency_us".into(),
+        "idle_owner_rpc_put_latency_us".into(),
         latency_summary(&mut owner_rpc_latencies_us),
     );
     events.record(
         "owner_rpc_put_latency_sampled",
         json!({
             "samples": sample_count, "policy": config.write_ack_policy,
-            "latency_us": observations["owner_rpc_put_latency_us"]
+            "latency_us": observations["idle_owner_rpc_put_latency_us"]
         }),
     )?;
 
@@ -713,6 +821,20 @@ async fn run_cluster(
             &ports,
             &coordinator_endpoint,
             &admin_client,
+            &mut processes,
+            events,
+            measurements,
+            observations,
+        )
+        .await;
+    }
+
+    if matches!(config.mode, ExperimentMode::Latency) {
+        return run_latency(
+            config,
+            &members,
+            &admin_client,
+            &workload_client,
             &mut processes,
             events,
             measurements,
@@ -868,6 +990,7 @@ async fn run_cluster(
         "verification_complete",
         json!({ "epoch": topology.epoch, "members": topology.members.len() }),
     )?;
+    record_topology(events, &admin_client).await?;
     Ok(topology.epoch)
 }
 
@@ -887,19 +1010,8 @@ async fn record_node_pressure(
 ) -> Result<()> {
     let mut nodes = BTreeMap::new();
     for member in members {
-        let result = tokio::time::timeout(Duration::from_secs(2), async {
-            let mut client =
-                configure_data_node_client(DataNodeClient::connect(member.endpoint.clone()).await?);
-            Ok::<_, anyhow::Error>(
-                client
-                    .get_process_info(hashring_core::proto::Empty {})
-                    .await?
-                    .into_inner(),
-            )
-        })
-        .await;
-        let value = match result {
-            Ok(Ok(info)) => json!({
+        let value = match query_node_info(&member.endpoint).await {
+            Ok(info) => json!({
                 "owner_write_timing": state_write_timing_json(info.owner_write_timing),
                 "follower_write_timing": state_write_timing_json(info.follower_write_timing),
                 "ack_write_timing": state_write_timing_json(info.ack_write_timing),
@@ -919,8 +1031,7 @@ async fn record_node_pressure(
                 "replication_rpc_retries": info.replication_rpc_retries,
                 "replication_stream_peak_pending": info.replication_stream_peak_pending,
             }),
-            Ok(Err(error)) => json!({ "error": error.to_string() }),
-            Err(_) => json!({ "error": "node pressure request timed out" }),
+            Err(error) => json!({ "error": error.to_string() }),
         };
         nodes.insert(member.node_id.clone(), value);
     }
@@ -1202,6 +1313,326 @@ async fn run_availability(
         "replacement_to_full_rf_seconds": restored_seconds }),
     )?;
     Ok(completed.target_topology.epoch)
+}
+
+/// Records the ring the cluster runs right now.
+///
+/// The snapshot is the output of `hashring-rs topology`, so a run that has
+/// ended can still be read: a reader takes the snapshots from the event log
+/// instead of asking a coordinator that is gone.
+async fn record_topology(events: &EventLog, client: &HashringClient) -> Result<TopologySnapshot> {
+    let topology = match client.refresh_topology().await {
+        Ok(topology) => topology,
+        Err(error) => {
+            eprintln!("the topology could not be refreshed for the snapshot: {error}");
+            client.topology().await
+        }
+    };
+    events.record("topology_published", serde_json::to_value(&topology)?)?;
+    Ok(topology)
+}
+
+/// The counters one node reports, and the CPU it used.
+#[derive(Clone, Copy, Debug, Default)]
+struct NodeCounters {
+    ops_handled: u64,
+    cpu_seconds: Option<f64>,
+}
+
+/// Runs the `latency` mode: one stage per target rate, and a check of the key
+/// space the load left behind.
+#[allow(clippy::too_many_arguments)]
+async fn run_latency(
+    config: &ExperimentConfig,
+    members: &[Member],
+    admin_client: &HashringClient,
+    workload_client: &HashringClient,
+    processes: &mut ProcessGroup,
+    events: &EventLog,
+    measurements: &mut BTreeMap<String, Measurement>,
+    observations: &mut BTreeMap<String, Value>,
+) -> Result<u64> {
+    ensure!(
+        !config.target_rates.is_empty(),
+        "the latency mode needs at least one target rate"
+    );
+    let key_space = config.key_count;
+    let mix = latency::OperationMix::parse(&config.mix)?;
+    let delete_pool = delete_pool_size(config, &mix, key_space);
+    // The distribution covers the keys the load reads and writes. The keys it
+    // deletes are a pool of their own, so a delete never races another
+    // operation on the same key.
+    let distribution =
+        latency::KeyDistribution::parse(&config.key_distribution, key_space - delete_pool)?;
+    let plan = latency::LoadPlan {
+        key_space,
+        value_bytes: config.value_bytes,
+        mix,
+        distribution: distribution.clone(),
+        max_in_flight: config.max_in_flight,
+        delete_pool_start: key_space - delete_pool,
+        deleted: Arc::new(
+            (0..delete_pool as usize)
+                .map(|_| AtomicBool::new(false))
+                .collect(),
+        ),
+        highest_latency_micros: highest_latency_micros(config),
+        drain_timeout: Duration::from_millis(config.operation_timeout_ms) + Duration::from_secs(5),
+    };
+    observations.insert("latency_key_space".into(), json!(key_space));
+    observations.insert("latency_delete_pool_keys".into(), json!(delete_pool));
+    observations.insert(
+        "latency_key_distribution".into(),
+        json!(distribution.name()),
+    );
+    observations.insert("latency_mix".into(), json!(config.mix));
+    // The `measurements` of a latency run hold one entry per rate stage, so
+    // the preload and the check that follows it move to the observations.
+    for name in ["initial_put", "initial_get_verify"] {
+        if let Some(measurement) = measurements.remove(name) {
+            observations.insert(name.into(), serde_json::to_value(measurement)?);
+        }
+    }
+
+    let topology = admin_client.refresh_topology().await?;
+    let owned_keys = owned_key_counts(&topology, key_space);
+    let runner = latency::LoadRunner::new(workload_client.clone(), plan.clone())?;
+    let pids = processes.pids();
+    let mut saturated_windows = serde_json::Map::new();
+    for (index, rate) in config.target_rates.iter().enumerate() {
+        let stage = latency::StageSettings {
+            name: format!("rate_{index}"),
+            target_rate: *rate,
+            warmup_seconds: config.warmup_seconds,
+            duration_seconds: config.duration_seconds,
+        };
+        runner.run_warmup(&stage, events).await?;
+        let before = sample_node_counters(members, &pids).await?;
+        let (mut measurement, saturated) = runner.run_measured(&stage, events).await?;
+        let after = sample_node_counters(members, &pids).await?;
+        measurement.load_balance = load_balance(&owned_keys, &before, &after, measurement.seconds)?;
+        saturated_windows.insert(stage.name.clone(), json!(saturated));
+        measurements.insert(stage.name, Measurement::LatencyStage(measurement));
+    }
+    observations.insert(
+        "latency_saturated_windows".into(),
+        Value::from(saturated_windows),
+    );
+    let expected = (0..key_space)
+        .map(|key| (!plan.is_deleted(key)).then_some(0))
+        .collect::<Vec<_>>();
+    verify_dataset(
+        workload_client,
+        Workload {
+            key_count: key_space,
+            value_bytes: config.value_bytes,
+            concurrency: config.concurrency,
+        },
+        &expected,
+    )
+    .await?;
+    observations.insert("latency_verified_keys".into(), json!(key_space));
+    processes.ensure_running()?;
+    let topology = admin_client.refresh_topology().await?;
+    events.record(
+        "verification_complete",
+        json!({ "epoch": topology.epoch, "members": topology.members.len() }),
+    )?;
+    record_topology(events, admin_client).await?;
+    Ok(topology.epoch)
+}
+
+/// The keys the load may delete.
+///
+/// The load deletes from a pool of its own, so a delete never races another
+/// operation on the same key and the key space can be checked afterwards. The
+/// pool is as large as the run's deletes need, and never more than half of the
+/// key space and never less than a twentieth of it.
+fn delete_pool_size(config: &ExperimentConfig, mix: &latency::OperationMix, key_space: u64) -> u64 {
+    if mix.delete_fraction() <= 0.0 {
+        return 0;
+    }
+    let expected: f64 = config
+        .target_rates
+        .iter()
+        .map(|rate| {
+            *rate as f64
+                * (config.duration_seconds + config.warmup_seconds) as f64
+                * mix.delete_fraction()
+        })
+        .sum();
+    let wanted = expected.ceil() as u64;
+    let minimum = (key_space as f64 * 0.05).floor() as u64;
+    let maximum = (key_space as f64 * 0.5).floor() as u64;
+    wanted
+        .clamp(minimum, maximum)
+        .min(key_space.saturating_sub(1))
+}
+
+/// The largest latency the histogram keeps.
+///
+/// A request cannot take longer than the operation deadline, and the driver
+/// measures from the moment the request was due, so the deadline plus a
+/// second covers every request it can issue.
+fn highest_latency_micros(config: &ExperimentConfig) -> u64 {
+    config
+        .operation_timeout_ms
+        .saturating_mul(1_000)
+        .saturating_add(1_000_000)
+        .min(600_000_000)
+}
+
+/// The number of keys each node owns.
+fn owned_key_counts(topology: &TopologySnapshot, key_space: u64) -> BTreeMap<String, u64> {
+    let mut counts: BTreeMap<&str, u64> = topology
+        .members
+        .iter()
+        .map(|member| (member.node_id.as_str(), 0))
+        .collect();
+    for key in 0..key_space {
+        if let Ok(owner) = topology.owner(&key.to_be_bytes())
+            && let Some(count) = counts.get_mut(owner.node_id.as_str())
+        {
+            *count += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(node, count)| (node.to_owned(), count))
+        .collect()
+}
+
+/// The operations a node served and the CPU it used.
+async fn sample_node_counters(
+    members: &[Member],
+    pids: &BTreeMap<String, u32>,
+) -> Result<BTreeMap<String, NodeCounters>> {
+    let mut counters = BTreeMap::new();
+    for member in members {
+        let ops_handled = query_node_info(&member.endpoint)
+            .await
+            .with_context(|| format!("sampling operations of {}", member.node_id))?
+            .ops_handled;
+        let cpu_seconds = pids
+            .get(&member.node_id)
+            .and_then(|pid| process_cpu_seconds(*pid));
+        counters.insert(
+            member.node_id.clone(),
+            NodeCounters {
+                ops_handled,
+                cpu_seconds,
+            },
+        );
+    }
+    Ok(counters)
+}
+
+async fn query_node_info(endpoint: &str) -> Result<hashring_core::proto::NodeInfoResponse> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut client =
+            configure_data_node_client(DataNodeClient::connect(endpoint.to_owned()).await?);
+        Ok(client
+            .get_process_info(hashring_core::proto::Empty {})
+            .await?
+            .into_inner())
+    })
+    .await
+    .context("node information request timed out")?
+}
+
+/// How the keys and the requests were spread over the nodes.
+fn load_balance(
+    owned_keys: &BTreeMap<String, u64>,
+    before: &BTreeMap<String, NodeCounters>,
+    after: &BTreeMap<String, NodeCounters>,
+    seconds: f64,
+) -> Result<LoadBalanceMeasurement> {
+    let mut per_node = BTreeMap::new();
+    let mut owned = Vec::new();
+    let mut handled = Vec::new();
+    for (node, keys) in owned_keys {
+        let start = before.get(node).context("missing initial node counters")?;
+        let end = after.get(node).context("missing final node counters")?;
+        let ops_handled = end
+            .ops_handled
+            .checked_sub(start.ops_handled)
+            .context("node operations counter decreased during the stage")?;
+        let cpu_percent = start
+            .cpu_seconds
+            .zip(end.cpu_seconds)
+            .and_then(|(a, b)| (seconds > 0.0 && b >= a).then_some((b - a) / seconds * 100.0));
+        owned.push(*keys as f64);
+        handled.push(ops_handled as f64);
+        per_node.insert(
+            node.clone(),
+            LoadBalanceNode {
+                owned_keys: *keys,
+                ops_handled,
+                cpu_percent,
+            },
+        );
+    }
+    Ok(LoadBalanceMeasurement {
+        per_node,
+        owned_keys_max_over_mean: max_over_mean(&owned),
+        owned_keys_cv: coefficient_of_variation(&owned),
+        ops_handled_max_over_mean: max_over_mean(&handled),
+        ops_handled_cv: coefficient_of_variation(&handled),
+    })
+}
+
+/// The largest value divided by the mean of the values.
+fn max_over_mean(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    if mean <= 0.0 {
+        return 0.0;
+    }
+    values.iter().copied().fold(0.0_f64, f64::max) / mean
+}
+
+/// The standard deviation of the values divided by their mean.
+fn coefficient_of_variation(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    if mean <= 0.0 {
+        return 0.0;
+    }
+    let variance = values
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / values.len() as f64;
+    variance.sqrt() / mean
+}
+
+/// The CPU time a process has used, in seconds.
+///
+/// The counter is the kernel's, so it covers the whole life of the process,
+/// not only the time it spent in this run.
+fn process_cpu_seconds(pid: u32) -> Option<f64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The command name is in parentheses and may hold spaces, so the fields
+    // after it are found from the last closing parenthesis.
+    let rest = stat.rsplit_once(") ")?.1;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    Some((utime + stime) as f64 / clock_ticks_per_second() as f64)
+}
+
+/// The clock ticks the kernel counts CPU time in.
+fn clock_ticks_per_second() -> u64 {
+    static TICKS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TICKS.get_or_init(|| {
+        command_output(None, "getconf", &["CLK_TCK"])
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(100)
+    })
 }
 
 async fn migrate_while_mutating(
@@ -1589,11 +2020,11 @@ fn deterministic_value(key: u64, round: u64, value_bytes: usize) -> Vec<u8> {
 
 fn measurement(operations: u64, duration: Duration) -> Measurement {
     let seconds = duration.as_secs_f64();
-    Measurement {
+    Measurement::Throughput(ThroughputMeasurement {
         operations,
         seconds,
         operations_per_second: operations as f64 / seconds.max(f64::EPSILON),
-    }
+    })
 }
 
 fn spawn_node(
@@ -1683,7 +2114,7 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
     }
     let initial_count = match config.mode {
         ExperimentMode::Correctness => config.node_count - 1,
-        ExperimentMode::Performance => config.node_count,
+        ExperimentMode::Performance | ExperimentMode::Latency => config.node_count,
         ExperimentMode::Availability => 3,
     };
     ensure!(
@@ -1704,6 +2135,21 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
         usize::try_from(config.key_count).is_ok(),
         "key_count exceeds the platform address space"
     );
+    if matches!(config.mode, ExperimentMode::Latency) {
+        ensure!(
+            !config.target_rates.is_empty(),
+            "the latency mode needs at least one target rate"
+        );
+        ensure!(
+            config.target_rates.iter().all(|rate| *rate > 0),
+            "every target rate must be positive"
+        );
+        ensure!(
+            config.duration_seconds > 0,
+            "duration_seconds must be positive"
+        );
+        ensure!(config.max_in_flight > 0, "max_in_flight must be positive");
+    }
     ensure!(config.concurrency > 0, "concurrency must be positive");
     ensure!(
         config.range_move_concurrency > 0 && config.replica_repair_concurrency > 0,
@@ -1845,6 +2291,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn load_balance_preserves_missing_cpu_and_rejects_missing_or_reset_counters() {
+        let owned = BTreeMap::from([("node-1".to_owned(), 10)]);
+        let before = BTreeMap::from([(
+            "node-1".to_owned(),
+            NodeCounters {
+                ops_handled: 20,
+                cpu_seconds: Some(1.0),
+            },
+        )]);
+        let mut after = BTreeMap::from([(
+            "node-1".to_owned(),
+            NodeCounters {
+                ops_handled: 40,
+                cpu_seconds: None,
+            },
+        )]);
+        let result = load_balance(&owned, &before, &after, 2.0).unwrap();
+        assert_eq!(result.per_node["node-1"].ops_handled, 20);
+        assert!(
+            serde_json::to_value(result).unwrap()["per_node"]["node-1"]["cpu_percent"].is_null()
+        );
+        after.get_mut("node-1").unwrap().cpu_seconds = Some(2.0);
+        assert_eq!(
+            load_balance(&owned, &before, &after, 2.0).unwrap().per_node["node-1"].cpu_percent,
+            Some(50.0)
+        );
+        after.get_mut("node-1").unwrap().ops_handled = 10;
+        assert!(load_balance(&owned, &before, &after, 2.0).is_err());
+        assert!(load_balance(&owned, &BTreeMap::new(), &after, 2.0).is_err());
+    }
+
+    #[tokio::test]
+    async fn node_operations_sampling_propagates_connection_failure() {
+        assert!(query_node_info("http://127.0.0.1:0").await.is_err());
+    }
+
+    #[test]
     fn deterministic_values_include_key_round_and_requested_length() {
         assert_eq!(deterministic_value(7, 3, 13).len(), 13);
         assert_eq!(deterministic_value(7, 3, 13), deterministic_value(7, 3, 13));
@@ -1871,7 +2354,10 @@ mod tests {
         let restored: ExperimentSummary = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert!(!restored.success);
         assert!(restored.error.unwrap().contains("injected failure"));
-        assert_eq!(restored.measurements["initial_put"].operations, 10);
+        match &restored.measurements["initial_put"] {
+            Measurement::Throughput(measurement) => assert_eq!(measurement.operations, 10),
+            other => panic!("expected a throughput measurement, got {other:?}"),
+        }
     }
 
     #[test]

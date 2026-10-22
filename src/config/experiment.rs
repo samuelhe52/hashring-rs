@@ -25,6 +25,18 @@ pub const DEFAULT_VIRTUAL_NODES: u32 = 128;
 pub const DEFAULT_OPERATION_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_MIGRATION_TIMEOUT_MS: u64 = 600_000;
 pub const DEFAULT_PRE_PUBLISH_DELAY_MS: u64 = 250;
+/// The keys the `latency` mode writes before its load starts.
+pub const DEFAULT_PRELOAD_KEYS: u64 = 100_000;
+/// The seconds at the start of every `latency` stage that are not counted.
+pub const DEFAULT_WARMUP_SECONDS: u64 = 10;
+/// The seconds of every `latency` stage that are counted.
+pub const DEFAULT_DURATION_SECONDS: u64 = 60;
+/// The `GET:PUT:DELETE` share of the `latency` mode's requests.
+pub const DEFAULT_MIX: &str = "90:9:1";
+/// How the `latency` mode picks the key of a request.
+pub const DEFAULT_KEY_DISTRIBUTION: &str = "zipf:0.99";
+/// How many requests the `latency` mode may have in flight at once.
+pub const DEFAULT_MAX_IN_FLIGHT: usize = 4096;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -55,6 +67,13 @@ pub struct ExperimentFile {
     pub policy: Option<PolicyArg>,
     pub worker_threads: Option<NonZeroUsize>,
     pub coordinator_worker_threads: Option<NonZeroUsize>,
+    pub preload_keys: Option<u64>,
+    pub target_rates: Option<Vec<u64>>,
+    pub warmup_seconds: Option<u64>,
+    pub duration_seconds: Option<u64>,
+    pub mix: Option<String>,
+    pub key_distribution: Option<String>,
+    pub max_in_flight: Option<usize>,
     pub max_dedup_bytes: Option<usize>,
     pub max_value_bytes: Option<usize>,
     pub max_pending_replication_bytes: Option<usize>,
@@ -105,23 +124,40 @@ pub fn resolve(
         .unwrap_or(ExperimentModeArg::Correctness)
         .into();
     let node_count = args.nodes.or(file.nodes).unwrap_or(match mode {
-        ExperimentMode::Correctness | ExperimentMode::Performance => 10,
+        ExperimentMode::Correctness | ExperimentMode::Performance | ExperimentMode::Latency => 10,
         ExperimentMode::Availability => 4,
     });
     let policy = args.policy.or(file.policy).unwrap_or(match mode {
         ExperimentMode::Availability => PolicyArg::FirstSuccessor,
         _ => PolicyArg::OwnerOnly,
     });
+    // The `latency` mode writes its keys before the load starts and the load
+    // reads and writes the same keys, so the preload count is the key space
+    // of the run. `--keys` names the same count there.
+    let preload_keys = args.preload_keys.or(file.preload_keys);
+    let key_count = match mode {
+        ExperimentMode::Latency => preload_keys
+            .or(args.keys)
+            .or(file.keys)
+            .unwrap_or(DEFAULT_PRELOAD_KEYS),
+        _ => args.keys.or(file.keys).unwrap_or(match mode {
+            ExperimentMode::Correctness => 20_000,
+            ExperimentMode::Performance => 1_000_000,
+            ExperimentMode::Availability => 1_000,
+            ExperimentMode::Latency => DEFAULT_PRELOAD_KEYS,
+        }),
+    };
+    let target_rates = if args.target_rates.is_empty() {
+        file.target_rates.clone().unwrap_or_default()
+    } else {
+        args.target_rates.clone()
+    };
 
     Ok(ExperimentConfig {
         mode,
         output_dir,
         node_count,
-        key_count: args.keys.or(file.keys).unwrap_or(match mode {
-            ExperimentMode::Correctness => 20_000,
-            ExperimentMode::Performance => 1_000_000,
-            ExperimentMode::Availability => 1_000,
-        }),
+        key_count,
         value_bytes: args
             .value_bytes
             .or(file.value_bytes)
@@ -196,6 +232,33 @@ pub fn resolve(
             .or(file.lease_duration_ms)
             .unwrap_or(DEFAULT_LEASE_DURATION_MILLIS),
         write_ack_policy: policy.into(),
+        preload_keys: match mode {
+            ExperimentMode::Latency => Some(key_count),
+            _ => None,
+        },
+        target_rates,
+        warmup_seconds: args
+            .warmup_seconds
+            .or(file.warmup_seconds)
+            .unwrap_or(DEFAULT_WARMUP_SECONDS),
+        duration_seconds: args
+            .duration_seconds
+            .or(file.duration_seconds)
+            .unwrap_or(DEFAULT_DURATION_SECONDS),
+        mix: args
+            .mix
+            .clone()
+            .or(file.mix)
+            .unwrap_or(DEFAULT_MIX.to_owned()),
+        key_distribution: args
+            .key_distribution
+            .clone()
+            .or(file.key_distribution)
+            .unwrap_or(DEFAULT_KEY_DISTRIBUTION.to_owned()),
+        max_in_flight: args
+            .max_in_flight
+            .or(file.max_in_flight)
+            .unwrap_or(DEFAULT_MAX_IN_FLIGHT),
         node: node::options(&node_settings),
     })
 }
@@ -228,7 +291,7 @@ mod tests {
         let mut argv = vec!["hashring-rs", "experiment"];
         argv.extend_from_slice(extra);
         match Cli::try_parse_from(argv).unwrap().command {
-            Command::Experiment(args) => args,
+            Command::Experiment(args) => *args,
             _ => unreachable!(),
         }
     }

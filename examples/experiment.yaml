@@ -31,6 +31,16 @@ policy: first-successor
 # worker_threads: 2   # default: CPUs / (nodes + 2), at least 2
 # coordinator_worker_threads: 4   # default: one per available CPU
 
+# The `latency` mode only. The load is offered at a fixed rate, and every
+# rate is one stage of the run.
+# preload_keys: 100000   # the keys written before the load, and its key space
+# target_rates: [5000, 10000, 20000]   # operations per second
+# warmup_seconds: 10   # the start of every stage that is not counted
+# duration_seconds: 60  # the length of every stage that is counted
+# mix: "90:9:1"   # the GET:PUT:DELETE share of the requests
+# key_distribution: zipf:0.99   # uniform, zipf:<theta>, hotspot:<keys>:<traffic>
+# max_in_flight: 4096   # a request over the limit is dropped, not queued
+
 # Forwarded to every data node the run starts; see the node flags.
 max_dedup_bytes: 134217728              # 128 MiB
 max_value_bytes: 8388608                # 8 MiB

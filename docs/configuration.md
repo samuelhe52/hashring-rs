@@ -113,18 +113,25 @@ replaced during the run.
 | Flag | YAML key | Default | Scope | Notes |
 | --- | --- | --- | --- | --- |
 | `--config` | — | none | process | |
-| `--mode` | `mode` | `correctness` | experiment | `correctness`, `performance` or `availability`. |
+| `--mode` | `mode` | `correctness` | experiment | `correctness`, `performance`, `availability` or `latency`. |
 | `--output` | `output` | required | experiment | New or empty directory. |
 | `--nodes` | `nodes` | 4 for availability, 10 otherwise | experiment | Peak node count. |
-| `--keys` | `keys` | 20,000 / 1,000,000 / 1,000 by mode | experiment | |
+| `--keys` | `keys` | 20,000 / 1,000,000 / 1,000 by mode | experiment | The `latency` mode reads it as the key count of the run, which is its `--preload-keys`. |
 | `--value-bytes` | `value_bytes` | 128 | experiment | |
-| `--concurrency` | `concurrency` | 64 | experiment | |
+| `--concurrency` | `concurrency` | 64 | experiment | The `latency` mode uses it for the preload and the check, not for the load. |
 | `--operation-timeout-ms` | `operation_timeout_ms` | 30000 | experiment | At most `--receipt-retention-ms`, since mutations stop retrying there. |
 | `--migration-timeout-ms` | `migration_timeout_ms` | 600000 | experiment | |
 | `--pre-publish-delay-ms` | `pre_publish_delay_ms` | 250 | experiment | Observation window before each publication. |
 | `--require-clean-source` | `require_clean_source` | off | experiment | Refuse a run whose source is not one clean commit. |
 | `--verbose` | `verbose` | off | experiment | |
 | `--policy` | `policy` | `first-successor` for availability, `owner-only` otherwise | experiment | ACK policy. |
+| `--preload-keys` | `preload_keys` | 100,000 | experiment | `latency` mode only: the keys written before the load, and the key space the load reads and writes. |
+| `--target-rates` | `target_rates` | none | experiment | `latency` mode only: the target rates in operations per second, one stage each. A list in YAML. |
+| `--warmup-seconds` | `warmup_seconds` | 10 | experiment | `latency` mode only: the seconds at the start of every stage that are not counted. |
+| `--duration-seconds` | `duration_seconds` | 60 | experiment | `latency` mode only: the seconds of every stage that are counted. |
+| `--mix` | `mix` | `90:9:1` | experiment | `latency` mode only: the `GET:PUT:DELETE` share of the requests. |
+| `--key-distribution` | `key_distribution` | `zipf:0.99` | experiment | `latency` mode only: `uniform`, `zipf:<theta>`, or `hotspot:<key share>:<traffic share>`. |
+| `--max-in-flight` | `max_in_flight` | 4096 | experiment | `latency` mode only: how many requests may be in flight at once. A request over the limit is dropped and counted as late. |
 | `--worker-threads` | `worker_threads` | CPUs / (nodes + 2), at least 2 | process | For the driver and each node. |
 | `--coordinator-worker-threads` | `coordinator_worker_threads` | one per available CPU | process | For the run's coordinator, which is not on the data path. |
 | `--seed`, `--virtual-nodes`, `--range-move-concurrency`, `--replica-repair-concurrency`, `--prepublication-failure-grace-ms`, `--desired-replication-factor`, `--minimum-admitted-copies`, `--minimum-healthy-followers`, `--max-replica-lag-ms`, `--receipt-retention-ms`, `--lease-duration-ms` | as for `coordinator` | as for `coordinator` | as for `coordinator` | Passed to the run's coordinator. |

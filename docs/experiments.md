@@ -11,6 +11,7 @@ For quick-start commands, see the [README](../README.md#experiments).
 | `correctness` | Starts with 9 nodes and scales to 10 under concurrent rewrites and deletes, keeping a third moving cohort as snapshot sentinels. It then scales back to 9 while restoring or deleting the mutation cohorts, and verifies present and absent keys after every stage. | 20,000 | 10 (peak) |
 | `performance` | Nominal acceptance profile | 1,000,000 | 10 |
 | `availability` | Failure and repair: 3 live nodes plus 1 replacement | 1,000 | 4 |
+| `latency` | Open-loop load at a series of target rates, and the latency of that load. See [the latency mode](#the-latency-mode). | 100,000 | 10 |
 
 Every mode defaults to 128-byte values, concurrency 64, seed 1, 128 virtual
 nodes, and a 30-second operation deadline. The default ACK policy is
@@ -47,6 +48,16 @@ non-empty one. It writes:
 - `coordinator.redb`: the coordinator database
 - `summary.json`: the results
 
+The manifest's `runtime_source` holds the source the run was built from: the
+commit, the status of the working tree, the diff of the files that were
+changed, and the files that were never added to the index. The last part is
+there because `git diff` does not hold them, and a run of a tree that was
+never committed is only reproducible if the tree itself is kept. For each of
+those files the manifest holds the path, the size, the digest, and the
+content of the file when it is text and small enough to keep. A file that
+could not be read is held with the error and without a digest, so a file that
+is not there is never recorded as an empty one.
+
 `results/` is ignored by Git, so raw databases and logs stay local.
 
 ### Reproducibility
@@ -62,7 +73,14 @@ All modes:
 - initial-put throughput
 - sampled latency distributions in microseconds (p50, p95, p99, max) for
   end-to-end client `PUT` and for direct owner-RPC `PUT`. The direct figure
-  includes the network hop and owner processing, not only CPU time.
+  includes the network hop and owner processing, not only CPU time. Both are
+  measured on an **idle** cluster, after the workload has finished, so they
+  are a baseline and not the latency under load. The `latency` mode measures
+  the other one.
+  - `idle_client_put_latency_us` and `idle_owner_rpc_put_latency_us` are the
+    names of these two figures. They were `client_put_latency_us` and
+    `owner_rpc_put_latency_us` before the rename that says what the sample
+    is; the older results still use the old names.
 - `node_pressure_after_initial_put`, recorded per node:
   - current and peak deduplication receipt store bytes, and its capacity
   - owner and follower budget rejections
@@ -70,6 +88,8 @@ All modes:
   - replication RPC retries
   - peak pending entries in one replication stream, not counting the RPC in
     flight
+  - the operations the node served as the owner of a key, by kind, and their
+    sum
 
   The same sample is also logged as a `node_pressure_sampled` event, even when
   the initial writes fail. Counters are per process and reset when a node
@@ -86,10 +106,246 @@ Availability mode also records:
   of at least 1 MiB
 - time from replacement to full RF
 
+The `latency` mode records one measurement per target rate, and its own
+observations. See [the latency mode](#the-latency-mode).
+
 All of these are local process measurements, not service-level guarantees.
 
 If a concurrent writer fails, the runner records the error and waits for the
 migration outcome before it writes the summary.
+
+## The latency mode
+
+`performance` mode is a closed-loop benchmark: 64 tasks write as fast as they
+can, so a slow cluster makes the clients send less, and the latency it
+reports comes from 128 serial `PUT`s on an idle cluster afterwards. The
+`latency` mode measures the latency of a load that is offered at a fixed rate,
+which is the number a service-level objective is written against.
+
+[`latency-acceptance.md`](latency-acceptance.md) is the run this mode was
+accepted with: what it measured, what the numbers were, and what they are not.
+
+### The open loop
+
+Requests are due at fixed offsets from the start of a stage: request `n` is
+due at `stage start + n / rate`. The sender does not wait for a response
+before it sends the next one, and a request that is late is not delayed
+further to make room for a later one. Two things follow from that:
+
+- A request's latency is measured from the moment it was **due**, not from the
+  moment it was sent. A request that waited in the client counts the waiting,
+  which is what keeps a slow cluster from hiding its own tail.
+- A request that cannot be sent because `--max-in-flight` requests are
+  already in flight is **dropped** and counted as `late`. It is not queued.
+  A cluster that cannot keep up therefore shows a lower achieved rate rather
+  than a longer queue inside the driver, and the offered rate stays the rate
+  the run asked for.
+
+The sender runs on its own thread and waits against the wall clock, with a
+sleep and a short spin, because a runtime timer wakes up about a millisecond
+late. That is longer than the latencies this mode measures, so a runtime
+timer would put a millisecond of the sender's own delay into every request.
+[latency-sender-timing.md](optimizations/latency-sender-timing.md) has the
+measurements.
+
+The sender is not allowed to be the bottleneck. Every second the run records
+how many requests the schedule called for and how many the sender had sent;
+if the sender is behind by more than a twentieth of a second's worth of
+requests, the stage is marked `sender_saturated` and its numbers do not
+describe the cluster.
+
+### Parameters
+
+| Flag | Meaning | Default |
+| --- | --- | --- |
+| `--preload-keys` | The keys written before the load starts, and the key space the load reads and writes. `--keys` names the same count. | 100,000 |
+| `--target-rates` | The target rates in operations per second. Each rate is one stage of the run. | none, so the mode needs at least one |
+| `--warmup-seconds` | The seconds at the start of every stage that are not counted. | 10 |
+| `--duration-seconds` | The seconds of every stage that are counted. | 60 |
+| `--mix` | The `GET:PUT:DELETE` share of the requests. | `90:9:1` |
+| `--key-distribution` | `uniform`, `zipf:<theta>`, or `hotspot:<key share>:<traffic share>`. | `zipf:0.99` |
+| `--max-in-flight` | How many requests may be in flight at once. | 4096 |
+
+The value size is the run's `--value-bytes`, and every other setting is the
+run's own: node count, replication factor, ACK policy, hash seed, virtual
+nodes, and the operation deadline.
+
+The target rates are the input, not the output: measure the capacity with
+`performance` mode first, then offer a share of it. A stage that cannot reach
+its target rate says so.
+
+### What a stage reports
+
+`summary.json` holds one `measurements` entry per target rate, named
+`rate_0`, `rate_1`, and so on:
+
+```jsonc
+"rate_2": {
+  "target_rate": 20000, "achieved_rate": 19998, "seconds": 60,
+  "sender_saturated": false,   // the sender did not keep up with its schedule
+  "issued": 1199880,           // the requests the sender sent
+  "late": 120,                 // the requests it had to drop
+  "ops": { "get": 1079892, "put": 107989, "delete": 11999 },
+  "errors": { "deadline": 0, "not_found": 0, "operation": 0,
+              "protocol": 0, "rpc": 0, "topology": 0 },
+  "retries": 120,               // the times the client had to try again
+  "latency_us": {
+    "get": { "p50": 180, "p95": 600, "p99": 2100, "p999": 8000,
+             "max": 21000,        // the upper bound of the largest bucket
+             "max_observed": 20980, // the longest request itself
+             "over_range": 0,     // the requests longer than the histogram
+             "samples": 1079892 },
+    "put": { ... }, "delete": { ... }
+  },
+  "load_balance": {
+    "per_node": {
+      "node-1": { "owned_keys": 10120, "ops_handled": 120400, "cpu_percent": 61.0 }
+    },
+    "owned_keys_max_over_mean": 1.08, "owned_keys_cv": 0.04,
+    "ops_handled_max_over_mean": 1.31, "ops_handled_cv": 0.12
+  }
+}
+```
+
+The `errors` map counts failures by reason. `deadline` is a request that ran
+out of its operation deadline, `operation` is a request the cluster refused,
+`rpc` is a request whose transport failed, `topology` is a request the
+client could not route, and `protocol` is a response the client could not
+read. `not_found` is a read of a key that is not there, which is an outcome
+of the workload and not a failure of the cluster. The map holds all six
+reasons in every window and every stage, with a zero for the ones that did
+not occur, so a reader finds the same keys in every run.
+
+The `ops` map counts the operations that **succeeded**, and the `errors` map
+counts the ones that did not. The latency histogram holds every request that
+came back, so its `samples` is the sum of the two, and a request that failed
+is in the histogram with the latency it took to fail.
+
+The histogram's range ends at the operation deadline plus a second, because a
+request cannot take longer than its deadline. A request longer than that is
+recorded in the top bucket and counted in `over_range`, so it is not lost, but
+the histogram does not measure it: `max` is the upper bound of that bucket
+rather than the length of the slowest request. `max_observed` is the longest
+request itself, so a reader can tell a request that was truncated from one
+that was near the bound.
+
+`issued` and `late` do not overlap: a request the in-flight limit dropped was
+never sent, so `ops` and `errors` add up to `issued`. A stage that does not
+add up is a bug in the measurement, so the run fails with an error rather
+than report a rate that is quietly short.
+
+A request that fails after the client has tried it again is counted under the
+reason it failed with, and the tries themselves are in `retries`. A retry is
+any attempt the client made after a failure it could try again: the retry of a
+request, and the retry of a topology refresh. There is no separate "the
+retries ran out" reason, because a client that gives up fails with a
+deadline or with a transport error, and counting it twice would make the map
+harder to read.
+
+The load balance has two layers. `owned_keys` is how the key space was
+divided: the number of keys each node owns, counted over the key space
+itself. `ops_handled` and `cpu_percent` are how the requests were divided:
+the operations each node served while the stage ran, and the share of one
+core it used (`null` when CPU sampling is unavailable). A failed node operations
+sample fails the run rather than inventing a zero. `max_over_mean` is the largest value divided by the mean, and
+`cv` is the standard deviation divided by the mean.
+
+The measurements of a latency run hold the rate stages and nothing else: the
+preload and the read that checks it are in the `observations`, under
+`initial_put` and `initial_get_verify`.
+
+### The events
+
+`events.jsonl` holds one `metrics_sampled` event per second of every stage,
+the warmup included:
+
+```jsonc
+{
+  "event": "metrics_sampled",
+  "unix_ms": 1791998161278,
+  "fields": {
+    "stage": "rate_2", "warmup": false, "window_ms": 1000,
+    "target_rate": 20000, "issued": 19990, "late": 10,
+    "behind": 0, "sender_lag": 0,
+    "ops": { "get": 17980, "put": 1810, "delete": 200 },
+    "errors": { "deadline": 0, "not_found": 0, "operation": 0,
+                "protocol": 0, "rpc": 0, "topology": 0 },
+    "retries": 12,
+    "epoch": 1,
+    "latency_us": { "get": { "p50": 180, "p95": 600, "p99": 2100, "max": 9800 } }
+  }
+}
+```
+
+`behind` is how many requests the schedule had called for in that window and
+the sender had not dealt with yet, neither sent nor dropped. It is zero when
+the sender keeps up. A request the in-flight limit dropped is not behind: the
+sender dealt with it, and the cluster is the one that could not keep up.
+
+`sender_lag` is the sender's own lag, over the phase so far, and it is not the
+lag of the window. It is the number that decides the stage's
+`sender_saturated`: the sender is behind its own schedule when it is more
+than a twentieth of a second's worth of requests behind. The schedule is
+absolute, so a sender that fell behind catches up in a burst and its lag
+falls again; the published value is the lag at the last window boundary, not
+a maximum and not a total. The two numbers answer different
+questions — `behind` is about one second of the load, `sender_lag` about the
+whole phase — and a reader should not read one as the other.
+
+`retries` is how many times the client had to try again in that window, for a
+request or for a topology refresh, and `epoch` is the topology epoch it routed
+with. A window with retries is a window the cluster was not answering at once.
+
+Every mode, not only `latency`, writes a `topology_published` event when the
+cluster is ready, after every topology change, and at the end of the run. Its
+`fields` are the output of `hashring-rs topology`, so a run that has ended can
+still be read: the ring of every epoch is in the event log, and a reader does
+not have to ask a coordinator that is gone.
+
+### The key space after the load
+
+The load leaves a key space behind, and the run checks it before it writes
+its summary. Every key the load did not delete must still hold the value the
+preload wrote, and every key it did delete must be gone.
+
+A delete and a write to the same key race each other, and the outcome of the
+race is not known, so the load deletes from a **pool of its own**: the last
+part of the key space, which no read and no write ever touches. A delete
+therefore never races another operation on the same key, and the expected
+state of every key is known. The pool is as large as the run's deletes need,
+and never more than half of the key space and never less than a twentieth of
+it; the acceptance run needed more than half, so its pool was 50,000 of the
+100,000 keys. The sizes are in the `latency_delete_pool_keys` observation.
+
+Every write stores the same value for a key, the one the preload wrote, so two
+writes to the same key cannot disagree about what the key holds.
+
+The check itself is in the `latency_verified_keys` observation, and a run that
+fails it fails.
+
+### Reading the numbers
+
+- A stage whose `sender_saturated` is true does not describe the cluster. The
+  sender could not keep up, so the offered rate was not the requested one.
+- The `latency` mode's `achieved_rate` is the operations that **succeeded**,
+  divided by the length of the stage. The requests the sender dropped are in
+  `late`, and the requests that failed are in `errors`.
+- The percentiles come from a histogram that keeps every request, so they are
+  the percentiles of the whole stage and not of a sample of it. The histogram
+  has three significant figures, so its `max` is the upper bound of the
+  bucket the largest value falls in, a little above the value itself.
+- The histogram's range ends at the operation deadline plus a second, and a
+  request longer than that is recorded in its top bucket and counted in
+  `over_range`. Its `max` is then the bound and not the length of the
+  slowest request, and `max_observed` is the length of the slowest request.
+- A window's `behind` and the stage's `sender_saturated` are two different
+  numbers. `behind` is the lag of that window, and `sender_lag` is the
+  sender's lag over the phase, which is what `sender_saturated` is decided
+  by.
+- The `idle_*` figures of the other modes and the `latency` mode's figures
+  answer different questions. The first is how fast a request goes when
+  nothing else is happening; the second is how fast it goes when the cluster
+  is at the rate the stage asked for.
 
 ## Diagnostics and profiling
 
