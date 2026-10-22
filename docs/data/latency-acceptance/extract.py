@@ -44,7 +44,7 @@ MEDIAN_COLUMNS = [
 ]
 
 
-def load_runs(results_dir):
+def load_runs(results_dir, mode="latency"):
     """Every latency run in the results directory, with its summary."""
     runs = []
     for name in sorted(os.listdir(results_dir)):
@@ -58,7 +58,7 @@ def load_runs(results_dir):
         with open(manifest_path) as handle:
             manifest = json.load(handle)
         config = manifest.get("config") or {}
-        if config.get("mode") != "latency":
+        if config.get("mode") != mode:
             continue
         summary["config"] = config
         runs.append((name, summary))
@@ -177,17 +177,7 @@ def median_rows(rows):
 
 def capacity_rows(results_dir):
     rows = []
-    for name in sorted(os.listdir(results_dir)):
-        summary_path = os.path.join(results_dir, name, "summary.json")
-        manifest_path = os.path.join(results_dir, name, "manifest.json")
-        if not os.path.isfile(summary_path) or not os.path.isfile(manifest_path):
-            continue
-        with open(summary_path) as handle:
-            summary = json.load(handle)
-        with open(manifest_path) as handle:
-            manifest = json.load(handle)
-        if (manifest.get("config") or {}).get("mode") != "performance":
-            continue
+    for name, summary in load_runs(results_dir, mode="performance"):
         for stage, measurement in (summary.get("measurements") or {}).items():
             rows.append({
                 "run": name,
@@ -209,101 +199,63 @@ def markdown_table(rows, columns):
     return "\n".join(lines)
 
 
-def campaign_table(rows):
-    """The latency table of the report: every repetition, with the speed of
-    the host the run landed on."""
-    lines = [
-        "| Run | Distribution | Rate | Host | p50 | p95 | p99 | p999 | max |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
-    ]
-    for row in rows:
-        if row["kind"] != "campaign":
-            continue
-        lines.append(
-            "| {run} | {distribution} | {rate} | {host} | {p50} | {p95} | {p99} | {p999} | {maximum} |".format(
-                run=row["run"],
-                distribution=row["distribution"],
-                rate=f"{int(row['target_rate']):,}",
-                host=f"{int(row['host_preload_ops']):,}",
-                p50=f"{row['get_p50']:,.0f} us",
-                p95=f"{row['get_p95']:,.0f} us",
-                p99=f"{row['get_p99']:,.0f} us",
-                p999=f"{row['get_p999']:,.0f} us",
-                maximum=f"{row['get_max']:,.0f} us",
-            )
-        )
-    return "\n".join(lines)
+REPORT_COLUMNS = {
+    "campaign": [
+        ("Run", "run", "{}"), ("Distribution", "distribution", "{}"),
+        ("Rate", "target_rate", "{:,.0f}"), ("Host", "host_preload_ops", "{:,.0f}"),
+        *[(label, "get_" + label, "{:,.0f} us") for label in ("p50", "p95", "p99", "p999")],
+        ("max", "get_max", "{:,.0f} us"),
+    ],
+    "balance": [
+        ("Distribution", "distribution", "{}"), ("Rate", "target_rate", "{:,.0f}"),
+        ("Owned keys, max over mean", "owned_mom", "{:.3f}"),
+        ("Owned keys, cv", "owned_cv", "{:.3f}"),
+        ("Operations, max over mean", "ops_mom", "{:.3f}"),
+        ("Operations, cv", "ops_cv", "{:.3f}"),
+        ("Busiest node's CPU", "cpu_max_percent", "{:.1f}%"),
+    ],
+    "ladder": [
+        ("Target rate", "target_rate", "{:,.0f}"), ("Achieved", "achieved_rate", "{:,.0f}"),
+        *[(label, "get_" + label, "{:,.0f} us") for label in ("p50", "p95", "p99", "p999")],
+        ("Late", "late", "{:,.0f}"), ("Sender saturated", "sender_saturated", "{}"),
+    ],
+    "vnode": [
+        ("Virtual nodes", "virtual_nodes", "{}"),
+        ("Owned keys, max over mean", "owned_mom", "{:.3f}"),
+        ("Owned keys, cv", "owned_cv", "{:.3f}"),
+        ("Operations, max over mean", "ops_mom", "{:.3f}"),
+        ("Operations, cv", "ops_cv", "{:.3f}"),
+    ],
+}
 
 
-def balance_table(rows):
-    """The load balance table of the report."""
-    lines = [
-        "| Distribution | Rate | Owned keys, max over mean | Owned keys, cv | Operations, max over mean | Operations, cv | Busiest node's CPU |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
-    ]
-    for row in rows:
-        if row["kind"] != "campaign":
-            continue
-        lines.append(
-            "| {distribution} | {rate} | {owned} | {owned_cv} | {ops} | {ops_cv} | {cpu} |".format(
-                distribution=row["distribution"],
-                rate=f"{int(row['target_rate']):,}",
-                owned=f"{row['owned_mom']:.3f}",
-                owned_cv=f"{row['owned_cv']:.3f}",
-                ops=f"{row['ops_mom']:.3f}",
-                ops_cv=f"{row['ops_cv']:.3f}",
-                cpu=f"{row['cpu_max_percent']:.1f}%" if row.get('cpu_max_percent') is not None else "unavailable",
-            )
-        )
-    return "\n".join(lines)
+def report_table(rows, kind):
+    columns = REPORT_COLUMNS[kind]
+    def cell(row, key, template):
+        value = row.get(key)
+        if value is None:
+            return "unavailable"
+        if key == "sender_saturated":
+            value = "yes" if value else "no"
+        elif key == "host_preload_ops":
+            value = int(value)
+        return template.format(value)
+    formatted = [{label: cell(row, key, template) for label, key, template in columns} for row in rows]
+    return markdown_table(formatted, [label for label, _, _ in columns])
 
 
-def ladder_table(rows):
-    """The ladder table of the report."""
-    lines = [
-        "| Target rate | Achieved | p50 | p95 | p99 | p999 | Late | Sender saturated |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- |",
-    ]
-    for row in rows:
-        if row["kind"] != "ladder":
-            continue
-        lines.append(
-            "| {rate} | {achieved} | {p50} | {p95} | {p99} | {p999} | {late} | {saturated} |".format(
-                rate=f"{int(row['target_rate']):,}",
-                achieved=f"{row['achieved_rate']:,.0f}",
-                p50=f"{row['get_p50']:,.0f} us",
-                p95=f"{row['get_p95']:,.0f} us",
-                p99=f"{row['get_p99']:,.0f} us",
-                p999=f"{row['get_p999']:,.0f} us",
-                late=f"{int(row['late']):,}",
-                saturated="yes" if row["sender_saturated"] else "no",
-            )
-        )
-    return "\n".join(lines)
-
-
-def vnode_table(rows):
-    """The virtual node table of the report."""
-    lines = [
-        "| Virtual nodes | Owned keys, max over mean | Owned keys, cv | Operations, max over mean | Operations, cv |",
-        "| --- | --- | --- | --- | --- |",
-    ]
-    seen = {}
-    for row in rows:
-        if row["kind"] != "vnode" or row["virtual_nodes"] in seen:
-            continue
-        seen[row["virtual_nodes"]] = row
-    for vnodes, row in sorted(seen.items()):
-        lines.append(
-            "| {vnodes} | {owned} | {owned_cv} | {ops} | {ops_cv} |".format(
-                vnodes=vnodes,
-                owned=f"{row['owned_mom']:.3f}",
-                owned_cv=f"{row['owned_cv']:.3f}",
-                ops=f"{row['ops_mom']:.3f}",
-                ops_cv=f"{row['ops_cv']:.3f}",
-            )
-        )
-    return "\n".join(lines)
+def report(rows):
+    medians = median_rows(rows)
+    vnodes = {}
+    for row in medians:
+        if row["kind"] == "vnode":
+            vnodes.setdefault(row["virtual_nodes"], row)
+    return "\n\n".join([
+        report_table([row for row in rows if row["kind"] == "campaign"], "campaign"),
+        report_table([row for row in medians if row["kind"] == "campaign"], "balance"),
+        report_table([row for row in medians if row["kind"] == "ladder"], "ladder"),
+        report_table([row for _, row in sorted(vnodes.items())], "vnode"),
+    ])
 
 
 def main():
@@ -325,17 +277,7 @@ def main():
     elif mode == "markdown":
         print(markdown_table(median_rows(rows), MEDIAN_COLUMNS))
     elif mode == "report":
-        # The campaign is shown repetition by repetition: the host's speed
-        # moves the latencies, so the spread is the measurement. The rest is
-        # over the repetitions, because those numbers do not move.
-        medians = median_rows(rows)
-        print(campaign_table(rows))
-        print()
-        print(balance_table(medians))
-        print()
-        print(ladder_table(medians))
-        print()
-        print(vnode_table(medians))
+        print(report(rows))
     else:
         print_table(rows)
     return 0
