@@ -317,14 +317,8 @@ Reproducing the source is therefore a checkout:
 git checkout 52adf85
 ```
 
-No patch is needed, and the patch that the earlier campaign needed is not
-kept any more. That campaign ran from a tree that was never committed, and
-the manifest of its runs could hold only the files git already tracked; the
-manifest now also keeps the files that were never added to the index, with
-the content of the ones that are text and small enough, so a run of an
-uncommitted tree carries its own source. This run was a clean run that was
-still not reported as `source_reproducible`, and the only reason was
-the script: it wrote its `host.txt` into
+No patch is needed. The source of this run was committed, but the run was not
+reported as `source_reproducible` because the script wrote its `host.txt` into
 `docs/data/latency-acceptance/<run>/` before the first run started, so
 `git status` of every run saw that one untracked file — 457 bytes, held in
 the manifest with its content — and the `git_changed_files: 1` of

@@ -258,35 +258,7 @@ struct RuntimeSource {
     git_dirty: Option<bool>,
     git_status_porcelain: Option<String>,
     git_diff: Option<String>,
-    /// The files that were not in the commit.
-    ///
-    /// `git diff` holds the files that were tracked and changed, and not the
-    /// files that were never added to the index. A run of a tree that was
-    /// never committed is only reproducible if the tree itself is kept, so
-    /// the untracked files go into the manifest: the path, the size and the
-    /// digest of each, and the content of the text files that are small
-    /// enough to keep.
-    git_untracked: Vec<UntrackedFile>,
     source_tree_blake3: Option<String>,
-}
-
-/// A file that was not in the commit the run was built from.
-///
-/// The manifest holds the path, the size and the digest of the file, and the
-/// content of the file when it is text and small enough to keep. A file that
-/// could not be read is held with the error and without a digest, so it is
-/// never recorded as an empty file.
-#[derive(Serialize)]
-struct UntrackedFile {
-    path: String,
-    /// The size of the file, when it could be read.
-    bytes: Option<u64>,
-    /// The digest of the file, when it could be read.
-    blake3: Option<String>,
-    /// The content of the file, when it is text and small enough to keep.
-    content: Option<String>,
-    /// The error that stopped the file from being read, when there was one.
-    error: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -489,7 +461,7 @@ pub async fn run_experiment(
         runtime_tree_hash.as_deref(),
     );
     let manifest = ExperimentManifest {
-        schema_version: 7,
+        schema_version: 8,
         started_unix_ms: unix_ms(),
         executable_path: executable.display().to_string(),
         executable_blake3: file_digest(&executable)?,
@@ -512,7 +484,6 @@ pub async fn run_experiment(
                 "git",
                 &["diff", "--binary", "HEAD"],
             ),
-            git_untracked: untracked_files(build_source_root),
             source_tree_blake3: runtime_tree_hash,
         },
         source_reproducible,
@@ -2303,88 +2274,6 @@ fn command_output(cwd: Option<&Path>, program: &str, arguments: &[&str]) -> Opti
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
-/// The largest untracked file whose content the manifest keeps.
-const MAX_UNTRACKED_FILE_BYTES: usize = 4 * 1024 * 1024;
-
-/// The files that are not in the commit.
-///
-/// A run of a tree that was never committed is only reproducible if the tree
-/// itself is kept, and `git diff` does not hold the files that were never
-/// added to the index. The untracked files go into the manifest, so the
-/// source a run was built from is in the run's own output.
-///
-/// The content of a file is kept when the file is text and small enough.
-/// The size and the digest are kept for every file that could be read, and a
-/// file that could not be read is kept with its error, so a file that is not
-/// there is never recorded as an empty one.
-fn untracked_files(root: &Path) -> Vec<UntrackedFile> {
-    let Some(listing) = command_output(
-        Some(root),
-        "git",
-        &["ls-files", "--others", "--exclude-standard", "-z"],
-    ) else {
-        return Vec::new();
-    };
-    listing
-        .split('\0')
-        .filter(|path| !path.is_empty())
-        .map(|path| untracked_file(root, path))
-        .collect()
-}
-
-/// Reads one untracked file, and keeps what can be kept of it.
-///
-/// The size comes from the metadata and the digest from the file itself, so
-/// a file that is too large to keep is hashed in chunks and never loaded
-/// into memory.
-fn untracked_file(root: &Path, path: &str) -> UntrackedFile {
-    let full = root.join(path);
-    let bytes = match fs::metadata(&full) {
-        Ok(metadata) => metadata.len(),
-        Err(error) => return unreadable_file(path, error),
-    };
-    if bytes > MAX_UNTRACKED_FILE_BYTES as u64 {
-        // The file is too large to keep, so it is hashed in chunks and
-        // dropped.
-        return match file_digest(&full) {
-            Ok(blake3) => UntrackedFile {
-                path: path.to_owned(),
-                bytes: Some(bytes),
-                blake3: Some(blake3),
-                content: None,
-                error: None,
-            },
-            Err(error) => unreadable_file(path, error),
-        };
-    }
-    let contents = match fs::read(&full) {
-        Ok(contents) => contents,
-        Err(error) => return unreadable_file(path, error),
-    };
-    let blake3 = blake3::hash(&contents).to_hex().to_string();
-    UntrackedFile {
-        path: path.to_owned(),
-        bytes: Some(bytes),
-        blake3: Some(blake3),
-        content: String::from_utf8(contents).ok(),
-        error: None,
-    }
-}
-
-/// The entry of a file that could not be read.
-///
-/// It holds the error and nothing else, because a file that was not read has
-/// no size and no digest that can be trusted.
-fn unreadable_file(path: &str, error: impl std::fmt::Display) -> UntrackedFile {
-    UntrackedFile {
-        path: path.to_owned(),
-        bytes: None,
-        blake3: None,
-        content: None,
-        error: Some(error.to_string()),
-    }
-}
-
 fn source_is_reproducible(
     build_git_dirty: &str,
     build_git_commit: &str,
@@ -2531,67 +2420,6 @@ mod tests {
             Measurement::Throughput(measurement) => assert_eq!(measurement.operations, 10),
             other => panic!("expected a throughput measurement, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn the_untracked_files_are_kept_with_their_content() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        let git = |arguments: &[&str]| {
-            let status = Command::new("git")
-                .current_dir(root)
-                .args(arguments)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .unwrap();
-            assert!(status.success(), "git {arguments:?} failed");
-        };
-        git(&["init"]);
-        git(&["config", "user.email", "test@example.com"]);
-        git(&["config", "user.name", "test"]);
-        fs::write(root.join("tracked.txt"), "tracked\n").unwrap();
-        git(&["add", "tracked.txt"]);
-        git(&["commit", "-m", "first"]);
-        // A file that was never added to the index. `git diff` does not hold
-        // it, so the manifest has to.
-        fs::write(root.join("new.rs"), "fn main() {}\n").unwrap();
-        // A file that cannot be read. A broken symlink is the case that
-        // fails for every user, root included.
-        std::os::unix::fs::symlink(root.join("missing.rs"), root.join("broken.rs")).unwrap();
-
-        let files = untracked_files(root);
-        assert_eq!(files.len(), 2);
-
-        let readable = files
-            .iter()
-            .find(|file| file.path == "new.rs")
-            .expect("the readable file is listed");
-        assert_eq!(readable.bytes, Some(13));
-        assert_eq!(readable.content.as_deref(), Some("fn main() {}\n"));
-        assert_eq!(readable.blake3.as_deref().unwrap().len(), 64);
-        assert!(readable.error.is_none());
-
-        // The file that could not be read is listed with the error, and not
-        // as an empty file.
-        let broken = files
-            .iter()
-            .find(|file| file.path == "broken.rs")
-            .expect("the unreadable file is listed");
-        assert_eq!(broken.content, None);
-        assert_eq!(broken.bytes, None);
-        assert_eq!(broken.blake3, None);
-        assert!(
-            broken.error.is_some(),
-            "the unreadable file holds its error"
-        );
-
-        // The manifest holds the error, and no size and no digest.
-        let entry = serde_json::to_value(broken).unwrap();
-        assert!(entry["bytes"].is_null());
-        assert!(entry["blake3"].is_null());
-        assert!(entry["content"].is_null());
-        assert!(entry["error"].as_str().is_some());
     }
 
     #[test]

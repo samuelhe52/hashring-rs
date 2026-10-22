@@ -59,11 +59,9 @@ the last run now, so a run of a clean tree reports
 `source_reproducible: true` — which needs the tables of the run before it
 committed, because they live in this tracked directory too.
 
-A run of a tree that was never committed carries its source too: the manifest
-keeps the files that are not in the index, with the content of the ones that
-are text and small enough. The campaign the report replaces needed a patch
-file for exactly that reason — its mode and its script were never added to
-the index — and the patch was dropped when the campaign was.
+Formal runs should use `--require-clean-source`. The manifest records the
+commit, tracked diff, working-tree status and source digest; it does not
+archive untracked files. Commit the source before collecting acceptance data.
 
 The `host.txt` holds the hash of the binary. The build is deterministic at a
 fixed path, but the absolute build root is compiled into the binary, so the
