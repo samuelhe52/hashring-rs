@@ -32,13 +32,15 @@ produced them.
 
 The hash above is the hash of the binary that ran, recorded by the run
 itself in [`host.txt`](data/latency-acceptance/host.txt) and in the
-`manifest.json` of every run. The build is deterministic — two
-`cargo build --release` runs of the same source give the same bytes — and the
-source the run was built from is in
+`manifest.json` of every run. The build is deterministic at a fixed path —
+two `cargo build --release` runs of the same source at the same path give
+the same bytes — and the source the run was built from is in
 [`source.patch`](data/latency-acceptance/source.patch), which reproduces the
-source tree digest the run recorded. The tree has changed since: a doc
-comment and a clippy attribute were added to `latency.rs`, and the mode was
-changed afterwards to fix what the review of this report found.
+source tree digest the run recorded. The digest comes back from any path; the
+binary's hash does not, because the absolute build root is compiled into the
+binary. The tree has changed since: a doc comment and a clippy attribute
+were added to `latency.rs`, and the mode was changed afterwards to fix what
+the review of this report found.
 
 The target rates are a share of the capacity the cluster showed in
 `performance` mode, which measured **80,615 operations per second** for the

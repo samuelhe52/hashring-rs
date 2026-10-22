@@ -567,15 +567,19 @@ impl LoadRunner {
             retries_before,
         ));
         let (issued, late, saturated_windows) = self.drive(stage, start, end).await?;
-        // A stage that sent nothing is not a measurement of the cluster. The
-        // accounting below would accept it, because no request was issued
-        // and none came back, so a stage that offered no load would be
-        // published as a stage that offered nothing.
-        ensure!(
-            issued > 0,
-            "the stage {} issued no requests at all",
-            stage.name
-        );
+        // A measured stage that sent nothing is not a measurement of the
+        // cluster. The accounting below would accept it, because no request
+        // was issued and none came back, so a stage that offered no load
+        // would be published as a stage that offered nothing. A warmup is
+        // not measured, and a warmup that sent nothing does not fail the
+        // run.
+        if !warmup {
+            ensure!(
+                issued > 0,
+                "the stage {} issued no requests at all",
+                stage.name
+            );
+        }
         // The sampler writes the window that ends with the phase, so it is
         // waited for rather than stopped: a window that is dropped would leave
         // its samples out of the stage.

@@ -54,10 +54,14 @@ cd /tmp/campaign && git apply /path/to/source.patch
 ```
 
 The patched tree has the source tree digest the run recorded in every
-manifest, `52875185bd69bc52c9a8460da2e94650c134b4de57155fcb5e825475d5daf817`,
-and building it gives the binary whose hash is in `host.txt`. The manifest
-now keeps the files that were not in the index with their content, so a run
-of an uncommitted tree carries its own source; that came after this campaign,
-which is why this one needed the patch.
+manifest, `52875185bd69bc52c9a8460da2e94650c134b4de57155fcb5e825475d5daf817`.
+The digest is the part of the source that does not depend on where the tree
+is built. The binary's bytes do: the absolute build root is compiled into
+them, so the hash in `host.txt` comes back only from a build at the same
+absolute path, with the same target directory layout. The manifest now keeps
+the files that were not in the index, with the content of the ones that are
+text and small enough, so a run of an uncommitted tree carries its own
+source; that came after this campaign, which is why this one needed the
+patch.
 
 The `host.txt` holds the hash of the binary.

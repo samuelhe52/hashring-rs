@@ -66,14 +66,25 @@ async fn experiment_runner_preserves_reproducibility_artifacts() {
     );
     // The source of a tree that was never committed is in the manifest: the
     // files that were not added to the index are held with their content,
-    // because `git diff` does not hold them.
+    // because `git diff` does not hold them. A file that could not be read
+    // holds its error and no digest, so the fields may be absent.
     let untracked = manifest["runtime_source"]["git_untracked"]
         .as_array()
         .expect("the manifest holds the untracked files");
     for file in untracked {
-        assert!(file["path"].as_str().is_some());
-        assert_eq!(file["blake3"].as_str().unwrap().len(), 64);
-        assert!(file["bytes"].as_u64().is_some());
+        assert!(file.get("path").and_then(|value| value.as_str()).is_some());
+        // A file that could not be read holds its error and no digest, so
+        // the size and the digest are absent.
+        assert!(file.get("blake3").is_none_or(
+            |value| value.is_null() || value.as_str().is_some_and(|digest| digest.len() == 64)
+        ));
+        assert!(
+            file.get("bytes")
+                .is_none_or(|value| value.is_null() || value.is_u64())
+        );
+        if let Some(error) = file.get("error").and_then(|value| value.as_str()) {
+            assert!(!error.is_empty());
+        }
     }
     let summary: serde_json::Value =
         serde_json::from_slice(&std::fs::read(output_directory.join("summary.json")).unwrap())

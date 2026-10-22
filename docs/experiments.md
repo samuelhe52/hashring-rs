@@ -50,10 +50,13 @@ non-empty one. It writes:
 
 The manifest's `runtime_source` holds the source the run was built from: the
 commit, the status of the working tree, the diff of the files that were
-changed, and the files that were never added to the index with their
-content. The last part is there because `git diff` does not hold them, and a
-run of a tree that was never committed is only reproducible if the tree
-itself is kept.
+changed, and the files that were never added to the index. The last part is
+there because `git diff` does not hold them, and a run of a tree that was
+never committed is only reproducible if the tree itself is kept. For each of
+those files the manifest holds the path, the size, the digest, and the
+content of the file when it is text and small enough to keep. A file that
+could not be read is held with the error and without a digest, so a file that
+is not there is never recorded as an empty one.
 
 `results/` is ignored by Git, so raw databases and logs stay local.
 
@@ -281,8 +284,10 @@ sender dealt with it, and the cluster is the one that could not keep up.
 `sender_lag` is the sender's own lag, over the phase so far, and it is not the
 lag of the window. It is the number that decides the stage's
 `sender_saturated`: the sender is behind its own schedule when it is more
-than a twentieth of a second's worth of requests behind, and it stays behind
-by that much for the rest of the phase. The two numbers answer different
+than a twentieth of a second's worth of requests behind. The schedule is
+absolute, so a sender that fell behind catches up in a burst and its lag
+falls again; the published value is the lag at the last window boundary, not
+a maximum and not a total. The two numbers answer different
 questions — `behind` is about one second of the load, `sender_lag` about the
 whole phase — and a reader should not read one as the other.
 
