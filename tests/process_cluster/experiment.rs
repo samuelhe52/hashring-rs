@@ -541,10 +541,7 @@ async fn scaling_round_trip_defers_s1_verification_and_records_the_stop_window()
         let first_ok = window["first_write_ok_ms"].as_f64().unwrap();
         assert!(first <= last, "{window}");
         assert!(last <= first_ok, "{window}");
-        assert!(
-            window["observed_ms"].as_f64().unwrap() > 0.0,
-            "{window}"
-        );
+        assert!(window["observed_ms"].as_f64().unwrap() > 0.0, "{window}");
         let published = transition["published_ms"].as_f64().unwrap();
         let complete = transition["complete_ms"].as_f64().unwrap();
         assert!(published > 0.0, "{transition}");
@@ -561,4 +558,3 @@ async fn scaling_round_trip_defers_s1_verification_and_records_the_stop_window()
     assert!(events.contains("scaling_cohorts_verified"));
     assert!(events.contains("removed_node_exited"));
 }
-
