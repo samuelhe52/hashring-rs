@@ -1010,19 +1010,8 @@ async fn record_node_pressure(
 ) -> Result<()> {
     let mut nodes = BTreeMap::new();
     for member in members {
-        let result = tokio::time::timeout(Duration::from_secs(2), async {
-            let mut client =
-                configure_data_node_client(DataNodeClient::connect(member.endpoint.clone()).await?);
-            Ok::<_, anyhow::Error>(
-                client
-                    .get_process_info(hashring_core::proto::Empty {})
-                    .await?
-                    .into_inner(),
-            )
-        })
-        .await;
-        let value = match result {
-            Ok(Ok(info)) => json!({
+        let value = match query_node_info(&member.endpoint).await {
+            Ok(info) => json!({
                 "owner_write_timing": state_write_timing_json(info.owner_write_timing),
                 "follower_write_timing": state_write_timing_json(info.follower_write_timing),
                 "ack_write_timing": state_write_timing_json(info.ack_write_timing),
@@ -1042,8 +1031,7 @@ async fn record_node_pressure(
                 "replication_rpc_retries": info.replication_rpc_retries,
                 "replication_stream_peak_pending": info.replication_stream_peak_pending,
             }),
-            Ok(Err(error)) => json!({ "error": error.to_string() }),
-            Err(_) => json!({ "error": "node pressure request timed out" }),
+            Err(error) => json!({ "error": error.to_string() }),
         };
         nodes.insert(member.node_id.clone(), value);
     }
@@ -1420,32 +1408,30 @@ async fn run_latency(
         };
         runner.run_warmup(&stage, events).await?;
         let before = sample_node_counters(members, &pids).await?;
-        let outcome = runner.run_measured(&stage, events).await?;
+        let (mut measurement, saturated) = runner.run_measured(&stage, events).await?;
         let after = sample_node_counters(members, &pids).await?;
-        saturated_windows.insert(outcome.name.clone(), json!(outcome.saturated_windows));
-        measurements.insert(
-            outcome.name.clone(),
-            Measurement::LatencyStage(LatencyStageMeasurement {
-                target_rate: outcome.target_rate,
-                achieved_rate: outcome.achieved_rate,
-                seconds: outcome.seconds,
-                sender_saturated: outcome.sender_saturated,
-                issued: outcome.issued,
-                late: outcome.late,
-                ops: outcome.ops,
-                errors: outcome.errors,
-                retries: outcome.retries,
-                latency_us: outcome.latency_us,
-                load_balance: load_balance(&owned_keys, &before, &after, outcome.seconds)?,
-            }),
-        );
+        measurement.load_balance = load_balance(&owned_keys, &before, &after, measurement.seconds)?;
+        saturated_windows.insert(stage.name.clone(), json!(saturated));
+        measurements.insert(stage.name, Measurement::LatencyStage(measurement));
     }
     observations.insert(
         "latency_saturated_windows".into(),
         Value::from(saturated_windows),
     );
-    let verified = verify_latency_keyspace(workload_client, &plan, config.concurrency).await?;
-    observations.insert("latency_verified_keys".into(), json!(verified));
+    let expected = (0..key_space)
+        .map(|key| (!plan.is_deleted(key)).then_some(0))
+        .collect::<Vec<_>>();
+    verify_dataset(
+        workload_client,
+        Workload {
+            key_count: key_space,
+            value_bytes: config.value_bytes,
+            concurrency: config.concurrency,
+        },
+        &expected,
+    )
+    .await?;
+    observations.insert("latency_verified_keys".into(), json!(key_space));
     processes.ensure_running()?;
     let topology = admin_client.refresh_topology().await?;
     events.record(
@@ -1523,9 +1509,10 @@ async fn sample_node_counters(
 ) -> Result<BTreeMap<String, NodeCounters>> {
     let mut counters = BTreeMap::new();
     for member in members {
-        let ops_handled = query_node_ops(&member.endpoint)
+        let ops_handled = query_node_info(&member.endpoint)
             .await
-            .with_context(|| format!("sampling operations of {}", member.node_id))?;
+            .with_context(|| format!("sampling operations of {}", member.node_id))?
+            .ops_handled;
         let cpu_seconds = pids
             .get(&member.node_id)
             .and_then(|pid| process_cpu_seconds(*pid));
@@ -1540,22 +1527,17 @@ async fn sample_node_counters(
     Ok(counters)
 }
 
-/// The number of operations a node served since it started.
-async fn query_node_ops(endpoint: &str) -> Result<u64> {
+async fn query_node_info(endpoint: &str) -> Result<hashring_core::proto::NodeInfoResponse> {
     tokio::time::timeout(Duration::from_secs(2), async {
-        let mut client = configure_data_node_client(
-            DataNodeClient::connect(endpoint.to_owned())
-                .await
-                .map_err(|error| anyhow::anyhow!("{error}"))?,
-        );
-        let info = client
+        let mut client =
+            configure_data_node_client(DataNodeClient::connect(endpoint.to_owned()).await?);
+        Ok(client
             .get_process_info(hashring_core::proto::Empty {})
-            .await
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
-        Ok::<_, anyhow::Error>(info.into_inner().ops_handled)
+            .await?
+            .into_inner())
     })
     .await
-    .context("node operations request timed out")?
+    .context("node information request timed out")?
 }
 
 /// How the keys and the requests were spread over the nodes.
@@ -1626,50 +1608,6 @@ fn coefficient_of_variation(values: &[f64]) -> f64 {
         .sum::<f64>()
         / values.len() as f64;
     variance.sqrt() / mean
-}
-
-/// Checks the key space the load left behind.
-///
-/// Every key the load did not delete must still hold the value the preload
-/// wrote, and every key it did delete must be gone. The load deletes from a
-/// pool of its own, so no delete raced another operation on the same key and
-/// the expected state of every key is known.
-async fn verify_latency_keyspace(
-    client: &HashringClient,
-    plan: &latency::LoadPlan,
-    concurrency: usize,
-) -> Result<u64> {
-    let present = AtomicU64::new(0);
-    let absent = AtomicU64::new(0);
-    stream::iter(0..plan.key_space)
-        .map(Ok::<_, anyhow::Error>)
-        .try_for_each_concurrent(Some(concurrency), |key| {
-            let client = client.clone();
-            let plan = plan.clone();
-            let present = &present;
-            let absent = &absent;
-            async move {
-                let deleted = plan.is_deleted(key);
-                match client.get(key.to_be_bytes().to_vec()).await {
-                    Ok(output) => {
-                        ensure!(
-                            output.value == deterministic_value(key, 0, plan.value_bytes),
-                            "key {key} holds a value the load did not write"
-                        );
-                        ensure!(!deleted, "key {key} was deleted but is still present");
-                        present.fetch_add(1, AtomicOrdering::Relaxed);
-                    }
-                    Err(ClientError::Operation(failure)) if failure.code == ErrorCode::NotFound => {
-                        ensure!(deleted, "key {key} is missing but was never deleted");
-                        absent.fetch_add(1, AtomicOrdering::Relaxed);
-                    }
-                    Err(error) => return Err(error.into()),
-                }
-                Ok(())
-            }
-        })
-        .await?;
-    Ok(present.load(AtomicOrdering::Relaxed) + absent.load(AtomicOrdering::Relaxed))
 }
 
 /// The CPU time a process has used, in seconds.
@@ -2386,7 +2324,7 @@ mod tests {
 
     #[tokio::test]
     async fn node_operations_sampling_propagates_connection_failure() {
-        assert!(query_node_ops("http://127.0.0.1:0").await.is_err());
+        assert!(query_node_info("http://127.0.0.1:0").await.is_err());
     }
 
     #[test]
