@@ -26,6 +26,8 @@
 #                  by the operator; the default 6000 is only a starting point
 #   OPEN_POOL_SECONDS  20; the 100k key space limits how long a high-rate open
 #                  pool can last
+#   OPEN_MAX_DEDUP_BYTES  268435456; the open group's high write rate needs
+#                  room for receipts on top of a large preload
 #   REQUIRE_CLEAN  1
 #
 set -euo pipefail
@@ -36,6 +38,10 @@ REPS="${REPS:-3}"
 GROUPS="${GROUPS:-main control diagnostic policy open}"
 OPEN_RATE="${OPEN_RATE:-6000}"
 OPEN_POOL_SECONDS="${OPEN_POOL_SECONDS:-20}"
+# The open group is the only one whose write rate needs the receipt budget:
+# a 1M-key preload holds roughly 95 MB per node, and the open-loop writes add
+# several MB/s on top of that.
+OPEN_MAX_DEDUP_BYTES="${OPEN_MAX_DEDUP_BYTES:-268435456}"
 MAX_IN_FLIGHT="${MAX_IN_FLIGHT:-4096}"
 REQUIRE_CLEAN="${REQUIRE_CLEAN:-1}"
 STAMP="$(date -u +%Y%m%d-%H%M%S)"
@@ -116,7 +122,8 @@ for group in $GROUPS; do
         run "$group" "$rep" --scaling-scenario round-trip \
           --scaling-load-mode open --scaling-open-rate "$OPEN_RATE" \
           --scaling-pool-seconds "$OPEN_POOL_SECONDS" \
-          --max-in-flight "$MAX_IN_FLIGHT" "${common[@]}"
+          --max-in-flight "$MAX_IN_FLIGHT" \
+          --max-dedup-bytes "$OPEN_MAX_DEDUP_BYTES" "${common[@]}"
         ;;
       replace)
         run "$group" "$rep" --scaling-scenario replace --nodes 11 \
