@@ -228,7 +228,7 @@ impl<'a> Store<'a> {
         }
     }
 
-    /// Runs `operation` on every key, at most [`FAN_OUT`] at a time, and
+    /// Runs `operation` on every key, at most `FAN_OUT` at a time, and
     /// returns the answers in argument order. Any key's failure fails the
     /// command, reported for the first failing key in argument order: a count
     /// or a value list built from the keys that happened to answer would be a
