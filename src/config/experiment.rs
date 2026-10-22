@@ -12,7 +12,7 @@ use hashring_core::topology::{
     DEFAULT_MAX_REPLICA_LAG_MILLIS, DEFAULT_MINIMUM_ADMITTED_COPIES,
     DEFAULT_MINIMUM_HEALTHY_FOLLOWERS, DEFAULT_RECEIPT_RETENTION_MILLIS,
 };
-use hashring_experiment::{ExperimentConfig, ExperimentMode, ScalingScenario};
+use hashring_experiment::{ExperimentConfig, ExperimentMode, ScalingLoadMode, ScalingScenario};
 use serde::Deserialize;
 
 use super::{LoadedFile, node};
@@ -81,6 +81,8 @@ pub struct ExperimentFile {
     pub key_distribution: Option<String>,
     pub max_in_flight: Option<usize>,
     pub scaling_scenario: Option<ScalingScenario>,
+    pub scaling_load_mode: Option<ScalingLoadMode>,
+    pub scaling_open_rate: Option<u64>,
     pub initial_nodes: Option<usize>,
     pub scaling_write_rate: Option<u64>,
     pub scaling_pool_seconds: Option<u64>,
@@ -134,7 +136,13 @@ pub fn resolve(
         .or(file.mode)
         .unwrap_or(ExperimentModeArg::Correctness)
         .into();
+    let scaling_scenario = args
+        .scaling_scenario
+        .map(ScalingScenario::from)
+        .or(file.scaling_scenario)
+        .unwrap_or(ScalingScenario::RoundTrip);
     let node_count = args.nodes.or(file.nodes).unwrap_or(match mode {
+        ExperimentMode::Scaling if scaling_scenario == ScalingScenario::Replace => 11,
         ExperimentMode::Correctness
         | ExperimentMode::Performance
         | ExperimentMode::Latency
@@ -145,16 +153,13 @@ pub fn resolve(
         ExperimentMode::Availability => PolicyArg::FirstSuccessor,
         _ => PolicyArg::OwnerOnly,
     });
-    let scaling_scenario = args
-        .scaling_scenario
-        .map(ScalingScenario::from)
-        .or(file.scaling_scenario)
-        .unwrap_or(ScalingScenario::RoundTrip);
     let initial_nodes = args.initial_nodes.or(file.initial_nodes).or({
         match mode {
             ExperimentMode::Scaling => Some(match scaling_scenario {
-                ScalingScenario::Shrink => node_count,
+                ScalingScenario::Shrink | ScalingScenario::Control => node_count,
                 ScalingScenario::Grow | ScalingScenario::RoundTrip => node_count.saturating_sub(1),
+                ScalingScenario::Replace => node_count.saturating_sub(1),
+                ScalingScenario::Churn => node_count.saturating_sub(3),
             }),
             ExperimentMode::Correctness => Some(node_count.saturating_sub(1)),
             _ => None,
@@ -295,6 +300,15 @@ pub fn resolve(
             .or(file.max_in_flight)
             .unwrap_or(DEFAULT_MAX_IN_FLIGHT),
         scaling_scenario,
+        scaling_load_mode: args
+            .scaling_load_mode
+            .map(ScalingLoadMode::from)
+            .or(file.scaling_load_mode)
+            .unwrap_or(ScalingLoadMode::Closed),
+        scaling_open_rate: args
+            .scaling_open_rate
+            .or(file.scaling_open_rate)
+            .unwrap_or(0),
         initial_nodes,
         scaling_write_rate: args
             .scaling_write_rate
@@ -366,17 +380,37 @@ mod tests {
         assert_eq!(config.scaling_write_rate, 200);
         assert_eq!(config.scaling_pool_seconds, 120);
         assert_eq!(config.scaling_post_seconds, 10);
+        assert!(matches!(config.scaling_load_mode, ScalingLoadMode::Closed));
+        assert_eq!(config.scaling_open_rate, 0);
 
         let args = experiment_args(&[
             "--mode",
             "scaling",
             "--scaling-scenario",
-            "shrink",
+            "replace",
+            "--output",
+            "out",
+        ]);
+        let config = resolve(&args, None, 24).unwrap();
+        assert_eq!(config.node_count, 11);
+        assert_eq!(config.initial_nodes, Some(10));
+
+        let args = experiment_args(&[
+            "--mode",
+            "scaling",
+            "--scaling-scenario",
+            "control",
+            "--scaling-load-mode",
+            "open",
+            "--scaling-open-rate",
+            "1000",
             "--output",
             "out",
         ]);
         let config = resolve(&args, None, 24).unwrap();
         assert_eq!(config.initial_nodes, Some(10));
+        assert!(matches!(config.scaling_load_mode, ScalingLoadMode::Open));
+        assert_eq!(config.scaling_open_rate, 1000);
     }
 
     #[test]

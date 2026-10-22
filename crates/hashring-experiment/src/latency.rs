@@ -664,7 +664,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 
 /// Sleep until just before the absolute deadline, then spin. Adapt the margin
 /// to the kernel's last overshoot; Tokio's millisecond timer is too coarse.
-fn wait_until(due: Instant, margin: &mut Duration) {
+pub(super) fn wait_until(due: Instant, margin: &mut Duration) {
     let coarse = due.checked_sub(*margin).unwrap_or(due);
     let now = Instant::now();
     if coarse > now {

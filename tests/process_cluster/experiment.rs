@@ -320,3 +320,78 @@ async fn availability_experiment_records_failover_loss_and_rf_repair() {
         assert!(events.contains("full_rf_restored"));
     }
 }
+
+#[tokio::test]
+async fn scaling_control_experiment_runs_closed_and_open_loads() {
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    for (label, load_mode, keys, open_rate) in [
+        ("closed", "closed", "2000", &[] as &[&str]),
+        ("open", "open", "3000", &["--scaling-open-rate", "200"]),
+    ] {
+        let output_directory = directory.path().join(label);
+        let mut arguments = vec![
+            "experiment",
+            "--mode",
+            "scaling",
+            "--scaling-scenario",
+            "control",
+            "--scaling-load-mode",
+            load_mode,
+            "--output",
+            output_directory.to_str().unwrap(),
+            "--nodes",
+            "3",
+            "--keys",
+            keys,
+            "--concurrency",
+            "8",
+            "--scaling-write-rate",
+            "20",
+            "--scaling-pool-seconds",
+            "30",
+            "--warmup-seconds",
+            "1",
+            "--scaling-post-seconds",
+            "2",
+            "--max-in-flight",
+            "256",
+            "--virtual-nodes",
+            "16",
+        ];
+        arguments.extend_from_slice(open_rate);
+        let output = Command::new(env!("CARGO_BIN_EXE_hashring-rs"))
+            .args(&arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{label} scaling control experiment failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let summary: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output_directory.join("summary.json")).unwrap())
+                .unwrap();
+        assert_eq!(summary["success"], true);
+        let transition = &summary["observations"]["control_transition"];
+        assert_eq!(transition["control"], true);
+        assert_eq!(transition["direct_merge"], false);
+        assert!(transition["work_steps_ms"].is_null());
+        assert_eq!(transition["retries_by_reason"]["range_busy"], 0);
+        assert_eq!(
+            summary["observations"]["scaling_metrics"]["load_mode"],
+            load_mode
+        );
+        if load_mode == "open" {
+            assert!(
+                summary["observations"]["scaling_metrics"]["issued"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+        }
+        let events = std::fs::read_to_string(output_directory.join("events.jsonl")).unwrap();
+        assert!(events.contains("scaling_control_window_started"));
+        assert!(events.contains("scaling_transition_complete"));
+    }
+}

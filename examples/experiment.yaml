@@ -42,11 +42,14 @@ policy: first-successor
 # max_in_flight: 4096   # a request over the limit is dropped, not queued
 
 # The `scaling` mode only.
-# scaling_scenario: round-trip   # round-trip, grow, or shrink
-# initial_nodes: 9               # default: peak - 1 for grow/round-trip, peak for shrink
-# scaling_write_rate: 200        # one-shot writes and deletes per second; reads are not paced
+# scaling_scenario: round-trip   # round-trip, grow, shrink, replace, churn, or control
+# scaling_load_mode: closed      # closed or open
+# scaling_open_rate: 1000        # total operations per second in open mode
+# initial_nodes: 9               # default: peak - 1 for grow/round-trip/replace, peak for shrink/control,
+#                                #          peak - 3 for churn
+# scaling_write_rate: 200        # closed-loop one-shot writes and deletes per second; reads are not paced
 # scaling_pool_seconds: 120      # how long one transition's one-shot pools must last
-# scaling_post_seconds: 10       # how long the load keeps running after a change
+# scaling_post_seconds: 10       # how long the load keeps running after a change (the control window)
 
 # Forwarded to every data node the run starts; see the node flags.
 max_dedup_bytes: 134217728              # 128 MiB

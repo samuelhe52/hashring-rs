@@ -61,6 +61,12 @@ pub enum ScalingScenario {
     RoundTrip,
     Grow,
     Shrink,
+    /// Replace one node with another at the same member count.
+    Replace,
+    /// Grow by several nodes at once, then shrink back.
+    Churn,
+    /// Keep the topology unchanged and measure the load alone.
+    Control,
 }
 
 impl ScalingScenario {
@@ -69,6 +75,30 @@ impl ScalingScenario {
             Self::RoundTrip => "round-trip",
             Self::Grow => "grow",
             Self::Shrink => "shrink",
+            Self::Replace => "replace",
+            Self::Churn => "churn",
+            Self::Control => "control",
+        }
+    }
+}
+
+/// How a `scaling` run offers its load.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScalingLoadMode {
+    /// A fixed number of workers, each sending its next request when the
+    /// previous one returns.
+    Closed,
+    /// Requests due at fixed offsets from the start of the run. A request that
+    /// cannot be sent within `max_in_flight` is dropped and counted as late.
+    Open,
+}
+
+impl ScalingLoadMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Open => "open",
         }
     }
 }
@@ -120,9 +150,14 @@ pub struct ExperimentConfig {
     pub max_in_flight: usize,
     /// The membership change a `scaling` run performs.
     pub scaling_scenario: ScalingScenario,
+    /// How a `scaling` run offers its load.
+    pub scaling_load_mode: ScalingLoadMode,
+    /// The total operation rate of an open-loop `scaling` run. Zero in closed
+    /// loop mode.
+    pub scaling_open_rate: u64,
     /// The nodes a `scaling` run starts with. `None` derives it from the
     /// scenario: one fewer than the peak for a grow or a round trip, the peak
-    /// for a shrink.
+    /// for a shrink, and three fewer than the peak for a churn.
     pub initial_nodes: Option<usize>,
     /// The one-shot write and delete operations a `scaling` run offers per
     /// second. Reads are not paced.
@@ -635,8 +670,10 @@ async fn run_cluster(
             config
                 .initial_nodes
                 .unwrap_or_else(|| match config.scaling_scenario {
-                    ScalingScenario::Shrink => config.node_count,
+                    ScalingScenario::Shrink | ScalingScenario::Control => config.node_count,
                     ScalingScenario::Grow | ScalingScenario::RoundTrip => config.node_count - 1,
+                    ScalingScenario::Replace => config.node_count - 1,
+                    ScalingScenario::Churn => config.node_count.saturating_sub(3),
                 })
         }
     };
@@ -2176,8 +2213,10 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
             config
                 .initial_nodes
                 .unwrap_or_else(|| match config.scaling_scenario {
-                    ScalingScenario::Shrink => config.node_count,
+                    ScalingScenario::Shrink | ScalingScenario::Control => config.node_count,
                     ScalingScenario::Grow | ScalingScenario::RoundTrip => config.node_count - 1,
+                    ScalingScenario::Replace => config.node_count - 1,
+                    ScalingScenario::Churn => config.node_count.saturating_sub(3),
                 })
         }
     };
@@ -2259,6 +2298,38 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
                 initial_count + 1 == config.node_count,
                 "a round trip starts with one fewer node than the peak"
             ),
+            ScalingScenario::Replace => ensure!(
+                initial_count + 1 == config.node_count,
+                "a replace run starts with one fewer node than the peak so one spare member can \
+                 replace an initial member"
+            ),
+            ScalingScenario::Churn => ensure!(
+                initial_count + 2 <= config.node_count,
+                "a churn run needs at least two more peak nodes than its initial membership"
+            ),
+            ScalingScenario::Control => ensure!(
+                initial_count == config.node_count,
+                "a control run starts with every peak node and changes no membership"
+            ),
+        }
+        if config.scaling_load_mode == ScalingLoadMode::Open {
+            ensure!(
+                config.scaling_open_rate > 0,
+                "an open-loop scaling run needs a positive scaling_open_rate"
+            );
+            ensure!(
+                config.scaling_open_rate * 3 / 100 > 0 && config.scaling_open_rate * 12 / 100 > 0,
+                "an open-loop scaling run needs a rate high enough to offer every write cohort"
+            );
+            ensure!(
+                config.max_in_flight > 0,
+                "an open-loop scaling run needs a positive max_in_flight"
+            );
+        } else {
+            ensure!(
+                config.scaling_open_rate == 0,
+                "scaling_open_rate only applies to an open-loop scaling run"
+            );
         }
         ensure!(
             config.scaling_write_rate > 0,

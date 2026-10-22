@@ -13,11 +13,11 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use futures::{StreamExt, stream};
 use hashring_client::{ClientError, HashringClient, MutationOutcome};
 use hashring_core::{
-    migration::{MigrationPhase, TopologyChange},
+    migration::MigrationPhase,
     proto::ErrorCode,
     topology::{Member, TopologySnapshot},
 };
@@ -26,8 +26,8 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use super::{
-    EventLog, ExperimentConfig, ProcessGroup, ScalingScenario, deterministic_value,
-    latency::LatencyHistogram, measurement, spawn_node, wait_for_listener,
+    EventLog, ExperimentConfig, ProcessGroup, ScalingLoadMode, ScalingScenario,
+    deterministic_value, latency::LatencyHistogram, measurement, spawn_node, wait_for_listener,
 };
 
 /// The phase a request started in. Requests are attributed by start, because a
@@ -139,9 +139,21 @@ fn applicable_strata(scenario: ScalingScenario, label: &str) -> BTreeSet<Stratum
         Stratum::ReplicasChanged,
         Stratum::Unchanged,
     ];
+    let replace = [
+        Stratum::RemovedSource,
+        Stratum::NewTarget,
+        Stratum::OwnerChanged,
+        Stratum::ReplicasChanged,
+        Stratum::Unchanged,
+    ];
+    let control = [Stratum::Unchanged];
     let chosen: &[Stratum] = match (scenario, label) {
         (ScalingScenario::Grow, _) => &grow,
         (ScalingScenario::Shrink, _) => &shrink,
+        (ScalingScenario::Replace, _) => &replace,
+        (ScalingScenario::Churn, "grow") => &grow,
+        (ScalingScenario::Churn, "shrink") => &shrink,
+        (ScalingScenario::Control, _) => &control,
         (ScalingScenario::RoundTrip, "grow") => &grow,
         (ScalingScenario::RoundTrip, "shrink") => &shrink,
         _ => &grow,
@@ -266,14 +278,28 @@ struct MetricState {
 struct Metrics {
     phase: AtomicU8,
     highest_micros: u64,
+    open: bool,
+    issued: AtomicU64,
+    late: AtomicU64,
+    total_issued: AtomicU64,
+    total_late: AtomicU64,
+    in_flight: AtomicU64,
+    max_in_flight: usize,
     state: Mutex<MetricState>,
 }
 
 impl Metrics {
-    fn new(operation_timeout: Duration) -> Result<Self> {
+    fn new(operation_timeout: Duration, open: bool, max_in_flight: usize) -> Result<Self> {
         Ok(Self {
             phase: AtomicU8::new(Phase::Pre.byte()),
             highest_micros: (operation_timeout.as_micros() as u64).saturating_add(1_000_000),
+            open,
+            issued: AtomicU64::new(0),
+            late: AtomicU64::new(0),
+            total_issued: AtomicU64::new(0),
+            total_late: AtomicU64::new(0),
+            in_flight: AtomicU64::new(0),
+            max_in_flight,
             state: Mutex::new(MetricState {
                 window: BTreeMap::new(),
                 total: BTreeMap::new(),
@@ -283,6 +309,26 @@ impl Metrics {
                 violation_examples: Vec::new(),
             }),
         })
+    }
+
+    /// Reserves one in-flight slot. Returns false when the offered load is
+    /// already at the limit; the caller drops the request and records it late.
+    fn try_begin(&self) -> bool {
+        if self.in_flight.fetch_add(1, Ordering::AcqRel) < self.max_in_flight as u64 {
+            self.issued.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
+            false
+        }
+    }
+
+    fn late(&self) {
+        self.late.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn finish(&self) {
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
     }
 
     fn phase(&self) -> Phase {
@@ -331,6 +377,12 @@ impl Metrics {
         let mut state = self.state.lock().expect("the metrics lock is not poisoned");
         let window = std::mem::take(&mut state.window);
         let errors = std::mem::take(&mut state.window_errors);
+        let issued = self.issued.swap(0, Ordering::AcqRel);
+        let late = self.late.swap(0, Ordering::AcqRel);
+        self.total_issued.fetch_add(issued, Ordering::Relaxed);
+        self.total_late.fetch_add(late, Ordering::Relaxed);
+        let in_flight = self.in_flight.load(Ordering::Acquire);
+        let open = self.open;
         let mut seconds = BTreeMap::new();
         for (key, bucket) in window {
             seconds.insert(
@@ -358,7 +410,12 @@ impl Metrics {
             "metrics_sampled",
             json!({
                 "mode": "scaling",
+                "load_mode": if open { "open" } else { "closed" },
                 "phase": self.phase().name(),
+                "issued": issued,
+                "late": late,
+                "achieved_rate": issued as f64,
+                "in_flight": in_flight,
                 "metrics": seconds,
                 "errors": errors,
                 "violations": violations,
@@ -384,10 +441,14 @@ impl Metrics {
             .collect();
         json!({
             "phase": self.phase().name(),
+            "load_mode": if self.open { "open" } else { "closed" },
             "metrics": metrics,
             "errors": state.total_errors,
             "violations": state.violations,
             "violation_examples": state.violation_examples,
+            "issued": self.total_issued.load(Ordering::Acquire),
+            "late": self.total_late.load(Ordering::Acquire),
+            "in_flight": self.in_flight.load(Ordering::Acquire),
         })
     }
 
@@ -586,6 +647,297 @@ impl Drop for TaskHandles {
     }
 }
 
+/// A fixed-rate sender thread. The thread measures the due time against the
+/// wall clock; a Tokio timer would add about a millisecond to every request,
+/// which is larger than the latencies a migration window shows.
+struct OpenSender {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<Result<()>>>,
+}
+
+impl OpenSender {
+    fn join(mut self) -> Result<()> {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| anyhow!("an open-loop sender thread panicked"))??;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for OpenSender {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+fn start_closed_reads(
+    config: &ExperimentConfig,
+    client: &HashringClient,
+    metrics: Arc<Metrics>,
+    read_pool: Arc<Vec<u64>>,
+    distribution: crate::latency::KeyDistribution,
+    stop: Arc<AtomicBool>,
+    tasks: &mut TaskHandles,
+) {
+    for task in 0..config.concurrency {
+        let client = client.clone();
+        let metrics = Arc::clone(&metrics);
+        let stop = Arc::clone(&stop);
+        let read_pool = Arc::clone(&read_pool);
+        let distribution = distribution.clone();
+        let value_bytes = config.value_bytes;
+        let seed = config.hash_seed ^ (task as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        tasks.push(tokio::spawn(async move {
+            let mut rng = StdRng::seed_from_u64(seed);
+            while !stop.load(Ordering::Acquire) {
+                let index = distribution.sample(&mut rng, read_pool.len() as u64) as usize;
+                let key = read_pool[index];
+                let phase = metrics.phase();
+                metrics.issued.fetch_add(1, Ordering::Relaxed);
+                let started = Instant::now();
+                let result = client.get(key.to_be_bytes().to_vec()).await;
+                let elapsed = started.elapsed();
+                record_read(&metrics, key, value_bytes, phase, elapsed, result);
+            }
+            Ok(())
+        }));
+    }
+}
+
+fn record_read(
+    metrics: &Metrics,
+    key: u64,
+    value_bytes: usize,
+    phase: Phase,
+    elapsed: Duration,
+    result: Result<hashring_client::GetOutput, ClientError>,
+) {
+    match result {
+        Ok(output) if output.value == deterministic_value(key, 0, value_bytes) => {
+            metrics.record("get", phase, elapsed, &Ok(()));
+        }
+        Ok(_) => {
+            metrics.record("get", phase, elapsed, &Err(ClientError::MissingVersion));
+            metrics.violation(
+                "read_wrong_value",
+                format!("key {key} returned a value that was never written"),
+            );
+        }
+        Err(error) if is_not_found(&error) => {
+            metrics.violation("read_missing", format!("key {key} was not found"));
+            metrics.record("get", phase, elapsed, &Err(error));
+        }
+        Err(error) => {
+            metrics.record("get", phase, elapsed, &Err(error));
+        }
+    }
+}
+
+fn start_open_reads(
+    config: &ExperimentConfig,
+    client: &HashringClient,
+    metrics: Arc<Metrics>,
+    read_pool: Arc<Vec<u64>>,
+    distribution: crate::latency::KeyDistribution,
+    stop: Arc<AtomicBool>,
+    rate: u64,
+) -> Result<OpenSender> {
+    let handle = tokio::runtime::Handle::current();
+    let client = client.clone();
+    let thread_stop = Arc::clone(&stop);
+    let seed = config.hash_seed;
+    let value_bytes = config.value_bytes;
+    let thread = std::thread::Builder::new()
+        .name("scaling-open-reads".to_owned())
+        .spawn(move || {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut index = 0_u64;
+            let mut margin = Duration::from_micros(100);
+            let start = Instant::now();
+            while !thread_stop.load(Ordering::Acquire) {
+                let due = start + Duration::from_secs_f64(index as f64 / rate as f64);
+                super::latency::wait_until(due, &mut margin);
+                if thread_stop.load(Ordering::Acquire) {
+                    break;
+                }
+                if metrics.try_begin() {
+                    let key =
+                        read_pool[distribution.sample(&mut rng, read_pool.len() as u64) as usize];
+                    let client = client.clone();
+                    let metrics = Arc::clone(&metrics);
+                    handle.spawn(async move {
+                        let phase = metrics.phase();
+                        let result = client.get(key.to_be_bytes().to_vec()).await;
+                        let elapsed = Instant::now().saturating_duration_since(due);
+                        record_read(&metrics, key, value_bytes, phase, elapsed, result);
+                        metrics.finish();
+                    });
+                } else {
+                    metrics.late();
+                }
+                index += 1;
+            }
+            Ok(())
+        })?;
+    Ok(OpenSender {
+        stop,
+        thread: Some(thread),
+    })
+}
+
+struct OpenWriteContext<'a> {
+    config: &'a ExperimentConfig,
+    client: &'a HashringClient,
+    plan: &'a TransitionPlan,
+    ledger: &'a Arc<Ledger>,
+    metrics: &'a Arc<Metrics>,
+    stop: &'a Arc<AtomicBool>,
+    probe_tx: mpsc::UnboundedSender<(u64, Option<Vec<u8>>)>,
+}
+
+fn start_open_writes(context: OpenWriteContext<'_>) -> Result<Vec<OpenSender>> {
+    let OpenWriteContext {
+        config,
+        client,
+        plan,
+        ledger,
+        metrics,
+        stop,
+        probe_tx,
+    } = context;
+    let total = config.scaling_open_rate;
+    let cohorts = [
+        (Cohort::Rewrite, Arc::clone(&plan.rewrite), total * 12 / 100),
+        (
+            Cohort::WriteNew,
+            Arc::clone(&plan.write_new),
+            total * 5 / 100,
+        ),
+        (Cohort::Delete, Arc::clone(&plan.delete), total * 3 / 100),
+    ];
+    let mut senders = Vec::new();
+    let sender_context = OpenSenderContext {
+        client,
+        ledger,
+        metrics,
+        stop,
+        probe_tx,
+        value_bytes: config.value_bytes,
+    };
+    for (cohort, pool, rate) in cohorts {
+        ensure!(rate > 0, "an open-loop write share rounds to zero");
+        senders.push(start_open_writes_for(cohort, rate, pool, &sender_context)?);
+    }
+    Ok(senders)
+}
+
+struct OpenSenderContext<'a> {
+    client: &'a HashringClient,
+    ledger: &'a Arc<Ledger>,
+    metrics: &'a Arc<Metrics>,
+    stop: &'a Arc<AtomicBool>,
+    probe_tx: mpsc::UnboundedSender<(u64, Option<Vec<u8>>)>,
+    value_bytes: usize,
+}
+
+fn start_open_writes_for(
+    cohort: Cohort,
+    rate: u64,
+    pool: Arc<KeyPool>,
+    context: &OpenSenderContext<'_>,
+) -> Result<OpenSender> {
+    let value_bytes = context.value_bytes;
+    let probe_tx = context.probe_tx.clone();
+    let handle = tokio::runtime::Handle::current();
+    let client = context.client.clone();
+    let ledger = Arc::clone(context.ledger);
+    let metrics = Arc::clone(context.metrics);
+    let stop = Arc::clone(context.stop);
+    let thread_stop = Arc::clone(&stop);
+    let thread = std::thread::Builder::new()
+        .name(format!("scaling-open-{}", cohort.metric_name()))
+        .spawn(move || {
+            let mut index = 0_u64;
+            let mut margin = Duration::from_micros(100);
+            let start = Instant::now();
+            while !thread_stop.load(Ordering::Acquire) {
+                let due = start + Duration::from_secs_f64(index as f64 / rate as f64);
+                super::latency::wait_until(due, &mut margin);
+                if thread_stop.load(Ordering::Acquire) {
+                    break;
+                }
+                if !metrics.try_begin() {
+                    metrics.late();
+                    index += 1;
+                    continue;
+                }
+                let Some(key) = pool.next() else {
+                    metrics.finish();
+                    break;
+                };
+                let client = client.clone();
+                let ledger = Arc::clone(&ledger);
+                let metrics = Arc::clone(&metrics);
+                let probe_tx = probe_tx.clone();
+                handle.spawn(async move {
+                    let phase = metrics.phase();
+                    let result = match cohort {
+                        Cohort::Rewrite | Cohort::WriteNew => client
+                            .put(
+                                key.to_be_bytes().to_vec(),
+                                deterministic_value(key, 1, value_bytes),
+                            )
+                            .await
+                            .map(|_| ()),
+                        Cohort::Delete => {
+                            client.delete(key.to_be_bytes().to_vec()).await.map(|_| ())
+                        }
+                    };
+                    let elapsed = Instant::now().saturating_duration_since(due);
+                    ledger.record(key, cohort, &result);
+                    metrics.record(cohort.metric_name(), phase, elapsed, &result);
+                    if result.is_ok() {
+                        let expected = match cohort {
+                            Cohort::Delete => None,
+                            Cohort::Rewrite | Cohort::WriteNew => {
+                                Some(deterministic_value(key, 1, value_bytes))
+                            }
+                        };
+                        let _ = probe_tx.send((key, expected));
+                    }
+                    metrics.finish();
+                });
+                index += 1;
+            }
+            Ok(())
+        })?;
+    Ok(OpenSender {
+        stop: Arc::clone(&stop),
+        thread: Some(thread),
+    })
+}
+
+async fn drain_in_flight(metrics: &Metrics, config: &ExperimentConfig) -> Result<()> {
+    if metrics.in_flight.load(Ordering::Acquire) == 0 {
+        return Ok(());
+    }
+    let deadline = Instant::now()
+        + Duration::from_millis(config.operation_timeout_ms)
+            .saturating_add(Duration::from_secs(10));
+    while metrics.in_flight.load(Ordering::Acquire) > 0 {
+        ensure!(
+            Instant::now() < deadline,
+            "{} open-loop requests were still in flight after the drain deadline",
+            metrics.in_flight.load(Ordering::Acquire)
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    Ok(())
+}
+
 pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
     let crate::RunContext {
         config,
@@ -614,9 +966,11 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
     let observer =
         HashringClient::connect(coordinator_endpoint.to_owned(), Duration::from_secs(2)).await?;
 
-    let metrics = Arc::new(Metrics::new(Duration::from_millis(
-        config.operation_timeout_ms,
-    ))?);
+    let metrics = Arc::new(Metrics::new(
+        Duration::from_millis(config.operation_timeout_ms),
+        config.scaling_load_mode == ScalingLoadMode::Open,
+        config.max_in_flight,
+    )?);
     let sampler = tokio::spawn({
         let metrics = Arc::clone(&metrics);
         let events = events.clone();
@@ -636,45 +990,29 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
         crate::latency::KeyDistribution::parse(&config.key_distribution, read_pool.len() as u64)?;
     let read_stop = Arc::new(AtomicBool::new(false));
     let mut read_tasks = TaskHandles::new(Arc::clone(&read_stop));
-    for task in 0..config.concurrency {
-        let client = workload_client.clone();
-        let metrics = Arc::clone(&metrics);
-        let stop = Arc::clone(&read_stop);
-        let read_pool = Arc::clone(&read_pool);
-        let distribution = distribution.clone();
-        let value_bytes = config.value_bytes;
-        let seed = config.hash_seed ^ (task as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-        read_tasks.push(tokio::spawn(async move {
-            let mut rng = StdRng::seed_from_u64(seed);
-            while !stop.load(Ordering::Acquire) {
-                let index = distribution.sample(&mut rng, read_pool.len() as u64) as usize;
-                let key = read_pool[index];
-                let phase = metrics.phase();
-                let started = Instant::now();
-                let result = client.get(key.to_be_bytes().to_vec()).await;
-                let elapsed = started.elapsed();
-                match result {
-                    Ok(output) if output.value == deterministic_value(key, 0, value_bytes) => {
-                        metrics.record("get", phase, elapsed, &Ok(()));
-                    }
-                    Ok(_) => {
-                        metrics.record("get", phase, elapsed, &Err(ClientError::MissingVersion));
-                        metrics.violation(
-                            "read_wrong_value",
-                            format!("key {key} returned a value that was never written"),
-                        );
-                    }
-                    Err(error) if is_not_found(&error) => {
-                        metrics.violation("read_missing", format!("key {key} was not found"));
-                        metrics.record("get", phase, elapsed, &Err(error));
-                    }
-                    Err(error) => {
-                        metrics.record("get", phase, elapsed, &Err(error));
-                    }
-                }
-            }
-            Ok(())
-        }));
+    let mut open_reads: Option<OpenSender> = None;
+    if config.scaling_load_mode == ScalingLoadMode::Open {
+        let rate = config.scaling_open_rate * 80 / 100;
+        ensure!(rate > 0, "the open-loop read share rounds to zero");
+        open_reads = Some(start_open_reads(
+            config,
+            workload_client,
+            Arc::clone(&metrics),
+            Arc::clone(&read_pool),
+            distribution.clone(),
+            Arc::clone(&read_stop),
+            rate,
+        )?);
+    } else {
+        start_closed_reads(
+            config,
+            workload_client,
+            Arc::clone(&metrics),
+            Arc::clone(&read_pool),
+            distribution.clone(),
+            Arc::clone(&read_stop),
+            &mut read_tasks,
+        );
     }
 
     let mut all_entries = BTreeMap::new();
@@ -684,19 +1022,39 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
     let mut pending_verification: Option<(&'static str, BTreeMap<u64, Allowed>)> = None;
 
     for (index, transition) in transitions.iter().enumerate() {
-        let change = control
-            .begin_topology_change(transition.target_members.clone())
-            .await
-            .with_context(|| format!("staging the {} change", transition.label))?;
-        ensure!(
-            change.base_topology.is_some(),
-            "the staged {} change has no base topology",
-            transition.label
-        );
+        let control_run = is_control(config);
+        let staged = if control_run {
+            None
+        } else {
+            let change = control
+                .begin_topology_change(transition.target_members.clone())
+                .await
+                .with_context(|| format!("staging the {} change", transition.label))?;
+            ensure!(
+                change.base_topology.is_some(),
+                "the staged {} change has no base topology",
+                transition.label
+            );
+            Some(change)
+        };
+        let (base_topology, target_topology) = match &staged {
+            Some(change) => (
+                change
+                    .base_topology
+                    .clone()
+                    .expect("the staged change has a base topology"),
+                change.target_topology.clone(),
+            ),
+            None => {
+                let current = admin_client.refresh_topology().await?;
+                (current.clone(), current)
+            }
+        };
         let plan = build_transition_plan(
             config,
             transition,
-            &change,
+            &base_topology,
+            &target_topology,
             &pool_plan,
             index,
             transitions.len(),
@@ -706,29 +1064,26 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
         // The new members are in the pending topology already, so they can be
         // started now. The removed members are told to stop by the coordinator
         // once their ranges have been handed off.
-        let base_members = change
-            .base_topology
-            .as_ref()
-            .expect("the staged change has a base topology")
-            .members
-            .clone();
-        for member in &transition.target_members {
-            if !base_members
-                .iter()
-                .any(|base| base.node_id == member.node_id)
-            {
-                let peak_index = peak_members
+        let base_members = base_topology.members.clone();
+        if !control_run {
+            for member in &transition.target_members {
+                if !base_members
                     .iter()
-                    .position(|peak| peak.node_id == member.node_id)
-                    .with_context(|| format!("{} is not a peak member", member.node_id))?;
-                let port = ports[peak_index + 1];
-                spawn_node(
-                    processes,
-                    member.node_id.clone(),
-                    port,
-                    coordinator_endpoint,
-                )?;
-                wait_for_listener(port, processes).await?;
+                    .any(|base| base.node_id == member.node_id)
+                {
+                    let peak_index = peak_members
+                        .iter()
+                        .position(|peak| peak.node_id == member.node_id)
+                        .with_context(|| format!("{} is not a peak member", member.node_id))?;
+                    let port = ports[peak_index + 1];
+                    spawn_node(
+                        processes,
+                        member.node_id.clone(),
+                        port,
+                        coordinator_endpoint,
+                    )?;
+                    wait_for_listener(port, processes).await?;
+                }
             }
         }
 
@@ -736,10 +1091,11 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
             "scaling_transition_started",
             json!({
                 "label": transition.label,
-                "change_id": change.change_id,
-                "base_epoch": change.base_epoch,
-                "target_epoch": change.target_topology.epoch,
-                "direct_merge": change.direct_merge,
+                "change_id": staged.as_ref().map(|change| change.change_id.clone()).unwrap_or_default(),
+                "base_epoch": base_topology.epoch,
+                "target_epoch": target_topology.epoch,
+                "direct_merge": staged.as_ref().is_some_and(|change| change.direct_merge),
+                "control": control_run,
                 "rewrite_keys": plan.rewrite.len(),
                 "new_keys": plan.write_new.len(),
                 "delete_keys": plan.delete.len(),
@@ -800,16 +1156,29 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
             Ok::<_, anyhow::Error>(())
         });
 
-        start_writes(WriteContext {
-            config,
-            client: workload_client,
-            plan: &plan,
-            ledger: &ledger,
-            metrics: &metrics,
-            stop: &write_stop,
-            handles: &mut write_tasks,
-            probe_tx: probe_tx.clone(),
-        });
+        let mut open_writes: Vec<OpenSender> = Vec::new();
+        if config.scaling_load_mode == ScalingLoadMode::Open {
+            open_writes = start_open_writes(OpenWriteContext {
+                config,
+                client: workload_client,
+                plan: &plan,
+                ledger: &ledger,
+                metrics: &metrics,
+                stop: &write_stop,
+                probe_tx: probe_tx.clone(),
+            })?;
+        } else {
+            start_writes(WriteContext {
+                config,
+                client: workload_client,
+                plan: &plan,
+                ledger: &ledger,
+                metrics: &metrics,
+                stop: &write_stop,
+                handles: &mut write_tasks,
+                probe_tx: probe_tx.clone(),
+            });
+        }
 
         // The previous transition's cohorts are verified while this
         // transition's write batches are already running, so the load never
@@ -837,67 +1206,79 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
         let retries_before = workload_client.retry_reasons();
         let operations_before = metrics.total_operations();
         let started = Instant::now();
-        ledger.begin_publish_window();
         metrics.set_phase(Phase::Pre);
-        let mut last_phase = Phase::Pre;
-        let execution_client = control.clone();
-        let change_id = change.change_id.clone();
-        let base_epoch = change.base_epoch;
-        let target_epoch = change.target_topology.epoch;
-        let execution = tokio::spawn(async move {
-            execution_client
-                .execute_topology_change(change_id, base_epoch, target_epoch)
-                .await
-        });
-        loop {
-            if execution.is_finished() {
-                break;
+        let completed = if let Some(staged) = &staged {
+            ledger.begin_publish_window();
+            let mut last_phase = Phase::Pre;
+            let execution_client = control.clone();
+            let change_id = staged.change_id.clone();
+            let base_epoch = staged.base_epoch;
+            let target_epoch = staged.target_topology.epoch;
+            let execution = tokio::spawn(async move {
+                execution_client
+                    .execute_topology_change(change_id, base_epoch, target_epoch)
+                    .await
+            });
+            loop {
+                if execution.is_finished() {
+                    break;
+                }
+                if let Ok(Some(current)) = observer.topology_change().await {
+                    let phase = phase_of(current.phase);
+                    if phase != last_phase {
+                        metrics.set_phase(phase);
+                        events.record(
+                            "migration_phase_changed",
+                            json!({
+                                "label": transition.label,
+                                "phase": format!("{:?}", current.phase),
+                                "epoch": current.target_topology.epoch,
+                            }),
+                        )?;
+                        last_phase = phase;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            if let Ok(Some(current)) = observer.topology_change().await {
-                let phase = phase_of(current.phase);
-                if phase != last_phase {
-                    metrics.set_phase(phase);
+            let completed = execution
+                .await
+                .context("joining the topology change execution")??;
+            ensure!(
+                completed.phase == MigrationPhase::Complete,
+                "the {} change ended in {:?}",
+                transition.label,
+                completed.phase
+            );
+            // The removed nodes are told to stop once their ranges are handed
+            // off. Wait for them before the process liveness checks, or a
+            // normal removal looks like an unexpected exit.
+            for member in &base_members {
+                if !transition
+                    .target_members
+                    .iter()
+                    .any(|target| target.node_id == member.node_id)
+                {
+                    let status = processes
+                        .wait_for_successful_exit(&member.node_id, Duration::from_secs(10))
+                        .await?;
                     events.record(
-                        "migration_phase_changed",
-                        json!({
-                            "label": transition.label,
-                            "phase": format!("{:?}", current.phase),
-                            "epoch": current.target_topology.epoch,
-                        }),
+                        "removed_node_exited",
+                        json!({ "node_id": member.node_id, "status": status }),
                     )?;
-                    last_phase = phase;
                 }
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        let completed = execution
-            .await
-            .context("joining the topology change execution")??;
-        ensure!(
-            completed.phase == MigrationPhase::Complete,
-            "the {} change ended in {:?}",
-            transition.label,
-            completed.phase
-        );
-        // The removed nodes are told to stop once their ranges are handed
-        // off. Wait for them before the process liveness checks, or a normal
-        // removal looks like an unexpected exit.
-        for member in &base_members {
-            if !transition
-                .target_members
-                .iter()
-                .any(|target| target.node_id == member.node_id)
-            {
-                let status = processes
-                    .wait_for_successful_exit(&member.node_id, Duration::from_secs(10))
-                    .await?;
-                events.record(
-                    "removed_node_exited",
-                    json!({ "node_id": member.node_id, "status": status }),
-                )?;
-            }
-        }
-        ledger.end_publish_window();
+            ledger.end_publish_window();
+            Some(completed)
+        } else {
+            // S0 keeps the topology unchanged. The measured baseline is the
+            // post-change window with the same load.
+            events.record(
+                "scaling_control_window_started",
+                json!({ "seconds": config.scaling_post_seconds }),
+            )?;
+            tokio::time::sleep(Duration::from_secs(config.scaling_post_seconds)).await;
+            None
+        };
         let change_seconds = started.elapsed();
         metrics.set_phase(Phase::Post);
         let retries_after = workload_client.retry_reasons();
@@ -910,26 +1291,38 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                 )
             })
             .collect();
-        let range_busy = retry_delta.get("range_busy").copied().unwrap_or(0);
-        ensure!(
-            range_busy > 0,
-            "the {} change produced no client-observed RangeBusy write rejection, so the run has no evidence that writes were stopped; it is invalid",
-            transition.label
-        );
+        if completed.is_some() {
+            let range_busy = retry_delta.get("range_busy").copied().unwrap_or(0);
+            ensure!(
+                range_busy > 0,
+                "the {} change produced no client-observed RangeBusy write rejection, so the run has no evidence that writes were stopped; it is invalid",
+                transition.label
+            );
+        }
 
-        let target_epoch = completed.target_topology.epoch;
-        wait_for_full_rf_at_epoch(
-            &observer,
-            config.desired_replication_factor,
-            target_epoch,
-            Duration::from_millis(config.migration_timeout_ms),
-            processes,
-        )
-        .await?;
+        let target_epoch = target_topology.epoch;
+        if completed.is_some() {
+            wait_for_full_rf_at_epoch(
+                &observer,
+                config.desired_replication_factor,
+                target_epoch,
+                Duration::from_millis(config.migration_timeout_ms),
+                processes,
+            )
+            .await?;
 
-        // Keep the load running while the post-change window is measured.
-        if config.scaling_post_seconds > 0 {
-            tokio::time::sleep(Duration::from_secs(config.scaling_post_seconds)).await;
+            // Keep the load running while the post-change window is measured.
+            if config.scaling_post_seconds > 0 {
+                tokio::time::sleep(Duration::from_secs(config.scaling_post_seconds)).await;
+            }
+        } else if config.scaling_post_seconds == 0 {
+            ensure!(false, "a control run needs a positive post window");
+        }
+
+        // Open-loop senders only stop here; their requests are drained by the
+        // in-flight accounting rather than by a task join.
+        for sender in open_writes.drain(..) {
+            sender.join()?;
         }
 
         write_tasks
@@ -942,6 +1335,7 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
         tokio::time::timeout(Duration::from_secs(30), probe_handle)
             .await
             .context("the read-after-write probe did not stop")???;
+        drain_in_flight(&metrics, config).await?;
 
         ensure!(
             !plan.rewrite.exhausted() && !plan.write_new.exhausted() && !plan.delete.exhausted(),
@@ -987,7 +1381,7 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
             workload_client.clone(),
             Arc::clone(&metrics),
             publish_expected,
-            config.scaling_write_rate,
+            effective_write_rate(config),
         )));
 
         let elapsed = started.elapsed();
@@ -1001,9 +1395,11 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
             json!({
                 "change_seconds": change_seconds.as_secs_f64(),
                 "post_seconds": config.scaling_post_seconds,
-                "direct_merge": completed.direct_merge,
-                "base_epoch": completed.base_epoch,
+                "control": completed.is_none(),
+                "direct_merge": completed.as_ref().is_some_and(|change| change.direct_merge),
+                "base_epoch": base_topology.epoch,
                 "target_epoch": target_epoch,
+                "work_steps_ms": completed.as_ref().map(|change| json!(change.timings)),
                 "retries_by_reason": retry_delta,
                 "rewrite_pool": plan.rewrite.len(),
                 "new_pool": plan.write_new.len(),
@@ -1019,6 +1415,7 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                 "seconds": change_seconds.as_secs_f64(),
                 "target_epoch": target_epoch,
                 "retries_by_reason": retry_delta,
+                "work_steps_ms": completed.as_ref().map(|change| json!(change.timings)),
             }),
         )?;
 
@@ -1038,6 +1435,10 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
             .await
             .context("the read-after-publish probe did not stop")???;
     }
+    if let Some(sender) = open_reads.take() {
+        sender.join()?;
+    }
+    drain_in_flight(&metrics, config).await?;
     read_tasks
         .stop(
             Duration::from_millis(config.operation_timeout_ms)
@@ -1081,6 +1482,8 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
         json!({
             "read_keys": read_pool.len(),
             "read_distribution": distribution.name(),
+            "load_mode": config.scaling_load_mode.name(),
+            "open_rate": config.scaling_open_rate,
             "write_rate": config.scaling_write_rate,
             "pool_seconds": config.scaling_pool_seconds,
             "transitions": transitions.iter().map(|t| t.label).collect::<Vec<_>>(),
@@ -1108,7 +1511,7 @@ fn transitions(
             label: "shrink",
             target_members: initial_members[..initial_members.len().saturating_sub(1)].to_vec(),
         }],
-        ScalingScenario::RoundTrip => vec![
+        ScalingScenario::RoundTrip | ScalingScenario::Churn => vec![
             Transition {
                 label: "grow",
                 target_members: peak_members[..config.node_count].to_vec(),
@@ -1118,6 +1521,38 @@ fn transitions(
                 target_members: initial_members.to_vec(),
             },
         ],
+        ScalingScenario::Replace => {
+            let mut target_members = initial_members.to_vec();
+            target_members.pop();
+            target_members.push(
+                peak_members
+                    .last()
+                    .expect("a replace run has a spare peak member")
+                    .clone(),
+            );
+            vec![Transition {
+                label: "replace",
+                target_members,
+            }]
+        }
+        ScalingScenario::Control => vec![Transition {
+            label: "control",
+            target_members: initial_members.to_vec(),
+        }],
+    }
+}
+
+fn is_control(config: &ExperimentConfig) -> bool {
+    config.scaling_scenario == ScalingScenario::Control
+}
+
+/// The one-shot write and delete rate the pools must cover. Closed-loop runs
+/// pace writes with `scaling_write_rate`; open-loop runs offer 20% of
+/// `scaling_open_rate` as writes.
+fn effective_write_rate(config: &ExperimentConfig) -> u64 {
+    match config.scaling_load_mode {
+        ScalingLoadMode::Closed => config.scaling_write_rate,
+        ScalingLoadMode::Open => config.scaling_open_rate * 20 / 100,
     }
 }
 
@@ -1154,16 +1589,12 @@ fn plan_keys(config: &ExperimentConfig, transitions: &[Transition]) -> Result<Bu
 fn build_transition_plan(
     config: &ExperimentConfig,
     transition: &Transition,
-    change: &TopologyChange,
+    base: &TopologySnapshot,
+    target: &TopologySnapshot,
     pool_plan: &BuildPlan,
     index: usize,
     transitions: usize,
 ) -> Result<TransitionPlan> {
-    let base = change
-        .base_topology
-        .as_ref()
-        .context("a planned change has a base topology")?;
-    let target = &change.target_topology;
     let base_ids: BTreeSet<&str> = base
         .members
         .iter()
@@ -1192,7 +1623,7 @@ fn build_transition_plan(
         chunk_start + per_transition
     };
 
-    let write_rate = config.scaling_write_rate;
+    let write_rate = effective_write_rate(config);
     let rewrite_quota = (write_rate * 60 / 100 * config.scaling_pool_seconds) as usize;
     let new_quota = (write_rate * 25 / 100 * config.scaling_pool_seconds) as usize;
     let delete_quota = (write_rate * 15 / 100 * config.scaling_pool_seconds) as usize;
@@ -1405,6 +1836,7 @@ fn start_writes(context: WriteContext<'_>) {
                         tokio::time::sleep(interval).await;
                     }
                     let phase = metrics.phase();
+                    metrics.issued.fetch_add(1, Ordering::Relaxed);
                     let started = Instant::now();
                     let result = match cohort {
                         Cohort::Rewrite | Cohort::WriteNew => client

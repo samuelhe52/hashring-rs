@@ -18,7 +18,9 @@ use hashring_core::{
         WriteAvailabilityGuard,
     },
 };
-use hashring_experiment::{ExperimentConfig, ExperimentMode, ScalingScenario, run_experiment};
+use hashring_experiment::{
+    ExperimentConfig, ExperimentMode, ScalingLoadMode, ScalingScenario, run_experiment,
+};
 use hashring_node::DataNodeService;
 use serde::Deserialize;
 use tonic::transport::Server;
@@ -386,6 +388,9 @@ enum ScalingScenarioArg {
     RoundTrip,
     Grow,
     Shrink,
+    Replace,
+    Churn,
+    Control,
 }
 
 impl From<ScalingScenarioArg> for ScalingScenario {
@@ -394,6 +399,25 @@ impl From<ScalingScenarioArg> for ScalingScenario {
             ScalingScenarioArg::RoundTrip => ScalingScenario::RoundTrip,
             ScalingScenarioArg::Grow => ScalingScenario::Grow,
             ScalingScenarioArg::Shrink => ScalingScenario::Shrink,
+            ScalingScenarioArg::Replace => ScalingScenario::Replace,
+            ScalingScenarioArg::Churn => ScalingScenario::Churn,
+            ScalingScenarioArg::Control => ScalingScenario::Control,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum ScalingLoadModeArg {
+    Closed,
+    Open,
+}
+
+impl From<ScalingLoadModeArg> for ScalingLoadMode {
+    fn from(mode: ScalingLoadModeArg) -> Self {
+        match mode {
+            ScalingLoadModeArg::Closed => ScalingLoadMode::Closed,
+            ScalingLoadModeArg::Open => ScalingLoadMode::Open,
         }
     }
 }
@@ -530,10 +554,18 @@ struct ExperimentArgs {
     /// [default: 4096]
     #[arg(long)]
     max_in_flight: Option<usize>,
-    /// The membership change a scaling run performs: round-trip, grow, or
-    /// shrink. [default: round-trip]
+    /// The membership change a scaling run performs: round-trip, grow,
+    /// shrink, replace, churn, or control. [default: round-trip]
     #[arg(long, value_enum)]
     scaling_scenario: Option<ScalingScenarioArg>,
+    /// How a scaling run offers its load: closed or open. [default: closed]
+    #[arg(long, value_enum)]
+    scaling_load_mode: Option<ScalingLoadModeArg>,
+    /// The total operation rate of an open-loop scaling run. The read share is
+    /// 80%, and writes are split across the rewrite, fresh-write, and delete
+    /// cohorts. Required for --scaling-load-mode open.
+    #[arg(long)]
+    scaling_open_rate: Option<u64>,
     /// The nodes a scaling run starts with. [default: peak - 1 for a grow or
     /// round trip, peak for a shrink]
     #[arg(long)]
