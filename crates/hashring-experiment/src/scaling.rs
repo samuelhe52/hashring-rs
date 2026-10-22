@@ -289,6 +289,9 @@ struct Metrics {
     total_issued: AtomicU64,
     total_late: AtomicU64,
     in_flight: AtomicU64,
+    /// In-flight open-loop writes. The local drain after a transition waits
+    /// for these only; the reads continue into the next transition.
+    in_flight_writes: AtomicU64,
     /// Successful PUT and DELETE completions. The write-stop window uses it
     /// to find the first write that went through after the last rejection.
     writes_ok: AtomicU64,
@@ -307,6 +310,7 @@ impl Metrics {
             total_issued: AtomicU64::new(0),
             total_late: AtomicU64::new(0),
             in_flight: AtomicU64::new(0),
+            in_flight_writes: AtomicU64::new(0),
             writes_ok: AtomicU64::new(0),
             max_in_flight,
             state: Mutex::new(MetricState {
@@ -334,6 +338,22 @@ impl Metrics {
 
     fn late(&self) {
         self.late.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Reserves an in-flight slot for a write and counts it separately, so a
+    /// transition can drain its writes while the reads keep going.
+    fn begin_write(&self) -> bool {
+        if self.try_begin() {
+            self.in_flight_writes.fetch_add(1, Ordering::AcqRel);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn finish_write(&self) {
+        self.in_flight_writes.fetch_sub(1, Ordering::AcqRel);
+        self.finish();
     }
 
     fn finish(&self) {
@@ -940,13 +960,13 @@ fn start_open_writes_for(
                 if thread_stop.load(Ordering::Acquire) {
                     break;
                 }
-                if !metrics.try_begin() {
+                if !metrics.begin_write() {
                     metrics.late();
                     index += 1;
                     continue;
                 }
                 let Some(key) = pool.next() else {
-                    metrics.finish();
+                    metrics.finish_write();
                     break;
                 };
                 let client = client.clone();
@@ -979,7 +999,7 @@ fn start_open_writes_for(
                         };
                         let _ = probe_tx.send((key, expected));
                     }
-                    metrics.finish();
+                    metrics.finish_write();
                 });
                 index += 1;
             }
@@ -1004,7 +1024,27 @@ async fn drain_in_flight(metrics: &Metrics, config: &ExperimentConfig) -> Result
             "{} open-loop requests were still in flight after the drain deadline",
             metrics.in_flight.load(Ordering::Acquire)
         );
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::time::sleep(PHASE_POLL_INTERVAL).await;
+    }
+    Ok(())
+}
+
+/// Waits for one transition's writes only. The reads belong to the next
+/// transition, so they are not part of this drain.
+async fn drain_writes(metrics: &Metrics, config: &ExperimentConfig) -> Result<()> {
+    if metrics.in_flight_writes.load(Ordering::Acquire) == 0 {
+        return Ok(());
+    }
+    let deadline = Instant::now()
+        + Duration::from_millis(config.operation_timeout_ms)
+            .saturating_add(Duration::from_secs(10));
+    while metrics.in_flight_writes.load(Ordering::Acquire) > 0 {
+        ensure!(
+            Instant::now() < deadline,
+            "{} open-loop write requests were still in flight after the drain deadline",
+            metrics.in_flight_writes.load(Ordering::Acquire)
+        );
+        tokio::time::sleep(PHASE_POLL_INTERVAL).await;
     }
     Ok(())
 }
@@ -1439,7 +1479,7 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
         tokio::time::timeout(Duration::from_secs(30), probe_handle)
             .await
             .context("the read-after-write probe did not stop")???;
-        drain_in_flight(&metrics, config).await?;
+        drain_writes(&metrics, config).await?;
 
         ensure!(
             !plan.rewrite.exhausted() && !plan.write_new.exhausted() && !plan.delete.exhausted(),

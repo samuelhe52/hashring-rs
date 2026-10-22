@@ -397,6 +397,76 @@ async fn scaling_control_experiment_runs_closed_and_open_loads() {
 }
 
 #[tokio::test]
+async fn scaling_open_loop_round_trip_drains_its_own_writes() {
+    // Reads keep running across a transition, so the local drain may only
+    // wait for the write batches. At this rate the reads are always in
+    // flight, which is the case a drain over all requests cannot finish.
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let output_directory = directory.path().join("open-round-trip");
+    let output = Command::new(env!("CARGO_BIN_EXE_hashring-rs"))
+        .args([
+            "experiment",
+            "--mode",
+            "scaling",
+            "--scaling-scenario",
+            "round-trip",
+            "--scaling-load-mode",
+            "open",
+            "--scaling-open-rate",
+            "6000",
+            "--output",
+            output_directory.to_str().unwrap(),
+            "--nodes",
+            "4",
+            "--desired-replication-factor",
+            "2",
+            "--keys",
+            "40000",
+            "--concurrency",
+            "8",
+            "--scaling-pool-seconds",
+            "8",
+            "--warmup-seconds",
+            "1",
+            "--scaling-post-seconds",
+            "2",
+            "--max-in-flight",
+            "256",
+            "--virtual-nodes",
+            "16",
+            "--operation-timeout-ms",
+            "30000",
+            "--migration-timeout-ms",
+            "120000",
+            "--max-dedup-bytes",
+            "33554432",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "open-loop round-trip failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output_directory.join("summary.json")).unwrap())
+            .unwrap();
+    assert_eq!(summary["success"], true);
+    let metrics = &summary["observations"]["scaling_metrics"];
+    assert_eq!(metrics["load_mode"], "open");
+    assert!(metrics["issued"].as_u64().unwrap() > 0);
+    assert_eq!(metrics["in_flight"], 0);
+    let grow = &summary["observations"]["grow_transition"];
+    assert_eq!(grow["verification"], "deferred_to_next_transition");
+    let shrink = &summary["observations"]["shrink_transition"];
+    assert_eq!(shrink["verification"], "passed");
+    for transition in [grow, shrink] {
+        assert!(transition["stop_window"]["observed_ms"].as_f64().unwrap() > 0.0);
+    }
+}
+
+#[tokio::test]
 async fn scaling_round_trip_defers_s1_verification_and_records_the_stop_window() {
     let _guard = process_test_lock().lock().await;
     let directory = tempfile::tempdir().unwrap();
