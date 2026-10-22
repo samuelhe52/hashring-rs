@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         Arc, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -131,6 +131,84 @@ pub enum MutationOutcome {
     MayHaveApplied,
 }
 
+/// Why the client tried a request again.
+///
+/// The count is cumulative over the client's lifetime, like
+/// [`HashringClient::retry_count`]. A driver reads it before and after a phase
+/// to tell which failures the cluster produced and which were transport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum RetryReason {
+    Moved,
+    RangeBusy,
+    Unavailable,
+    ResourceExhausted,
+    TemporarilyUnavailable,
+    ReplicaNotReady,
+    OutcomeUnknown,
+    LeaseExpired,
+    Rpc,
+    TopologyRefresh,
+}
+
+impl RetryReason {
+    pub const ALL: [RetryReason; 10] = [
+        Self::Moved,
+        Self::RangeBusy,
+        Self::Unavailable,
+        Self::ResourceExhausted,
+        Self::TemporarilyUnavailable,
+        Self::ReplicaNotReady,
+        Self::OutcomeUnknown,
+        Self::LeaseExpired,
+        Self::Rpc,
+        Self::TopologyRefresh,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Moved => "moved",
+            Self::RangeBusy => "range_busy",
+            Self::Unavailable => "unavailable",
+            Self::ResourceExhausted => "resource_exhausted",
+            Self::TemporarilyUnavailable => "temporarily_unavailable",
+            Self::ReplicaNotReady => "replica_not_ready",
+            Self::OutcomeUnknown => "outcome_unknown",
+            Self::LeaseExpired => "lease_expired",
+            Self::Rpc => "rpc",
+            Self::TopologyRefresh => "topology_refresh",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Moved => 0,
+            Self::RangeBusy => 1,
+            Self::Unavailable => 2,
+            Self::ResourceExhausted => 3,
+            Self::TemporarilyUnavailable => 4,
+            Self::ReplicaNotReady => 5,
+            Self::OutcomeUnknown => 6,
+            Self::LeaseExpired => 7,
+            Self::Rpc => 8,
+            Self::TopologyRefresh => 9,
+        }
+    }
+
+    fn from_error_code(code: ErrorCode) -> Option<Self> {
+        match code {
+            ErrorCode::Moved => Some(Self::Moved),
+            ErrorCode::RangeBusy => Some(Self::RangeBusy),
+            ErrorCode::Unavailable => Some(Self::Unavailable),
+            ErrorCode::ResourceExhausted => Some(Self::ResourceExhausted),
+            ErrorCode::TemporarilyUnavailable => Some(Self::TemporarilyUnavailable),
+            ErrorCode::ReplicaNotReady => Some(Self::ReplicaNotReady),
+            ErrorCode::OutcomeUnknown => Some(Self::OutcomeUnknown),
+            ErrorCode::LeaseExpired => Some(Self::LeaseExpired),
+            _ => None,
+        }
+    }
+}
+
 impl From<bool> for MutationOutcome {
     fn from(unknown_write_outcome: bool) -> Self {
         if unknown_write_outcome {
@@ -259,6 +337,8 @@ struct ClientInner {
     /// Every internal retry this client made. A load driver reads it to tell
     /// a slow cluster apart from a client that had to try again.
     retries: AtomicU64,
+    /// The retries by reason, cumulative like `retries`.
+    retry_reasons: [AtomicU64; 10],
 }
 
 impl HashringClient {
@@ -293,6 +373,7 @@ impl HashringClient {
             background_minimum_epoch: AtomicU64::new(0),
             background_trigger_generation: AtomicU64::new(0),
             retries: AtomicU64::new(0),
+            retry_reasons: std::array::from_fn(|_| AtomicU64::new(0)),
         });
         if let Some(interval) = config
             .topology_poll_interval
@@ -323,6 +404,23 @@ impl HashringClient {
     /// reads it before and after.
     pub fn retry_count(&self) -> u64 {
         self.inner.retries.load(Ordering::Relaxed)
+    }
+
+    /// The internal retries by reason, cumulative over the client's lifetime.
+    pub fn retry_reasons(&self) -> BTreeMap<&'static str, u64> {
+        RetryReason::ALL
+            .into_iter()
+            .map(|reason| {
+                (
+                    reason.name(),
+                    self.inner.retry_reasons[reason.index()].load(Ordering::Relaxed),
+                )
+            })
+            .collect()
+    }
+
+    fn record_retry_reason(&self, reason: RetryReason) {
+        self.inner.retry_reasons[reason.index()].fetch_add(1, Ordering::Relaxed);
     }
 
     // Request routing needs only the epoch and selected endpoint. Keep them
@@ -527,6 +625,7 @@ impl HashringClient {
                 Ok(Ok(response)) => response.into_inner(),
                 Ok(Err(status)) => {
                     if retryable_status(&status) {
+                        self.record_retry_reason(RetryReason::Rpc);
                         self.refresh_after_unavailable(epoch, deadline, false)
                             .await?;
                         self.retry_delay(deadline, &mut attempt, false).await?;
@@ -711,6 +810,7 @@ impl HashringClient {
                         accumulated_write_ambiguity(unknown_write_outcome, &status);
                     if retryable_status(&status) {
                         tracing::debug!(operation = "put", request_id, attempt, epoch = epoch, code = ?status.code(), message = status.message(), "retrying node RPC status");
+                        self.record_retry_reason(RetryReason::Rpc);
                         self.refresh_after_unavailable(epoch, deadline, unknown_write_outcome)
                             .await?;
                         self.retry_delay(deadline, &mut attempt, unknown_write_outcome)
@@ -833,6 +933,7 @@ impl HashringClient {
                         accumulated_write_ambiguity(unknown_write_outcome, &status);
                     if retryable_status(&status) {
                         tracing::debug!(operation = "delete", request_id, attempt, epoch = epoch, code = ?status.code(), message = status.message(), "retrying node RPC status");
+                        self.record_retry_reason(RetryReason::Rpc);
                         self.refresh_after_unavailable(epoch, deadline, unknown_write_outcome)
                             .await?;
                         self.retry_delay(deadline, &mut attempt, unknown_write_outcome)
@@ -899,6 +1000,7 @@ impl HashringClient {
         let code = ErrorCode::try_from(error.code).unwrap_or(ErrorCode::Unspecified);
         match code {
             ErrorCode::Moved => {
+                self.record_retry_reason(RetryReason::Moved);
                 let required_epoch = error.current_epoch.max(attempted_epoch.saturating_add(1));
                 self.refresh_topology_before(deadline, unknown_write_outcome, Some(required_epoch))
                     .await?;
@@ -907,6 +1009,7 @@ impl HashringClient {
                 Ok(true)
             }
             ErrorCode::Unavailable if error.retryable => {
+                self.record_retry_reason(RetryReason::Unavailable);
                 self.refresh_after_unavailable(attempted_epoch, deadline, unknown_write_outcome)
                     .await?;
                 self.retry_delay(deadline, attempt, unknown_write_outcome)
@@ -920,6 +1023,9 @@ impl HashringClient {
             | ErrorCode::OutcomeUnknown
                 if error.retryable =>
             {
+                if let Some(reason) = RetryReason::from_error_code(code) {
+                    self.record_retry_reason(reason);
+                }
                 if error.current_epoch > attempted_epoch {
                     self.refresh_topology_before(
                         deadline,
@@ -942,6 +1048,7 @@ impl HashringClient {
                 Ok(true)
             }
             ErrorCode::LeaseExpired if error.retryable => {
+                self.record_retry_reason(RetryReason::LeaseExpired);
                 self.refresh_topology_before(deadline, unknown_write_outcome, None)
                     .await?;
                 self.retry_delay(deadline, attempt, unknown_write_outcome)
@@ -1191,6 +1298,7 @@ async fn refresh_retry_delay(
     unknown_write_outcome: bool,
 ) -> Result<(), ClientError> {
     inner.retries.fetch_add(1, Ordering::Relaxed);
+    inner.retry_reasons[RetryReason::TopologyRefresh.index()].fetch_add(1, Ordering::Relaxed);
     retry_delay(deadline, attempt, unknown_write_outcome).await
 }
 
@@ -1779,6 +1887,7 @@ mod tests {
                 background_minimum_epoch: AtomicU64::new(0),
                 background_trigger_generation: AtomicU64::new(0),
                 retries: AtomicU64::new(0),
+                retry_reasons: std::array::from_fn(|_| AtomicU64::new(0)),
             }),
         }
     }
