@@ -28,6 +28,8 @@
 #                  pool can last
 #   OPEN_MAX_DEDUP_BYTES  268435456; the open group's high write rate needs
 #                  room for receipts on top of a large preload
+#   OPEN_POST_SECONDS  5; the open group's post window, so its pools last the
+#                  whole transition
 #   REQUIRE_CLEAN  1
 #
 set -euo pipefail
@@ -42,6 +44,9 @@ OPEN_POOL_SECONDS="${OPEN_POOL_SECONDS:-20}"
 # a 1M-key preload holds roughly 95 MB per node, and the open-loop writes add
 # several MB/s on top of that.
 OPEN_MAX_DEDUP_BYTES="${OPEN_MAX_DEDUP_BYTES:-268435456}"
+# The open group's transition already holds the load for its warmup and its
+# RF convergence, and its one-shot pools must survive the whole transition.
+OPEN_POST_SECONDS="${OPEN_POST_SECONDS:-5}"
 MAX_IN_FLIGHT="${MAX_IN_FLIGHT:-4096}"
 REQUIRE_CLEAN="${REQUIRE_CLEAN:-1}"
 STAMP="$(date -u +%Y%m%d-%H%M%S)"
@@ -94,44 +99,46 @@ run() {
 
 for group in $GROUPS; do
   for ((rep = 1; rep <= REPS; rep++)); do
-    common=(--warmup-seconds 10 --scaling-post-seconds 10)
+    common=(--warmup-seconds 10)
+    post=(--scaling-post-seconds 10)
     if [[ "$REQUIRE_CLEAN" == "1" ]]; then
       common+=(--require-clean-source)
     fi
     case "$group" in
       main)
         run "$group" "$rep" --scaling-scenario round-trip \
-          --scaling-pool-seconds 120 "${common[@]}"
+          --scaling-pool-seconds 120 "${common[@]}" "${post[@]}"
         ;;
       control)
         run "$group" "$rep" --scaling-scenario control \
-          --scaling-pool-seconds 120 "${common[@]}"
+          --scaling-pool-seconds 120 "${common[@]}" "${post[@]}"
         ;;
       diagnostic)
         # A 250 ms pre-publication delay is a diagnostic, never part of main.
         run "$group" "$rep" --scaling-scenario round-trip \
-          --scaling-pool-seconds 120 --pre-publish-delay-ms 250 "${common[@]}"
+          --scaling-pool-seconds 120 --pre-publish-delay-ms 250 "${common[@]}" "${post[@]}"
         ;;
       policy)
         run "$group" "$rep" --scaling-scenario round-trip \
-          --scaling-pool-seconds 120 --policy first-successor "${common[@]}"
+          --scaling-pool-seconds 120 --policy first-successor "${common[@]}" "${post[@]}"
         ;;
       open)
         # The rate must be 60% of a capacity measured under the same
         # configuration; the footnote belongs in the report.
+        post=(--scaling-post-seconds "$OPEN_POST_SECONDS")
         run "$group" "$rep" --scaling-scenario round-trip \
           --scaling-load-mode open --scaling-open-rate "$OPEN_RATE" \
           --scaling-pool-seconds "$OPEN_POOL_SECONDS" \
           --max-in-flight "$MAX_IN_FLIGHT" \
-          --max-dedup-bytes "$OPEN_MAX_DEDUP_BYTES" "${common[@]}"
+          --max-dedup-bytes "$OPEN_MAX_DEDUP_BYTES" "${common[@]}" "${post[@]}"
         ;;
       replace)
         run "$group" "$rep" --scaling-scenario replace --nodes 11 \
-          "${common[@]}"
+          "${common[@]}" "${post[@]}"
         ;;
       churn)
         run "$group" "$rep" --scaling-scenario churn --nodes 9 \
-          --initial-nodes 6 "${common[@]}"
+          --initial-nodes 6 "${common[@]}" "${post[@]}"
         ;;
       *)
         echo "error: unknown group '$group'" >&2
