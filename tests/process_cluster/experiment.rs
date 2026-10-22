@@ -43,7 +43,7 @@ async fn experiment_runner_preserves_reproducibility_artifacts() {
             .unwrap();
     assert_eq!(manifest["config"]["node_count"], 4);
     assert_eq!(manifest["config"]["key_count"], 300);
-    assert_eq!(manifest["schema_version"], 6);
+    assert_eq!(manifest["schema_version"], 7);
     // Every node is started with the run's tuning, so it must parse.
     assert_eq!(manifest["config"]["node"]["max_dedup_bytes"], 33_554_432);
     assert_eq!(manifest["executable_blake3"].as_str().unwrap().len(), 64);
@@ -64,6 +64,17 @@ async fn experiment_runner_preserves_reproducibility_artifacts() {
         manifest["source_reproducible"],
         expected_source_reproducible
     );
+    // The source of a tree that was never committed is in the manifest: the
+    // files that were not added to the index are held with their content,
+    // because `git diff` does not hold them.
+    let untracked = manifest["runtime_source"]["git_untracked"]
+        .as_array()
+        .expect("the manifest holds the untracked files");
+    for file in untracked {
+        assert!(file["path"].as_str().is_some());
+        assert_eq!(file["blake3"].as_str().unwrap().len(), 64);
+        assert!(file["bytes"].as_u64().is_some());
+    }
     let summary: serde_json::Value =
         serde_json::from_slice(&std::fs::read(output_directory.join("summary.json")).unwrap())
             .unwrap();

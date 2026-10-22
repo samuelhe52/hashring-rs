@@ -258,7 +258,24 @@ struct RuntimeSource {
     git_dirty: Option<bool>,
     git_status_porcelain: Option<String>,
     git_diff: Option<String>,
+    /// The files that were not in the commit, with their content.
+    ///
+    /// `git diff` holds the files that were tracked and changed, and not the
+    /// files that were never added to the index. A run of a tree that was
+    /// never committed is only reproducible if the tree itself is kept, so
+    /// the untracked files go into the manifest with their content.
+    git_untracked: Vec<UntrackedFile>,
     source_tree_blake3: Option<String>,
+}
+
+/// A file that was not in the commit the run was built from.
+#[derive(Serialize)]
+struct UntrackedFile {
+    path: String,
+    bytes: u64,
+    blake3: String,
+    /// The content of the file, when it is text and small enough to keep.
+    content: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -461,7 +478,7 @@ pub async fn run_experiment(
         runtime_tree_hash.as_deref(),
     );
     let manifest = ExperimentManifest {
-        schema_version: 6,
+        schema_version: 7,
         started_unix_ms: unix_ms(),
         executable_path: executable.display().to_string(),
         executable_blake3: file_digest(&executable)?,
@@ -484,6 +501,7 @@ pub async fn run_experiment(
                 "git",
                 &["diff", "--binary", "HEAD"],
             ),
+            git_untracked: untracked_files(build_source_root),
             source_tree_blake3: runtime_tree_hash,
         },
         source_reproducible,
@@ -2271,6 +2289,45 @@ fn command_output(cwd: Option<&Path>, program: &str, arguments: &[&str]) -> Opti
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+/// The largest untracked file whose content the manifest keeps.
+const MAX_UNTRACKED_FILE_BYTES: usize = 4 * 1024 * 1024;
+
+/// The files that are not in the commit, and their content.
+///
+/// A run of a tree that was never committed is only reproducible if the tree
+/// itself is kept, and `git diff` does not hold the files that were never
+/// added to the index. The content of the untracked files goes into the
+/// manifest, so the source a run was built from is in the run's own output.
+fn untracked_files(root: &Path) -> Vec<UntrackedFile> {
+    let Some(listing) = command_output(
+        Some(root),
+        "git",
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    ) else {
+        return Vec::new();
+    };
+    listing
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            let contents = fs::read(root.join(path)).unwrap_or_default();
+            let bytes = contents.len() as u64;
+            let blake3 = blake3::hash(&contents).to_hex().to_string();
+            let content = if contents.len() <= MAX_UNTRACKED_FILE_BYTES {
+                String::from_utf8(contents).ok()
+            } else {
+                None
+            };
+            UntrackedFile {
+                path: path.to_owned(),
+                bytes,
+                blake3,
+                content,
+            }
+        })
+        .collect()
+}
+
 fn source_is_reproducible(
     build_git_dirty: &str,
     build_git_commit: &str,
@@ -2380,6 +2437,38 @@ mod tests {
             Measurement::Throughput(measurement) => assert_eq!(measurement.operations, 10),
             other => panic!("expected a throughput measurement, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_untracked_files_are_kept_with_their_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let git = |arguments: &[&str]| {
+            let status = Command::new("git")
+                .current_dir(root)
+                .args(arguments)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {arguments:?} failed");
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "test"]);
+        fs::write(root.join("tracked.txt"), "tracked\n").unwrap();
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "-m", "first"]);
+        // A file that was never added to the index. `git diff` does not hold
+        // it, so the manifest has to.
+        fs::write(root.join("new.rs"), "fn main() {}\n").unwrap();
+
+        let files = untracked_files(root);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "new.rs");
+        assert_eq!(files[0].bytes, 13);
+        assert_eq!(files[0].content.as_deref(), Some("fn main() {}\n"));
+        assert_eq!(files[0].blake3.len(), 64);
     }
 
     #[test]
