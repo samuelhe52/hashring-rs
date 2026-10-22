@@ -1,0 +1,3154 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 3a19090..f334022 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -232,6 +232,12 @@ version = "3.20.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
+ 
++[[package]]
++name = "byteorder"
++version = "1.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
++
+ [[package]]
+ name = "bytes"
+ version = "1.12.1"
+@@ -639,6 +645,8 @@ dependencies = [
+  "futures",
+  "hashring-client",
+  "hashring-core",
++ "hdrhistogram",
++ "rand",
+  "serde",
+  "serde_json",
+  "tempfile",
+@@ -714,6 +722,16 @@ dependencies = [
+  "tracing-subscriber",
+ ]
+ 
++[[package]]
++name = "hdrhistogram"
++version = "7.6.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f49d1053f4708f0af3cf9fc5bffc7e68a914a3c45becb231c80068c9c3f78bea"
++dependencies = [
++ "byteorder",
++ "num-traits",
++]
++
+ [[package]]
+ name = "heck"
+ version = "0.5.0"
+diff --git a/README.md b/README.md
+index ad8850b..2082b4b 100644
+--- a/README.md
++++ b/README.md
+@@ -285,6 +285,10 @@ target/release/hashring-rs experiment --mode performance --require-clean-source
+ # Kill an owner, measure failover, data loss, and repair time.
+ target/release/hashring-rs experiment --mode availability --policy first-successor \
+   --output results/availability
++
++# Offer a fixed rate and measure the latency of that load, one stage per rate.
++target/release/hashring-rs experiment --mode latency --target-rates 5000,10000,20000 \
++  --output results/latency
+ ```
+ 
+ Experiment settings can also come from a YAML file whose keys are the flag
+diff --git a/crates/hashring-client/src/lib.rs b/crates/hashring-client/src/lib.rs
+index 4fef503..59cca78 100644
+--- a/crates/hashring-client/src/lib.rs
++++ b/crates/hashring-client/src/lib.rs
+@@ -256,6 +256,9 @@ struct ClientInner {
+     background_refresh_running: AtomicBool,
+     background_minimum_epoch: AtomicU64,
+     background_trigger_generation: AtomicU64,
++    /// Every internal retry this client made. A load driver reads it to tell
++    /// a slow cluster apart from a client that had to try again.
++    retries: AtomicU64,
+ }
+ 
+ impl HashringClient {
+@@ -289,6 +292,7 @@ impl HashringClient {
+             background_refresh_running: AtomicBool::new(false),
+             background_minimum_epoch: AtomicU64::new(0),
+             background_trigger_generation: AtomicU64::new(0),
++            retries: AtomicU64::new(0),
+         });
+         if let Some(interval) = config
+             .topology_poll_interval
+@@ -303,6 +307,23 @@ impl HashringClient {
+         self.inner.topology.read().await.clone()
+     }
+ 
++    /// The epoch of the topology the client is routing with.
++    ///
++    /// A caller that only wants the epoch should read it here rather than
++    /// clone the whole snapshot.
++    pub async fn epoch(&self) -> u64 {
++        self.inner.topology.read().await.epoch
++    }
++
++    /// How many internal retries this client has made.
++    ///
++    /// A retry is one attempt a client made after a retryable failure. The
++    /// count is cumulative over the client's lifetime, so a caller that wants
++    /// the retries of one phase reads it before and after.
++    pub fn retry_count(&self) -> u64 {
++        self.inner.retries.load(Ordering::Relaxed)
++    }
++
+     // Request routing needs only the epoch and selected endpoint. Keep them
+     // from one snapshot without cloning every token assignment on each attempt.
+     async fn route(&self, key: &[u8]) -> Result<(u64, String), ClientError> {
+@@ -906,7 +927,7 @@ impl HashringClient {
+                     )
+                     .await?;
+                 }
+-                retry_delay_with_hint(
++                self.retry_delay_with_hint(
+                     deadline,
+                     attempt,
+                     unknown_write_outcome,
+@@ -1039,9 +1060,21 @@ impl HashringClient {
+         attempt: &mut u32,
+         unknown_write_outcome: bool,
+     ) -> Result<(), ClientError> {
++        self.inner.retries.fetch_add(1, Ordering::Relaxed);
+         retry_delay(deadline, attempt, unknown_write_outcome).await
+     }
+ 
++    async fn retry_delay_with_hint(
++        &self,
++        deadline: Instant,
++        attempt: &mut u32,
++        unknown_write_outcome: bool,
++        minimum_delay: Duration,
++    ) -> Result<(), ClientError> {
++        self.inner.retries.fetch_add(1, Ordering::Relaxed);
++        retry_delay_with_hint(deadline, attempt, unknown_write_outcome, minimum_delay).await
++    }
++
+     async fn data_node_client(
+         &self,
+         endpoint: &str,
+@@ -1703,6 +1736,7 @@ mod tests {
+                 background_refresh_running: AtomicBool::new(false),
+                 background_minimum_epoch: AtomicU64::new(0),
+                 background_trigger_generation: AtomicU64::new(0),
++                retries: AtomicU64::new(0),
+             }),
+         }
+     }
+diff --git a/crates/hashring-core/proto/hashring.proto b/crates/hashring-core/proto/hashring.proto
+index 13950b6..7ab2023 100644
+--- a/crates/hashring-core/proto/hashring.proto
++++ b/crates/hashring-core/proto/hashring.proto
+@@ -314,6 +314,14 @@ message NodeInfoResponse {
+   StateWriteTiming ack_write_timing = 13;
+   ReceiptCleanupTiming receipt_cleanup_timing = 14;
+   StateWriteTiming ack_completion_write_timing = 15;
++  // Operations this node served as the owner of a key, counted per kind. A
++  // request the node rejected or that found no key is not counted, so the
++  // totals match the operations a client saw succeed.
++  uint64 ops_get = 16;
++  uint64 ops_put = 17;
++  uint64 ops_delete = 18;
++  // The three counters above, summed.
++  uint64 ops_handled = 19;
+ }
+ 
+ // Cumulative per-process timings. Wait totals can overlap across tasks.
+diff --git a/crates/hashring-experiment/Cargo.toml b/crates/hashring-experiment/Cargo.toml
+index cc458f3..5251302 100644
+--- a/crates/hashring-experiment/Cargo.toml
++++ b/crates/hashring-experiment/Cargo.toml
+@@ -9,6 +9,8 @@ blake3 = "1"
+ futures = "0.3"
+ hashring-client = { version = "0.1.0", path = "../hashring-client" }
+ hashring-core = { version = "0.1.0", path = "../hashring-core" }
++hdrhistogram = { version = "7", default-features = false }
++rand = "0.8"
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
+ tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+diff --git a/crates/hashring-experiment/src/latency.rs b/crates/hashring-experiment/src/latency.rs
+new file mode 100644
+index 0000000..bac001a
+--- /dev/null
++++ b/crates/hashring-experiment/src/latency.rs
+@@ -0,0 +1,1075 @@
++//! The open-loop load driver of the `latency` experiment mode.
++//!
++//! The driver sends requests on a fixed schedule: request `n` of a stage is
++//! due at `stage start + n / rate`. A request that cannot be sent because too
++//! many requests are still in flight is dropped and counted, never queued, so
++//! a cluster that cannot keep up shows up as a lower achieved rate instead of
++//! a longer queue inside the driver. Every request's latency is measured from
++//! the moment it was due, not from the moment it was sent, so a slow cluster
++//! cannot hide its tail behind a delayed send.
++
++use std::collections::BTreeMap;
++use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
++use std::sync::{Arc, Mutex};
++use std::time::{Duration, Instant};
++
++use anyhow::{Context, Result, bail, ensure};
++use hashring_client::{ClientError, HashringClient};
++use hashring_core::proto::ErrorCode;
++use hdrhistogram::Histogram;
++use rand::Rng;
++use serde_json::json;
++
++use crate::{EventLog, LatencySummary, deterministic_value};
++
++/// The operations the load issues.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Operation {
++    Get,
++    Put,
++    Delete,
++}
++
++impl Operation {
++    const ALL: [Operation; 3] = [Operation::Get, Operation::Put, Operation::Delete];
++
++    fn index(self) -> usize {
++        match self {
++            Operation::Get => 0,
++            Operation::Put => 1,
++            Operation::Delete => 2,
++        }
++    }
++
++    pub fn name(self) -> &'static str {
++        match self {
++            Operation::Get => "get",
++            Operation::Put => "put",
++            Operation::Delete => "delete",
++        }
++    }
++}
++
++/// The share of the requests that are reads, writes, and deletes.
++#[derive(Clone, Copy, Debug)]
++pub struct OperationMix {
++    weights: [u64; 3],
++    total: u64,
++}
++
++impl OperationMix {
++    /// Parses a `GET:PUT:DELETE` ratio such as `90:9:1`.
++    pub fn parse(text: &str) -> Result<Self> {
++        let parts: Vec<&str> = text.split(':').map(str::trim).collect();
++        ensure!(
++            parts.len() == 3,
++            "a mix is GET:PUT:DELETE, like '90:9:1', not '{text}'"
++        );
++        let mut weights = [0_u64; 3];
++        for (index, part) in parts.iter().enumerate() {
++            weights[index] = part
++                .parse::<u64>()
++                .with_context(|| format!("the mix weight '{part}' is not a number"))?;
++        }
++        let total: u64 = weights.iter().sum();
++        ensure!(total > 0, "a mix must allow at least one operation");
++        Ok(Self { weights, total })
++    }
++
++    /// The share of the requests that delete a key.
++    pub fn delete_fraction(&self) -> f64 {
++        self.weights[2] as f64 / self.total as f64
++    }
++
++    pub fn pick(&self, rng: &mut impl Rng) -> Operation {
++        let mut draw = rng.gen_range(0..self.total);
++        for (index, weight) in self.weights.iter().enumerate() {
++            if draw < *weight {
++                return Operation::ALL[index];
++            }
++            draw -= *weight;
++        }
++        Operation::ALL[0]
++    }
++}
++
++/// How the load picks the key of a request.
++#[derive(Clone, Debug)]
++pub enum KeyDistribution {
++    /// Every key is equally likely.
++    Uniform,
++    /// The keys follow a Zipf distribution, so a few keys take most of the
++    /// traffic.
++    Zipf {
++        theta: f64,
++        /// The cumulative share of the traffic up to and including each key.
++        cumulative: Vec<f64>,
++        total: f64,
++    },
++    /// A share of the keys takes most of the traffic.
++    Hotspot { hot_keys: u64, traffic_ratio: f64 },
++}
++
++impl KeyDistribution {
++    /// Parses `uniform`, `zipf:<theta>`, or `hotspot:<key share>:<traffic share>`.
++    pub fn parse(spec: &str, key_space: u64) -> Result<Self> {
++        let spec = spec.trim();
++        if spec.eq_ignore_ascii_case("uniform") {
++            return Ok(Self::Uniform);
++        }
++        if let Some(rest) = spec.strip_prefix("zipf:") {
++            let theta: f64 = rest
++                .trim()
++                .parse()
++                .with_context(|| format!("the Zipf exponent '{rest}' is not a number"))?;
++            ensure!(
++                theta > 0.0 && theta.is_finite(),
++                "the Zipf exponent must be a positive number"
++            );
++            ensure!(
++                key_space > 0,
++                "a key space of zero keys has no distribution"
++            );
++            // The cumulative share of every key. The weights are
++            // 1/(k+1)^theta, so the table is built once and sampled by a
++            // binary search.
++            let mut cumulative = Vec::with_capacity(key_space as usize);
++            let mut total = 0.0_f64;
++            for key in 0..key_space {
++                total += 1.0 / ((key + 1) as f64).powf(theta);
++                cumulative.push(total);
++            }
++            return Ok(Self::Zipf {
++                theta,
++                cumulative,
++                total,
++            });
++        }
++        if let Some(rest) = spec.strip_prefix("hotspot:") {
++            let parts: Vec<&str> = rest.split(':').map(str::trim).collect();
++            ensure!(
++                parts.len() == 2,
++                "a hotspot distribution is hotspot:<key share>:<traffic share>"
++            );
++            let key_share: f64 = parts[0]
++                .parse()
++                .with_context(|| format!("the hotspot key share '{}' is not a number", parts[0]))?;
++            let traffic_share: f64 = parts[1].parse().with_context(|| {
++                format!("the hotspot traffic share '{}' is not a number", parts[1])
++            })?;
++            ensure!(
++                key_share > 0.0 && key_share < 1.0,
++                "the hotspot key share must be between 0 and 1"
++            );
++            ensure!(
++                traffic_share > 0.0 && traffic_share < 1.0,
++                "the hotspot traffic share must be between 0 and 1"
++            );
++            let hot_keys = ((key_space as f64) * key_share).round() as u64;
++            ensure!(
++                hot_keys > 0 && hot_keys < key_space,
++                "the hotspot key share leaves no keys on one side of the split"
++            );
++            return Ok(Self::Hotspot {
++                hot_keys,
++                traffic_ratio: traffic_share,
++            });
++        }
++        bail!("unknown key distribution '{spec}'")
++    }
++
++    /// The distribution as it is written in a configuration file.
++    pub fn name(&self) -> String {
++        match self {
++            Self::Uniform => "uniform".to_owned(),
++            Self::Zipf { theta, .. } => format!("zipf:{theta}"),
++            Self::Hotspot {
++                hot_keys,
++                traffic_ratio,
++            } => format!("hotspot:{hot_keys}:{traffic_ratio}"),
++        }
++    }
++
++    /// Picks one of the `key_space` keys.
++    pub fn sample(&self, rng: &mut impl Rng, key_space: u64) -> u64 {
++        match self {
++            Self::Uniform => rng.gen_range(0..key_space),
++            Self::Zipf {
++                cumulative, total, ..
++            } => {
++                let draw = rng.gen_range(0.0..1.0) * total;
++                let index = cumulative.partition_point(|share| *share <= draw) as u64;
++                // The table is built for the whole key space, so a draw at its
++                // very top can land on its last key.
++                index.min(key_space.saturating_sub(1))
++            }
++            Self::Hotspot {
++                hot_keys,
++                traffic_ratio,
++            } => {
++                if rng.gen_range(0.0..1.0) < *traffic_ratio {
++                    rng.gen_range(0..*hot_keys)
++                } else {
++                    *hot_keys + rng.gen_range(0..(key_space - hot_keys))
++                }
++            }
++        }
++    }
++}
++
++/// A latency histogram over microseconds.
++///
++/// The histogram keeps every sample, so the percentiles of a stage are the
++/// percentiles of all its requests and not of a sample of them.
++pub struct LatencyHistogram {
++    inner: Histogram<u64>,
++    highest_micros: u64,
++}
++
++impl LatencyHistogram {
++    pub fn new(highest_micros: u64) -> Result<Self> {
++        let highest_micros = highest_micros.max(1);
++        let inner = Histogram::new_with_bounds(1, highest_micros, 3)
++            .context("creating a latency histogram")?;
++        Ok(Self {
++            inner,
++            highest_micros,
++        })
++    }
++
++    pub fn record(&mut self, micros: u64) {
++        // A value inside the histogram's range is always recorded.
++        let _ = self.inner.record(micros.clamp(1, self.highest_micros));
++    }
++
++    pub fn merge(&mut self, other: &Self) {
++        let _ = self.inner.add(&other.inner);
++    }
++
++    pub fn reset(&mut self) {
++        self.inner.reset();
++    }
++
++    pub fn summary(&self) -> LatencySummary {
++        if self.inner.is_empty() {
++            return LatencySummary::default();
++        }
++        LatencySummary {
++            p50: self.inner.value_at_quantile(0.50),
++            p95: self.inner.value_at_quantile(0.95),
++            p99: self.inner.value_at_quantile(0.99),
++            p999: self.inner.value_at_quantile(0.999),
++            max: self.inner.max(),
++            samples: self.inner.len(),
++        }
++    }
++}
++
++/// What one second of the load produced.
++struct WindowState {
++    /// The samples of the window that is running.
++    current: Vec<LatencyHistogram>,
++    /// The samples of the whole stage.
++    total: Vec<LatencyHistogram>,
++    /// The operations of the window that is running.
++    completed: [u64; 3],
++    /// The operations of the whole stage.
++    total_completed: [u64; 3],
++    /// The errors of the window that is running.
++    errors: BTreeMap<String, u64>,
++    /// The errors of the whole stage.
++    total_errors: BTreeMap<String, u64>,
++}
++
++impl WindowState {
++    /// Moves the open window into the totals of the stage.
++    ///
++    /// The stage reports the totals, so a window whose counters are left
++    /// behind reports those requests as never having happened. The sampler
++    /// folds every second of a phase, and the last fold of a phase is this
++    /// one: the requests that were still in flight when the sampler stopped
++    /// finish before it runs, and belong to the stage all the same.
++    fn fold(&mut self) {
++        for index in 0..self.current.len() {
++            self.total[index].merge(&self.current[index]);
++            self.current[index].reset();
++        }
++        for operation in Operation::ALL {
++            let index = operation.index();
++            self.total_completed[index] += self.completed[index];
++            self.completed[index] = 0;
++        }
++        for (reason, count) in std::mem::take(&mut self.errors) {
++            *self.total_errors.entry(reason).or_insert(0) += count;
++        }
++    }
++}
++
++/// The counters of the running stage.
++struct Metrics {
++    state: Mutex<WindowState>,
++    in_flight: AtomicUsize,
++    issued: AtomicU64,
++    late: AtomicU64,
++    /// Set when the stage is over, so a sender that is still running stops.
++    stopped: AtomicBool,
++}
++
++impl Metrics {
++    fn new(highest_micros: u64) -> Result<Self> {
++        let mut current = Vec::with_capacity(3);
++        let mut total = Vec::with_capacity(3);
++        for _ in 0..3 {
++            current.push(LatencyHistogram::new(highest_micros)?);
++            total.push(LatencyHistogram::new(highest_micros)?);
++        }
++        Ok(Self {
++            state: Mutex::new(WindowState {
++                current,
++                total,
++                completed: [0; 3],
++                total_completed: [0; 3],
++                errors: BTreeMap::new(),
++                total_errors: BTreeMap::new(),
++            }),
++            in_flight: AtomicUsize::new(0),
++            issued: AtomicU64::new(0),
++            late: AtomicU64::new(0),
++            stopped: AtomicBool::new(false),
++        })
++    }
++
++    fn record_success(&self, operation: Operation, latency_micros: u64) {
++        let mut state = self.state.lock().expect("the metrics lock is not poisoned");
++        state.current[operation.index()].record(latency_micros);
++        state.completed[operation.index()] += 1;
++    }
++
++    fn record_error(&self, operation: Operation, reason: &'static str, latency_micros: u64) {
++        let mut state = self.state.lock().expect("the metrics lock is not poisoned");
++        state.current[operation.index()].record(latency_micros);
++        *state.errors.entry(reason.to_owned()).or_insert(0) += 1;
++    }
++}
++
++/// One stage of the load: one target rate.
++#[derive(Clone, Debug)]
++pub struct StageSettings {
++    pub name: String,
++    pub target_rate: u64,
++    pub warmup_seconds: u64,
++    pub duration_seconds: u64,
++}
++
++/// Everything the load needs that does not change between stages.
++#[derive(Clone, Debug)]
++pub struct LoadPlan {
++    pub key_space: u64,
++    pub value_bytes: usize,
++    pub mix: OperationMix,
++    pub distribution: KeyDistribution,
++    pub max_in_flight: usize,
++    /// The keys from here on are the ones the load deletes. They are disjoint
++    /// from the keys it reads and writes, so a delete never races another
++    /// operation on the same key.
++    pub delete_pool_start: u64,
++    /// The keys the load has deleted, so the key space can be checked
++    /// afterwards.
++    pub deleted: Arc<Vec<AtomicBool>>,
++    pub highest_latency_micros: u64,
++    /// How long the stage waits for the requests that are still in flight.
++    /// A request cannot take longer than the operation deadline, so this is
++    /// the deadline plus a margin.
++    pub drain_timeout: Duration,
++}
++
++impl LoadPlan {
++    /// Whether the load deleted the key.
++    pub fn is_deleted(&self, key: u64) -> bool {
++        if key < self.delete_pool_start {
++            return false;
++        }
++        self.deleted
++            .get((key - self.delete_pool_start) as usize)
++            .is_some_and(|deleted| deleted.load(Ordering::Acquire))
++    }
++
++    /// Records that the load deleted the key.
++    pub fn mark_deleted(&self, key: u64) {
++        if key < self.delete_pool_start {
++            return;
++        }
++        if let Some(deleted) = self.deleted.get((key - self.delete_pool_start) as usize) {
++            deleted.store(true, Ordering::Release);
++        }
++    }
++
++    fn sample_key(&self, operation: Operation, rng: &mut impl Rng) -> u64 {
++        match operation {
++            Operation::Delete => {
++                let pool = self.key_space - self.delete_pool_start;
++                if pool == 0 {
++                    return 0;
++                }
++                self.delete_pool_start + rng.gen_range(0..pool)
++            }
++            _ => self.distribution.sample(rng, self.delete_pool_start),
++        }
++    }
++
++    fn value(&self, key: u64) -> Vec<u8> {
++        deterministic_value(key, 0, self.value_bytes)
++    }
++}
++
++/// What one stage measured.
++#[derive(Clone, Debug)]
++pub struct StageOutcome {
++    pub name: String,
++    pub target_rate: u64,
++    pub achieved_rate: f64,
++    pub seconds: f64,
++    pub sender_saturated: bool,
++    pub issued: u64,
++    pub late: u64,
++    pub ops: BTreeMap<String, u64>,
++    pub errors: BTreeMap<String, u64>,
++    /// The internal retries the client made while the stage ran.
++    pub retries: u64,
++    pub latency_us: BTreeMap<String, LatencySummary>,
++    /// The windows in which the driver did not keep up with its own schedule.
++    pub saturated_windows: u64,
++}
++
++/// The load of one stage, warmup first and then the measured window.
++pub struct LoadRunner {
++    client: HashringClient,
++    plan: Arc<LoadPlan>,
++    metrics: Arc<Metrics>,
++}
++
++impl LoadRunner {
++    pub fn new(client: HashringClient, plan: LoadPlan) -> Result<Self> {
++        let metrics = Arc::new(Metrics::new(plan.highest_latency_micros)?);
++        Ok(Self {
++            client,
++            plan: Arc::new(plan),
++            metrics,
++        })
++    }
++
++    /// Runs the warmup of a stage. Its samples are thrown away, so only the
++    /// window that follows describes the stage.
++    pub async fn run_warmup(&self, stage: &StageSettings, events: &EventLog) -> Result<()> {
++        if stage.warmup_seconds == 0 {
++            return Ok(());
++        }
++        self.run_phase(stage, events, stage.warmup_seconds, true)
++            .await?;
++        Ok(())
++    }
++
++    /// Runs the window of a stage that its statistics come from.
++    pub async fn run_measured(
++        &self,
++        stage: &StageSettings,
++        events: &EventLog,
++    ) -> Result<StageOutcome> {
++        self.run_phase(stage, events, stage.duration_seconds, false)
++            .await
++    }
++
++    /// Forgets everything the previous phase counted, so a phase reports only
++    /// what it ran itself.
++    ///
++    /// The totals accumulate over the samples the phase recorded, and a phase
++    /// that started with the totals of the phase before it would report both.
++    /// The warmup's samples are discarded by the same call: the measured
++    /// phase begins by forgetting them.
++    fn forget(&self) {
++        let mut state = self
++            .metrics
++            .state
++            .lock()
++            .expect("the metrics lock is not poisoned");
++        for histogram in state.current.iter_mut() {
++            histogram.reset();
++        }
++        for histogram in state.total.iter_mut() {
++            histogram.reset();
++        }
++        state.completed = [0; 3];
++        state.total_completed = [0; 3];
++        state.errors.clear();
++        state.total_errors.clear();
++        self.metrics.issued.store(0, Ordering::Relaxed);
++        self.metrics.late.store(0, Ordering::Relaxed);
++    }
++
++    async fn run_phase(
++        &self,
++        stage: &StageSettings,
++        events: &EventLog,
++        seconds: u64,
++        warmup: bool,
++    ) -> Result<StageOutcome> {
++        let start = Instant::now();
++        let end = start + Duration::from_secs(seconds);
++        // The sender of the previous phase has stopped; this one starts fresh.
++        self.metrics.stopped.store(false, Ordering::Relaxed);
++        // Every phase counts only its own requests. The measured phase picks
++        // up the warmup's counters here, and the warmup of the next stage
++        // picks up the measured phase's.
++        self.forget();
++        // The client's retries are cumulative, so the phase starts from the
++        // count it has now.
++        let retries_before = self.client.retry_count();
++        let sampler = tokio::spawn(sample_windows(
++            Arc::clone(&self.metrics),
++            events.clone(),
++            self.client.clone(),
++            stage.clone(),
++            warmup,
++            start,
++            end,
++            retries_before,
++        ));
++        let (issued, late, saturated_windows) = self.drive(stage, start, end).await?;
++        // The sampler writes the window that ends with the phase, so it is
++        // waited for rather than stopped: a window that is dropped would leave
++        // its samples out of the stage.
++        let _ = sampler.await;
++        // The requests that were still in flight when the window closed
++        // belong to the stage, even though no window reports them.
++        self.merge_pending();
++        // The totals are read here and not in the sender, because the last
++        // window is folded in only now. A stage that read them earlier
++        // would miss it, and its rate would be short by a second's worth of
++        // requests.
++        let (ops, errors, latency_us) = self.totals();
++        let completed: u64 = ops.values().sum();
++        // Every request the sender sent came back, and every request that
++        // came back was recorded. A stage that does not add up is reported as
++        // a failure instead of a rate that is quietly short.
++        let failed: u64 = errors.values().sum();
++        if completed + failed != issued {
++            bail!(
++                "the stage issued {} requests, but {} of them came back",
++                issued,
++                completed + failed
++            );
++        }
++        let seconds = end.duration_since(start).as_secs_f64();
++        Ok(StageOutcome {
++            name: stage.name.clone(),
++            target_rate: stage.target_rate,
++            achieved_rate: completed as f64 / seconds.max(f64::EPSILON),
++            seconds,
++            sender_saturated: saturated_windows > 0,
++            issued,
++            late,
++            ops,
++            // Every reason, the ones that did not occur at zero.
++            errors: complete_errors(&errors),
++            retries: self.client.retry_count().saturating_sub(retries_before),
++            latency_us,
++            saturated_windows,
++        })
++    }
++
++    /// The open loop: every request is due at a fixed offset from the start
++    /// of the phase, and is sent then or not at all.
++    ///
++    /// Returns how many requests it sent, how many it had to drop, and how
++    /// many windows it did not keep up with. The samples are read by the
++    /// caller, after the sampler has folded its last window in.
++    async fn drive(
++        &self,
++        stage: &StageSettings,
++        start: Instant,
++        end: Instant,
++    ) -> Result<(u64, u64, u64)> {
++        let handle = tokio::runtime::Handle::current();
++        let client = self.client.clone();
++        let plan = Arc::clone(&self.plan);
++        let metrics = Arc::clone(&self.metrics);
++        let settings = stage.clone();
++        let (sender, sent) = tokio::sync::oneshot::channel();
++        let thread = std::thread::Builder::new()
++            .name("latency-sender".to_owned())
++            .spawn(move || {
++                let result = send_requests(handle, client, plan, metrics, settings, start, end);
++                let _ = sender.send(result);
++            })?;
++        let (issued, late, saturated_windows) = sent.await.unwrap_or((0, 0, 0));
++        // Let the requests that are still in flight finish, so the stage
++        // reports every request it sent. A request cannot take longer than
++        // the operation deadline, so the wait is bounded.
++        let deadline = Instant::now() + self.plan.drain_timeout;
++        while self.metrics.in_flight.load(Ordering::Acquire) > 0 {
++            if Instant::now() >= deadline {
++                bail!(
++                    "{} requests were still in flight {:?} after the stage ended",
++                    self.metrics.in_flight.load(Ordering::Relaxed),
++                    self.plan.drain_timeout
++                );
++            }
++            tokio::time::sleep(Duration::from_millis(5)).await;
++        }
++        self.metrics.stopped.store(true, Ordering::Relaxed);
++        let _ = thread.join();
++        Ok((issued, late, saturated_windows))
++    }
++
++    /// Moves the samples the stage still holds in its open window into its
++    /// totals. The sampler has stopped, so this is the phase's last fold.
++    fn merge_pending(&self) {
++        let mut state = self
++            .metrics
++            .state
++            .lock()
++            .expect("the metrics lock is not poisoned");
++        state.fold();
++    }
++
++    /// The operations, errors, and latencies the stage recorded.
++    fn totals(
++        &self,
++    ) -> (
++        BTreeMap<String, u64>,
++        BTreeMap<String, u64>,
++        BTreeMap<String, LatencySummary>,
++    ) {
++        let state = self
++            .metrics
++            .state
++            .lock()
++            .expect("the metrics lock is not poisoned");
++        let mut ops = BTreeMap::new();
++        let mut latency_us = BTreeMap::new();
++        for operation in Operation::ALL {
++            let index = operation.index();
++            ops.insert(operation.name().to_owned(), state.total_completed[index]);
++            latency_us.insert(operation.name().to_owned(), state.total[index].summary());
++        }
++        (ops, state.total_errors.clone(), latency_us)
++    }
++}
++
++/// The margin the sender leaves between the end of its sleep and the moment
++/// a request was due. The sleep of the kernel overshoots by about this much,
++/// so the spin that finishes the wait is short.
++const SEND_MARGIN: Duration = Duration::from_micros(20);
++
++/// Waits until `due` as closely as the host's timer allows.
++///
++/// The kernel's timer is coarse, so the wait has two parts: a sleep that ends
++/// a little before the deadline, and a spin for the rest. The margin is the
++/// overshoot the last sleep showed, so the spin stays short and the request
++/// goes out on time.
++///
++/// A runtime timer is not used here. It wakes up about a millisecond late,
++/// which is longer than the latencies this mode measures, so every request
++/// would carry a millisecond of the sender's own delay.
++fn wait_until(due: Instant, margin: &mut Duration) {
++    let coarse = due.checked_sub(*margin).unwrap_or(due);
++    let now = Instant::now();
++    if coarse > now {
++        std::thread::sleep(coarse - now);
++        let overshoot = Instant::now().saturating_duration_since(coarse);
++        *margin = (overshoot + SEND_MARGIN).clamp(SEND_MARGIN, Duration::from_millis(5));
++    }
++    while Instant::now() < due {
++        std::hint::spin_loop();
++    }
++}
++
++/// Sends the requests of a phase, and returns how many it sent, how many it
++/// had to drop, and how many windows it did not keep up with.
++fn send_requests(
++    handle: tokio::runtime::Handle,
++    client: HashringClient,
++    plan: Arc<LoadPlan>,
++    metrics: Arc<Metrics>,
++    stage: StageSettings,
++    start: Instant,
++    end: Instant,
++) -> (u64, u64, u64) {
++    let rate = stage.target_rate as f64;
++    let mut margin = Duration::from_micros(100);
++    let mut issued = 0_u64;
++    let mut late = 0_u64;
++    let mut saturated_windows = 0_u64;
++    let mut index = 0_u64;
++    let mut window_end = start + Duration::from_secs(1);
++    while index < u64::MAX {
++        let due = start + Duration::from_secs_f64(index as f64 / rate);
++        if due >= end {
++            break;
++        }
++        if metrics.stopped.load(Ordering::Relaxed) {
++            break;
++        }
++        wait_until(due, &mut margin);
++        // The limit is enforced by the one sender, so the check and the
++        // reservation cannot race with each other.
++        if metrics.in_flight.load(Ordering::Acquire) >= plan.max_in_flight {
++            late += 1;
++            metrics.late.fetch_add(1, Ordering::Relaxed);
++        } else {
++            metrics.in_flight.fetch_add(1, Ordering::AcqRel);
++            issued += 1;
++            metrics.issued.fetch_add(1, Ordering::Relaxed);
++            let request = Request {
++                client: client.clone(),
++                plan: Arc::clone(&plan),
++                metrics: Arc::clone(&metrics),
++                due,
++            };
++            handle.spawn(async move { request.run().await });
++        }
++        index += 1;
++        let now = Instant::now();
++        if now >= window_end {
++            // The schedule says how many requests were due by now. A sender
++            // that is behind it did not keep up, and the stage's numbers are
++            // not usable.
++            let expected = ((now.duration_since(start).as_secs_f64()) * rate).floor() as u64 + 1;
++            let behind = expected.saturating_sub(issued + late);
++            if behind > 2 + stage.target_rate / 20 {
++                saturated_windows += 1;
++            }
++            window_end += Duration::from_secs(1);
++        }
++    }
++    (issued, late, saturated_windows)
++}
++
++/// One request of the load.
++struct Request {
++    client: HashringClient,
++    plan: Arc<LoadPlan>,
++    metrics: Arc<Metrics>,
++    /// The moment the request was due, which is where its latency starts.
++    due: Instant,
++}
++
++impl Request {
++    async fn run(self) {
++        let (operation, key) = {
++            let mut rng = rand::thread_rng();
++            let operation = self.plan.mix.pick(&mut rng);
++            (operation, self.plan.sample_key(operation, &mut rng))
++        };
++        let encoded = key.to_be_bytes().to_vec();
++        let outcome = match operation {
++            Operation::Get => self.client.get(encoded).await.map(|_| ()),
++            Operation::Put => {
++                let value = self.plan.value(key);
++                self.client.put(encoded, value).await.map(|_| ())
++            }
++            Operation::Delete => self.client.delete(encoded).await.map(|_| ()),
++        };
++        let latency = Instant::now().saturating_duration_since(self.due);
++        let latency_micros = latency.as_micros().min(u64::MAX as u128) as u64;
++        match classify(operation, outcome) {
++            Ok(()) => {
++                if operation == Operation::Delete {
++                    self.plan.mark_deleted(key);
++                }
++                self.metrics.record_success(operation, latency_micros)
++            }
++            Err(reason) => self.metrics.record_error(operation, reason, latency_micros),
++        }
++        self.metrics.in_flight.fetch_sub(1, Ordering::AcqRel);
++    }
++}
++
++/// Turns a failed operation into the reason it failed.
++///
++/// A delete of a key that is already gone is not a failure: the key is
++/// absent, which is what the delete asked for.
++fn classify(operation: Operation, outcome: Result<(), ClientError>) -> Result<(), &'static str> {
++    match outcome {
++        Ok(()) => Ok(()),
++        Err(ClientError::MissingVersion) if operation == Operation::Delete => Ok(()),
++        Err(ClientError::DeadlineExceeded { .. }) => Err("deadline"),
++        Err(ClientError::Operation(failure)) => {
++            if failure.code == ErrorCode::NotFound && operation == Operation::Get {
++                Err("not_found")
++            } else {
++                Err("operation")
++            }
++        }
++        Err(ClientError::Rpc { .. }) => Err("rpc"),
++        Err(ClientError::Topology(_) | ClientError::TopologyRefresh { .. }) => Err("topology"),
++        Err(ClientError::MissingVersion) => Err("protocol"),
++    }
++}
++
++/// Every reason an operation can be reported under.
++///
++/// A run reports all of them in its `errors` maps, with a zero for the ones
++/// that did not occur, so a reader compares the same fields in every window
++/// of every run instead of guessing which ones a map is missing.
++pub const ERROR_REASONS: [&str; 6] = [
++    "deadline",
++    "not_found",
++    "operation",
++    "protocol",
++    "rpc",
++    "topology",
++];
++
++/// The errors with every reason in them, the ones that did not occur at zero.
++fn complete_errors(errors: &BTreeMap<String, u64>) -> BTreeMap<String, u64> {
++    let mut complete: BTreeMap<String, u64> = ERROR_REASONS
++        .iter()
++        .map(|reason| ((*reason).to_owned(), 0))
++        .collect();
++    for (reason, count) in errors {
++        *complete.entry(reason.clone()).or_insert(0) += count;
++    }
++    complete
++}
++
++/// Writes one `metrics_sampled` event per second of the phase.
++async fn sample_windows(
++    metrics: Arc<Metrics>,
++    events: EventLog,
++    client: HashringClient,
++    stage: StageSettings,
++    warmup: bool,
++    start: Instant,
++    end: Instant,
++    retries_before: u64,
++) {
++    let mut window_start = start;
++    let mut retries_seen = retries_before;
++    while window_start < end {
++        let window_end = window_start + Duration::from_secs(1);
++        tokio::time::sleep_until(window_end.into()).await;
++        let (issued, late, completed, errors, latency_us) = {
++            let mut state = metrics
++                .state
++                .lock()
++                .expect("the metrics lock is not poisoned");
++            let mut latency_us = serde_json::Map::new();
++            for operation in Operation::ALL {
++                latency_us.insert(
++                    operation.name().to_owned(),
++                    serde_json::to_value(state.current[operation.index()].summary())
++                        .expect("a latency summary is serializable"),
++                );
++            }
++            // What the window produced is read before the fold takes it.
++            let completed = state.completed;
++            let errors = state.errors.clone();
++            state.fold();
++            let issued = metrics.issued.swap(0, Ordering::AcqRel);
++            let late = metrics.late.swap(0, Ordering::AcqRel);
++            (issued, late, completed, errors, latency_us)
++        };
++        let mut ops = serde_json::Map::new();
++        for operation in Operation::ALL {
++            ops.insert(
++                operation.name().to_owned(),
++                serde_json::Value::from(completed[operation.index()]),
++            );
++        }
++        // The window's share of the schedule. A sender that is behind it did
++        // not keep up, and the window's numbers do not describe the cluster.
++        // A request the in-flight limit dropped is not behind: the sender
++        // dealt with it, and the cluster is the one that could not.
++        let length = window_end.min(end).saturating_duration_since(window_start);
++        let expected = (length.as_secs_f64() * stage.target_rate as f64).floor() as u64;
++        let behind = expected.saturating_sub(issued + late);
++        // The retries the client made in this window, and the epoch it routed
++        // with. A retry is a request the client had to try again, so a window
++        // with retries is a window the cluster was not answering at once.
++        let retries_now = client.retry_count();
++        let retries = retries_now.saturating_sub(retries_seen);
++        retries_seen = retries_now;
++        let epoch = client.epoch().await;
++        let fields = json!({
++            "stage": stage.name,
++            "warmup": warmup,
++            "window_ms": 1000,
++            "target_rate": stage.target_rate,
++            "issued": issued,
++            "late": late,
++            "behind": behind,
++            "ops": ops,
++            // Every reason, the ones that did not occur at zero, so a reader
++            // finds the same keys in every window of every run.
++            "errors": complete_errors(&errors),
++            "retries": retries,
++            "epoch": epoch,
++            "latency_us": latency_us,
++        });
++        if events.record("metrics_sampled", fields).is_err() {
++            return;
++        }
++        window_start = window_end;
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use rand::SeedableRng;
++
++    #[test]
++    fn a_mix_picks_the_operations_it_names() {
++        let mix = OperationMix::parse("90:9:1").unwrap();
++        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
++        let mut counts = [0_u64; 3];
++        for _ in 0..10_000 {
++            counts[mix.pick(&mut rng).index()] += 1;
++        }
++        assert!(counts[0] > counts[1] && counts[1] > counts[2]);
++        assert!(counts[2] > 50 && counts[2] < 200);
++    }
++
++    #[test]
++    fn a_mix_rejects_a_ratio_it_cannot_use() {
++        assert!(OperationMix::parse("90:9").is_err());
++        assert!(OperationMix::parse("0:0:0").is_err());
++        assert!(OperationMix::parse("a:b:c").is_err());
++    }
++
++    #[test]
++    fn a_uniform_distribution_covers_the_whole_key_space() {
++        let distribution = KeyDistribution::parse("uniform", 1000).unwrap();
++        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
++        let mut seen = std::collections::BTreeSet::new();
++        for _ in 0..5_000 {
++            seen.insert(distribution.sample(&mut rng, 1000));
++        }
++        // Five draws per key leave a few of the thousand untouched.
++        assert!(
++            seen.len() > 990,
++            "only {} of 1000 keys were drawn",
++            seen.len()
++        );
++    }
++
++    #[test]
++    fn a_zipf_distribution_favours_the_first_keys() {
++        let distribution = KeyDistribution::parse("zipf:0.99", 10_000).unwrap();
++        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
++        let mut first = 0_u64;
++        for _ in 0..20_000 {
++            if distribution.sample(&mut rng, 10_000) < 100 {
++                first += 1;
++            }
++        }
++        // The hottest hundred keys of a Zipf 0.99 distribution take a tenth of
++        // the traffic, far more than the one percent a uniform draw gives.
++        assert!(
++            first > 1_000,
++            "only {first} of 20000 draws hit the hot keys"
++        );
++    }
++
++    #[test]
++    fn a_hotspot_distribution_sends_its_traffic_to_a_few_keys() {
++        let distribution = KeyDistribution::parse("hotspot:0.01:0.5", 10_000).unwrap();
++        let mut rng = rand::rngs::StdRng::seed_from_u64(5);
++        let mut hot = 0_u64;
++        for _ in 0..10_000 {
++            if distribution.sample(&mut rng, 10_000) < 100 {
++                hot += 1;
++            }
++        }
++        assert!(hot > 4_000 && hot < 6_000, "{hot} of 10000 draws were hot");
++    }
++
++    #[test]
++    fn a_distribution_stays_inside_the_range_it_is_sampled_for() {
++        for spec in ["uniform", "zipf:0.99", "hotspot:0.01:0.5"] {
++            let distribution = KeyDistribution::parse(spec, 1000).unwrap();
++            let mut rng = rand::rngs::StdRng::seed_from_u64(17);
++            for _ in 0..20_000 {
++                assert!(distribution.sample(&mut rng, 900) < 900);
++            }
++        }
++    }
++
++    #[test]
++    fn a_delete_never_touches_a_key_the_load_reads() {
++        let plan = LoadPlan {
++            key_space: 1000,
++            value_bytes: 8,
++            mix: OperationMix::parse("90:9:1").unwrap(),
++            distribution: KeyDistribution::parse("zipf:0.99", 900).unwrap(),
++            max_in_flight: 16,
++            delete_pool_start: 900,
++            deleted: Arc::new((0..100).map(|_| AtomicBool::new(false)).collect()),
++            highest_latency_micros: 1_000_000,
++            drain_timeout: Duration::from_secs(1),
++        };
++        let mut rng = rand::rngs::StdRng::seed_from_u64(23);
++        for _ in 0..20_000 {
++            assert!(plan.sample_key(Operation::Get, &mut rng) < 900);
++            assert!(plan.sample_key(Operation::Put, &mut rng) < 900);
++            assert!(plan.sample_key(Operation::Delete, &mut rng) >= 900);
++        }
++    }
++
++    #[test]
++    fn a_histogram_keeps_every_sample_and_finds_its_percentiles() {
++        let mut histogram = LatencyHistogram::new(60_000_000).unwrap();
++        for value in 1..=10_000_u64 {
++            histogram.record(value);
++        }
++        let summary = histogram.summary();
++        assert_eq!(summary.samples, 10_000);
++        // A histogram reports the upper bound of the bucket a value falls in,
++        // so its maximum is a little above the largest value recorded.
++        assert!(summary.max >= 10_000 && summary.max <= 10_010);
++        assert!(summary.p50 >= 4_900 && summary.p50 <= 5_100);
++        assert!(summary.p99 >= 9_800 && summary.p99 <= 10_010);
++    }
++
++    #[test]
++    fn a_histogram_merges_the_windows_of_a_stage() {
++        let mut first = LatencyHistogram::new(60_000_000).unwrap();
++        let mut second = LatencyHistogram::new(60_000_000).unwrap();
++        for value in 1..=100_u64 {
++            first.record(value);
++            second.record(value);
++        }
++        first.merge(&second);
++        assert_eq!(first.summary().samples, 200);
++    }
++
++    #[test]
++    fn folding_a_window_moves_everything_it_counted_into_the_totals() {
++        let metrics = Metrics::new(1_000_000).unwrap();
++        metrics.record_success(Operation::Get, 10);
++        metrics.record_success(Operation::Get, 20);
++        metrics.record_error(Operation::Put, "deadline", 30);
++        {
++            let mut state = metrics.state.lock().unwrap();
++            // The fold that closes a phase runs after the sampler stopped, so
++            // a fold that took the latencies and left the counters would
++            // report the phase as short by the requests of its last second.
++            state.fold();
++            // A failed request is in the errors and in the latencies, and the
++            // two of them are what it takes to account for every request the
++            // phase issued.
++            assert_eq!(state.total_completed, [2, 0, 0]);
++            assert_eq!(state.total_errors.get("deadline"), Some(&1));
++            assert_eq!(state.total[0].summary().samples, 2);
++            assert_eq!(state.total[1].summary().samples, 1);
++            // The window is empty once it is folded, so folding it again
++            // reports the same totals instead of counting them twice.
++            state.fold();
++        }
++        let state = metrics.state.lock().unwrap();
++        assert_eq!(state.total_completed, [2, 0, 0]);
++        assert_eq!(state.total_errors.get("deadline"), Some(&1));
++        assert_eq!(state.total[0].summary().samples, 2);
++    }
++}
+diff --git a/crates/hashring-experiment/src/lib.rs b/crates/hashring-experiment/src/lib.rs
+index 7879e9b..3e82adf 100644
+--- a/crates/hashring-experiment/src/lib.rs
++++ b/crates/hashring-experiment/src/lib.rs
+@@ -7,7 +7,7 @@ use std::{
+     process::{Child, Command, Stdio},
+     sync::{
+         Arc, Mutex,
+-        atomic::{AtomicU64, Ordering as AtomicOrdering},
++        atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
+     },
+     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+ };
+@@ -18,19 +18,22 @@ use hashring_client::{ClientError, HashringClient};
+ use hashring_core::{
+     migration::{MigrationPhase, TopologyChange},
+     proto::{ErrorCode, PutRequest, data_node_client::DataNodeClient},
+-    topology::{Member, WriteAckPolicy},
++    topology::{Member, TopologySnapshot, WriteAckPolicy},
+     transport::configure_data_node_client,
+ };
+ use serde::{Deserialize, Serialize};
+ use serde_json::{Value, json};
+ use tonic::transport::Channel;
+ 
++mod latency;
++
+ #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+ #[serde(rename_all = "snake_case")]
+ pub enum ExperimentMode {
+     Correctness,
+     Performance,
+     Availability,
++    Latency,
+ }
+ 
+ #[derive(Clone, Debug, Deserialize, Serialize)]
+@@ -63,6 +66,21 @@ pub struct ExperimentConfig {
+     pub receipt_retention_ms: u64,
+     pub lease_duration_ms: u64,
+     pub write_ack_policy: WriteAckPolicy,
++    /// The keys the `latency` mode writes before its load starts, and the key
++    /// space its load reads and writes. `None` in the other modes.
++    pub preload_keys: Option<u64>,
++    /// The target rates of the `latency` mode, one stage each.
++    pub target_rates: Vec<u64>,
++    /// The seconds at the start of every stage that are not counted.
++    pub warmup_seconds: u64,
++    /// The seconds of every stage that are counted.
++    pub duration_seconds: u64,
++    /// The `GET:PUT:DELETE` share of the `latency` mode's requests.
++    pub mix: String,
++    /// How the `latency` mode picks the key of a request.
++    pub key_distribution: String,
++    /// How many requests the `latency` mode may have in flight at once.
++    pub max_in_flight: usize,
+     /// Forwarded to every data node the run starts.
+     pub node: NodeOptions,
+ }
+@@ -126,13 +144,80 @@ pub struct ExperimentSummary {
+     pub observations: BTreeMap<String, Value>,
+ }
+ 
++/// One entry of a run's `measurements`.
++///
++/// A throughput stage reports the operations it ran and the rate they ran at.
++/// A `latency` stage reports one target rate, so it carries that rate's
++/// latency distribution, its errors, and its load balance.
+ #[derive(Clone, Debug, Deserialize, Serialize)]
+-pub struct Measurement {
++#[serde(untagged)]
++pub enum Measurement {
++    Throughput(ThroughputMeasurement),
++    LatencyStage(LatencyStageMeasurement),
++}
++
++#[derive(Clone, Debug, Deserialize, Serialize)]
++pub struct ThroughputMeasurement {
+     pub operations: u64,
+     pub seconds: f64,
+     pub operations_per_second: f64,
+ }
+ 
++/// The percentiles of one operation's latency, in microseconds.
++#[derive(Clone, Debug, Default, Deserialize, Serialize)]
++pub struct LatencySummary {
++    pub p50: u64,
++    pub p95: u64,
++    pub p99: u64,
++    pub p999: u64,
++    pub max: u64,
++    pub samples: u64,
++}
++
++/// What one node did during a stage.
++#[derive(Clone, Debug, Default, Deserialize, Serialize)]
++pub struct LoadBalanceNode {
++    /// The keys the node owns.
++    pub owned_keys: u64,
++    /// The operations the node served.
++    pub ops_handled: u64,
++    /// The share of one core the node used.
++    pub cpu_percent: f64,
++}
++
++/// How evenly the keys and the requests were spread over the nodes.
++#[derive(Clone, Debug, Default, Deserialize, Serialize)]
++pub struct LoadBalanceMeasurement {
++    pub per_node: BTreeMap<String, LoadBalanceNode>,
++    pub owned_keys_max_over_mean: f64,
++    pub owned_keys_cv: f64,
++    pub ops_handled_max_over_mean: f64,
++    pub ops_handled_cv: f64,
++}
++
++/// One target rate of the `latency` mode.
++#[derive(Clone, Debug, Deserialize, Serialize)]
++pub struct LatencyStageMeasurement {
++    pub target_rate: u64,
++    pub achieved_rate: f64,
++    pub seconds: f64,
++    /// Whether the driver kept up with its own schedule. A stage the driver
++    /// could not keep up with does not describe the cluster.
++    pub sender_saturated: bool,
++    /// The requests the driver sent.
++    pub issued: u64,
++    /// The requests the driver did not send because too many were in flight.
++    pub late: u64,
++    /// The operations that succeeded, by kind.
++    pub ops: BTreeMap<String, u64>,
++    /// The operations that failed, by reason.
++    pub errors: BTreeMap<String, u64>,
++    /// The internal retries the client made during the stage.
++    pub retries: u64,
++    pub latency_us: BTreeMap<String, LatencySummary>,
++    pub load_balance: LoadBalanceMeasurement,
++}
++
+ #[derive(Serialize)]
+ struct ExperimentManifest<'a> {
+     schema_version: u32,
+@@ -308,6 +393,14 @@ impl ProcessGroup {
+         }
+     }
+ 
++    /// The process ids of the started processes, by name.
++    fn pids(&self) -> BTreeMap<String, u32> {
++        self.processes
++            .iter()
++            .map(|process| (process.name.clone(), process.child.id()))
++            .collect()
++    }
++
+     fn kill(&mut self, name: &str) -> Result<(String, Instant)> {
+         let index = self
+             .processes
+@@ -358,7 +451,7 @@ pub async fn run_experiment(
+         runtime_tree_hash.as_deref(),
+     );
+     let manifest = ExperimentManifest {
+-        schema_version: 5,
++        schema_version: 6,
+         started_unix_ms: unix_ms(),
+         executable_path: executable.display().to_string(),
+         executable_blake3: file_digest(&executable)?,
+@@ -476,7 +569,7 @@ async fn run_cluster(
+         .collect();
+     let initial_count = match config.mode {
+         ExperimentMode::Correctness => config.node_count - 1,
+-        ExperimentMode::Performance => config.node_count,
++        ExperimentMode::Performance | ExperimentMode::Latency => config.node_count,
+         ExperimentMode::Availability => 3,
+     };
+     let initial_members = &members[..initial_count];
+@@ -568,6 +661,7 @@ async fn run_cluster(
+         "initial_full_rf_seconds".into(),
+         json!(rf_started.elapsed().as_secs_f64()),
+     );
++    record_topology(events, &admin_client).await?;
+     if config.write_ack_policy != WriteAckPolicy::OwnerOnly {
+         let change = admin_client
+             .begin_write_policy_change(config.write_ack_policy)
+@@ -583,6 +677,7 @@ async fn run_cluster(
+             "ack_policy_activated",
+             json!({ "policy": config.write_ack_policy }),
+         )?;
++        record_topology(events, &admin_client).await?;
+     }
+ 
+     let workload = Workload {
+@@ -628,15 +723,18 @@ async fn run_cluster(
+             .await?;
+         latencies_us.push(started.elapsed().as_micros() as u64);
+     }
++    // The workload is over and the cluster is idle, so these figures are the
++    // latency of an idle cluster and not the latency under load. The name
++    // says so, and the `latency` mode measures the other one.
+     observations.insert(
+-        "client_put_latency_us".into(),
++        "idle_client_put_latency_us".into(),
+         latency_summary(&mut latencies_us),
+     );
+     events.record(
+         "client_put_latency_sampled",
+         json!({
+             "samples": sample_count, "policy": config.write_ack_policy,
+-            "latency_us": observations["client_put_latency_us"]
++            "latency_us": observations["idle_client_put_latency_us"]
+         }),
+     )?;
+     let sample_topology = admin_client.refresh_topology().await?;
+@@ -695,14 +793,14 @@ async fn run_cluster(
+         owner_rpc_latencies_us.push(started.elapsed().as_micros() as u64);
+     }
+     observations.insert(
+-        "owner_rpc_put_latency_us".into(),
++        "idle_owner_rpc_put_latency_us".into(),
+         latency_summary(&mut owner_rpc_latencies_us),
+     );
+     events.record(
+         "owner_rpc_put_latency_sampled",
+         json!({
+             "samples": sample_count, "policy": config.write_ack_policy,
+-            "latency_us": observations["owner_rpc_put_latency_us"]
++            "latency_us": observations["idle_owner_rpc_put_latency_us"]
+         }),
+     )?;
+ 
+@@ -721,6 +819,20 @@ async fn run_cluster(
+         .await;
+     }
+ 
++    if matches!(config.mode, ExperimentMode::Latency) {
++        return run_latency(
++            config,
++            &members,
++            &admin_client,
++            &workload_client,
++            &mut processes,
++            events,
++            measurements,
++            observations,
++        )
++        .await;
++    }
++
+     if matches!(config.mode, ExperimentMode::Correctness) {
+         let added = &members[config.node_count - 1];
+         let scale_out = admin_client.begin_topology_change(members.clone()).await?;
+@@ -868,6 +980,7 @@ async fn run_cluster(
+         "verification_complete",
+         json!({ "epoch": topology.epoch, "members": topology.members.len() }),
+     )?;
++    record_topology(events, &admin_client).await?;
+     Ok(topology.epoch)
+ }
+ 
+@@ -1204,6 +1317,373 @@ async fn run_availability(
+     Ok(completed.target_topology.epoch)
+ }
+ 
++/// Records the ring the cluster runs right now.
++///
++/// The snapshot is the output of `hashring-rs topology`, so a run that has
++/// ended can still be read: a reader takes the snapshots from the event log
++/// instead of asking a coordinator that is gone.
++async fn record_topology(events: &EventLog, client: &HashringClient) -> Result<TopologySnapshot> {
++    let topology = match client.refresh_topology().await {
++        Ok(topology) => topology,
++        Err(error) => {
++            eprintln!("the topology could not be refreshed for the snapshot: {error}");
++            client.topology().await
++        }
++    };
++    events.record("topology_published", serde_json::to_value(&topology)?)?;
++    Ok(topology)
++}
++
++/// The counters one node reports, and the CPU it used.
++#[derive(Clone, Copy, Debug, Default)]
++struct NodeCounters {
++    ops_handled: u64,
++    cpu_seconds: f64,
++}
++
++/// Runs the `latency` mode: one stage per target rate, and a check of the key
++/// space the load left behind.
++#[allow(clippy::too_many_arguments)]
++async fn run_latency(
++    config: &ExperimentConfig,
++    members: &[Member],
++    admin_client: &HashringClient,
++    workload_client: &HashringClient,
++    processes: &mut ProcessGroup,
++    events: &EventLog,
++    measurements: &mut BTreeMap<String, Measurement>,
++    observations: &mut BTreeMap<String, Value>,
++) -> Result<u64> {
++    ensure!(
++        !config.target_rates.is_empty(),
++        "the latency mode needs at least one target rate"
++    );
++    let key_space = config.key_count;
++    let mix = latency::OperationMix::parse(&config.mix)?;
++    let delete_pool = delete_pool_size(config, &mix, key_space);
++    // The distribution covers the keys the load reads and writes. The keys it
++    // deletes are a pool of their own, so a delete never races another
++    // operation on the same key.
++    let distribution =
++        latency::KeyDistribution::parse(&config.key_distribution, key_space - delete_pool)?;
++    let plan = latency::LoadPlan {
++        key_space,
++        value_bytes: config.value_bytes,
++        mix,
++        distribution: distribution.clone(),
++        max_in_flight: config.max_in_flight,
++        delete_pool_start: key_space - delete_pool,
++        deleted: Arc::new(
++            (0..delete_pool as usize)
++                .map(|_| AtomicBool::new(false))
++                .collect(),
++        ),
++        highest_latency_micros: highest_latency_micros(config),
++        drain_timeout: Duration::from_millis(config.operation_timeout_ms) + Duration::from_secs(5),
++    };
++    observations.insert("latency_key_space".into(), json!(key_space));
++    observations.insert("latency_delete_pool_keys".into(), json!(delete_pool));
++    observations.insert(
++        "latency_key_distribution".into(),
++        json!(distribution.name()),
++    );
++    observations.insert("latency_mix".into(), json!(config.mix));
++    // The `measurements` of a latency run hold one entry per rate stage, so
++    // the preload and the check that follows it move to the observations.
++    for name in ["initial_put", "initial_get_verify"] {
++        if let Some(measurement) = measurements.remove(name) {
++            observations.insert(name.into(), serde_json::to_value(measurement)?);
++        }
++    }
++
++    let topology = admin_client.refresh_topology().await?;
++    let owned_keys = owned_key_counts(&topology, key_space);
++    let runner = latency::LoadRunner::new(workload_client.clone(), plan.clone())?;
++    let pids = processes.pids();
++    let mut saturated_windows = serde_json::Map::new();
++    for (index, rate) in config.target_rates.iter().enumerate() {
++        let stage = latency::StageSettings {
++            name: format!("rate_{index}"),
++            target_rate: *rate,
++            warmup_seconds: config.warmup_seconds,
++            duration_seconds: config.duration_seconds,
++        };
++        runner.run_warmup(&stage, events).await?;
++        let before = sample_node_counters(members, &pids).await;
++        let outcome = runner.run_measured(&stage, events).await?;
++        let after = sample_node_counters(members, &pids).await;
++        saturated_windows.insert(outcome.name.clone(), json!(outcome.saturated_windows));
++        measurements.insert(
++            outcome.name.clone(),
++            Measurement::LatencyStage(LatencyStageMeasurement {
++                target_rate: outcome.target_rate,
++                achieved_rate: outcome.achieved_rate,
++                seconds: outcome.seconds,
++                sender_saturated: outcome.sender_saturated,
++                issued: outcome.issued,
++                late: outcome.late,
++                ops: outcome.ops,
++                errors: outcome.errors,
++                retries: outcome.retries,
++                latency_us: outcome.latency_us,
++                load_balance: load_balance(&owned_keys, &before, &after, outcome.seconds),
++            }),
++        );
++    }
++    observations.insert(
++        "latency_saturated_windows".into(),
++        Value::from(saturated_windows),
++    );
++    let verified = verify_latency_keyspace(workload_client, &plan, config.concurrency).await?;
++    observations.insert("latency_verified_keys".into(), json!(verified));
++    processes.ensure_running()?;
++    let topology = admin_client.refresh_topology().await?;
++    events.record(
++        "verification_complete",
++        json!({ "epoch": topology.epoch, "members": topology.members.len() }),
++    )?;
++    record_topology(events, admin_client).await?;
++    Ok(topology.epoch)
++}
++
++/// The keys the load may delete.
++///
++/// The load deletes from a pool of its own, so a delete never races another
++/// operation on the same key and the key space can be checked afterwards. The
++/// pool is as large as the run's deletes need, and never more than half of the
++/// key space.
++fn delete_pool_size(config: &ExperimentConfig, mix: &latency::OperationMix, key_space: u64) -> u64 {
++    if mix.delete_fraction() <= 0.0 {
++        return 0;
++    }
++    let expected: f64 = config
++        .target_rates
++        .iter()
++        .map(|rate| {
++            *rate as f64
++                * (config.duration_seconds + config.warmup_seconds) as f64
++                * mix.delete_fraction()
++        })
++        .sum();
++    let wanted = expected.ceil() as u64;
++    let minimum = (key_space as f64 * 0.05).floor() as u64;
++    let maximum = (key_space as f64 * 0.5).floor() as u64;
++    wanted
++        .clamp(minimum, maximum)
++        .min(key_space.saturating_sub(1))
++}
++
++/// The largest latency the histogram keeps.
++///
++/// A request cannot take longer than the operation deadline, and the driver
++/// measures from the moment the request was due, so the deadline plus a
++/// second covers every request it can issue.
++fn highest_latency_micros(config: &ExperimentConfig) -> u64 {
++    config
++        .operation_timeout_ms
++        .saturating_mul(1_000)
++        .saturating_add(1_000_000)
++        .min(600_000_000)
++}
++
++/// The number of keys each node owns.
++fn owned_key_counts(topology: &TopologySnapshot, key_space: u64) -> BTreeMap<String, u64> {
++    let mut counts: BTreeMap<&str, u64> = topology
++        .members
++        .iter()
++        .map(|member| (member.node_id.as_str(), 0))
++        .collect();
++    for key in 0..key_space {
++        if let Ok(owner) = topology.owner(&key.to_be_bytes())
++            && let Some(count) = counts.get_mut(owner.node_id.as_str())
++        {
++            *count += 1;
++        }
++    }
++    counts
++        .into_iter()
++        .map(|(node, count)| (node.to_owned(), count))
++        .collect()
++}
++
++/// The operations a node served and the CPU it used.
++async fn sample_node_counters(
++    members: &[Member],
++    pids: &BTreeMap<String, u32>,
++) -> BTreeMap<String, NodeCounters> {
++    let mut counters = BTreeMap::new();
++    for member in members {
++        let ops_handled = query_node_ops(&member.endpoint).await.unwrap_or(0);
++        let cpu_seconds = pids
++            .get(&member.node_id)
++            .and_then(|pid| process_cpu_seconds(*pid))
++            .unwrap_or(0.0);
++        counters.insert(
++            member.node_id.clone(),
++            NodeCounters {
++                ops_handled,
++                cpu_seconds,
++            },
++        );
++    }
++    counters
++}
++
++/// The number of operations a node served since it started.
++async fn query_node_ops(endpoint: &str) -> Option<u64> {
++    let result = tokio::time::timeout(Duration::from_secs(2), async {
++        let mut client = configure_data_node_client(
++            DataNodeClient::connect(endpoint.to_owned())
++                .await
++                .map_err(|error| anyhow::anyhow!("{error}"))?,
++        );
++        let info = client
++            .get_process_info(hashring_core::proto::Empty {})
++            .await
++            .map_err(|error| anyhow::anyhow!("{error}"))?;
++        Ok::<_, anyhow::Error>(info.into_inner().ops_handled)
++    })
++    .await;
++    result.ok().and_then(|value| value.ok())
++}
++
++/// How the keys and the requests were spread over the nodes.
++fn load_balance(
++    owned_keys: &BTreeMap<String, u64>,
++    before: &BTreeMap<String, NodeCounters>,
++    after: &BTreeMap<String, NodeCounters>,
++    seconds: f64,
++) -> LoadBalanceMeasurement {
++    let mut per_node = BTreeMap::new();
++    let mut owned = Vec::new();
++    let mut handled = Vec::new();
++    for (node, keys) in owned_keys {
++        let start = before.get(node).copied().unwrap_or_default();
++        let end = after.get(node).copied().unwrap_or_default();
++        let ops_handled = end.ops_handled.saturating_sub(start.ops_handled);
++        let cpu_percent = if seconds > 0.0 {
++            (end.cpu_seconds - start.cpu_seconds) / seconds * 100.0
++        } else {
++            0.0
++        };
++        owned.push(*keys as f64);
++        handled.push(ops_handled as f64);
++        per_node.insert(
++            node.clone(),
++            LoadBalanceNode {
++                owned_keys: *keys,
++                ops_handled,
++                cpu_percent,
++            },
++        );
++    }
++    LoadBalanceMeasurement {
++        per_node,
++        owned_keys_max_over_mean: max_over_mean(&owned),
++        owned_keys_cv: coefficient_of_variation(&owned),
++        ops_handled_max_over_mean: max_over_mean(&handled),
++        ops_handled_cv: coefficient_of_variation(&handled),
++    }
++}
++
++/// The largest value divided by the mean of the values.
++fn max_over_mean(values: &[f64]) -> f64 {
++    if values.is_empty() {
++        return 0.0;
++    }
++    let mean = values.iter().sum::<f64>() / values.len() as f64;
++    if mean <= 0.0 {
++        return 0.0;
++    }
++    values.iter().copied().fold(0.0_f64, f64::max) / mean
++}
++
++/// The standard deviation of the values divided by their mean.
++fn coefficient_of_variation(values: &[f64]) -> f64 {
++    if values.is_empty() {
++        return 0.0;
++    }
++    let mean = values.iter().sum::<f64>() / values.len() as f64;
++    if mean <= 0.0 {
++        return 0.0;
++    }
++    let variance = values
++        .iter()
++        .map(|value| (value - mean).powi(2))
++        .sum::<f64>()
++        / values.len() as f64;
++    variance.sqrt() / mean
++}
++
++/// Checks the key space the load left behind.
++///
++/// Every key the load did not delete must still hold the value the preload
++/// wrote, and every key it did delete must be gone. The load deletes from a
++/// pool of its own, so no delete raced another operation on the same key and
++/// the expected state of every key is known.
++async fn verify_latency_keyspace(
++    client: &HashringClient,
++    plan: &latency::LoadPlan,
++    concurrency: usize,
++) -> Result<u64> {
++    let present = AtomicU64::new(0);
++    let absent = AtomicU64::new(0);
++    stream::iter(0..plan.key_space)
++        .map(Ok::<_, anyhow::Error>)
++        .try_for_each_concurrent(Some(concurrency), |key| {
++            let client = client.clone();
++            let plan = plan.clone();
++            let present = &present;
++            let absent = &absent;
++            async move {
++                let deleted = plan.is_deleted(key);
++                match client.get(key.to_be_bytes().to_vec()).await {
++                    Ok(output) => {
++                        ensure!(
++                            output.value == deterministic_value(key, 0, plan.value_bytes),
++                            "key {key} holds a value the load did not write"
++                        );
++                        ensure!(!deleted, "key {key} was deleted but is still present");
++                        present.fetch_add(1, AtomicOrdering::Relaxed);
++                    }
++                    Err(ClientError::Operation(failure)) if failure.code == ErrorCode::NotFound => {
++                        ensure!(deleted, "key {key} is missing but was never deleted");
++                        absent.fetch_add(1, AtomicOrdering::Relaxed);
++                    }
++                    Err(error) => return Err(error.into()),
++                }
++                Ok(())
++            }
++        })
++        .await?;
++    Ok(present.load(AtomicOrdering::Relaxed) + absent.load(AtomicOrdering::Relaxed))
++}
++
++/// The CPU time a process has used, in seconds.
++///
++/// The counter is the kernel's, so it covers the whole life of the process,
++/// not only the time it spent in this run.
++fn process_cpu_seconds(pid: u32) -> Option<f64> {
++    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
++    // The command name is in parentheses and may hold spaces, so the fields
++    // after it are found from the last closing parenthesis.
++    let rest = stat.rsplit_once(") ")?.1;
++    let fields: Vec<&str> = rest.split_whitespace().collect();
++    let utime: u64 = fields.get(11)?.parse().ok()?;
++    let stime: u64 = fields.get(12)?.parse().ok()?;
++    Some((utime + stime) as f64 / clock_ticks_per_second() as f64)
++}
++
++/// The clock ticks the kernel counts CPU time in.
++fn clock_ticks_per_second() -> u64 {
++    static TICKS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
++    *TICKS.get_or_init(|| {
++        command_output(None, "getconf", &["CLK_TCK"])
++            .and_then(|value| value.trim().parse().ok())
++            .unwrap_or(100)
++    })
++}
++
+ async fn migrate_while_mutating(
+     workload_client: &HashringClient,
+     admin_client: &HashringClient,
+@@ -1589,11 +2069,11 @@ fn deterministic_value(key: u64, round: u64, value_bytes: usize) -> Vec<u8> {
+ 
+ fn measurement(operations: u64, duration: Duration) -> Measurement {
+     let seconds = duration.as_secs_f64();
+-    Measurement {
++    Measurement::Throughput(ThroughputMeasurement {
+         operations,
+         seconds,
+         operations_per_second: operations as f64 / seconds.max(f64::EPSILON),
+-    }
++    })
+ }
+ 
+ fn spawn_node(
+@@ -1683,7 +2163,7 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
+     }
+     let initial_count = match config.mode {
+         ExperimentMode::Correctness => config.node_count - 1,
+-        ExperimentMode::Performance => config.node_count,
++        ExperimentMode::Performance | ExperimentMode::Latency => config.node_count,
+         ExperimentMode::Availability => 3,
+     };
+     ensure!(
+@@ -1704,6 +2184,21 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
+         usize::try_from(config.key_count).is_ok(),
+         "key_count exceeds the platform address space"
+     );
++    if matches!(config.mode, ExperimentMode::Latency) {
++        ensure!(
++            !config.target_rates.is_empty(),
++            "the latency mode needs at least one target rate"
++        );
++        ensure!(
++            config.target_rates.iter().all(|rate| *rate > 0),
++            "every target rate must be positive"
++        );
++        ensure!(
++            config.duration_seconds > 0,
++            "duration_seconds must be positive"
++        );
++        ensure!(config.max_in_flight > 0, "max_in_flight must be positive");
++    }
+     ensure!(config.concurrency > 0, "concurrency must be positive");
+     ensure!(
+         config.range_move_concurrency > 0 && config.replica_repair_concurrency > 0,
+@@ -1871,7 +2366,10 @@ mod tests {
+         let restored: ExperimentSummary = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+         assert!(!restored.success);
+         assert!(restored.error.unwrap().contains("injected failure"));
+-        assert_eq!(restored.measurements["initial_put"].operations, 10);
++        match &restored.measurements["initial_put"] {
++            Measurement::Throughput(measurement) => assert_eq!(measurement.operations, 10),
++            other => panic!("expected a throughput measurement, got {other:?}"),
++        }
+     }
+ 
+     #[test]
+diff --git a/crates/hashring-node/src/lib.rs b/crates/hashring-node/src/lib.rs
+index db2ab98..7a194c7 100644
+--- a/crates/hashring-node/src/lib.rs
++++ b/crates/hashring-node/src/lib.rs
+@@ -417,6 +417,12 @@ struct NodePressureStats {
+     replication_reservation_rejections: AtomicU64,
+     replication_rpc_retries: AtomicU64,
+     replication_stream_peak_pending: AtomicU64,
++    /// Operations this node served as the owner of a key. The load-balance
++    /// report of the `latency` mode reads them to show where the requests of
++    /// a skewed workload went.
++    ops_get: AtomicU64,
++    ops_put: AtomicU64,
++    ops_delete: AtomicU64,
+ }
+ 
+ struct NodeState {
+diff --git a/crates/hashring-node/src/rpc.rs b/crates/hashring-node/src/rpc.rs
+index 73fd81b..2635820 100644
+--- a/crates/hashring-node/src/rpc.rs
++++ b/crates/hashring-node/src/rpc.rs
+@@ -218,6 +218,7 @@ impl DataNode for DataNodeService {
+                 ..Default::default()
+             }));
+         };
++        self.pressure.ops_get.fetch_add(1, AtomicOrdering::Relaxed);
+         Ok(Response::new(GetResponse {
+             value: record.value.to_vec(),
+             version: Some(record.version.clone()),
+@@ -705,6 +706,7 @@ impl DataNode for DataNodeService {
+         }
+         let record_key: Arc<[u8]> = Arc::from(request.key.as_slice());
+         state.insert_record(record_key.clone(), record.clone());
++        self.pressure.ops_put.fetch_add(1, AtomicOrdering::Relaxed);
+         for source in state
+             .sources
+             .values_mut()
+@@ -1067,6 +1069,9 @@ impl DataNode for DataNodeService {
+         // One allocation shared by the record, its index entry and the receipt.
+         let record_key: Arc<[u8]> = Arc::from(request.key.as_slice());
+         state.apply_record(record_key.clone(), tombstone);
++        self.pressure
++            .ops_delete
++            .fetch_add(1, AtomicOrdering::Relaxed);
+         for source in state
+             .sources
+             .values_mut()
+@@ -1456,6 +1461,12 @@ impl DataNode for DataNodeService {
+                 .pressure
+                 .replication_stream_peak_pending
+                 .load(AtomicOrdering::Relaxed),
++            ops_get: self.pressure.ops_get.load(AtomicOrdering::Relaxed),
++            ops_put: self.pressure.ops_put.load(AtomicOrdering::Relaxed),
++            ops_delete: self.pressure.ops_delete.load(AtomicOrdering::Relaxed),
++            ops_handled: self.pressure.ops_get.load(AtomicOrdering::Relaxed)
++                + self.pressure.ops_put.load(AtomicOrdering::Relaxed)
++                + self.pressure.ops_delete.load(AtomicOrdering::Relaxed),
+         }))
+     }
+ 
+diff --git a/docs/configuration.md b/docs/configuration.md
+index 01c199c..34618e1 100644
+--- a/docs/configuration.md
++++ b/docs/configuration.md
+@@ -113,18 +113,25 @@ replaced during the run.
+ | Flag | YAML key | Default | Scope | Notes |
+ | --- | --- | --- | --- | --- |
+ | `--config` | — | none | process | |
+-| `--mode` | `mode` | `correctness` | experiment | `correctness`, `performance` or `availability`. |
++| `--mode` | `mode` | `correctness` | experiment | `correctness`, `performance`, `availability` or `latency`. |
+ | `--output` | `output` | required | experiment | New or empty directory. |
+ | `--nodes` | `nodes` | 4 for availability, 10 otherwise | experiment | Peak node count. |
+-| `--keys` | `keys` | 20,000 / 1,000,000 / 1,000 by mode | experiment | |
++| `--keys` | `keys` | 20,000 / 1,000,000 / 1,000 by mode | experiment | The `latency` mode reads it as the key count of the run, which is its `--preload-keys`. |
+ | `--value-bytes` | `value_bytes` | 128 | experiment | |
+-| `--concurrency` | `concurrency` | 64 | experiment | |
++| `--concurrency` | `concurrency` | 64 | experiment | The `latency` mode uses it for the preload and the check, not for the load. |
+ | `--operation-timeout-ms` | `operation_timeout_ms` | 30000 | experiment | At most `--receipt-retention-ms`, since mutations stop retrying there. |
+ | `--migration-timeout-ms` | `migration_timeout_ms` | 600000 | experiment | |
+ | `--pre-publish-delay-ms` | `pre_publish_delay_ms` | 250 | experiment | Observation window before each publication. |
+ | `--require-clean-source` | `require_clean_source` | off | experiment | Refuse a run whose source is not one clean commit. |
+ | `--verbose` | `verbose` | off | experiment | |
+ | `--policy` | `policy` | `first-successor` for availability, `owner-only` otherwise | experiment | ACK policy. |
++| `--preload-keys` | `preload_keys` | 100,000 | experiment | `latency` mode only: the keys written before the load, and the key space the load reads and writes. |
++| `--target-rates` | `target_rates` | none | experiment | `latency` mode only: the target rates in operations per second, one stage each. A list in YAML. |
++| `--warmup-seconds` | `warmup_seconds` | 10 | experiment | `latency` mode only: the seconds at the start of every stage that are not counted. |
++| `--duration-seconds` | `duration_seconds` | 60 | experiment | `latency` mode only: the seconds of every stage that are counted. |
++| `--mix` | `mix` | `90:9:1` | experiment | `latency` mode only: the `GET:PUT:DELETE` share of the requests. |
++| `--key-distribution` | `key_distribution` | `zipf:0.99` | experiment | `latency` mode only: `uniform`, `zipf:<theta>`, or `hotspot:<key share>:<traffic share>`. |
++| `--max-in-flight` | `max_in_flight` | 4096 | experiment | `latency` mode only: how many requests may be in flight at once. A request over the limit is dropped and counted as late. |
+ | `--worker-threads` | `worker_threads` | CPUs / (nodes + 2), at least 2 | process | For the driver and each node. |
+ | `--coordinator-worker-threads` | `coordinator_worker_threads` | one per available CPU | process | For the run's coordinator, which is not on the data path. |
+ | `--seed`, `--virtual-nodes`, `--range-move-concurrency`, `--replica-repair-concurrency`, `--prepublication-failure-grace-ms`, `--desired-replication-factor`, `--minimum-admitted-copies`, `--minimum-healthy-followers`, `--max-replica-lag-ms`, `--receipt-retention-ms`, `--lease-duration-ms` | as for `coordinator` | as for `coordinator` | as for `coordinator` | Passed to the run's coordinator. |
+diff --git a/docs/experiments.md b/docs/experiments.md
+index 242a98e..ff04617 100644
+--- a/docs/experiments.md
++++ b/docs/experiments.md
+@@ -11,6 +11,7 @@ For quick-start commands, see the [README](../README.md#experiments).
+ | `correctness` | Starts with 9 nodes and scales to 10 under concurrent rewrites and deletes, keeping a third moving cohort as snapshot sentinels. It then scales back to 9 while restoring or deleting the mutation cohorts, and verifies present and absent keys after every stage. | 20,000 | 10 (peak) |
+ | `performance` | Nominal acceptance profile | 1,000,000 | 10 |
+ | `availability` | Failure and repair: 3 live nodes plus 1 replacement | 1,000 | 4 |
++| `latency` | Open-loop load at a series of target rates, and the latency of that load. See [the latency mode](#the-latency-mode). | 100,000 | 10 |
+ 
+ Every mode defaults to 128-byte values, concurrency 64, seed 1, 128 virtual
+ nodes, and a 30-second operation deadline. The default ACK policy is
+@@ -62,7 +63,14 @@ All modes:
+ - initial-put throughput
+ - sampled latency distributions in microseconds (p50, p95, p99, max) for
+   end-to-end client `PUT` and for direct owner-RPC `PUT`. The direct figure
+-  includes the network hop and owner processing, not only CPU time.
++  includes the network hop and owner processing, not only CPU time. Both are
++  measured on an **idle** cluster, after the workload has finished, so they
++  are a baseline and not the latency under load. The `latency` mode measures
++  the other one.
++  - `idle_client_put_latency_us` and `idle_owner_rpc_put_latency_us` are the
++    names of these two figures. They were `client_put_latency_us` and
++    `owner_rpc_put_latency_us` before the rename that says what the sample
++    is; the older results still use the old names.
+ - `node_pressure_after_initial_put`, recorded per node:
+   - current and peak deduplication receipt store bytes, and its capacity
+   - owner and follower budget rejections
+@@ -70,6 +78,8 @@ All modes:
+   - replication RPC retries
+   - peak pending entries in one replication stream, not counting the RPC in
+     flight
++  - the operations the node served as the owner of a key, by kind, and their
++    sum
+ 
+   The same sample is also logged as a `node_pressure_sampled` event, even when
+   the initial writes fail. Counters are per process and reset when a node
+@@ -86,11 +96,212 @@ Availability mode also records:
+   of at least 1 MiB
+ - time from replacement to full RF
+ 
++The `latency` mode records one measurement per target rate, and its own
++observations. See [the latency mode](#the-latency-mode).
++
+ All of these are local process measurements, not service-level guarantees.
+ 
+ If a concurrent writer fails, the runner records the error and waits for the
+ migration outcome before it writes the summary.
+ 
++## The latency mode
++
++`performance` mode is a closed-loop benchmark: 64 tasks write as fast as they
++can, so a slow cluster makes the clients send less, and the latency it
++reports comes from 128 serial `PUT`s on an idle cluster afterwards. The
++`latency` mode measures the latency of a load that is offered at a fixed rate,
++which is the number a service-level objective is written against.
++
++[`latency-acceptance.md`](latency-acceptance.md) is the run this mode was
++accepted with: what it measured, what the numbers were, and what they are not.
++
++### The open loop
++
++Requests are due at fixed offsets from the start of a stage: request `n` is
++due at `stage start + n / rate`. The sender does not wait for a response
++before it sends the next one, and a request that is late is not delayed
++further to make room for a later one. Two things follow from that:
++
++- A request's latency is measured from the moment it was **due**, not from the
++  moment it was sent. A request that waited in the client counts the waiting,
++  which is what keeps a slow cluster from hiding its own tail.
++- A request that cannot be sent because `--max-in-flight` requests are
++  already in flight is **dropped** and counted as `late`. It is not queued.
++  A cluster that cannot keep up therefore shows a lower achieved rate rather
++  than a longer queue inside the driver, and the offered rate stays the rate
++  the run asked for.
++
++The sender runs on its own thread and waits against the wall clock, with a
++sleep and a short spin, because a runtime timer wakes up about a millisecond
++late. That is longer than the latencies this mode measures, so a runtime
++timer would put a millisecond of the sender's own delay into every request.
++[latency-sender-timing.md](optimizations/latency-sender-timing.md) has the
++measurements.
++
++The sender is not allowed to be the bottleneck. Every second the run records
++how many requests the schedule called for and how many the sender had sent;
++if the sender is behind by more than a twentieth of a second's worth of
++requests, the stage is marked `sender_saturated` and its numbers do not
++describe the cluster.
++
++### Parameters
++
++| Flag | Meaning | Default |
++| --- | --- | --- |
++| `--preload-keys` | The keys written before the load starts, and the key space the load reads and writes. `--keys` names the same count. | 100,000 |
++| `--target-rates` | The target rates in operations per second. Each rate is one stage of the run. | none, so the mode needs at least one |
++| `--warmup-seconds` | The seconds at the start of every stage that are not counted. | 10 |
++| `--duration-seconds` | The seconds of every stage that are counted. | 60 |
++| `--mix` | The `GET:PUT:DELETE` share of the requests. | `90:9:1` |
++| `--key-distribution` | `uniform`, `zipf:<theta>`, or `hotspot:<key share>:<traffic share>`. | `zipf:0.99` |
++| `--max-in-flight` | How many requests may be in flight at once. | 4096 |
++
++The value size is the run's `--value-bytes`, and every other setting is the
++run's own: node count, replication factor, ACK policy, hash seed, virtual
++nodes, and the operation deadline.
++
++The target rates are the input, not the output: measure the capacity with
++`performance` mode first, then offer a share of it. A stage that cannot reach
++its target rate says so.
++
++### What a stage reports
++
++`summary.json` holds one `measurements` entry per target rate, named
++`rate_0`, `rate_1`, and so on:
++
++```jsonc
++"rate_2": {
++  "target_rate": 20000, "achieved_rate": 19998, "seconds": 60,
++  "sender_saturated": false,   // the sender did not keep up with its schedule
++  "issued": 1199880,           // the requests the sender sent
++  "late": 120,                 // the requests it had to drop
++  "ops": { "get": 1079892, "put": 107989, "delete": 11999 },
++  "errors": { "deadline": 0, "not_found": 0, "operation": 0,
++              "protocol": 0, "rpc": 0, "topology": 0 },
++  "retries": 120,               // the times the client had to try again
++  "latency_us": {
++    "get": { "p50": 180, "p95": 600, "p99": 2100, "p999": 8000, "max": 21000, "samples": 1079892 },
++    "put": { ... }, "delete": { ... }
++  },
++  "load_balance": {
++    "per_node": {
++      "node-1": { "owned_keys": 10120, "ops_handled": 120400, "cpu_percent": 61.0 }
++    },
++    "owned_keys_max_over_mean": 1.08, "owned_keys_cv": 0.04,
++    "ops_handled_max_over_mean": 1.31, "ops_handled_cv": 0.12
++  }
++}
++```
++
++The `errors` map counts failures by reason. `deadline` is a request that ran
++out of its operation deadline, `operation` is a request the cluster refused,
++`rpc` is a request whose transport failed, `topology` is a request the
++client could not route, and `protocol` is a response the client could not
++read. `not_found` is a read of a key that is not there, which is an outcome
++of the workload and not a failure of the cluster. The map holds all six
++reasons in every window and every stage, with a zero for the ones that did
++not occur, so a reader finds the same keys in every run.
++
++The `ops` map counts the operations that **succeeded**, and the `errors` map
++counts the ones that did not. The latency histogram holds every request that
++came back, so its `samples` is the sum of the two, and a request that failed
++is in the histogram with the latency it took to fail.
++
++`issued` and `late` do not overlap: a request the in-flight limit dropped was
++never sent, so `ops` and `errors` add up to `issued`. A stage that does not
++add up is a bug in the measurement, so the run fails with an error rather
++than report a rate that is quietly short.
++
++A request that fails after the client has tried it again is counted under the
++reason it failed with, and the tries themselves are in `retries`. There is no
++separate "the retries ran out" reason, because a client that gives up fails
++with a deadline or with a transport error, and counting it twice would make
++the map harder to read.
++
++The load balance has two layers. `owned_keys` is how the key space was
++divided: the number of keys each node owns, counted over the key space
++itself. `ops_handled` and `cpu_percent` are how the requests were divided:
++the operations each node served while the stage ran, and the share of one
++core it used. `max_over_mean` is the largest value divided by the mean, and
++`cv` is the standard deviation divided by the mean.
++
++The measurements of a latency run hold the rate stages and nothing else: the
++preload and the read that checks it are in the `observations`, under
++`initial_put` and `initial_get_verify`.
++
++### The events
++
++`events.jsonl` holds one `metrics_sampled` event per second of every stage,
++the warmup included:
++
++```jsonc
++{
++  "event": "metrics_sampled",
++  "unix_ms": 1791998161278,
++  "fields": {
++    "stage": "rate_2", "warmup": false, "window_ms": 1000,
++    "target_rate": 20000, "issued": 19990, "late": 10, "behind": 0,
++    "ops": { "get": 17980, "put": 1810, "delete": 200 },
++    "errors": { "deadline": 0, "not_found": 0, "operation": 0,
++                "protocol": 0, "rpc": 0, "topology": 0 },
++    "retries": 12,
++    "epoch": 1,
++    "latency_us": { "get": { "p50": 180, "p95": 600, "p99": 2100, "max": 9800 } }
++  }
++}
++```
++
++`behind` is how many requests the schedule had called for and the sender had
++not dealt with yet, neither sent nor dropped. It is zero when the sender keeps
++up. A request the in-flight limit dropped is not behind: the sender dealt
++with it, and the cluster is the one that could not keep up.
++
++`retries` is how many times the client had to try a request again in that
++window, and `epoch` is the topology epoch it routed with. A window with
++retries is a window the cluster was not answering at once.
++
++Every mode, not only `latency`, writes a `topology_published` event when the
++cluster is ready, after every topology change, and at the end of the run. Its
++`fields` are the output of `hashring-rs topology`, so a run that has ended can
++still be read: the ring of every epoch is in the event log, and a reader does
++not have to ask a coordinator that is gone.
++
++### The key space after the load
++
++The load leaves a key space behind, and the run checks it before it writes
++its summary. Every key the load did not delete must still hold the value the
++preload wrote, and every key it did delete must be gone.
++
++A delete and a write to the same key race each other, and the outcome of the
++race is not known, so the load deletes from a **pool of its own**: the last
++few percent of the key space, which no read and no write ever touches. A
++delete therefore never races another operation on the same key, and the
++expected state of every key is known. The pool is as large as the run's
++deletes need, and never more than half of the key space; the sizes are in the
++`latency_delete_pool_keys` observation.
++
++Every write stores the same value for a key, the one the preload wrote, so two
++writes to the same key cannot disagree about what the key holds.
++
++The check itself is in the `latency_verified_keys` observation, and a run that
++fails it fails.
++
++### Reading the numbers
++
++- A stage whose `sender_saturated` is true does not describe the cluster. The
++  sender could not keep up, so the offered rate was not the requested one.
++- The `latency` mode's `achieved_rate` is the operations that **succeeded**,
++  divided by the length of the stage. The requests the sender dropped are in
++  `late`, and the requests that failed are in `errors`.
++- The percentiles come from a histogram that keeps every request, so they are
++  the percentiles of the whole stage and not of a sample of it. The histogram
++  has three significant figures, so its `max` is the upper bound of the
++  bucket the largest value falls in, a little above the value itself.
++- The `idle_*` figures of the other modes and the `latency` mode's figures
++  answer different questions. The first is how fast a request goes when
++  nothing else is happening; the second is how fast it goes when the cluster
++  is at the rate the stage asked for.
++
+ ## Diagnostics and profiling
+ 
+ `--verbose` prints client retry reasons to the experiment's stderr and adds
+diff --git a/docs/optimizations/latency-sender-timing.md b/docs/optimizations/latency-sender-timing.md
+new file mode 100644
+index 0000000..9341988
+--- /dev/null
++++ b/docs/optimizations/latency-sender-timing.md
+@@ -0,0 +1,81 @@
++# The latency mode's sender cannot use a runtime timer
++
++The `latency` mode measures the latency of a load that is offered at a fixed
++rate. Every request's latency starts at the moment it was **due**, not at the
++moment it was sent, so a slow cluster cannot hide its tail behind a delayed
++send. That makes the sender's own timing part of the measurement: if the
++sender wakes up late, every request carries that delay, and the number the
++run reports is the sender's delay plus the cluster's.
++
++The first version of the sender used `tokio::time::sleep_until`, one sleep per
++request. It produced numbers that were plausible and wrong: at 500 operations
++per second it reported a p50 of 1493 us for a `GET`, and the p50 barely moved
++between 200 and 20000 operations per second. The cluster's round trip is
++tens of microseconds, so a p50 of 1493 us was the sender, not the cluster.
++
++## What the timer does
++
++Measured on this host, 200 sleeps per interval, the overshoot of each wake-up
++against the deadline it was given:
++
++| Wait | interval | p50 | p90 | max |
++| --- | --- | --- | --- | --- |
++| `tokio::time::sleep_until` | 50 us | 847 us | 1297 us | 1604 us |
++| `tokio::time::sleep_until` | 1 ms | 733 us | 1156 us | 2116 us |
++| `tokio::time::sleep_until` | 5 ms | 762 us | 1162 us | 1252 us |
++| `std::thread::sleep` | 50 us | 52 us | 53 us | 57 us |
++| `std::thread::sleep` | 5 ms | 56 us | 64 us | 412 us |
++| `std::thread::sleep` + spin | 50 us | 0 us | 0 us | 67 us |
++| `std::thread::sleep` + spin | 5 ms | 0 us | 0 us | 660 us |
++
++The runtime timer is a millisecond-granularity wheel, so its wake-up is late
++by about three quarters of a millisecond whatever the deadline was. The
++kernel's own timer is late by about 50 us, and a spin for the last few
++microseconds removes even that.
++
++The overshoot does not accumulate: the sender sleeps until the **absolute**
++deadline of the next request, so a late wake-up does not push the schedule
++forward. That is why the offered rate was right and only the latency was
++wrong. At a 50 us interval the rate itself is off by 6%, because there the
++overshoot is a fifth of the interval.
++
++## What the sender does now
++
++The sender runs on a thread of its own, outside the runtime, and waits against
++the wall clock in two parts: a sleep that ends a little before the deadline,
++and a spin for the rest. The margin is the overshoot the last sleep showed,
++plus 20 us, so the spin stays short whatever the host's timer does. A request
++is handed to the runtime only once it is due, and the runtime's own wake-up
++then adds its few microseconds to the request's latency.
++
++The cost of the spin is bounded by the margin, not by the interval, so it is
++about 20 us per request: a fifth of a core at 10000 operations per second.
++
++## What it bought
++
++The same run, 3 nodes, 128-byte values, `GET:PUT:DELETE` of `90:9:1`:
++
++| | p50 `GET` | p99 `GET` | max `GET` |
++| --- | --- | --- | --- |
++| runtime timer | 1493 us | 2223 us | 2767 us |
++| dedicated thread | 142 us | 589 us | 1642 us |
++
++The p50 fell by a factor of ten and the number now means something: the
++latencies a cluster is judged by are tens of microseconds, and an instrument
++that is a millisecond late cannot measure them.
++
++The rule this leaves behind: a measurement that resolves microseconds needs a
++clock that is not a millisecond wide, and the cost of that clock is part of
++the measurement budget.
++
++## Trade-offs
++
++- The sender needs a thread of its own, so a phase cannot be driven from a
++  plain async task. The requests themselves still run on the runtime.
++- The spin holds a core for a few microseconds per request. At 10000
++  operations per second that is about a fifth of a core, and it competes with
++  the nodes for the host, which is the same tradeoff every accurate load
++  generator makes.
++- The margin adapts to the host's timer, so the sender behaves the same on a
++  host with a coarse timer and on one with a fine timer, at the cost of a
++  margin that is only right after the first sleep.
+diff --git a/docs/optimizations/network-rtt-sensitivity.md b/docs/optimizations/network-rtt-sensitivity.md
+index f491793..6c49745 100644
+--- a/docs/optimizations/network-rtt-sensitivity.md
++++ b/docs/optimizations/network-rtt-sensitivity.md
+@@ -43,7 +43,9 @@ the next section, and the conclusions below lean on it accordingly.
+ `client_put_latency_us` is the experiment's own sample of 128 puts issued **one at a
+ time** after the initial verify, on an otherwise quiet cluster
+ (`crates/hashring-experiment/src/lib.rs:613`). It is a single-operation, unloaded
+-latency, not the latency under `--concurrency`.
++latency, not the latency under `--concurrency`. The field is now called
++`idle_client_put_latency_us`, because the name says what the sample is; the runs
++below predate the rename.
+ 
+ That is usually a defect and here it is the point. Its slope against RTT is a
+ difference, so the queueing that `--concurrency` adds cancels out of it, and what
+diff --git a/examples/experiment.yaml b/examples/experiment.yaml
+index e17e420..a53467b 100644
+--- a/examples/experiment.yaml
++++ b/examples/experiment.yaml
+@@ -31,6 +31,16 @@ policy: first-successor
+ # worker_threads: 2   # default: CPUs / (nodes + 2), at least 2
+ # coordinator_worker_threads: 4   # default: one per available CPU
+ 
++# The `latency` mode only. The load is offered at a fixed rate, and every
++# rate is one stage of the run.
++# preload_keys: 100000   # the keys written before the load, and its key space
++# target_rates: [5000, 10000, 20000]   # operations per second
++# warmup_seconds: 10   # the start of every stage that is not counted
++# duration_seconds: 60  # the length of every stage that is counted
++# mix: "90:9:1"   # the GET:PUT:DELETE share of the requests
++# key_distribution: zipf:0.99   # uniform, zipf:<theta>, hotspot:<keys>:<traffic>
++# max_in_flight: 4096   # a request over the limit is dropped, not queued
++
+ # Forwarded to every data node the run starts; see the node flags.
+ max_dedup_bytes: 134217728              # 128 MiB
+ max_value_bytes: 8388608                # 8 MiB
+diff --git a/scripts/latency-sweep.sh b/scripts/latency-sweep.sh
+new file mode 100755
+index 0000000..bb7ef24
+--- /dev/null
++++ b/scripts/latency-sweep.sh
+@@ -0,0 +1,244 @@
++#!/usr/bin/env bash
++# latency-sweep.sh — the acceptance run of the `latency` experiment mode.
++#
++# What it does
++# ------------
++#   1. Measures the capacity of the cluster with `performance` mode, which is
++#      the closed-loop write throughput.
++#   2. Runs the `latency` mode at a series of target rates, for every key
++#      distribution, and repeats the whole thing, so every number has an
++#      error bar.
++#   3. Runs the same load at a series of virtual node counts, to see how
++#      evenly the ring divides the key space.
++#
++# Why the rates are a share of the capacity
++# -----------------------------------------
++#   The target rate is the input of a run, not its output. A rate above what
++#      the cluster can do does not measure the cluster, it measures the
++#      driver, so the rates are a share of what `performance` mode measured.
++#      The shares are 0.25, 0.5, 0.75 and 0.9, and the ladder afterwards
++#      shows where the mode actually gives up.
++#
++# The repetitions are interleaved
++# -------------------------------
++#   The distributions are run in the order uniform, zipf, uniform, zipf, ...
++#      so a machine that drifts over the half hour of the campaign moves both
++#      groups in the same direction, instead of moving one group and then the
++#      other.
++#
++# Usage
++# -----
++#   ./scripts/latency-sweep.sh
++#   REPS=5 ./scripts/latency-sweep.sh
++#   RATES="5000 10000 20000" ./scripts/latency-sweep.sh     # skip the capacity run
++#   DISTRIBUTIONS="uniform" ./scripts/latency-sweep.sh
++#   LADDER=0 ./scripts/latency-sweep.sh
++#   SKIP_CAMPAIGN=1 ./scripts/latency-sweep.sh               # only the ladder and the rings
++#   FIRST_REP=3 REPS=5 ./scripts/latency-sweep.sh            # start the repetitions at three
++#   SKIP_VNODES=1 ./scripts/latency-sweep.sh                  # no virtual node comparison
++#   OUT_DIR=results/latency-acceptance-20261022-002702 ./scripts/latency-sweep.sh
++#
++# Output
++# ------
++#   results/latency-acceptance-<timestamp>/   the experiment output
++#   docs/data/latency-acceptance/*.tsv       one row per stage, and the
++#                                             medians over the repetitions
++
++set -euo pipefail
++
++BINARY="${BINARY:-target/release/hashring-rs}"
++NODES="${NODES:-10}"
++REPLICATION_FACTOR="${REPLICATION_FACTOR:-3}"
++POLICY="${POLICY:-owner-only}"
++VALUE_BYTES="${VALUE_BYTES:-128}"
++PRELOAD_KEYS="${PRELOAD_KEYS:-100000}"
++MIX="${MIX:-90:9:1}"
++WARMUP="${WARMUP:-10}"
++DURATION="${DURATION:-60}"
++REPS="${REPS:-3}"
++FIRST_REP="${FIRST_REP:-1}"
++DISTRIBUTIONS="${DISTRIBUTIONS:-uniform zipf:0.99}"
++VNODES="${VNODES:-16 64 128 256}"
++VNODE_RATES="${VNODE_RATES:-}"
++LADDER="${LADDER:-1}"
++LADDER_WARMUP="${LADDER_WARMUP:-3}"
++LADDER_DURATION="${LADDER_DURATION:-10}"
++LADDER_RATES="${LADDER_RATES:-}"
++DATA_DIR="${DATA_DIR:-docs/data/latency-acceptance}"
++OPERATION_TIMEOUT_MS="${OPERATION_TIMEOUT_MS:-30000}"
++MIGRATION_TIMEOUT_MS="${MIGRATION_TIMEOUT_MS:-600000}"
++
++if [[ ! -x "$BINARY" ]]; then
++  echo "error: '$BINARY' not found; run 'cargo build --release' first." >&2
++  exit 1
++fi
++
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
++cd "$PROJECT_ROOT"
++
++EXTRACT="${EXTRACT:-$PROJECT_ROOT/docs/data/latency-acceptance/extract.py}"
++
++OUT_DIR="${OUT_DIR:-results/latency-acceptance-$(date +%Y%m%d-%H%M%S)}"
++mkdir -p "$OUT_DIR"
++DATA_OUT="$DATA_DIR/$(basename "$OUT_DIR")"
++mkdir -p "$DATA_OUT"
++
++# The host the numbers were measured on. A latency number without the host it
++# came from is not a measurement.
++{
++  echo "date: $(date -Is)"
++  echo "uname: $(uname -a)"
++  echo "cpus: $(nproc)"
++  echo "memory_total_kb: $(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
++  echo "memory_available_kb: $(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
++  echo "load: $(cat /proc/loadavg)"
++  echo "binary_sha256: $(sha256sum "$BINARY" | cut -d' ' -f1)"
++  echo "git_commit: $(git rev-parse --short HEAD)"
++  echo "git_changed_files: $(git status --porcelain | wc -l)"
++  echo "cargo: $(cargo --version)"
++  echo "rustc: $(rustc --version)"
++} > "$DATA_OUT/host.txt"
++cat "$DATA_OUT/host.txt"
++
++run_experiment() {
++  local out="$1"
++  shift
++  rm -rf "$out"
++  echo "  -> $out"
++  "$BINARY" experiment --output "$out" "$@" > "$out.log" 2>&1 || {
++    echo "  FAILED, see $out.log" >&2
++    tail -20 "$out.log" >&2
++    return 1
++  }
++}
++
++# The flag takes a list, and the list is kept space separated here.
++as_list() {
++  echo "${1// /,}"
++}
++
++# The capacity of the cluster, and the rates that follow from it.
++capacity=0
++if [[ -z "${RATES:-}" ]]; then
++  echo "== capacity, performance mode"
++  run_experiment "$OUT_DIR/capacity" \
++    --mode performance \
++    --nodes "$NODES" \
++    --desired-replication-factor "$REPLICATION_FACTOR" \
++    --policy "$POLICY" \
++    --value-bytes "$VALUE_BYTES" \
++    --keys "$PRELOAD_KEYS" \
++    --operation-timeout-ms "$OPERATION_TIMEOUT_MS" \
++    --migration-timeout-ms "$MIGRATION_TIMEOUT_MS"
++  capacity="$(python3 - "$OUT_DIR/capacity/summary.json" << 'PY'
++import json, sys
++summary = json.load(open(sys.argv[1]))
++print(int(summary["measurements"]["initial_put"]["operations_per_second"]))
++PY
++)"
++  echo "  capacity: $capacity ops/s"
++  RATES="$(python3 - "$capacity" << 'PY'
++import sys
++capacity = int(sys.argv[1])
++print(" ".join(str(int(capacity * share)) for share in (0.25, 0.5, 0.75, 0.9)))
++PY
++)"
++fi
++echo "  rates: $RATES"
++
++# The campaign itself.
++if [[ "${SKIP_CAMPAIGN:-0}" == "1" ]]; then
++  echo "  skipped"
++else
++  for ((rep = FIRST_REP; rep <= REPS; rep++)); do
++    for distribution in $DISTRIBUTIONS; do
++      group="${distribution//[:.]/-}"
++      echo "== rep $rep, $distribution"
++      run_experiment "$OUT_DIR/$group-rep$rep" \
++        --mode latency \
++        --nodes "$NODES" \
++        --desired-replication-factor "$REPLICATION_FACTOR" \
++        --policy "$POLICY" \
++        --value-bytes "$VALUE_BYTES" \
++        --preload-keys "$PRELOAD_KEYS" \
++        --target-rates "$(as_list "$RATES")" \
++        --warmup-seconds "$WARMUP" \
++        --duration-seconds "$DURATION" \
++        --mix "$MIX" \
++        --key-distribution "$distribution" \
++        --virtual-nodes 128 \
++        --operation-timeout-ms "$OPERATION_TIMEOUT_MS" \
++        --migration-timeout-ms "$MIGRATION_TIMEOUT_MS"
++    done
++  done
++fi
++# Where the mode gives up. The capacity run measures the write path, and the
++# campaign's mix is mostly reads, so the knee of the curve is somewhere the
++# capacity run cannot see.
++if [[ "$LADDER" == "1" ]]; then
++  if [[ -z "$LADDER_RATES" ]]; then
++    LADDER_RATES="$(python3 - "$capacity" << 'PY'
++import sys
++capacity = int(sys.argv[1]) if sys.argv[1] else 20000
++print(" ".join(str(int(capacity * share)) for share in (1.0, 1.5, 2.0, 3.0)))
++PY
++)"
++  fi
++  echo "== ladder, $LADDER_RATES"
++  run_experiment "$OUT_DIR/ladder" \
++    --mode latency \
++    --nodes "$NODES" \
++    --desired-replication-factor "$REPLICATION_FACTOR" \
++    --policy "$POLICY" \
++    --value-bytes "$VALUE_BYTES" \
++    --preload-keys "$PRELOAD_KEYS" \
++    --target-rates "$(as_list "$LADDER_RATES")" \
++    --warmup-seconds "$LADDER_WARMUP" \
++    --duration-seconds "$LADDER_DURATION" \
++    --mix "$MIX" \
++    --key-distribution uniform \
++    --virtual-nodes 128 \
++    --operation-timeout-ms "$OPERATION_TIMEOUT_MS" \
++    --migration-timeout-ms "$MIGRATION_TIMEOUT_MS"
++fi
++
++# The virtual node comparison. The key space is what the ring divides, so the
++# rates only have to be high enough to show the request distribution too.
++if [[ -z "$VNODE_RATES" ]]; then
++  VNODE_RATES="$(python3 - "$RATES" << 'PY'
++import sys
++rates = [int(rate) for rate in sys.argv[1].split()]
++print(" ".join(str(rate) for rate in (rates[0], rates[len(rates) // 2])))
++PY
++)"
++fi
++for vnodes in $VNODES; do
++  if [[ "${SKIP_VNODES:-0}" == "1" ]]; then
++    break
++  fi
++  echo "== virtual nodes $vnodes"
++  run_experiment "$OUT_DIR/vnodes-$vnodes" \
++    --mode latency \
++    --nodes "$NODES" \
++    --desired-replication-factor "$REPLICATION_FACTOR" \
++    --policy "$POLICY" \
++    --value-bytes "$VALUE_BYTES" \
++    --preload-keys "$PRELOAD_KEYS" \
++    --target-rates "$(as_list "$VNODE_RATES")" \
++    --warmup-seconds "$WARMUP" \
++    --duration-seconds "$DURATION" \
++    --mix "$MIX" \
++    --key-distribution uniform \
++    --virtual-nodes "$vnodes" \
++    --operation-timeout-ms "$OPERATION_TIMEOUT_MS" \
++    --migration-timeout-ms "$MIGRATION_TIMEOUT_MS"
++done
++
++echo "== extracting"
++python3 "$EXTRACT" "$OUT_DIR" > "$DATA_OUT/stages.tsv"
++python3 "$EXTRACT" --medians "$OUT_DIR" > "$DATA_OUT/medians.tsv"
++cp "$DATA_OUT/host.txt" "$DATA_DIR/host.txt"
++echo "  $DATA_OUT/stages.tsv"
++echo "  $DATA_OUT/medians.tsv"
++echo "done"
+diff --git a/scripts/netem-sweep.sh b/scripts/netem-sweep.sh
+index 2fec810..9e65dc3 100755
+--- a/scripts/netem-sweep.sh
++++ b/scripts/netem-sweep.sh
+@@ -60,14 +60,16 @@
+ #
+ # Reading the latency column
+ # --------------------------
+-#   `client_put_latency_us` comes from the experiment's own sample of 128 puts
+-#   issued one at a time right after the initial verify, on an otherwise quiet
+-#   cluster (crates/hashring-experiment/src/lib.rs:613). It is therefore a
++#   `idle_client_put_latency_us` comes from the experiment's own sample of 128
++#   puts issued one at a time right after the initial verify, on an otherwise
++#   quiet cluster (crates/hashring-experiment/src/lib.rs:613). It is therefore a
+ #   *single-op, unloaded* latency, not the latency under --concurrency. That
+ #   makes its slope against RTT the cleanest quantity here: it is the number of
+ #   round trips the write path serializes on, with no queueing folded in. It
+ #   also means the in-flight column, which multiplies throughput by this p50, is
+ #   an estimate under Little's law with the wrong latency, not a measurement.
++#   The field was called `client_put_latency_us` before the rename that says
++#   the sample is of an idle cluster; the older results still use that name.
+ #
+ # Usage
+ # -----
+@@ -284,7 +286,18 @@ def rate(name):
+ 
+ 
+ def pct(block, key):
+-    return (o.get(block) or {}).get(key) or 0
++    value = (o.get(block) or {}).get(key) or 0
++    if value:
++        return value
++    # The idle-latency fields were renamed, so the results that predate the
++    # rename still hold the old names.
++    legacy = {
++        'idle_client_put_latency_us': 'client_put_latency_us',
++        'idle_owner_rpc_put_latency_us': 'owner_rpc_put_latency_us',
++    }.get(block)
++    if legacy:
++        return (o.get(legacy) or {}).get(key) or 0
++    return 0
+ 
+ 
+ pressure = o.get('node_pressure_after_initial_put') or {}
+@@ -308,10 +321,10 @@ print('\t'.join(str(x) for x in [
+     rate('initial_get_verify'),
+     seconds('scale_out_with_mutations'),
+     seconds('scale_in_with_mutations'),
+-    pct('client_put_latency_us', 'p50'),
+-    pct('client_put_latency_us', 'p95'),
+-    pct('client_put_latency_us', 'p99'),
+-    pct('owner_rpc_put_latency_us', 'p50'),
++    pct('idle_client_put_latency_us', 'p50'),
++    pct('idle_client_put_latency_us', 'p95'),
++    pct('idle_client_put_latency_us', 'p99'),
++    pct('idle_owner_rpc_put_latency_us', 'p50'),
+     o.get('initial_full_rf_seconds') or 0,
+     tot('replication_reservation_rejections'),
+     tot('replication_rpc_retries'),
+diff --git a/src/config/experiment.rs b/src/config/experiment.rs
+index 14fc96a..6d1ca21 100644
+--- a/src/config/experiment.rs
++++ b/src/config/experiment.rs
+@@ -25,6 +25,18 @@ pub const DEFAULT_VIRTUAL_NODES: u32 = 128;
+ pub const DEFAULT_OPERATION_TIMEOUT_MS: u64 = 30_000;
+ pub const DEFAULT_MIGRATION_TIMEOUT_MS: u64 = 600_000;
+ pub const DEFAULT_PRE_PUBLISH_DELAY_MS: u64 = 250;
++/// The keys the `latency` mode writes before its load starts.
++pub const DEFAULT_PRELOAD_KEYS: u64 = 100_000;
++/// The seconds at the start of every `latency` stage that are not counted.
++pub const DEFAULT_WARMUP_SECONDS: u64 = 10;
++/// The seconds of every `latency` stage that are counted.
++pub const DEFAULT_DURATION_SECONDS: u64 = 60;
++/// The `GET:PUT:DELETE` share of the `latency` mode's requests.
++pub const DEFAULT_MIX: &str = "90:9:1";
++/// How the `latency` mode picks the key of a request.
++pub const DEFAULT_KEY_DISTRIBUTION: &str = "zipf:0.99";
++/// How many requests the `latency` mode may have in flight at once.
++pub const DEFAULT_MAX_IN_FLIGHT: usize = 4096;
+ 
+ #[derive(Debug, Default, Deserialize)]
+ #[serde(deny_unknown_fields, default)]
+@@ -55,6 +67,13 @@ pub struct ExperimentFile {
+     pub policy: Option<PolicyArg>,
+     pub worker_threads: Option<NonZeroUsize>,
+     pub coordinator_worker_threads: Option<NonZeroUsize>,
++    pub preload_keys: Option<u64>,
++    pub target_rates: Option<Vec<u64>>,
++    pub warmup_seconds: Option<u64>,
++    pub duration_seconds: Option<u64>,
++    pub mix: Option<String>,
++    pub key_distribution: Option<String>,
++    pub max_in_flight: Option<usize>,
+     pub max_dedup_bytes: Option<usize>,
+     pub max_value_bytes: Option<usize>,
+     pub max_pending_replication_bytes: Option<usize>,
+@@ -105,23 +124,40 @@ pub fn resolve(
+         .unwrap_or(ExperimentModeArg::Correctness)
+         .into();
+     let node_count = args.nodes.or(file.nodes).unwrap_or(match mode {
+-        ExperimentMode::Correctness | ExperimentMode::Performance => 10,
++        ExperimentMode::Correctness | ExperimentMode::Performance | ExperimentMode::Latency => 10,
+         ExperimentMode::Availability => 4,
+     });
+     let policy = args.policy.or(file.policy).unwrap_or(match mode {
+         ExperimentMode::Availability => PolicyArg::FirstSuccessor,
+         _ => PolicyArg::OwnerOnly,
+     });
++    // The `latency` mode writes its keys before the load starts and the load
++    // reads and writes the same keys, so the preload count is the key space
++    // of the run. `--keys` names the same count there.
++    let preload_keys = args.preload_keys.or(file.preload_keys);
++    let key_count = match mode {
++        ExperimentMode::Latency => preload_keys
++            .or(args.keys)
++            .or(file.keys)
++            .unwrap_or(DEFAULT_PRELOAD_KEYS),
++        _ => args.keys.or(file.keys).unwrap_or(match mode {
++            ExperimentMode::Correctness => 20_000,
++            ExperimentMode::Performance => 1_000_000,
++            ExperimentMode::Availability => 1_000,
++            ExperimentMode::Latency => DEFAULT_PRELOAD_KEYS,
++        }),
++    };
++    let target_rates = if args.target_rates.is_empty() {
++        file.target_rates.clone().unwrap_or_default()
++    } else {
++        args.target_rates.clone()
++    };
+ 
+     Ok(ExperimentConfig {
+         mode,
+         output_dir,
+         node_count,
+-        key_count: args.keys.or(file.keys).unwrap_or(match mode {
+-            ExperimentMode::Correctness => 20_000,
+-            ExperimentMode::Performance => 1_000_000,
+-            ExperimentMode::Availability => 1_000,
+-        }),
++        key_count,
+         value_bytes: args
+             .value_bytes
+             .or(file.value_bytes)
+@@ -196,6 +232,33 @@ pub fn resolve(
+             .or(file.lease_duration_ms)
+             .unwrap_or(DEFAULT_LEASE_DURATION_MILLIS),
+         write_ack_policy: policy.into(),
++        preload_keys: match mode {
++            ExperimentMode::Latency => Some(key_count),
++            _ => None,
++        },
++        target_rates,
++        warmup_seconds: args
++            .warmup_seconds
++            .or(file.warmup_seconds)
++            .unwrap_or(DEFAULT_WARMUP_SECONDS),
++        duration_seconds: args
++            .duration_seconds
++            .or(file.duration_seconds)
++            .unwrap_or(DEFAULT_DURATION_SECONDS),
++        mix: args
++            .mix
++            .clone()
++            .or(file.mix)
++            .unwrap_or(DEFAULT_MIX.to_owned()),
++        key_distribution: args
++            .key_distribution
++            .clone()
++            .or(file.key_distribution)
++            .unwrap_or(DEFAULT_KEY_DISTRIBUTION.to_owned()),
++        max_in_flight: args
++            .max_in_flight
++            .or(file.max_in_flight)
++            .unwrap_or(DEFAULT_MAX_IN_FLIGHT),
+         node: node::options(&node_settings),
+     })
+ }
+@@ -228,7 +291,7 @@ mod tests {
+         let mut argv = vec!["hashring-rs", "experiment"];
+         argv.extend_from_slice(extra);
+         match Cli::try_parse_from(argv).unwrap().command {
+-            Command::Experiment(args) => args,
++            Command::Experiment(args) => *args,
+             _ => unreachable!(),
+         }
+     }
+diff --git a/src/main.rs b/src/main.rs
+index fa86d37..c871ec0 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -71,7 +71,10 @@ enum Command {
+     #[cfg(feature = "redis-lua-experimental")]
+     RedisLuaExperimentalGateway(ExperimentalGatewayArgs),
+     /// Run a reproducible separate-process correctness or performance experiment.
+-    Experiment(ExperimentArgs),
++    ///
++    /// The experiment takes more settings than the other commands, so it is
++    /// boxed to keep the enum small.
++    Experiment(Box<ExperimentArgs>),
+ }
+ 
+ #[derive(Args)]
+@@ -373,6 +376,7 @@ enum ExperimentModeArg {
+     Correctness,
+     Performance,
+     Availability,
++    Latency,
+ }
+ 
+ impl From<ExperimentModeArg> for ExperimentMode {
+@@ -381,6 +385,7 @@ impl From<ExperimentModeArg> for ExperimentMode {
+             ExperimentModeArg::Correctness => ExperimentMode::Correctness,
+             ExperimentModeArg::Performance => ExperimentMode::Performance,
+             ExperimentModeArg::Availability => ExperimentMode::Availability,
++            ExperimentModeArg::Latency => ExperimentMode::Latency,
+         }
+     }
+ }
+@@ -475,6 +480,36 @@ struct ExperimentArgs {
+     /// Tokio worker threads for the run's coordinator. [default: one per CPU]
+     #[arg(long)]
+     coordinator_worker_threads: Option<NonZeroUsize>,
++    /// The keys the latency mode writes before its load starts, and the key
++    /// space its load reads and writes. [default: 100000]
++    #[arg(long)]
++    preload_keys: Option<u64>,
++    /// The target rates of the latency mode, in operations per second. Each
++    /// rate is one stage of the run. [default: none, so the mode needs at
++    /// least one]
++    #[arg(long, value_delimiter = ',')]
++    target_rates: Vec<u64>,
++    /// The seconds at the start of every latency stage that are not counted.
++    /// [default: 10]
++    #[arg(long)]
++    warmup_seconds: Option<u64>,
++    /// The seconds of every latency stage that are counted. [default: 60]
++    #[arg(long)]
++    duration_seconds: Option<u64>,
++    /// The GET:PUT:DELETE share of the latency mode's requests. [default:
++    /// 90:9:1]
++    #[arg(long)]
++    mix: Option<String>,
++    /// How the latency mode picks the key of a request: `uniform`,
++    /// `zipf:<theta>`, or `hotspot:<key share>:<traffic share>`. [default:
++    /// zipf:0.99]
++    #[arg(long)]
++    key_distribution: Option<String>,
++    /// How many requests the latency mode may have in flight at once. A
++    /// request that would exceed the limit is not sent and is counted as late.
++    /// [default: 4096]
++    #[arg(long)]
++    max_in_flight: Option<usize>,
+     /// Forwarded to every data node the run starts.
+     #[command(flatten)]
+     node_tuning: NodeTuningArgs,
+@@ -492,7 +527,7 @@ fn main() -> Result<()> {
+             init_tracing(config.verbose)?;
+             hashring_core::rpc_profile::start_reporter("driver");
+             return build_runtime(Some(config.worker_threads))?
+-                .block_on(run_local_experiment(config));
++                .block_on(run_experiment_command(config));
+         }
+         Command::Node(args) => {
+             let file = args.config.as_deref().map(config::load).transpose()?;
+@@ -641,6 +676,53 @@ async fn run_local_experiment(config: ExperimentConfig) -> Result<()> {
+     Ok(())
+ }
+ 
++/// Runs an experiment, and stops it when the process is asked to stop.
++///
++/// The experiment starts a coordinator and a node per member as child
++/// processes. They are killed when the experiment's own value is dropped, and
++/// a signal ends the process without running any destructor, so a run that is
++/// interrupted would leave its nodes behind, holding their ports and their
++/// memory. The signal is awaited here instead, so the children are stopped
++/// with their parent.
++async fn run_experiment_command(config: ExperimentConfig) -> Result<()> {
++    tokio::select! {
++        result = run_local_experiment(config) => result,
++        _ = stop_signal() => {
++            // The experiment's own value is dropped here, which stops the
++            // nodes it started.
++            Err(anyhow::anyhow!("the experiment was interrupted"))
++        }
++    }
++}
++
++/// Waits for the process to be asked to stop.
++async fn stop_signal() {
++    #[cfg(unix)]
++    {
++        let mut terminate =
++            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
++                Ok(signal) => Some(signal),
++                Err(error) => {
++                    tracing::error!(%error, "failed to install the terminate handler");
++                    None
++                }
++            };
++        tokio::select! {
++            _ = tokio::signal::ctrl_c() => {}
++            _ = async {
++                match terminate.as_mut() {
++                    Some(signal) => { signal.recv().await; }
++                    None => std::future::pending().await,
++                }
++            } => {}
++        }
++    }
++    #[cfg(not(unix))]
++    {
++        let _ = tokio::signal::ctrl_c().await;
++    }
++}
++
+ async fn run_coordinator(
+     settings: CoordinatorSettings,
+     pre_publish_delay_ms: u64,
+diff --git a/tests/process_cluster/experiment.rs b/tests/process_cluster/experiment.rs
+index 163b7ee..d4f5bba 100644
+--- a/tests/process_cluster/experiment.rs
++++ b/tests/process_cluster/experiment.rs
+@@ -43,7 +43,7 @@ async fn experiment_runner_preserves_reproducibility_artifacts() {
+             .unwrap();
+     assert_eq!(manifest["config"]["node_count"], 4);
+     assert_eq!(manifest["config"]["key_count"], 300);
+-    assert_eq!(manifest["schema_version"], 5);
++    assert_eq!(manifest["schema_version"], 6);
+     // Every node is started with the run's tuning, so it must parse.
+     assert_eq!(manifest["config"]["node"]["max_dedup_bytes"], 33_554_432);
+     assert_eq!(manifest["executable_blake3"].as_str().unwrap().len(), 64);
+@@ -99,6 +99,150 @@ async fn experiment_runner_preserves_reproducibility_artifacts() {
+     assert!(!coordinator_log.contains("replica activation seeding planned"));
+ }
+ 
++#[tokio::test]
++async fn latency_experiment_measures_one_stage_per_target_rate() {
++    let _guard = process_test_lock().lock().await;
++    let directory = tempfile::tempdir().unwrap();
++    let output_directory = directory.path().join("latency");
++    let output = Command::new(env!("CARGO_BIN_EXE_hashring-rs"))
++        .args([
++            "experiment",
++            "--mode",
++            "latency",
++            "--output",
++            output_directory.to_str().unwrap(),
++            "--nodes",
++            "3",
++            "--preload-keys",
++            "500",
++            "--target-rates",
++            "200,400",
++            "--warmup-seconds",
++            "1",
++            "--duration-seconds",
++            "2",
++            "--mix",
++            "90:9:1",
++            "--key-distribution",
++            "uniform",
++            "--virtual-nodes",
++            "16",
++            "--operation-timeout-ms",
++            "10000",
++            "--migration-timeout-ms",
++            "60000",
++        ])
++        .output()
++        .unwrap();
++    assert!(
++        output.status.success(),
++        "latency experiment failed: {}",
++        String::from_utf8_lossy(&output.stderr)
++    );
++
++    let manifest: serde_json::Value =
++        serde_json::from_slice(&std::fs::read(output_directory.join("manifest.json")).unwrap())
++            .unwrap();
++    assert_eq!(manifest["config"]["mode"], "latency");
++    assert_eq!(manifest["config"]["preload_keys"], 500);
++    assert_eq!(manifest["config"]["key_count"], 500);
++    assert_eq!(
++        manifest["config"]["target_rates"],
++        serde_json::json!([200, 400])
++    );
++    assert_eq!(manifest["config"]["mix"], "90:9:1");
++    assert_eq!(manifest["config"]["key_distribution"], "uniform");
++
++    let summary: serde_json::Value =
++        serde_json::from_slice(&std::fs::read(output_directory.join("summary.json")).unwrap())
++            .unwrap();
++    assert_eq!(summary["success"], true, "{}", summary["error"]);
++    // One measurement per target rate, and nothing else: the preload and the
++    // check that follows it are observations of a latency run.
++    let measurements = summary["measurements"].as_object().unwrap();
++    assert_eq!(measurements.len(), 2);
++    // Every stage accounts for every request it sent. A stage that starts
++    // with the counters of the stage before it reports that stage's requests
++    // as its own, and a stage that misses its last window is short by a
++    // second's worth of them.
++    for (name, stage) in measurements {
++        let sum = |field: &str| -> u64 {
++            stage[field]
++                .as_object()
++                .map(|entries| {
++                    entries
++                        .values()
++                        .map(|value| value.as_u64().unwrap_or_default())
++                        .sum()
++                })
++                .unwrap_or_default()
++        };
++        assert_eq!(
++            sum("ops") + sum("errors"),
++            stage["issued"].as_u64().unwrap(),
++            "stage {name} does not account for every request it issued"
++        );
++        assert!(
++            (stage["achieved_rate"].as_f64().unwrap() - stage["target_rate"].as_f64().unwrap())
++                .abs()
++                < 1.0,
++            "stage {name} did not run at its target rate: {} against {}",
++            stage["achieved_rate"],
++            stage["target_rate"]
++        );
++    }
++    let stage = &measurements["rate_0"];
++    assert_eq!(stage["target_rate"], 200);
++    assert_eq!(stage["sender_saturated"], false);
++    assert_eq!(stage["late"], 0);
++    assert!(stage["achieved_rate"].as_f64().unwrap() > 0.0);
++    assert!(stage["seconds"].as_f64().unwrap() >= 2.0);
++    // Every request the driver sent is accounted for.
++    let completed: u64 = stage["ops"]
++        .as_object()
++        .unwrap()
++        .values()
++        .map(|value| value.as_u64().unwrap())
++        .sum();
++    assert_eq!(completed, stage["issued"].as_u64().unwrap());
++    assert!(stage["latency_us"]["get"]["samples"].as_u64().unwrap() > 0);
++    assert!(stage["latency_us"]["get"]["p99"].as_u64().unwrap() > 0);
++    let balance = stage["load_balance"].as_object().unwrap();
++    assert_eq!(balance["per_node"].as_object().unwrap().len(), 3);
++    assert!(balance["owned_keys_max_over_mean"].as_f64().unwrap() >= 1.0);
++    let owned: u64 = balance["per_node"]
++        .as_object()
++        .unwrap()
++        .values()
++        .map(|node| node["owned_keys"].as_u64().unwrap())
++        .sum();
++    assert_eq!(owned, 500);
++    // The key space the load left behind was checked.
++    assert_eq!(summary["observations"]["latency_verified_keys"], 500);
++
++    let events = std::fs::read_to_string(output_directory.join("events.jsonl")).unwrap();
++    let samples: Vec<serde_json::Value> = events
++        .lines()
++        .filter(|line| line.contains("\"metrics_sampled\""))
++        .map(|line| serde_json::from_str(line).unwrap())
++        .collect();
++    // One sample per second of every stage, the warmup included.
++    assert_eq!(samples.len(), 6);
++    assert_eq!(samples[0]["fields"]["stage"], "rate_0");
++    assert_eq!(samples[0]["fields"]["warmup"], true);
++    assert_eq!(samples[0]["fields"]["target_rate"], 200);
++    assert_eq!(samples[1]["fields"]["stage"], "rate_0");
++    assert_eq!(samples[1]["fields"]["warmup"], false);
++    assert_eq!(samples[3]["fields"]["stage"], "rate_1");
++    assert_eq!(samples[3]["fields"]["warmup"], true);
++    assert_eq!(samples[3]["fields"]["target_rate"], 400);
++    assert_eq!(samples[4]["fields"]["stage"], "rate_1");
++    assert_eq!(samples[4]["fields"]["warmup"], false);
++    assert!(samples[0]["fields"]["issued"].as_u64().unwrap() > 0);
++    // The ring is recorded, so a run that has ended can still be read.
++    assert!(events.contains("topology_published"));
++}
++
+ #[tokio::test]
+ async fn availability_experiment_records_failover_loss_and_rf_repair() {
+     let _guard = process_test_lock().lock().await;
+@@ -138,8 +282,8 @@ async fn availability_experiment_records_failover_loss_and_rf_repair() {
+         assert!(summary["observations"]["failover_seconds"].is_number());
+         assert!(summary["observations"]["read_recovery_seconds"].is_number());
+         assert!(summary["observations"]["replacement_to_full_rf_seconds"].is_number());
+-        assert!(summary["observations"]["client_put_latency_us"].is_object());
+-        assert!(summary["observations"]["owner_rpc_put_latency_us"].is_object());
++        assert!(summary["observations"]["idle_client_put_latency_us"].is_object());
++        assert!(summary["observations"]["idle_owner_rpc_put_latency_us"].is_object());
+         assert!(
+             summary["observations"]["acknowledged_key_survival"]["sampled"]
+                 .as_u64()
+
