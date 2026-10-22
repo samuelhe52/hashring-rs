@@ -406,6 +406,12 @@ impl HashringClient {
         self.inner.retries.load(Ordering::Relaxed)
     }
 
+    /// The number of retries for one reason. A driver that samples a counter
+    /// every few milliseconds needs one value, not the whole map.
+    pub fn retry_reason_count(&self, reason: RetryReason) -> u64 {
+        self.inner.retry_reasons[reason.index()].load(Ordering::Relaxed)
+    }
+
     /// The internal retries by reason, cumulative over the client's lifetime.
     pub fn retry_reasons(&self) -> BTreeMap<&'static str, u64> {
         RetryReason::ALL

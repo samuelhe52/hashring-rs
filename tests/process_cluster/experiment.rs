@@ -395,3 +395,90 @@ async fn scaling_control_experiment_runs_closed_and_open_loads() {
         assert!(events.contains("scaling_transition_complete"));
     }
 }
+
+#[tokio::test]
+async fn scaling_round_trip_defers_s1_verification_and_records_the_stop_window() {
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let output_directory = directory.path().join("round-trip");
+    let output = Command::new(env!("CARGO_BIN_EXE_hashring-rs"))
+        .args([
+            "experiment",
+            "--mode",
+            "scaling",
+            "--scaling-scenario",
+            "round-trip",
+            "--output",
+            output_directory.to_str().unwrap(),
+            "--nodes",
+            "4",
+            "--desired-replication-factor",
+            "2",
+            "--keys",
+            "8000",
+            "--concurrency",
+            "8",
+            "--scaling-write-rate",
+            "200",
+            "--scaling-pool-seconds",
+            "8",
+            "--warmup-seconds",
+            "1",
+            "--scaling-post-seconds",
+            "2",
+            "--max-in-flight",
+            "256",
+            "--virtual-nodes",
+            "16",
+            "--operation-timeout-ms",
+            "30000",
+            "--migration-timeout-ms",
+            "120000",
+            "--max-dedup-bytes",
+            "33554432",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "round-trip scaling experiment failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output_directory.join("summary.json")).unwrap())
+            .unwrap();
+    assert_eq!(summary["success"], true);
+
+    // S1's cohorts are verified at the start of S2, so a violation cannot be
+    // attributed to the wrong change.
+    let grow = &summary["observations"]["grow_transition"];
+    assert_eq!(grow["verification"], "deferred_to_next_transition");
+    let shrink = &summary["observations"]["shrink_transition"];
+    assert_eq!(shrink["verification"], "passed");
+    assert_eq!(shrink["direct_merge"], true);
+    assert!(
+        grow["retries_by_reason"]["range_busy"].as_u64().unwrap() > 0,
+        "the grow change produced no client-observed RangeBusy rejection"
+    );
+
+    // The write stop is defined by what the client saw, not by the phases.
+    for transition in [grow, shrink] {
+        let window = &transition["stop_window"];
+        let first = window["first_range_busy_ms"].as_f64().unwrap();
+        let last = window["last_range_busy_ms"].as_f64().unwrap();
+        let first_ok = window["first_write_ok_ms"].as_f64().unwrap();
+        assert!(first <= last, "{window}");
+        assert!(last <= first_ok, "{window}");
+        assert!(
+            window["observed_ms"].as_f64().unwrap() > 0.0,
+            "{window}"
+        );
+    }
+
+    // The two changes never share a key, so the S2 pools cannot see a value
+    // that the S1 settlement left unknown.
+    let events = std::fs::read_to_string(output_directory.join("events.jsonl")).unwrap();
+    assert!(events.contains("scaling_cohorts_verified"));
+    assert!(events.contains("removed_node_exited"));
+}
+

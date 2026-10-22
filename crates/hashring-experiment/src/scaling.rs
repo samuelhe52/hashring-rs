@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use futures::{StreamExt, stream};
-use hashring_client::{ClientError, HashringClient, MutationOutcome};
+use hashring_client::{ClientError, HashringClient, MutationOutcome, RetryReason};
 use hashring_core::{
     migration::MigrationPhase,
     proto::ErrorCode,
@@ -29,6 +29,11 @@ use super::{
     EventLog, ExperimentConfig, ProcessGroup, ScalingLoadMode, ScalingScenario,
     deterministic_value, latency::LatencyHistogram, measurement, spawn_node, wait_for_listener,
 };
+
+/// How often the runner polls the coordinator's phase and the client's write
+/// counters. It bounds the resolution of every phase boundary and of the
+/// client-observed write-stop window.
+const PHASE_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// The phase a request started in. Requests are attributed by start, because a
 /// write that starts in the pause and returns after publication did not become
@@ -284,6 +289,9 @@ struct Metrics {
     total_issued: AtomicU64,
     total_late: AtomicU64,
     in_flight: AtomicU64,
+    /// Successful PUT and DELETE completions. The write-stop window uses it
+    /// to find the first write that went through after the last rejection.
+    writes_ok: AtomicU64,
     max_in_flight: usize,
     state: Mutex<MetricState>,
 }
@@ -299,6 +307,7 @@ impl Metrics {
             total_issued: AtomicU64::new(0),
             total_late: AtomicU64::new(0),
             in_flight: AtomicU64::new(0),
+            writes_ok: AtomicU64::new(0),
             max_in_flight,
             state: Mutex::new(MetricState {
                 window: BTreeMap::new(),
@@ -363,6 +372,13 @@ impl Metrics {
                 .or_insert(0) += 1;
         }
         drop(state);
+        if result.is_ok() && matches!(kind, "put_rewrite" | "put_new" | "delete") {
+            self.writes_ok.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn writes_ok(&self) -> u64 {
+        self.writes_ok.load(Ordering::Acquire)
     }
 
     fn violation(&self, kind: &str, detail: String) {
@@ -469,6 +485,61 @@ impl Metrics {
             .values()
             .map(|bucket| bucket.count)
             .sum()
+    }
+}
+
+/// The write-stop window as the client observed it: the first and last
+/// `RangeBusy` rejection and the first successful write after them.
+///
+/// The coordinator's phase boundaries are not the fence: a node only fences a
+/// range when it receives the command, and a client only notices through a
+/// rejected attempt. The three timestamps are therefore sampled from the
+/// client's cumulative counters, at [`PHASE_POLL_INTERVAL`] resolution.
+#[derive(Default)]
+struct StopWindow {
+    previous_busy: u64,
+    previous_writes: u64,
+    first_busy_ms: Option<f64>,
+    last_busy_ms: Option<f64>,
+    first_ok_ms: Option<f64>,
+}
+
+impl StopWindow {
+    /// Samples cumulative counters. `now_ms` is measured from the start of the
+    /// change.
+    fn observe(&mut self, now_ms: f64, busy: u64, writes_ok: u64) {
+        if busy > self.previous_busy {
+            self.first_busy_ms.get_or_insert(now_ms);
+            self.last_busy_ms = Some(now_ms);
+            // A new rejection means the window is open again, so a write that
+            // completed before it is not the first write after the stop.
+            self.first_ok_ms = None;
+        } else if self.last_busy_ms.is_some()
+            && self.first_ok_ms.is_none()
+            && writes_ok > self.previous_writes
+        {
+            self.first_ok_ms = Some(now_ms);
+        }
+        self.previous_busy = busy;
+        self.previous_writes = writes_ok;
+    }
+
+    /// Whether more sampling cannot change the summary.
+    fn closed(&self) -> bool {
+        self.last_busy_ms.is_none() || self.first_ok_ms.is_some()
+    }
+
+    fn summary(&self) -> serde_json::Value {
+        json!({
+            "first_range_busy_ms": self.first_busy_ms,
+            "last_range_busy_ms": self.last_busy_ms,
+            "first_write_ok_ms": self.first_ok_ms,
+            "observed_ms": self
+                .first_busy_ms
+                .zip(self.first_ok_ms)
+                .map(|(first, ok)| ok - first),
+            "poll_ms": PHASE_POLL_INTERVAL.as_millis() as u64,
+        })
     }
 }
 
@@ -1207,6 +1278,7 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
         let operations_before = metrics.total_operations();
         let started = Instant::now();
         metrics.set_phase(Phase::Pre);
+        let mut stop_window: Option<StopWindow> = None;
         let completed = if let Some(staged) = &staged {
             ledger.begin_publish_window();
             let mut last_phase = Phase::Pre;
@@ -1219,6 +1291,12 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                     .execute_topology_change(change_id, base_epoch, target_epoch)
                     .await
             });
+            let mut window = StopWindow::default();
+            window.observe(
+                0.0,
+                workload_client.retry_reason_count(RetryReason::RangeBusy),
+                metrics.writes_ok(),
+            );
             loop {
                 if execution.is_finished() {
                     break;
@@ -1238,7 +1316,12 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                         last_phase = phase;
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(5)).await;
+                tokio::time::sleep(PHASE_POLL_INTERVAL).await;
+                window.observe(
+                    started.elapsed().as_secs_f64() * 1_000.0,
+                    workload_client.retry_reason_count(RetryReason::RangeBusy),
+                    metrics.writes_ok(),
+                );
             }
             let completed = execution
                 .await
@@ -1249,6 +1332,18 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                 transition.label,
                 completed.phase
             );
+            // The first write after the last rejection can complete after
+            // Complete, so keep sampling until the window closes.
+            let window_deadline = Instant::now() + Duration::from_secs(2);
+            while !window.closed() && Instant::now() < window_deadline {
+                tokio::time::sleep(PHASE_POLL_INTERVAL).await;
+                window.observe(
+                    started.elapsed().as_secs_f64() * 1_000.0,
+                    workload_client.retry_reason_count(RetryReason::RangeBusy),
+                    metrics.writes_ok(),
+                );
+            }
+            stop_window = Some(window);
             // The removed nodes are told to stop once their ranges are handed
             // off. Wait for them before the process liveness checks, or a
             // normal removal looks like an unexpected exit.
@@ -1400,6 +1495,7 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                 "base_epoch": base_topology.epoch,
                 "target_epoch": target_epoch,
                 "work_steps_ms": completed.as_ref().map(|change| json!(change.timings)),
+                "stop_window": stop_window.as_ref().map(StopWindow::summary),
                 "retries_by_reason": retry_delta,
                 "rewrite_pool": plan.rewrite.len(),
                 "new_pool": plan.write_new.len(),
