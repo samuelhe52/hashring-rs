@@ -26,14 +26,36 @@ use serde_json::{Value, json};
 use tonic::transport::Channel;
 
 mod latency;
+mod scaling;
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExperimentMode {
     Correctness,
     Performance,
     Availability,
     Latency,
+    Scaling,
+}
+
+/// The membership change a `scaling` run performs.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScalingScenario {
+    /// Grow by one node, then shrink back, in one cluster and one load.
+    RoundTrip,
+    Grow,
+    Shrink,
+}
+
+impl ScalingScenario {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::RoundTrip => "round-trip",
+            Self::Grow => "grow",
+            Self::Shrink => "shrink",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -81,7 +103,20 @@ pub struct ExperimentConfig {
     pub key_distribution: String,
     /// How many requests the `latency` mode may have in flight at once.
     pub max_in_flight: usize,
-    /// Forwarded to every data node the run starts.
+    /// The membership change a `scaling` run performs.
+    pub scaling_scenario: ScalingScenario,
+    /// The nodes a `scaling` run starts with. `None` derives it from the
+    /// scenario: one fewer than the peak for a grow or a round trip, the peak
+    /// for a shrink.
+    pub initial_nodes: Option<usize>,
+    /// The one-shot write and delete operations a `scaling` run offers per
+    /// second. Reads are not paced.
+    pub scaling_write_rate: u64,
+    /// How long the one-shot pools of one `scaling` transition must last.
+    pub scaling_pool_seconds: u64,
+    /// How long a `scaling` run keeps the load running after a change.
+    pub scaling_post_seconds: u64,
+    /// Forwarded to every data node.
     pub node: NodeOptions,
 }
 
@@ -610,6 +645,14 @@ async fn run_cluster(
         ExperimentMode::Correctness => config.node_count - 1,
         ExperimentMode::Performance | ExperimentMode::Latency => config.node_count,
         ExperimentMode::Availability => 3,
+        ExperimentMode::Scaling => {
+            config
+                .initial_nodes
+                .unwrap_or_else(|| match config.scaling_scenario {
+                    ScalingScenario::Shrink => config.node_count,
+                    ScalingScenario::Grow | ScalingScenario::RoundTrip => config.node_count - 1,
+                })
+        }
     };
     let initial_members = &members[..initial_count];
     let mut processes =
@@ -869,6 +912,23 @@ async fn run_cluster(
             measurements,
             observations,
         )
+        .await;
+    }
+
+    if matches!(config.mode, ExperimentMode::Scaling) {
+        return scaling::run(scaling::RunContext {
+            config,
+            peak_members: &members,
+            initial_count,
+            ports: &ports,
+            coordinator_endpoint: &coordinator_endpoint,
+            admin_client: &admin_client,
+            workload_client: &workload_client,
+            processes: &mut processes,
+            events,
+            measurements,
+            observations,
+        })
         .await;
     }
 
@@ -2204,6 +2264,14 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
         ExperimentMode::Correctness => config.node_count - 1,
         ExperimentMode::Performance | ExperimentMode::Latency => config.node_count,
         ExperimentMode::Availability => 3,
+        ExperimentMode::Scaling => {
+            config
+                .initial_nodes
+                .unwrap_or_else(|| match config.scaling_scenario {
+                    ScalingScenario::Shrink => config.node_count,
+                    ScalingScenario::Grow | ScalingScenario::RoundTrip => config.node_count - 1,
+                })
+        }
     };
     ensure!(
         initial_count >= config.desired_replication_factor as usize,
@@ -2259,6 +2327,44 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
          mutation's retries",
         config.receipt_retention_ms
     );
+    if matches!(config.mode, ExperimentMode::Scaling) {
+        ensure!(
+            initial_count <= config.node_count,
+            "initial_nodes exceeds the peak node count"
+        );
+        match config.scaling_scenario {
+            ScalingScenario::Grow => ensure!(
+                initial_count < config.node_count,
+                "a grow run needs fewer initial nodes than the peak"
+            ),
+            ScalingScenario::Shrink => {
+                ensure!(
+                    initial_count == config.node_count,
+                    "a shrink run starts with every peak node"
+                );
+                ensure!(
+                    config.node_count > config.desired_replication_factor as usize,
+                    "a shrink run needs more nodes than the desired replication factor"
+                );
+            }
+            ScalingScenario::RoundTrip => ensure!(
+                initial_count + 1 == config.node_count,
+                "a round trip starts with one fewer node than the peak"
+            ),
+        }
+        ensure!(
+            config.scaling_write_rate > 0,
+            "scaling_write_rate must be positive"
+        );
+        ensure!(
+            config.scaling_pool_seconds > 0,
+            "scaling_pool_seconds must be positive"
+        );
+        ensure!(
+            config.scaling_post_seconds > 0,
+            "scaling_post_seconds must be positive"
+        );
+    }
     Ok(())
 }
 

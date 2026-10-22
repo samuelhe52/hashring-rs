@@ -289,6 +289,11 @@ target/release/hashring-rs experiment --mode availability --policy first-success
 # Offer a fixed rate and measure the latency of that load, one stage per rate.
 target/release/hashring-rs experiment --mode latency --target-rates 5000,10000,20000 \
   --output results/latency
+
+# Keep mixed reads and writes running across 9 -> 10 -> 9 nodes, and verify
+# every cohort after each change.
+target/release/hashring-rs experiment --mode scaling \
+  --output results/scaling
 ```
 
 Experiment settings can also come from a YAML file whose keys are the flag

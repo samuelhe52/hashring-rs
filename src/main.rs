@@ -18,7 +18,7 @@ use hashring_core::{
         WriteAvailabilityGuard,
     },
 };
-use hashring_experiment::{ExperimentConfig, ExperimentMode, run_experiment};
+use hashring_experiment::{ExperimentConfig, ExperimentMode, ScalingScenario, run_experiment};
 use hashring_node::DataNodeService;
 use serde::Deserialize;
 use tonic::transport::Server;
@@ -377,6 +377,25 @@ enum ExperimentModeArg {
     Performance,
     Availability,
     Latency,
+    Scaling,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum ScalingScenarioArg {
+    RoundTrip,
+    Grow,
+    Shrink,
+}
+
+impl From<ScalingScenarioArg> for ScalingScenario {
+    fn from(scenario: ScalingScenarioArg) -> Self {
+        match scenario {
+            ScalingScenarioArg::RoundTrip => ScalingScenario::RoundTrip,
+            ScalingScenarioArg::Grow => ScalingScenario::Grow,
+            ScalingScenarioArg::Shrink => ScalingScenario::Shrink,
+        }
+    }
 }
 
 impl From<ExperimentModeArg> for ExperimentMode {
@@ -386,6 +405,7 @@ impl From<ExperimentModeArg> for ExperimentMode {
             ExperimentModeArg::Performance => ExperimentMode::Performance,
             ExperimentModeArg::Availability => ExperimentMode::Availability,
             ExperimentModeArg::Latency => ExperimentMode::Latency,
+            ExperimentModeArg::Scaling => ExperimentMode::Scaling,
         }
     }
 }
@@ -510,6 +530,26 @@ struct ExperimentArgs {
     /// [default: 4096]
     #[arg(long)]
     max_in_flight: Option<usize>,
+    /// The membership change a scaling run performs: round-trip, grow, or
+    /// shrink. [default: round-trip]
+    #[arg(long, value_enum)]
+    scaling_scenario: Option<ScalingScenarioArg>,
+    /// The nodes a scaling run starts with. [default: peak - 1 for a grow or
+    /// round trip, peak for a shrink]
+    #[arg(long)]
+    initial_nodes: Option<usize>,
+    /// The one-shot write and delete operations a scaling run offers per
+    /// second. Reads are not paced. [default: 200]
+    #[arg(long)]
+    scaling_write_rate: Option<u64>,
+    /// How long the one-shot pools of one scaling transition must last.
+    /// [default: 120]
+    #[arg(long)]
+    scaling_pool_seconds: Option<u64>,
+    /// How long a scaling run keeps the load running after a change.
+    /// [default: 10]
+    #[arg(long)]
+    scaling_post_seconds: Option<u64>,
     /// Forwarded to every data node the run starts.
     #[command(flatten)]
     node_tuning: NodeTuningArgs,

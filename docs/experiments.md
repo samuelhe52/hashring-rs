@@ -12,6 +12,7 @@ For quick-start commands, see the [README](../README.md#experiments).
 | `performance` | Nominal acceptance profile | 1,000,000 | 10 |
 | `availability` | Failure and repair: 3 live nodes plus 1 replacement | 1,000 | 4 |
 | `latency` | Open-loop load at a series of target rates, and the latency of that load. See [the latency mode](#the-latency-mode). | 100,000 | 10 |
+| `scaling` | One continuous mixed read/write load across 9→10→9 nodes (or a grow/shrink only), with per-cohort verification. See [the scaling mode](#the-scaling-mode). | 100,000 | 10 |
 
 Every mode defaults to 128-byte values, concurrency 64, seed 1, 128 virtual
 nodes, and a 30-second operation deadline. The default ACK policy is
@@ -345,6 +346,59 @@ fails it fails.
   answer different questions. The first is how fast a request goes when
   nothing else is happening; the second is how fast it goes when the cluster
   is at the rate the stage asked for.
+
+## The scaling mode
+
+`scaling` keeps a mixed read/write load running while membership changes. It
+exists to answer what happens to reads and writes *during* a scale, which the
+`correctness` mode does not: that mode mutates moving keys once and has no
+sustained GET load.
+
+The load has four cohorts, so every key's expected final state is known without
+a read/write race:
+
+| Cohort | Before | During | Checked after |
+| --- | --- | --- | --- |
+| `read` | `v0` | GET only | still `v0` |
+| `rewrite` | `v0` | one PUT to `v1` | `v1` |
+| `write_new` | absent | one PUT to `v1` | `v1` |
+| `delete` | `v0` | one DELETE | absent |
+
+Reads are unpaced and use `--key-distribution`. Writes and deletes are paced at
+`--scaling-write-rate` operations per second, split 60/25/15 across rewrite,
+fresh write, and delete, and the pools are sized from
+`--scaling-pool-seconds`. A pool that empties before the last transition
+completes makes the run invalid rather than changing the mix halfway through.
+
+`--scaling-scenario` picks the change:
+
+- `round-trip` (default): grow by one node, then shrink back, in one cluster
+  and one uninterrupted load.
+- `grow`: one scale-out.
+- `shrink`: one scale-in, starting with every peak node.
+
+The runner starts with `--initial-nodes` (default: peak - 1 for grow and
+round-trip, peak for shrink), warms up for `--warmup-seconds`, stages the
+change, starts any new node, executes the change, polls its phases, waits for
+the target epoch to reach full replication, and keeps the load running for
+`--scaling-post-seconds`. It then stops that transition's write cohorts, drains
+them, and verifies the cohorts before the next transition. Reads continue
+across the whole run. `--pre-publish-delay-ms` defaults to 0 here, because the
+delay runs after writes are paused and would be measured as migration latency.
+
+A successful write or delete is followed by a GET of the same key, and keys
+changed before publication are read again after it. Those probe GETs have
+their own metrics and are not mixed into the main GET histogram.
+
+`summary.json` holds one `<label>_transition` measurement and observation per
+change (change duration, target epoch, retries by reason, pool sizes, touched
+strata, direct-merge flag). `observations.scaling_metrics` holds the per-phase
+operation and latency totals, and `events.jsonl` holds one `metrics_sampled`
+event per second plus the phase transitions. The full protocol, cohorts, and
+pass criteria are in [scaling-under-load.md](scaling-under-load.md).
+
+The mode runs every process on one host and is a local measurement, not a
+service-level guarantee. `--require-clean-source` marks a formal run.
 
 ## Diagnostics and profiling
 
