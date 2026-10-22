@@ -60,14 +60,16 @@
 #
 # Reading the latency column
 # --------------------------
-#   `client_put_latency_us` comes from the experiment's own sample of 128 puts
-#   issued one at a time right after the initial verify, on an otherwise quiet
-#   cluster (crates/hashring-experiment/src/lib.rs:613). It is therefore a
+#   `idle_client_put_latency_us` comes from the experiment's own sample of 128
+#   puts issued one at a time right after the initial verify, on an otherwise
+#   quiet cluster (crates/hashring-experiment/src/lib.rs:613). It is therefore a
 #   *single-op, unloaded* latency, not the latency under --concurrency. That
 #   makes its slope against RTT the cleanest quantity here: it is the number of
 #   round trips the write path serializes on, with no queueing folded in. It
 #   also means the in-flight column, which multiplies throughput by this p50, is
 #   an estimate under Little's law with the wrong latency, not a measurement.
+#   The field was called `client_put_latency_us` before the rename that says
+#   the sample is of an idle cluster; the older results still use that name.
 #
 # Usage
 # -----
@@ -284,7 +286,18 @@ def rate(name):
 
 
 def pct(block, key):
-    return (o.get(block) or {}).get(key) or 0
+    value = (o.get(block) or {}).get(key) or 0
+    if value:
+        return value
+    # The idle-latency fields were renamed, so the results that predate the
+    # rename still hold the old names.
+    legacy = {
+        'idle_client_put_latency_us': 'client_put_latency_us',
+        'idle_owner_rpc_put_latency_us': 'owner_rpc_put_latency_us',
+    }.get(block)
+    if legacy:
+        return (o.get(legacy) or {}).get(key) or 0
+    return 0
 
 
 pressure = o.get('node_pressure_after_initial_put') or {}
@@ -308,10 +321,10 @@ print('\t'.join(str(x) for x in [
     rate('initial_get_verify'),
     seconds('scale_out_with_mutations'),
     seconds('scale_in_with_mutations'),
-    pct('client_put_latency_us', 'p50'),
-    pct('client_put_latency_us', 'p95'),
-    pct('client_put_latency_us', 'p99'),
-    pct('owner_rpc_put_latency_us', 'p50'),
+    pct('idle_client_put_latency_us', 'p50'),
+    pct('idle_client_put_latency_us', 'p95'),
+    pct('idle_client_put_latency_us', 'p99'),
+    pct('idle_owner_rpc_put_latency_us', 'p50'),
     o.get('initial_full_rf_seconds') or 0,
     tot('replication_reservation_rejections'),
     tot('replication_rpc_retries'),

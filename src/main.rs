@@ -71,7 +71,10 @@ enum Command {
     #[cfg(feature = "redis-lua-experimental")]
     RedisLuaExperimentalGateway(ExperimentalGatewayArgs),
     /// Run a reproducible separate-process correctness or performance experiment.
-    Experiment(ExperimentArgs),
+    ///
+    /// The experiment takes more settings than the other commands, so it is
+    /// boxed to keep the enum small.
+    Experiment(Box<ExperimentArgs>),
 }
 
 #[derive(Args)]
@@ -373,6 +376,7 @@ enum ExperimentModeArg {
     Correctness,
     Performance,
     Availability,
+    Latency,
 }
 
 impl From<ExperimentModeArg> for ExperimentMode {
@@ -381,6 +385,7 @@ impl From<ExperimentModeArg> for ExperimentMode {
             ExperimentModeArg::Correctness => ExperimentMode::Correctness,
             ExperimentModeArg::Performance => ExperimentMode::Performance,
             ExperimentModeArg::Availability => ExperimentMode::Availability,
+            ExperimentModeArg::Latency => ExperimentMode::Latency,
         }
     }
 }
@@ -475,6 +480,36 @@ struct ExperimentArgs {
     /// Tokio worker threads for the run's coordinator. [default: one per CPU]
     #[arg(long)]
     coordinator_worker_threads: Option<NonZeroUsize>,
+    /// The keys the latency mode writes before its load starts, and the key
+    /// space its load reads and writes. [default: 100000]
+    #[arg(long)]
+    preload_keys: Option<u64>,
+    /// The target rates of the latency mode, in operations per second. Each
+    /// rate is one stage of the run. [default: none, so the mode needs at
+    /// least one]
+    #[arg(long, value_delimiter = ',')]
+    target_rates: Vec<u64>,
+    /// The seconds at the start of every latency stage that are not counted.
+    /// [default: 10]
+    #[arg(long)]
+    warmup_seconds: Option<u64>,
+    /// The seconds of every latency stage that are counted. [default: 60]
+    #[arg(long)]
+    duration_seconds: Option<u64>,
+    /// The GET:PUT:DELETE share of the latency mode's requests. [default:
+    /// 90:9:1]
+    #[arg(long)]
+    mix: Option<String>,
+    /// How the latency mode picks the key of a request: `uniform`,
+    /// `zipf:<theta>`, or `hotspot:<key share>:<traffic share>`. [default:
+    /// zipf:0.99]
+    #[arg(long)]
+    key_distribution: Option<String>,
+    /// How many requests the latency mode may have in flight at once. A
+    /// request that would exceed the limit is not sent and is counted as late.
+    /// [default: 4096]
+    #[arg(long)]
+    max_in_flight: Option<usize>,
     /// Forwarded to every data node the run starts.
     #[command(flatten)]
     node_tuning: NodeTuningArgs,
@@ -492,7 +527,7 @@ fn main() -> Result<()> {
             init_tracing(config.verbose)?;
             hashring_core::rpc_profile::start_reporter("driver");
             return build_runtime(Some(config.worker_threads))?
-                .block_on(run_local_experiment(config));
+                .block_on(run_experiment_command(config));
         }
         Command::Node(args) => {
             let file = args.config.as_deref().map(config::load).transpose()?;
@@ -639,6 +674,53 @@ async fn run_local_experiment(config: ExperimentConfig) -> Result<()> {
     let summary = run_experiment(config, std::env::current_exe()?).await?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
+}
+
+/// Runs an experiment, and stops it when the process is asked to stop.
+///
+/// The experiment starts a coordinator and a node per member as child
+/// processes. They are killed when the experiment's own value is dropped, and
+/// a signal ends the process without running any destructor, so a run that is
+/// interrupted would leave its nodes behind, holding their ports and their
+/// memory. The signal is awaited here instead, so the children are stopped
+/// with their parent.
+async fn run_experiment_command(config: ExperimentConfig) -> Result<()> {
+    tokio::select! {
+        result = run_local_experiment(config) => result,
+        _ = stop_signal() => {
+            // The experiment's own value is dropped here, which stops the
+            // nodes it started.
+            Err(anyhow::anyhow!("the experiment was interrupted"))
+        }
+    }
+}
+
+/// Waits for the process to be asked to stop.
+async fn stop_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(signal) => Some(signal),
+                Err(error) => {
+                    tracing::error!(%error, "failed to install the terminate handler");
+                    None
+                }
+            };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = async {
+                match terminate.as_mut() {
+                    Some(signal) => { signal.recv().await; }
+                    None => std::future::pending().await,
+                }
+            } => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 async fn run_coordinator(

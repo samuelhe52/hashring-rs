@@ -43,7 +43,9 @@ the next section, and the conclusions below lean on it accordingly.
 `client_put_latency_us` is the experiment's own sample of 128 puts issued **one at a
 time** after the initial verify, on an otherwise quiet cluster
 (`crates/hashring-experiment/src/lib.rs:613`). It is a single-operation, unloaded
-latency, not the latency under `--concurrency`.
+latency, not the latency under `--concurrency`. The field is now called
+`idle_client_put_latency_us`, because the name says what the sample is; the runs
+below predate the rename.
 
 That is usually a defect and here it is the point. Its slope against RTT is a
 difference, so the queueing that `--concurrency` adds cancels out of it, and what

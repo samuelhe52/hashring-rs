@@ -43,7 +43,7 @@ async fn experiment_runner_preserves_reproducibility_artifacts() {
             .unwrap();
     assert_eq!(manifest["config"]["node_count"], 4);
     assert_eq!(manifest["config"]["key_count"], 300);
-    assert_eq!(manifest["schema_version"], 5);
+    assert_eq!(manifest["schema_version"], 6);
     // Every node is started with the run's tuning, so it must parse.
     assert_eq!(manifest["config"]["node"]["max_dedup_bytes"], 33_554_432);
     assert_eq!(manifest["executable_blake3"].as_str().unwrap().len(), 64);
@@ -100,6 +100,165 @@ async fn experiment_runner_preserves_reproducibility_artifacts() {
 }
 
 #[tokio::test]
+async fn latency_experiment_measures_one_stage_per_target_rate() {
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let output_directory = directory.path().join("latency");
+    let output = Command::new(env!("CARGO_BIN_EXE_hashring-rs"))
+        .args([
+            "experiment",
+            "--mode",
+            "latency",
+            "--output",
+            output_directory.to_str().unwrap(),
+            "--nodes",
+            "3",
+            "--preload-keys",
+            "500",
+            "--target-rates",
+            "200,400",
+            "--warmup-seconds",
+            "1",
+            "--duration-seconds",
+            "2",
+            "--mix",
+            "90:9:1",
+            "--key-distribution",
+            "uniform",
+            "--virtual-nodes",
+            "16",
+            "--operation-timeout-ms",
+            "10000",
+            "--migration-timeout-ms",
+            "60000",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "latency experiment failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output_directory.join("manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["config"]["mode"], "latency");
+    assert_eq!(manifest["config"]["preload_keys"], 500);
+    assert_eq!(manifest["config"]["key_count"], 500);
+    assert_eq!(
+        manifest["config"]["target_rates"],
+        serde_json::json!([200, 400])
+    );
+    assert_eq!(manifest["config"]["mix"], "90:9:1");
+    assert_eq!(manifest["config"]["key_distribution"], "uniform");
+
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output_directory.join("summary.json")).unwrap())
+            .unwrap();
+    assert_eq!(summary["success"], true, "{}", summary["error"]);
+    // One measurement per target rate, and nothing else: the preload and the
+    // check that follows it are observations of a latency run.
+    let measurements = summary["measurements"].as_object().unwrap();
+    assert_eq!(measurements.len(), 2);
+    // Every stage accounts for every request it sent. A stage that starts
+    // with the counters of the stage before it reports that stage's requests
+    // as its own, and a stage that misses its last window is short by a
+    // second's worth of them.
+    for (name, stage) in measurements {
+        let sum = |field: &str| -> u64 {
+            stage[field]
+                .as_object()
+                .map(|entries| {
+                    entries
+                        .values()
+                        .map(|value| value.as_u64().unwrap_or_default())
+                        .sum()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            sum("ops") + sum("errors"),
+            stage["issued"].as_u64().unwrap(),
+            "stage {name} does not account for every request it issued"
+        );
+        assert!(
+            (stage["achieved_rate"].as_f64().unwrap() - stage["target_rate"].as_f64().unwrap())
+                .abs()
+                < 1.0,
+            "stage {name} did not run at its target rate: {} against {}",
+            stage["achieved_rate"],
+            stage["target_rate"]
+        );
+    }
+    let stage = &measurements["rate_0"];
+    assert_eq!(stage["target_rate"], 200);
+    assert_eq!(stage["sender_saturated"], false);
+    assert_eq!(stage["late"], 0);
+    assert!(stage["achieved_rate"].as_f64().unwrap() > 0.0);
+    assert!(stage["seconds"].as_f64().unwrap() >= 2.0);
+    // Every request the driver sent is accounted for.
+    let completed: u64 = stage["ops"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|value| value.as_u64().unwrap())
+        .sum();
+    assert_eq!(completed, stage["issued"].as_u64().unwrap());
+    assert!(stage["latency_us"]["get"]["samples"].as_u64().unwrap() > 0);
+    assert!(stage["latency_us"]["get"]["p99"].as_u64().unwrap() > 0);
+    // The histogram keeps the longest sample and the number of the samples
+    // that were longer than its range, so a reader can tell a truncated
+    // sample from one that was near the bound.
+    assert_eq!(
+        stage["latency_us"]["get"]["max_observed"].as_u64().unwrap(),
+        stage["latency_us"]["get"]["max"].as_u64().unwrap()
+    );
+    assert_eq!(
+        stage["latency_us"]["get"]["over_range"].as_u64().unwrap(),
+        0
+    );
+    let balance = stage["load_balance"].as_object().unwrap();
+    assert_eq!(balance["per_node"].as_object().unwrap().len(), 3);
+    assert!(balance["owned_keys_max_over_mean"].as_f64().unwrap() >= 1.0);
+    let owned: u64 = balance["per_node"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|node| node["owned_keys"].as_u64().unwrap())
+        .sum();
+    assert_eq!(owned, 500);
+    // The key space the load left behind was checked.
+    assert_eq!(summary["observations"]["latency_verified_keys"], 500);
+
+    let events = std::fs::read_to_string(output_directory.join("events.jsonl")).unwrap();
+    let samples: Vec<serde_json::Value> = events
+        .lines()
+        .filter(|line| line.contains("\"metrics_sampled\""))
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    // One sample per second of every stage, the warmup included.
+    assert_eq!(samples.len(), 6);
+    assert_eq!(samples[0]["fields"]["stage"], "rate_0");
+    assert_eq!(samples[0]["fields"]["warmup"], true);
+    assert_eq!(samples[0]["fields"]["target_rate"], 200);
+    assert_eq!(samples[1]["fields"]["stage"], "rate_0");
+    assert_eq!(samples[1]["fields"]["warmup"], false);
+    assert_eq!(samples[3]["fields"]["stage"], "rate_1");
+    assert_eq!(samples[3]["fields"]["warmup"], true);
+    assert_eq!(samples[3]["fields"]["target_rate"], 400);
+    assert_eq!(samples[4]["fields"]["stage"], "rate_1");
+    assert_eq!(samples[4]["fields"]["warmup"], false);
+    assert!(samples[0]["fields"]["issued"].as_u64().unwrap() > 0);
+    // The window reports its own lag and the sender's, which are two
+    // different numbers.
+    assert!(samples[0]["fields"].get("behind").is_some());
+    assert!(samples[0]["fields"].get("sender_lag").is_some());
+    // The ring is recorded, so a run that has ended can still be read.
+    assert!(events.contains("topology_published"));
+}
+
+#[tokio::test]
 async fn availability_experiment_records_failover_loss_and_rf_repair() {
     let _guard = process_test_lock().lock().await;
     let directory = tempfile::tempdir().unwrap();
@@ -138,8 +297,8 @@ async fn availability_experiment_records_failover_loss_and_rf_repair() {
         assert!(summary["observations"]["failover_seconds"].is_number());
         assert!(summary["observations"]["read_recovery_seconds"].is_number());
         assert!(summary["observations"]["replacement_to_full_rf_seconds"].is_number());
-        assert!(summary["observations"]["client_put_latency_us"].is_object());
-        assert!(summary["observations"]["owner_rpc_put_latency_us"].is_object());
+        assert!(summary["observations"]["idle_client_put_latency_us"].is_object());
+        assert!(summary["observations"]["idle_owner_rpc_put_latency_us"].is_object());
         assert!(
             summary["observations"]["acknowledged_key_survival"]["sampled"]
                 .as_u64()
