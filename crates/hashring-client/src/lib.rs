@@ -1413,7 +1413,7 @@ mod tests {
             tokio::time::sleep(self.topology_delay).await;
             if self
                 .topology_failures_remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok()

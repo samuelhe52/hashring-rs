@@ -72,7 +72,7 @@ impl Matcher {
         let spent = before - budget;
         let _ = self
             .remaining
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
                 Some(left.saturating_sub(spent))
             });
         matched.unwrap_or_else(|| {
