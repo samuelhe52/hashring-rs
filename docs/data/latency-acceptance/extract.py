@@ -79,7 +79,8 @@ def stage_row(run, summary, stage, measurement):
     latency = measurement.get("latency_us") or {}
     balance = measurement.get("load_balance") or {}
     per_node = balance.get("per_node") or {}
-    cpus = [node.get("cpu_percent") or 0.0 for node in per_node.values()]
+    cpus = [node.get("cpu_percent") for node in per_node.values()]
+    cpu_complete = bool(cpus) and all(value is not None for value in cpus)
     row = {
         "run": run,
         "kind": run_kind(run),
@@ -97,8 +98,8 @@ def stage_row(run, summary, stage, measurement):
         "owned_cv": round(balance.get("owned_keys_cv") or 0.0, 4),
         "ops_mom": round(balance.get("ops_handled_max_over_mean") or 0.0, 3),
         "ops_cv": round(balance.get("ops_handled_cv") or 0.0, 4),
-        "cpu_max_percent": round(max(cpus), 1) if cpus else 0.0,
-        "cpu_sum_percent": round(sum(cpus), 1),
+        "cpu_max_percent": round(max(cpus), 1) if cpu_complete else None,
+        "cpu_sum_percent": round(sum(cpus), 1) if cpu_complete else None,
         "nodes": len(per_node),
         "verified_keys": (summary.get("observations") or {}).get("latency_verified_keys"),
         # The preload of the run is the same workload every time, so it is the
@@ -161,6 +162,7 @@ def median_rows(rows):
                 continue
             values = [member[column] for member in members if isinstance(member.get(column), (int, float))]
             if not values:
+                row[column] = None
                 continue
             row[column] = round(statistics.median(values), 3)
         # The spread of the two numbers a reader will argue about.
@@ -250,7 +252,7 @@ def balance_table(rows):
                 owned_cv=f"{row['owned_cv']:.3f}",
                 ops=f"{row['ops_mom']:.3f}",
                 ops_cv=f"{row['ops_cv']:.3f}",
-                cpu=f"{row['cpu_max_percent']:.1f}%",
+                cpu=f"{row['cpu_max_percent']:.1f}%" if row.get('cpu_max_percent') is not None else "unavailable",
             )
         )
     return "\n".join(lines)

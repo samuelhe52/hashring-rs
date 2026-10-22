@@ -30,7 +30,8 @@
 # -----
 #   ./scripts/latency-sweep.sh
 #   REPS=5 ./scripts/latency-sweep.sh
-#   RATES="5000 10000 20000" ./scripts/latency-sweep.sh     # skip the capacity run
+#   RATES="5000 10000 20000" LADDER=0 ./scripts/latency-sweep.sh # skip capacity and ladder
+#   RATES="5000 10000" LADDER_RATES="20000 30000" ./scripts/latency-sweep.sh
 #   DISTRIBUTIONS="uniform" ./scripts/latency-sweep.sh
 #   LADDER=0 ./scripts/latency-sweep.sh
 #   SKIP_CAMPAIGN=1 ./scripts/latency-sweep.sh               # only the ladder and the rings
@@ -68,6 +69,11 @@ DATA_DIR="${DATA_DIR:-docs/data/latency-acceptance}"
 OPERATION_TIMEOUT_MS="${OPERATION_TIMEOUT_MS:-30000}"
 MIGRATION_TIMEOUT_MS="${MIGRATION_TIMEOUT_MS:-600000}"
 
+if [[ -n "${RATES:-}" && "$LADDER" == "1" && -z "$LADDER_RATES" ]]; then
+  echo "error: custom RATES need LADDER_RATES or LADDER=0 (no capacity was measured)." >&2
+  exit 1
+fi
+
 if [[ ! -x "$BINARY" ]]; then
   echo "error: '$BINARY' not found; run 'cargo build --release' first." >&2
   exit 1
@@ -80,8 +86,13 @@ cd "$PROJECT_ROOT"
 EXTRACT="${EXTRACT:-$PROJECT_ROOT/docs/data/latency-acceptance/extract.py}"
 
 OUT_DIR="${OUT_DIR:-results/latency-acceptance-$(date +%Y%m%d-%H%M%S)}"
-mkdir -p "$OUT_DIR"
 DATA_OUT="$DATA_DIR/$(basename "$OUT_DIR")"
+if [[ -e "$DATA_OUT" || -L "$DATA_OUT" ]]; then
+  echo "error: refusing to overwrite '$DATA_OUT'." >&2
+  exit 1
+fi
+mkdir -p "$(dirname "$OUT_DIR")"
+mkdir "$OUT_DIR" || { echo "error: choose a new OUT_DIR; existing results are preserved." >&2; exit 1; }
 
 # The host the numbers were measured on. A latency number without the host it
 # came from is not a measurement. It is written into the run's own output
@@ -108,7 +119,7 @@ cat "$OUT_DIR/host.txt"
 run_experiment() {
   local out="$1"
   shift
-  rm -rf "$out"
+  mkdir "$out" || return 1
   echo "  -> $out"
   "$BINARY" experiment --output "$out" "$@" > "$out.log" 2>&1 || {
     echo "  FAILED, see $out.log" >&2
@@ -184,7 +195,7 @@ if [[ "$LADDER" == "1" ]]; then
   if [[ -z "$LADDER_RATES" ]]; then
     LADDER_RATES="$(python3 - "$capacity" << 'PY'
 import sys
-capacity = int(sys.argv[1]) if sys.argv[1] else 20000
+capacity = int(sys.argv[1])
 print(" ".join(str(int(capacity * share)) for share in (1.0, 1.5, 2.0, 3.0)))
 PY
 )"

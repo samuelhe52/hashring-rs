@@ -191,8 +191,8 @@ pub struct LoadBalanceNode {
     pub owned_keys: u64,
     /// The operations the node served.
     pub ops_handled: u64,
-    /// The share of one core the node used.
-    pub cpu_percent: f64,
+    /// The share of one core the node used, or None when CPU sampling is unavailable.
+    pub cpu_percent: Option<f64>,
 }
 
 /// How evenly the keys and the requests were spread over the nodes.
@@ -1377,7 +1377,7 @@ async fn record_topology(events: &EventLog, client: &HashringClient) -> Result<T
 #[derive(Clone, Copy, Debug, Default)]
 struct NodeCounters {
     ops_handled: u64,
-    cpu_seconds: f64,
+    cpu_seconds: Option<f64>,
 }
 
 /// Runs the `latency` mode: one stage per target rate, and a check of the key
@@ -1448,9 +1448,9 @@ async fn run_latency(
             duration_seconds: config.duration_seconds,
         };
         runner.run_warmup(&stage, events).await?;
-        let before = sample_node_counters(members, &pids).await;
+        let before = sample_node_counters(members, &pids).await?;
         let outcome = runner.run_measured(&stage, events).await?;
-        let after = sample_node_counters(members, &pids).await;
+        let after = sample_node_counters(members, &pids).await?;
         saturated_windows.insert(outcome.name.clone(), json!(outcome.saturated_windows));
         measurements.insert(
             outcome.name.clone(),
@@ -1465,7 +1465,7 @@ async fn run_latency(
                 errors: outcome.errors,
                 retries: outcome.retries,
                 latency_us: outcome.latency_us,
-                load_balance: load_balance(&owned_keys, &before, &after, outcome.seconds),
+                load_balance: load_balance(&owned_keys, &before, &after, outcome.seconds)?,
             }),
         );
     }
@@ -1549,14 +1549,15 @@ fn owned_key_counts(topology: &TopologySnapshot, key_space: u64) -> BTreeMap<Str
 async fn sample_node_counters(
     members: &[Member],
     pids: &BTreeMap<String, u32>,
-) -> BTreeMap<String, NodeCounters> {
+) -> Result<BTreeMap<String, NodeCounters>> {
     let mut counters = BTreeMap::new();
     for member in members {
-        let ops_handled = query_node_ops(&member.endpoint).await.unwrap_or(0);
+        let ops_handled = query_node_ops(&member.endpoint)
+            .await
+            .with_context(|| format!("sampling operations of {}", member.node_id))?;
         let cpu_seconds = pids
             .get(&member.node_id)
-            .and_then(|pid| process_cpu_seconds(*pid))
-            .unwrap_or(0.0);
+            .and_then(|pid| process_cpu_seconds(*pid));
         counters.insert(
             member.node_id.clone(),
             NodeCounters {
@@ -1565,12 +1566,12 @@ async fn sample_node_counters(
             },
         );
     }
-    counters
+    Ok(counters)
 }
 
 /// The number of operations a node served since it started.
-async fn query_node_ops(endpoint: &str) -> Option<u64> {
-    let result = tokio::time::timeout(Duration::from_secs(2), async {
+async fn query_node_ops(endpoint: &str) -> Result<u64> {
+    tokio::time::timeout(Duration::from_secs(2), async {
         let mut client = configure_data_node_client(
             DataNodeClient::connect(endpoint.to_owned())
                 .await
@@ -1582,8 +1583,8 @@ async fn query_node_ops(endpoint: &str) -> Option<u64> {
             .map_err(|error| anyhow::anyhow!("{error}"))?;
         Ok::<_, anyhow::Error>(info.into_inner().ops_handled)
     })
-    .await;
-    result.ok().and_then(|value| value.ok())
+    .await
+    .context("node operations request timed out")?
 }
 
 /// How the keys and the requests were spread over the nodes.
@@ -1592,19 +1593,21 @@ fn load_balance(
     before: &BTreeMap<String, NodeCounters>,
     after: &BTreeMap<String, NodeCounters>,
     seconds: f64,
-) -> LoadBalanceMeasurement {
+) -> Result<LoadBalanceMeasurement> {
     let mut per_node = BTreeMap::new();
     let mut owned = Vec::new();
     let mut handled = Vec::new();
     for (node, keys) in owned_keys {
-        let start = before.get(node).copied().unwrap_or_default();
-        let end = after.get(node).copied().unwrap_or_default();
-        let ops_handled = end.ops_handled.saturating_sub(start.ops_handled);
-        let cpu_percent = if seconds > 0.0 {
-            (end.cpu_seconds - start.cpu_seconds) / seconds * 100.0
-        } else {
-            0.0
-        };
+        let start = before.get(node).context("missing initial node counters")?;
+        let end = after.get(node).context("missing final node counters")?;
+        let ops_handled = end
+            .ops_handled
+            .checked_sub(start.ops_handled)
+            .context("node operations counter decreased during the stage")?;
+        let cpu_percent = start
+            .cpu_seconds
+            .zip(end.cpu_seconds)
+            .and_then(|(a, b)| (seconds > 0.0 && b >= a).then_some((b - a) / seconds * 100.0));
         owned.push(*keys as f64);
         handled.push(ops_handled as f64);
         per_node.insert(
@@ -1616,13 +1619,13 @@ fn load_balance(
             },
         );
     }
-    LoadBalanceMeasurement {
+    Ok(LoadBalanceMeasurement {
         per_node,
         owned_keys_max_over_mean: max_over_mean(&owned),
         owned_keys_cv: coefficient_of_variation(&owned),
         ops_handled_max_over_mean: max_over_mean(&handled),
         ops_handled_cv: coefficient_of_variation(&handled),
-    }
+    })
 }
 
 /// The largest value divided by the mean of the values.
@@ -2459,6 +2462,43 @@ fn unix_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_balance_preserves_missing_cpu_and_rejects_missing_or_reset_counters() {
+        let owned = BTreeMap::from([("node-1".to_owned(), 10)]);
+        let before = BTreeMap::from([(
+            "node-1".to_owned(),
+            NodeCounters {
+                ops_handled: 20,
+                cpu_seconds: Some(1.0),
+            },
+        )]);
+        let mut after = BTreeMap::from([(
+            "node-1".to_owned(),
+            NodeCounters {
+                ops_handled: 40,
+                cpu_seconds: None,
+            },
+        )]);
+        let result = load_balance(&owned, &before, &after, 2.0).unwrap();
+        assert_eq!(result.per_node["node-1"].ops_handled, 20);
+        assert!(
+            serde_json::to_value(result).unwrap()["per_node"]["node-1"]["cpu_percent"].is_null()
+        );
+        after.get_mut("node-1").unwrap().cpu_seconds = Some(2.0);
+        assert_eq!(
+            load_balance(&owned, &before, &after, 2.0).unwrap().per_node["node-1"].cpu_percent,
+            Some(50.0)
+        );
+        after.get_mut("node-1").unwrap().ops_handled = 10;
+        assert!(load_balance(&owned, &before, &after, 2.0).is_err());
+        assert!(load_balance(&owned, &BTreeMap::new(), &after, 2.0).is_err());
+    }
+
+    #[tokio::test]
+    async fn node_operations_sampling_propagates_connection_failure() {
+        assert!(query_node_ops("http://127.0.0.1:0").await.is_err());
+    }
 
     #[test]
     fn deterministic_values_include_key_round_and_requested_length() {

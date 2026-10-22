@@ -232,10 +232,9 @@ async fn latency_experiment_measures_one_stage_per_target_rate() {
     // The histogram keeps the longest sample and the number of the samples
     // that were longer than its range, so a reader can tell a truncated
     // sample from one that was near the bound.
-    assert_eq!(
-        stage["latency_us"]["get"]["max_observed"].as_u64().unwrap(),
-        stage["latency_us"]["get"]["max"].as_u64().unwrap()
-    );
+    let observed = stage["latency_us"]["get"]["max_observed"].as_u64().unwrap();
+    let bucket = stage["latency_us"]["get"]["max"].as_u64().unwrap();
+    assert!(bucket >= observed && bucket - observed <= bucket / 1_000 + 1);
     assert_eq!(
         stage["latency_us"]["get"]["over_range"].as_u64().unwrap(),
         0

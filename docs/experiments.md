@@ -246,7 +246,8 @@ The load balance has two layers. `owned_keys` is how the key space was
 divided: the number of keys each node owns, counted over the key space
 itself. `ops_handled` and `cpu_percent` are how the requests were divided:
 the operations each node served while the stage ran, and the share of one
-core it used. `max_over_mean` is the largest value divided by the mean, and
+core it used (`null` when CPU sampling is unavailable). A failed node operations
+sample fails the run rather than inventing a zero. `max_over_mean` is the largest value divided by the mean, and
 `cv` is the standard deviation divided by the mean.
 
 The measurements of a latency run hold the rate stages and nothing else: the
