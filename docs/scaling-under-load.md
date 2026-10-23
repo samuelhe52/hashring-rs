@@ -369,7 +369,7 @@ S1 与 S2 在**同一个集群生命周期内连续执行**：预载一次、负
 | 字段 | 含义 |
 |---|---|
 | `snapshot_copy_ms` | `CopyingSnapshot` 阶段墙钟，含该阶段内的初次 changelog 追赶 |
-| `changelog_replay_ms` | 所有 range 的 changelog 回放耗时之和；并发迁移时可能大于所在阶段 |
+| `changelog_replay_ms` | 所有 range 的 `replay_changelog` 耗时之和；不含之后的 digest 往返与 destination commit（它们属于 `verify_ms`）；并发迁移时可能大于所在阶段 |
 | `pause_writes_ms` | `PausingWrites` 阶段墙钟（direct merge 时含加栅栏） |
 | `verify_ms` | `Verifying` 阶段墙钟（复制路径含最终回放、digest 与提交） |
 | `publish_ms` | 从 `ReadyToPublish` 到提交新拓扑，含 `pre_publish_delay` |
@@ -377,16 +377,17 @@ S1 与 S2 在**同一个集群生命周期内连续执行**：预载一次、负
 | `merge_proof_ms` | direct merge 的 coverage/proof 计算 |
 | `catch_up_ms` | direct merge 等旧复制流追平的循环 |
 
-这些是 coordinator 侧的墙钟，不含客户端重试等待，也不含 `wait_for_full_rf` 在 `Complete` 之后的收敛时间。字段为 0 表示该路径不经过这一步（例如 S2 direct merge 的 `snapshot_copy_ms`/`changelog_replay_ms`）。另外 `<label>_transition` 还有 `published_ms`、`complete_ms`、`full_rf_seconds`：前两个从 change 开始计时，最后一个从 `Complete` 到目标 epoch 满 RF。
+这些是 coordinator 侧的墙钟，不含客户端重试等待，也不含 `wait_for_full_rf` 在 `Complete` 之后的收敛时间。字段为 0 表示该路径不经过这一步（例如 S2 direct merge 的 `snapshot_copy_ms`/`changelog_replay_ms`）。计时在发布后与 activation 后各写回一次持久化的 active change，所以 `change-status`、重复的 `execute-change`、以及重启后从 redb 读到的记录，都和 `execute-change` 的返回值一致。另外 `<label>_transition` 还有 `published_ms`、`complete_ms`、`full_rf_seconds`：前两个从 change 开始计时，最后一个从 `Complete`（含之后等被移除节点退出的时间）到目标 epoch 满 RF。
 
 ### 7.2 负载指标
 
 - 尝试数、成功数、失败数（应用层 `ErrorCode` / gRPC status / 连接失败 / 拓扑刷新分开）
-- 重试原因：`Moved`、`RangeBusy`、`Unavailable`、`ResourceExhausted`、`TemporarilyUnavailable`、`ReplicaNotReady`、`OutcomeUnknown`、`LeaseExpired`，以及 transport/connect/topology refresh
+- 重试原因：`Moved`、`RangeBusy`、`Unavailable`、`ResourceExhausted`、`TemporarilyUnavailable`、`ReplicaNotReady`、`OutcomeUnknown`、`LeaseExpired`、`Rpc`（传输层状态）、`Connect`（建连失败）、`TopologyRefresh`
 - 主负载 GET、PUT、DELETE 的 p50/p95/p99/max 与 `max_observed`；探针 GET（读己之写/删、发布后复读）单独直方图，不并入主负载
 - 每秒窗口：`epoch`、`issued`、`late`、`achieved_rate`、in-flight
 - 切写窗口的写尝试数、拒绝数、停写时长；首个成功写时间
-- **停写窗口的定义以客户端实际观测为准**：按区间（S2 是全集群）记录第一次和最后一次 `RangeBusy` 的时间，再取此后第一个成功写，用这三者定义窗口；phase 只做粗粒度标注。栅栏在节点收到 RPC 后才生效，与 coordinator 的 phase 切换存在时差，再叠加轮询误差，不能拿阶段边界当停写时长。实现上由 scaling 模式每 5 ms 采样客户端的 `RangeBusy` 计数与成功写计数，写入 `<label>_transition.stop_window`（`first_range_busy_ms`、`last_range_busy_ms`、`first_write_ok_ms`、`observed_ms`、`poll_ms`）。
+- **停写窗口的定义以客户端实际观测为准**：按区间（S2 是全集群）记录第一次和最后一次 `RangeBusy` 的时间，再取此后第一个成功写，用这三者定义窗口；phase 只做粗粒度标注。栅栏在节点收到 RPC 后才生效，与 coordinator 的 phase 切换存在时差，再叠加轮询误差，不能拿阶段边界当停写时长。实现上由 scaling 模式每 5 ms 采样客户端的 `RangeBusy` 计数与成功写计数，写入 `<label>_transition.stop_window`（`first_range_busy_ms`、`last_range_busy_ms`、`first_write_ok_ms`、`observed_ms`、`poll_ms`）。每个 transition 的窗口以它开始时的累计计数为基线，所以第二个 transition 不会把第一个的拒绝算成自己的，`first_range_busy_ms` 也不会被钉成 0。
+- 发布后复读在观察到 `Published` 的那一刻启动（限速、独立 client），不是整个 transition 结束后的一次终态复查，否则发布瞬间的短暂陈旧读会自愈、探针看不到。
 - 读连续失败最长间隔
 - 每层 cohort 的实际操作量与结果分布
 - 每次 change 的迁移量：`<label>_transition.migration` 的 `keys`、`keys_moved`、`rate`、`ranges`、`snapshot_records`
