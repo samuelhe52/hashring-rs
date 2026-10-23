@@ -498,13 +498,14 @@ impl Metrics {
     }
 
     fn total_operations(&self) -> u64 {
-        self.state
-            .lock()
-            .expect("the metrics lock is not poisoned")
-            .total
-            .values()
-            .map(|bucket| bucket.count)
-            .sum()
+        let state = self.state.lock().expect("the metrics lock is not poisoned");
+        // The buckets the sampler has not flushed yet are part of the count.
+        // Leaving them out makes two snapshots up to a second stale, and the
+        // transition's operations then depend on where the sampler's tick
+        // happened to fall.
+        let flushed: u64 = state.total.values().map(|bucket| bucket.count).sum();
+        let pending: u64 = state.window.values().map(|bucket| bucket.count).sum();
+        flushed + pending
     }
 }
 
@@ -525,6 +526,18 @@ struct StopWindow {
 }
 
 impl StopWindow {
+    /// A window whose baseline is the counters as they are now.
+    ///
+    /// Without it a later transition sees the earlier transitions' rejections
+    /// as new ones and pins its first rejection to zero.
+    fn starting(busy: u64, writes_ok: u64) -> Self {
+        Self {
+            previous_busy: busy,
+            previous_writes: writes_ok,
+            ..Self::default()
+        }
+    }
+
     /// Samples cumulative counters. `now_ms` is measured from the start of the
     /// change.
     fn observe(&mut self, now_ms: f64, busy: u64, writes_ok: u64) {
@@ -936,15 +949,15 @@ fn start_open_writes(context: OpenWriteContext<'_>) -> Result<Vec<OpenSender>> {
         stop,
         probe_tx,
     } = context;
-    let total = config.scaling_open_rate;
+    let rates = cohort_rates(config);
     let cohorts = [
-        (Cohort::Rewrite, Arc::clone(&plan.rewrite), total * 12 / 100),
+        (Cohort::Rewrite, Arc::clone(&plan.rewrite), rates.rewrite),
         (
             Cohort::WriteNew,
             Arc::clone(&plan.write_new),
-            total * 5 / 100,
+            rates.write_new,
         ),
-        (Cohort::Delete, Arc::clone(&plan.delete), total * 3 / 100),
+        (Cohort::Delete, Arc::clone(&plan.delete), rates.delete),
     ];
     let mut senders = Vec::new();
     let sender_context = OpenSenderContext {
@@ -1362,6 +1375,10 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
         let mut stop_window: Option<StopWindow> = None;
         let mut published_ms: Option<f64> = None;
         let mut complete_ms: Option<f64> = None;
+        // RF repair starts at completion, so the convergence clock starts
+        // there too. The removed-node waits below must not be hidden from it.
+        let mut rf_started: Option<Instant> = None;
+        let mut after_publish_probe: Option<tokio::task::JoinHandle<Result<()>>> = None;
         let completed = if let Some(staged) = &staged {
             ledger.begin_publish_window();
             let mut last_phase = Phase::Pre;
@@ -1374,9 +1391,7 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                     .execute_topology_change(change_id, base_epoch, target_epoch)
                     .await
             });
-            let mut window = StopWindow::default();
-            window.observe(
-                0.0,
+            let mut window = StopWindow::starting(
                 workload_client.retry_reason_count(RetryReason::RangeBusy),
                 metrics.writes_ok(),
             );
@@ -1389,6 +1404,19 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                     if phase != last_phase {
                         if phase == Phase::Published {
                             published_ms = Some(started.elapsed().as_secs_f64() * 1_000.0);
+                            // Re-read the keys written before the switch right
+                            // away. A stale read after publication heals
+                            // quickly, so a probe that starts after the whole
+                            // transition would never see it.
+                            if after_publish_probe.is_none() {
+                                after_publish_probe =
+                                    Some(tokio::spawn(spawn_after_publish_probe(
+                                        workload_client.clone(),
+                                        Arc::clone(&metrics),
+                                        ledger.publish_expected(),
+                                        write_operations_per_second(config),
+                                    )));
+                            }
                         }
                         metrics.set_phase(phase);
                         events.record(
@@ -1419,6 +1447,7 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                 completed.phase
             );
             complete_ms = Some(started.elapsed().as_secs_f64() * 1_000.0);
+            rf_started = Some(Instant::now());
             // The first write after the last rejection can complete after
             // Complete, so keep sampling until the window closes.
             let window_deadline = Instant::now() + Duration::from_secs(2);
@@ -1485,7 +1514,7 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
         let target_epoch = target_topology.epoch;
         let mut full_rf_seconds: Option<f64> = None;
         if completed.is_some() {
-            let rf_started = Instant::now();
+            let rf_started = rf_started.expect("a completed change records its completion time");
             wait_for_full_rf_at_epoch(
                 &observer,
                 config.desired_replication_factor,
@@ -1516,11 +1545,15 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                     .saturating_add(Duration::from_secs(10)),
             )
             .await?;
+        // The open senders hold a probe sender of their own, so the probe only
+        // sees the channel close after the writes are drained. Draining first
+        // keeps an in-flight write from racing the probe's timeout and
+        // failing the run with the wrong error.
+        drain_writes(&metrics, config).await?;
         drop(probe_tx);
         tokio::time::timeout(Duration::from_secs(30), probe_handle)
             .await
             .context("the read-after-write probe did not stop")???;
-        drain_writes(&metrics, config).await?;
 
         ensure!(
             !plan.rewrite.exhausted() && !plan.write_new.exhausted() && !plan.delete.exhausted(),
@@ -1559,15 +1592,11 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
             "deferred_to_next_transition"
         };
 
-        // Read after publication, with a separate client and a bounded rate,
-        // so the probe does not become a burst inside the measured window.
-        let publish_expected = ledger.publish_expected();
-        re_read_handles.push(tokio::spawn(spawn_after_publish_probe(
-            workload_client.clone(),
-            Arc::clone(&metrics),
-            publish_expected,
-            effective_write_rate(config),
-        )));
+        // The probe started when the publication was observed; keep its
+        // handle with the other probes.
+        if let Some(probe) = after_publish_probe.take() {
+            re_read_handles.push(probe);
+        }
 
         let elapsed = started.elapsed();
         let operations = metrics.total_operations().saturating_sub(operations_before);
@@ -1749,14 +1778,36 @@ fn is_control(config: &ExperimentConfig) -> bool {
     config.scaling_scenario == ScalingScenario::Control
 }
 
-/// The one-shot write and delete rate the pools must cover. Closed-loop runs
-/// pace writes with `scaling_write_rate`; open-loop runs offer 20% of
-/// `scaling_open_rate` as writes.
-fn effective_write_rate(config: &ExperimentConfig) -> u64 {
-    match config.scaling_load_mode {
-        ScalingLoadMode::Closed => config.scaling_write_rate,
-        ScalingLoadMode::Open => config.scaling_open_rate * 20 / 100,
+/// The write operations per second each cohort is offered.
+///
+/// The pools and the senders must share one definition. Deriving an open-loop
+/// total from 20% of the offered rate and then splitting it again rounded a
+/// small delete share down to zero in the pool while the sender still offered
+/// deletes.
+#[derive(Clone, Copy, Debug)]
+struct CohortRates {
+    rewrite: u64,
+    write_new: u64,
+    delete: u64,
+}
+
+/// The per-cohort write rates of the run's load mode.
+fn cohort_rates(config: &ExperimentConfig) -> CohortRates {
+    let (total, rewrite, write_new, delete) = match config.scaling_load_mode {
+        ScalingLoadMode::Closed => (config.scaling_write_rate, 60, 25, 15),
+        ScalingLoadMode::Open => (config.scaling_open_rate, 12, 5, 3),
+    };
+    CohortRates {
+        rewrite: total * rewrite / 100,
+        write_new: total * write_new / 100,
+        delete: total * delete / 100,
     }
+}
+
+/// The write operations per second of every cohort together.
+fn write_operations_per_second(config: &ExperimentConfig) -> u64 {
+    let rates = cohort_rates(config);
+    rates.rewrite + rates.write_new + rates.delete
 }
 
 struct Transition {
@@ -1826,13 +1877,14 @@ fn build_transition_plan(
         chunk_start + per_transition
     };
 
-    let write_rate = effective_write_rate(config);
-    let rewrite_quota = (write_rate * 60 / 100 * config.scaling_pool_seconds) as usize;
-    let new_quota = (write_rate * 25 / 100 * config.scaling_pool_seconds) as usize;
-    let delete_quota = (write_rate * 15 / 100 * config.scaling_pool_seconds) as usize;
+    let write_rate = cohort_rates(config);
+    let pool_seconds = config.scaling_pool_seconds;
+    let rewrite_quota = (write_rate.rewrite * pool_seconds) as usize;
+    let new_quota = (write_rate.write_new * pool_seconds) as usize;
+    let delete_quota = (write_rate.delete * pool_seconds) as usize;
     ensure!(
         rewrite_quota > 0 && new_quota > 0 && delete_quota > 0,
-        "scaling_write_rate is too low to give every cohort a key; raise it or raise --scaling-pool-seconds"
+        "the scaling write rate is too low to give every cohort a key; raise it or raise --scaling-pool-seconds"
     );
     ensure!(
         rewrite_quota + delete_quota <= (chunk_end - chunk_start) as usize,
@@ -2006,15 +2058,15 @@ fn start_writes(context: WriteContext<'_>) {
         handles,
         probe_tx,
     } = context;
-    let rate = config.scaling_write_rate;
+    let rate = cohort_rates(config);
     let cohorts = [
-        (Cohort::Rewrite, Arc::clone(&plan.rewrite), rate * 60 / 100),
+        (Cohort::Rewrite, Arc::clone(&plan.rewrite), rate.rewrite),
         (
             Cohort::WriteNew,
             Arc::clone(&plan.write_new),
-            rate * 25 / 100,
+            rate.write_new,
         ),
-        (Cohort::Delete, Arc::clone(&plan.delete), rate * 15 / 100),
+        (Cohort::Delete, Arc::clone(&plan.delete), rate.delete),
     ];
     for (cohort, pool, cohort_rate) in cohorts {
         if cohort_rate == 0 {

@@ -147,11 +147,13 @@ pub enum RetryReason {
     OutcomeUnknown,
     LeaseExpired,
     Rpc,
+    /// A data-node connection could not be established.
+    Connect,
     TopologyRefresh,
 }
 
 impl RetryReason {
-    pub const ALL: [RetryReason; 10] = [
+    pub const ALL: [RetryReason; 11] = [
         Self::Moved,
         Self::RangeBusy,
         Self::Unavailable,
@@ -161,6 +163,7 @@ impl RetryReason {
         Self::OutcomeUnknown,
         Self::LeaseExpired,
         Self::Rpc,
+        Self::Connect,
         Self::TopologyRefresh,
     ];
 
@@ -175,6 +178,7 @@ impl RetryReason {
             Self::OutcomeUnknown => "outcome_unknown",
             Self::LeaseExpired => "lease_expired",
             Self::Rpc => "rpc",
+            Self::Connect => "connect",
             Self::TopologyRefresh => "topology_refresh",
         }
     }
@@ -190,7 +194,8 @@ impl RetryReason {
             Self::OutcomeUnknown => 6,
             Self::LeaseExpired => 7,
             Self::Rpc => 8,
-            Self::TopologyRefresh => 9,
+            Self::Connect => 9,
+            Self::TopologyRefresh => 10,
         }
     }
 
@@ -338,7 +343,7 @@ struct ClientInner {
     /// a slow cluster apart from a client that had to try again.
     retries: AtomicU64,
     /// The retries by reason, cumulative like `retries`.
-    retry_reasons: [AtomicU64; 10],
+    retry_reasons: [AtomicU64; 11],
 }
 
 impl HashringClient {
@@ -611,6 +616,7 @@ impl HashringClient {
                     return Err(ClientError::deadline(false));
                 }
                 Err(_) => {
+                    self.record_retry_reason(RetryReason::Connect);
                     self.refresh_after_unavailable(epoch, deadline, false)
                         .await?;
                     self.retry_delay(deadline, &mut attempt, false).await?;
@@ -785,6 +791,7 @@ impl HashringClient {
                     return Err(ClientError::deadline(unknown_write_outcome));
                 }
                 Err(_) => {
+                    self.record_retry_reason(RetryReason::Connect);
                     self.refresh_after_unavailable(epoch, deadline, unknown_write_outcome)
                         .await?;
                     self.retry_delay(deadline, &mut attempt, unknown_write_outcome)
@@ -913,6 +920,7 @@ impl HashringClient {
                     return Err(ClientError::deadline(unknown_write_outcome));
                 }
                 Err(_) => {
+                    self.record_retry_reason(RetryReason::Connect);
                     self.refresh_after_unavailable(epoch, deadline, unknown_write_outcome)
                         .await?;
                     self.retry_delay(deadline, &mut attempt, unknown_write_outcome)

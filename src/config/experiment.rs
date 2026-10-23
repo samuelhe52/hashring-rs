@@ -166,6 +166,8 @@ pub fn resolve(
         ExperimentMode::Availability => PolicyArg::FirstSuccessor,
         _ => PolicyArg::OwnerOnly,
     });
+    // Only the scaling mode reads this setting; the others derive their
+    // initial membership from their own rules.
     let initial_nodes = args.initial_nodes.or(file.initial_nodes).or({
         match mode {
             ExperimentMode::Scaling => Some(match scaling_scenario {
@@ -174,7 +176,6 @@ pub fn resolve(
                 ScalingScenario::Replace => node_count.saturating_sub(1),
                 ScalingScenario::Churn => node_count.saturating_sub(3),
             }),
-            ExperimentMode::Correctness => Some(node_count.saturating_sub(1)),
             _ => None,
         }
     });

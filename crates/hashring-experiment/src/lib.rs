@@ -69,19 +69,6 @@ pub enum ScalingScenario {
     Control,
 }
 
-impl ScalingScenario {
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::RoundTrip => "round-trip",
-            Self::Grow => "grow",
-            Self::Shrink => "shrink",
-            Self::Replace => "replace",
-            Self::Churn => "churn",
-            Self::Control => "control",
-        }
-    }
-}
-
 /// How a `scaling` run offers its load.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1341,11 +1328,15 @@ async fn run_availability(context: RunContext<'_>) -> Result<u64> {
     // yet.
     let probe_key = owner_keys[0];
 
-    // The keys whose value the run overwrote, and the value it wrote. A tail
-    // key of an earlier round can be sampled again, so its expected value is
-    // not the one the initial dataset holds.
-    let mut expected_values: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
-    let mut previous_tail: Option<(u64, Vec<u8>)> = None;
+    // The value each sampled key is expected to hold, as the run last saw it.
+    // `None` means the run observed the key absent. The oracle follows what a
+    // failure left behind, so a loss the policy allows is not reported again
+    // by a later round that samples the same key.
+    let mut expected_values: BTreeMap<u64, Option<Vec<u8>>> = BTreeMap::new();
+    // The previous round's tail key and the value the run expects it to hold
+    // now, which is the observed value when the policy allowed the write to
+    // be lost.
+    let mut previous_tail: Option<(u64, Option<Vec<u8>>)> = None;
     let mut killed: Vec<String> = Vec::new();
     let mut round_records: Vec<AvailabilityRound> = Vec::new();
     let mut lost_total = 0u64;
@@ -1403,11 +1394,11 @@ async fn run_availability(context: RunContext<'_>) -> Result<u64> {
             .clamp(1024 * 1024, config.node.max_value_bytes);
         let tail_value = deterministic_value(tail_key, u64::from(round), tail_bytes);
         // The value the key held before this round's write. A key that was
-        // already a tail key keeps the value of that earlier write.
+        // already observed keeps what the run saw then, including absence.
         let prior_tail_value = expected_values
             .get(&tail_key)
             .cloned()
-            .unwrap_or_else(|| deterministic_value(tail_key, 0, config.value_bytes));
+            .unwrap_or_else(|| Some(deterministic_value(tail_key, 0, config.value_bytes)));
         let tail_put_started = Instant::now();
         let writer =
             HashringClient::connect(coordinator_endpoint.to_owned(), Duration::from_secs(10))
@@ -1416,7 +1407,7 @@ async fn run_availability(context: RunContext<'_>) -> Result<u64> {
             .put(tail_key.to_be_bytes().to_vec(), tail_value.clone())
             .await?;
         let tail_put_seconds = tail_put_started.elapsed().as_secs_f64();
-        expected_values.insert(tail_key, tail_value.clone());
+        expected_values.insert(tail_key, Some(tail_value.clone()));
         let tail_ack_at = Instant::now();
         let failed_at = Instant::now();
         let (exit, kill_signalled_at) = processes.kill(&victim)?;
@@ -1505,24 +1496,35 @@ async fn run_availability(context: RunContext<'_>) -> Result<u64> {
             let expected = expected_values
                 .get(key)
                 .cloned()
-                .unwrap_or_else(|| deterministic_value(*key, 0, config.value_bytes));
+                .unwrap_or_else(|| Some(deterministic_value(*key, 0, config.value_bytes)));
             match reader.get(key.to_be_bytes().to_vec()).await {
                 Ok(output) if *key == tail_key => {
                     if output.value != tail_value {
+                        // The policy may allow losing the just-acknowledged
+                        // write. The key must then hold what it held before
+                        // it, and the oracle follows the observed value.
                         ensure!(
-                            output.value == prior_tail_value,
+                            Some(&output.value) == prior_tail_value.as_ref(),
                             "tail key {key} has a value other than the acknowledged or prior value"
                         );
+                        expected_values.insert(*key, Some(output.value));
                         lost += 1;
                         tail_survived = false;
                     }
                 }
-                Ok(output) => ensure!(
-                    output.value == expected,
-                    "surviving key {key} has an unexpected value"
-                ),
+                Ok(output) => {
+                    ensure!(
+                        expected.as_deref() == Some(output.value.as_slice()),
+                        "surviving key {key} has an unexpected value"
+                    );
+                    expected_values.insert(*key, Some(output.value));
+                }
                 Err(ClientError::Operation(failure)) if failure.code == ErrorCode::NotFound => {
-                    lost += 1;
+                    // A key the oracle already knew absent is not a new loss.
+                    if expected.is_some() {
+                        lost += 1;
+                    }
+                    expected_values.insert(*key, None);
                     if *key == tail_key {
                         tail_survived = false;
                     }
@@ -1533,16 +1535,16 @@ async fn run_availability(context: RunContext<'_>) -> Result<u64> {
                 }
             }
         }
-        // The value the previous round wrote is checked here as well: a
+        // The value the previous round left is checked here as well: a
         // failure that follows another one must not lose it either. A round
         // that had to reuse the previous tail key has already overwritten it,
         // so it reports no result rather than a loss.
         let mut previous_tail_survived = None;
-        if !tail_reuses_previous && let Some((key, value)) = previous_tail.as_ref() {
+        if !tail_reuses_previous && let Some((key, expected)) = previous_tail.as_ref() {
             previous_tail_survived = Some(match reader.get(key.to_be_bytes().to_vec()).await {
-                Ok(output) => output.value == *value,
+                Ok(output) => Some(&output.value) == expected.as_ref(),
                 Err(ClientError::Operation(failure)) if failure.code == ErrorCode::NotFound => {
-                    false
+                    expected.is_none()
                 }
                 Err(error) => {
                     eprintln!("the previous round's tail key could not be read: {error}");
@@ -1664,6 +1666,10 @@ async fn run_availability(context: RunContext<'_>) -> Result<u64> {
         )
         .await?;
         let restored_seconds = restore_started.elapsed().as_secs_f64();
+        // Sample the recovery time once. The balance analysis below hashes the
+        // whole key space twice, and sampling again after it would make the
+        // per-round record disagree with the run-level figure.
+        let failure_to_full_rf_seconds = failed_at.elapsed().as_secs_f64();
         if round == 1 {
             observations.insert(
                 "replacement_to_full_rf_seconds".into(),
@@ -1671,7 +1677,7 @@ async fn run_availability(context: RunContext<'_>) -> Result<u64> {
             );
             observations.insert(
                 "failure_to_full_rf_seconds".into(),
-                json!(failed_at.elapsed().as_secs_f64()),
+                json!(failure_to_full_rf_seconds),
             );
         }
         measurements.insert(
@@ -1739,7 +1745,7 @@ async fn run_availability(context: RunContext<'_>) -> Result<u64> {
             }),
             previous_tail_survived,
             replacement_to_full_rf_seconds: restored_seconds,
-            failure_to_full_rf_seconds: failed_at.elapsed().as_secs_f64(),
+            failure_to_full_rf_seconds,
             live_members,
             owned_keys,
             balance,
@@ -1747,7 +1753,13 @@ async fn run_availability(context: RunContext<'_>) -> Result<u64> {
             survivor_owned_keys,
             survivor_balance,
         });
-        previous_tail = Some((tail_key, tail_value));
+        previous_tail = Some((
+            tail_key,
+            expected_values
+                .get(&tail_key)
+                .cloned()
+                .unwrap_or_else(|| Some(tail_value.clone())),
+        ));
     }
 
     observations.insert("availability_round_count".into(), json!(rounds));
@@ -2600,6 +2612,13 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
             "availability mode cannot keep AllReplicas writable after one node fails"
         );
     }
+    // Only the scaling mode reads this; the other modes derive their initial
+    // membership from their own rules, so an explicit value would be silently
+    // ignored.
+    ensure!(
+        config.initial_nodes.is_none() || matches!(config.mode, ExperimentMode::Scaling),
+        "initial_nodes only applies to the scaling mode"
+    );
     let initial_count = match config.mode {
         ExperimentMode::Correctness => config.node_count - 1,
         ExperimentMode::Performance | ExperimentMode::Latency => config.node_count,
@@ -2724,6 +2743,12 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
             ensure!(
                 config.scaling_open_rate == 0,
                 "scaling_open_rate only applies to an open-loop scaling run"
+            );
+            // Only the closed loop paces writes with this rate; an open-loop
+            // run takes its write rates from scaling_open_rate.
+            ensure!(
+                config.scaling_write_rate > 0,
+                "scaling_write_rate must be positive"
             );
         }
         ensure!(
