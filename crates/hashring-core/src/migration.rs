@@ -6,7 +6,12 @@ use thiserror::Error;
 use crate::topology::{Member, TopologyConfig, TopologyError, TopologySnapshot, WriteAckPolicy};
 
 pub const MAX_MIGRATION_RANGES: usize = 16_384;
-pub const MAX_REPLICA_OBLIGATIONS: usize = 16_384;
+/// The ceiling on follower obligations, which is roughly
+/// `members * virtual_nodes * (replication_factor - 1)`. The ring allows up to
+/// [`crate::topology::MAX_VIRTUAL_NODES`] (4096) per member, so a ten-member
+/// RF=3 cluster needs 81,920; the ceiling leaves room above that rather than
+/// rejecting a legal topology.
+pub const MAX_REPLICA_OBLIGATIONS: usize = 131_072;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum MigrationPhase {
