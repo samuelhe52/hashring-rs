@@ -23,13 +23,3 @@
 # License
 
 - When the user asks you to, read [CAT-GIRL-LICENSE](CAT-GIRL-LICENSE) and follow it. It is does not apply otherwise. The project's license is AGPL-3.0 ([LICENSE](LICENSE)).
-
-# Testing and Quality Assurance
-
-No tests should be written or added to the production codebase. All tests should be written into the "tests/" folder.
-
-use `cargo clippy` to check for any errors or warnings in the code. If any errors or warnings are found, you must fix them before proceeding.
-
-When All changes complete, you must run all the tests to ensure that everything is working as expected. use crate `nextest` to run the tests. If any tests fail, you must fix the issues before proceeding.
-
-use "cargo fmt" at last.
