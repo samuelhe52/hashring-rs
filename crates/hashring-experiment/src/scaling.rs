@@ -47,6 +47,7 @@ enum Phase {
     Verifying,
     ReadyToPublish,
     Published,
+    Complete,
     Post,
 }
 
@@ -60,6 +61,7 @@ impl Phase {
             5 => Self::ReadyToPublish,
             6 => Self::Published,
             7 => Self::Post,
+            8 => Self::Complete,
             _ => Self::Pre,
         }
     }
@@ -74,6 +76,7 @@ impl Phase {
             Self::ReadyToPublish => 5,
             Self::Published => 6,
             Self::Post => 7,
+            Self::Complete => 8,
         }
     }
 
@@ -87,6 +90,7 @@ impl Phase {
             Self::ReadyToPublish => "ready_to_publish",
             Self::Published => "published",
             Self::Post => "post",
+            Self::Complete => "complete",
         }
     }
 }
@@ -99,9 +103,11 @@ fn phase_of(phase: MigrationPhase) -> Phase {
         MigrationPhase::PausingWrites => Phase::PausingWrites,
         MigrationPhase::Verifying => Phase::Verifying,
         MigrationPhase::ReadyToPublish => Phase::ReadyToPublish,
-        MigrationPhase::Published | MigrationPhase::CleaningUp | MigrationPhase::Complete => {
-            Phase::Published
-        }
+        // `Complete` is a distinct observation: publication happened some
+        // polls earlier, so folding it into `Published` would record the
+        // completion time as the publication time.
+        MigrationPhase::Published | MigrationPhase::CleaningUp => Phase::Published,
+        MigrationPhase::Complete => Phase::Complete,
         MigrationPhase::Aborting | MigrationPhase::Aborted => Phase::Published,
     }
 }
@@ -547,7 +553,12 @@ impl StopWindow {
             // A new rejection means the window is open again, so a write that
             // completed before it is not the first write after the stop.
             self.first_ok_ms = None;
-        } else if self.last_busy_ms.is_some()
+        }
+        // Check the success independently of the branch above: a rejection and
+        // the first successful write can land in the same sample interval, and
+        // an `else if` would drop that sample and then advance the baseline
+        // past it, leaving the window open forever.
+        if self.last_busy_ms.is_some()
             && self.first_ok_ms.is_none()
             && writes_ok > self.previous_writes
         {
@@ -788,6 +799,47 @@ impl Drop for TaskHandles {
     }
 }
 
+/// The periodic metrics sampler.
+///
+/// Every early return after the sampler starts must stop it, or it keeps
+/// appending `metrics_sampled` events to `events.jsonl` after the run has
+/// reported its failure. Owning the task in a value with a `Drop` makes the
+/// cleanup independent of which `?` returned.
+struct MetricsSampler {
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl MetricsSampler {
+    fn spawn(metrics: Arc<Metrics>, events: EventLog) -> Self {
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if let Err(error) = metrics.sample(&events) {
+                    eprintln!("scaling metrics sample failed: {error:#}");
+                }
+            }
+        });
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    async fn stop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for MetricsSampler {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+}
+
 /// A fixed-rate sender thread. The thread measures the due time against the
 /// wall clock; a Tokio timer would add about a millisecond to every request,
 /// which is larger than the latencies a migration window shows.
@@ -797,11 +849,15 @@ struct OpenSender {
 }
 
 impl OpenSender {
-    fn join(mut self) -> Result<()> {
+    async fn join(mut self) -> Result<()> {
         self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
-            thread
-                .join()
+            // The sender is an OS thread because a Tokio timer would add
+            // roughly a millisecond per request. Waiting for it therefore has
+            // to leave the async worker.
+            tokio::task::spawn_blocking(move || thread.join())
+                .await
+                .context("joining an open-loop sender thread")?
                 .map_err(|_| anyhow!("an open-loop sender thread panicked"))??;
         }
         Ok(())
@@ -1132,18 +1188,7 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
         config.scaling_load_mode == ScalingLoadMode::Open,
         config.max_in_flight,
     )?);
-    let sampler = tokio::spawn({
-        let metrics = Arc::clone(&metrics);
-        let events = events.clone();
-        async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                if let Err(error) = metrics.sample(&events) {
-                    eprintln!("scaling metrics sample failed: {error:#}");
-                }
-            }
-        }
-    });
+    let mut sampler = MetricsSampler::spawn(Arc::clone(&metrics), events.clone());
 
     let pool_plan = plan_keys(config, &transitions)?;
     let read_pool = Arc::new(pool_plan.read.clone());
@@ -1179,7 +1224,7 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
     let mut all_entries = BTreeMap::new();
     let mut all_fresh = BTreeSet::new();
     let mut final_epoch = admin_client.refresh_topology().await?.epoch;
-    let mut re_read_handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::new();
+    let mut re_read_handles: Vec<(Duration, tokio::task::JoinHandle<Result<()>>)> = Vec::new();
     let mut pending_verification: Option<(&'static str, BTreeMap<u64, Allowed>)> = None;
 
     for (index, transition) in transitions.iter().enumerate() {
@@ -1378,7 +1423,7 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
         // RF repair starts at completion, so the convergence clock starts
         // there too. The removed-node waits below must not be hidden from it.
         let mut rf_started: Option<Instant> = None;
-        let mut after_publish_probe: Option<tokio::task::JoinHandle<Result<()>>> = None;
+        let mut after_publish_probe: Option<(Duration, tokio::task::JoinHandle<Result<()>>)> = None;
         let completed = if let Some(staged) = &staged {
             ledger.begin_publish_window();
             let mut last_phase = Phase::Pre;
@@ -1402,20 +1447,23 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                 if let Ok(Some(current)) = observer.topology_change().await {
                     let phase = phase_of(current.phase);
                     if phase != last_phase {
-                        if phase == Phase::Published {
-                            published_ms = Some(started.elapsed().as_secs_f64() * 1_000.0);
+                        if matches!(phase, Phase::Published | Phase::Complete) {
+                            published_ms
+                                .get_or_insert_with(|| started.elapsed().as_secs_f64() * 1_000.0);
                             // Re-read the keys written before the switch right
                             // away. A stale read after publication heals
                             // quickly, so a probe that starts after the whole
-                            // transition would never see it.
+                            // transition would never see it. A change that is
+                            // first observed as `Complete` still gets a probe;
+                            // starting it late is better than silently having
+                            // no read-after-publish coverage.
                             if after_publish_probe.is_none() {
-                                after_publish_probe =
-                                    Some(tokio::spawn(spawn_after_publish_probe(
-                                        workload_client.clone(),
-                                        Arc::clone(&metrics),
-                                        ledger.publish_expected(),
-                                        write_operations_per_second(config),
-                                    )));
+                                after_publish_probe = Some(spawn_after_publish_probe_task(
+                                    config,
+                                    workload_client,
+                                    &metrics,
+                                    &ledger,
+                                ));
                             }
                         }
                         metrics.set_phase(phase);
@@ -1447,6 +1495,20 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                 completed.phase
             );
             complete_ms = Some(started.elapsed().as_secs_f64() * 1_000.0);
+            // A short change can go from `Verifying` to `Complete` between two
+            // polls, so the loop above may exit without ever observing a
+            // published phase. Start the probe here rather than silently
+            // dropping the read-after-publish coverage; the earliest time we
+            // can name is completion.
+            if after_publish_probe.is_none() {
+                published_ms.get_or_insert(complete_ms.expect("just recorded"));
+                after_publish_probe = Some(spawn_after_publish_probe_task(
+                    config,
+                    workload_client,
+                    &metrics,
+                    &ledger,
+                ));
+            }
             rf_started = Some(Instant::now());
             // The first write after the last rejection can complete after
             // Complete, so keep sampling until the window closes.
@@ -1491,6 +1553,7 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
             None
         };
         let change_seconds = started.elapsed();
+        let change_operations = metrics.total_operations().saturating_sub(operations_before);
         metrics.set_phase(Phase::Post);
         let retries_after = workload_client.retry_reasons();
         let retry_delta: BTreeMap<_, _> = retries_after
@@ -1536,7 +1599,7 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
         // Open-loop senders only stop here; their requests are drained by the
         // in-flight accounting rather than by a task join.
         for sender in open_writes.drain(..) {
-            sender.join()?;
+            sender.join().await?;
         }
 
         write_tasks
@@ -1597,12 +1660,12 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
         if let Some(probe) = after_publish_probe.take() {
             re_read_handles.push(probe);
         }
-
-        let elapsed = started.elapsed();
-        let operations = metrics.total_operations().saturating_sub(operations_before);
+        // The throughput is the change's own: the numerator and denominator
+        // both stop when the change completes, so the post window and the
+        // verification reads cannot dilute it.
         measurements.insert(
             format!("{}_transition", transition.label),
-            measurement(operations, elapsed),
+            measurement(change_operations, change_seconds),
         );
         observations.insert(
             format!("{}_transition", transition.label),
@@ -1662,13 +1725,13 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
         pending_verification.is_none(),
         "the last transition's cohorts were not verified"
     );
-    for handle in re_read_handles {
-        tokio::time::timeout(Duration::from_secs(120), handle)
+    for (budget, handle) in re_read_handles {
+        tokio::time::timeout(budget, handle)
             .await
             .context("the read-after-publish probe did not stop")???;
     }
     if let Some(sender) = open_reads.take() {
-        sender.join()?;
+        sender.join().await?;
     }
     drain_in_flight(&metrics, config).await?;
     read_tasks
@@ -1677,8 +1740,7 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                 .saturating_add(Duration::from_secs(10)),
         )
         .await?;
-    sampler.abort();
-    let _ = sampler.await;
+    sampler.stop().await;
     let _ = metrics.sample(events);
 
     // The whole preloaded key space must still be what it was, with the
@@ -1808,6 +1870,41 @@ fn cohort_rates(config: &ExperimentConfig) -> CohortRates {
 fn write_operations_per_second(config: &ExperimentConfig) -> u64 {
     let rates = cohort_rates(config);
     rates.rewrite + rates.write_new + rates.delete
+}
+
+/// The paced rate of the read-after-publish probe. It reads at half the write
+/// rate so it trails the writes instead of competing with them, bounded on
+/// both ends so a tiny or enormous write rate still yields a usable pace.
+fn after_publish_probe_rate(config: &ExperimentConfig) -> u64 {
+    (write_operations_per_second(config) / 2).clamp(20, 500)
+}
+
+/// How long the probe may take for `entries` keys at `rate` reads per second.
+///
+/// The probe reads its snapshot once, serially, so its cost grows with the
+/// number of keys the change wrote. A fixed budget would time out a long
+/// change that the migration timeout explicitly allows.
+fn after_publish_probe_budget(entries: usize, rate: u64) -> Duration {
+    let pacing = entries as f64 / rate as f64;
+    Duration::from_secs_f64(pacing + 60.0).max(Duration::from_secs(120))
+}
+
+fn spawn_after_publish_probe_task(
+    config: &ExperimentConfig,
+    workload_client: &HashringClient,
+    metrics: &Arc<Metrics>,
+    ledger: &Ledger,
+) -> (Duration, tokio::task::JoinHandle<Result<()>>) {
+    let expected = ledger.publish_expected();
+    let rate = after_publish_probe_rate(config);
+    let budget = after_publish_probe_budget(expected.len(), rate);
+    let handle = tokio::spawn(spawn_after_publish_probe(
+        workload_client.clone(),
+        Arc::clone(metrics),
+        expected,
+        rate,
+    ));
+    (budget, handle)
 }
 
 struct Transition {
@@ -2128,9 +2225,8 @@ async fn spawn_after_publish_probe(
     client: HashringClient,
     metrics: Arc<Metrics>,
     expected: BTreeMap<u64, Allowed>,
-    write_rate: u64,
+    rate: u64,
 ) -> Result<()> {
-    let rate = (write_rate / 2).clamp(20, 500);
     let interval = Duration::from_secs_f64(1.0 / rate as f64);
     for (key, allowed) in expected {
         tokio::time::sleep(interval).await;
@@ -2325,5 +2421,29 @@ mod tests {
         let round_trip = applicable_strata(ScalingScenario::RoundTrip, "shrink");
         assert!(round_trip.contains(&Stratum::RemovedSource));
         assert!(!round_trip.contains(&Stratum::NewTarget));
+    }
+
+    #[test]
+    fn a_rejection_and_a_success_in_one_sample_still_close_the_stop_window() {
+        let mut window = StopWindow::starting(0, 0);
+        window.observe(10.0, 1, 1);
+        assert_eq!(window.first_busy_ms, Some(10.0));
+        assert_eq!(window.first_ok_ms, Some(10.0));
+        assert!(window.closed());
+    }
+
+    #[test]
+    fn completion_is_not_recorded_as_publication() {
+        assert_eq!(phase_of(MigrationPhase::Published), Phase::Published);
+        assert_eq!(phase_of(MigrationPhase::CleaningUp), Phase::Published);
+        assert_eq!(phase_of(MigrationPhase::Complete), Phase::Complete);
+    }
+
+    #[test]
+    fn the_probe_budget_grows_with_the_keys_it_must_read() {
+        let short = after_publish_probe_budget(100, 500);
+        let long = after_publish_probe_budget(100_000, 500);
+        assert!(short >= Duration::from_secs(120));
+        assert!(long > short);
     }
 }

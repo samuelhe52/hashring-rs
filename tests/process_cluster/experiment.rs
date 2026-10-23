@@ -629,7 +629,9 @@ async fn scaling_round_trip_defers_s1_verification_and_records_the_stop_window()
         assert!(first <= last, "{window}");
         assert!(last <= first_ok, "{window}");
         assert!(window["observed_ms"].as_f64().unwrap() > 0.0, "{window}");
-        let published = transition["published_ms"].as_f64().unwrap();
+        let published = transition["published_ms"]
+            .as_f64()
+            .expect("a completed change records a publication time");
         let complete = transition["complete_ms"].as_f64().unwrap();
         assert!(published > 0.0, "{transition}");
         assert!(complete >= published, "{transition}");
