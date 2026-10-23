@@ -62,15 +62,19 @@ impl CoordinatorService {
                 return Ok(change);
             }
             MigrationPhase::Published | MigrationPhase::CleaningUp => {
-                if change.direct_merge {
-                    return self.finish_direct_merge(change).await;
-                }
-                if change.supersedes_change_id.is_some() {
-                    return self.finish_recovered_change(change).await;
-                }
-                return self
-                    .finish_published_change(change, Instant::now() + self.migration_timeout)
-                    .await;
+                let completed = if change.direct_merge {
+                    self.finish_direct_merge(change).await
+                } else if change.supersedes_change_id.is_some() {
+                    self.finish_recovered_change(change).await
+                } else {
+                    self.finish_published_change(change, Instant::now() + self.migration_timeout)
+                        .await
+                }?;
+                // This path skipped the publish step that normally persists
+                // timings, so a change resumed here would keep a zero
+                // `activation_ms` forever without this.
+                self.store_change_timings_best_effort(&completed).await;
+                return Ok(completed);
             }
             MigrationPhase::Planned => {}
             MigrationPhase::Resetting
@@ -95,7 +99,6 @@ impl CoordinatorService {
         }
 
         let deadline = Instant::now() + self.migration_timeout;
-        let copy_started = Instant::now();
         self.set_phase(MigrationPhase::CopyingSnapshot).await?;
         change.phase = MigrationPhase::CopyingSnapshot;
         let change_ref = &change;
@@ -103,9 +106,9 @@ impl CoordinatorService {
             change.ranges.clone(),
             self.range_move_concurrency,
             |range| async move {
-                let progress = self.copy_range(change_ref, &range, deadline).await?;
+                let (progress, copy_ms) = self.copy_range(change_ref, &range, deadline).await?;
                 self.store_range_progress(&progress).await?;
-                Ok(progress)
+                Ok((progress, copy_ms))
             },
         )
         .await
@@ -117,10 +120,12 @@ impl CoordinatorService {
                     .await;
             }
         };
-        for progress in progresses {
+        let mut snapshot_copy_ms = 0;
+        for (progress, copy_ms) in progresses {
+            snapshot_copy_ms += copy_ms;
             replace_range_progress(&mut change, progress);
         }
-        change.timings.snapshot_copy_ms = millis(copy_started.elapsed());
+        change.timings.snapshot_copy_ms = snapshot_copy_ms;
         change.timings.changelog_replay_ms = replay_millis(&change);
 
         self.set_phase(MigrationPhase::ReplayingChangelog).await?;
@@ -184,12 +189,14 @@ impl CoordinatorService {
         change.timings.verify_ms = millis(verify_started.elapsed());
         change.timings.changelog_replay_ms = replay_millis(&change);
 
-        let publish_started = Instant::now();
         self.set_phase(MigrationPhase::ReadyToPublish).await?;
         change.phase = MigrationPhase::ReadyToPublish;
+        // The pre-publication delay is a diagnostic window for the observer,
+        // not publish work, so it must not inflate `publish_ms`.
         if !self.pre_publish_delay.is_zero() {
             tokio::time::sleep(self.pre_publish_delay).await;
         }
+        let publish_started = Instant::now();
         if let Err(error) = self.verify_destination_instances(&change, deadline).await {
             return self
                 .abort_after_error(&change, error, retry_transient)
@@ -236,14 +243,12 @@ impl CoordinatorService {
         tracing::debug!(change_id = %change.change_id, epoch = change.target_topology.epoch, moved_ranges = change.ranges.len(), replica_obligations = change.replica_obligations.len(), "topology published; activation pending");
         change.phase = MigrationPhase::Published;
         change.timings.publish_ms = millis(publish_started.elapsed());
-        self.store_change_timings(change.timings).await?;
+        self.store_change_timings_best_effort(&change).await;
         if !self.post_publish_delay.is_zero() {
             tokio::time::sleep(self.post_publish_delay).await;
         }
-        let activation_started = Instant::now();
-        let mut completed = self.finish_published_change(change, deadline).await?;
-        completed.timings.activation_ms = millis(activation_started.elapsed());
-        self.store_change_timings(completed.timings).await?;
+        let completed = self.finish_published_change(change, deadline).await?;
+        self.store_change_timings_best_effort(&completed).await;
         Ok(completed)
     }
 
@@ -410,7 +415,8 @@ impl CoordinatorService {
         *current = next;
         drop(current);
         self.pending_change_outages.lock().await.clear();
-        self.finish_recovered_change(recovery).await?;
+        let completed = self.finish_recovered_change(recovery).await?;
+        self.store_change_timings_best_effort(&completed).await;
         Ok(())
     }
 
@@ -418,6 +424,7 @@ impl CoordinatorService {
         &self,
         mut change: TopologyChange,
     ) -> Result<TopologyChange, Status> {
+        let activation_started = Instant::now();
         let original = self
             .state
             .read()
@@ -471,6 +478,7 @@ impl CoordinatorService {
             Instant::now() + self.migration_timeout,
         )
         .await?;
+        change.timings.activation_ms = millis(activation_started.elapsed());
         self.set_phase(MigrationPhase::Complete).await?;
         change.phase = MigrationPhase::Complete;
         Ok(change)
@@ -544,6 +552,7 @@ impl CoordinatorService {
         let safe_at = last_grant.max(self.startup_at + self.lease_duration);
         tokio::time::sleep_until(safe_at).await;
 
+        let publish_started = Instant::now();
         let publication = {
             let mut state = self.state.write().await;
             let grants = self.lease_grants.lock().await;
@@ -564,6 +573,7 @@ impl CoordinatorService {
             Ok::<(), Status>(())
         };
         publication?;
+        change.timings.publish_ms = millis(publish_started.elapsed());
         change.phase = MigrationPhase::Published;
         self.finish_failed_change(change).await
     }
@@ -572,9 +582,11 @@ impl CoordinatorService {
         &self,
         mut change: TopologyChange,
     ) -> Result<TopologyChange, Status> {
+        let activation_started = Instant::now();
         let deadline = Instant::now() + self.migration_timeout;
         self.install_removed_topology_survivors(&change, deadline)
             .await?;
+        change.timings.activation_ms = millis(activation_started.elapsed());
         self.set_phase(MigrationPhase::Complete).await?;
         change.phase = MigrationPhase::Complete;
         if let Some(failed_node_id) = &change.failed_node_id {
@@ -586,6 +598,10 @@ impl CoordinatorService {
                     target != failed_node_id && reporter != failed_node_id
                 });
         }
+        // A failover took this path, not the ordinary publish path, so its
+        // timings would otherwise stay all zero and be indistinguishable from
+        // "measured as zero".
+        self.store_change_timings_best_effort(&change).await;
         Ok(change)
     }
 
@@ -594,7 +610,8 @@ impl CoordinatorService {
         change: &TopologyChange,
         range: &RangeMigration,
         deadline: Instant,
-    ) -> Result<RangeMigration, Status> {
+    ) -> Result<(RangeMigration, u64), Status> {
+        let copy_started = Instant::now();
         let mut source = self.connect_node(&range.source_endpoint, deadline).await?;
         let mut destination = self
             .connect_node(&range.destination_endpoint, deadline)
@@ -698,6 +715,10 @@ impl CoordinatorService {
         }
 
         let replay_started = Instant::now();
+        // Stop the copy clock before the replay: the snapshot copy and the
+        // changelog replay are separate work steps, and `snapshot_copy_ms`
+        // would otherwise contain the replay it is compared against.
+        let copy_ms = millis(copy_started.elapsed());
         let watermark = replay_changelog(
             &mut source,
             &mut destination,
@@ -714,7 +735,7 @@ impl CoordinatorService {
         progress.snapshot_records = snapshot_records;
         progress.changelog_watermark = watermark;
         progress.changelog_replay_ms = millis(replay_started.elapsed());
-        Ok(progress)
+        Ok((progress, copy_ms))
     }
 
     pub(super) async fn verify_destination_instances(
@@ -828,6 +849,7 @@ impl CoordinatorService {
         _deadline: Instant,
     ) -> Result<TopologyChange, Status> {
         let deadline = Instant::now() + self.migration_timeout;
+        let activation_started = Instant::now();
         let needs_activation = !change.activation_ready;
         if needs_activation {
             let old_sources: Vec<_> = change
@@ -949,6 +971,10 @@ impl CoordinatorService {
             )
             .await?;
         }
+        // Activation ends here: the barrier is satisfied and the target
+        // topology is installed. Source cleanup and stopping removed nodes
+        // below are a separate work step, so they must not inflate this.
+        change.timings.activation_ms = millis(activation_started.elapsed());
         if change.ranges.is_empty() && change.replica_obligations.is_empty() {
             self.policy_fence_members(&change, false, deadline).await?;
         }
@@ -1351,27 +1377,49 @@ impl CoordinatorService {
     /// the caller, so without this the records that `change-status`, a
     /// repeated `execute-change`, and a restarted coordinator read would hold
     /// zeros.
+    ///
+    /// Timings are advisory: the caller already completed the work they
+    /// describe, so a failed write must not turn a successful change into an
+    /// error. The caller logs the failure instead.
     pub(super) async fn store_change_timings(
         &self,
+        expected: &ChangeIdentity,
         timings: MigrationTimings,
     ) -> Result<(), Status> {
         let mut state = self.state.write().await;
-        let mut next = state.clone();
-        let change = next
+        let change = state
             .active_change
             .as_mut()
             .ok_or_else(|| Status::internal("active change disappeared"))?;
+        if change_identity(change) != *expected {
+            return Err(Status::failed_precondition(
+                "active topology change changed before its timings were stored",
+            ));
+        }
         if change.timings == timings {
             return Ok(());
         }
         change.timings = timings;
         let change_id = change.change_id.clone();
         self.repository
-            .store_state(&next)
+            .store_state(&state)
             .map_err(|error| Status::internal(error.to_string()))?;
-        *state = next;
         tracing::debug!(%change_id, "topology change timings updated");
         Ok(())
+    }
+
+    /// Stores timings without turning a storage failure into a failed change.
+    pub(super) async fn store_change_timings_best_effort(&self, change: &TopologyChange) {
+        if let Err(error) = self
+            .store_change_timings(&change_identity(change), change.timings)
+            .await
+        {
+            tracing::warn!(
+                change_id = %change.change_id,
+                %error,
+                "topology change timings were not stored; the change itself is unaffected"
+            );
+        }
     }
 
     pub(super) async fn store_range_progress(

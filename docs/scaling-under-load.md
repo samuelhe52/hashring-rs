@@ -372,12 +372,12 @@ S1 与 S2 在**同一个集群生命周期内连续执行**：预载一次、负
 
 | 字段 | 含义 |
 |---|---|
-| `snapshot_copy_ms` | `CopyingSnapshot` 阶段墙钟，含该阶段内的初次 changelog 追赶 |
+| `snapshot_copy_ms` | 所有 range 的 snapshot 复制（含 dedup）耗时之和，不含该 range 的 changelog 回放；并发迁移时可能大于 `CopyingSnapshot` 阶段墙钟 |
 | `changelog_replay_ms` | 所有 range 的 `replay_changelog` 耗时之和；不含之后的 digest 往返与 destination commit（它们属于 `verify_ms`）；并发迁移时可能大于所在阶段 |
 | `pause_writes_ms` | `PausingWrites` 阶段墙钟（direct merge 时含加栅栏） |
 | `verify_ms` | `Verifying` 阶段墙钟（复制路径含最终回放、digest 与提交） |
-| `publish_ms` | 从 `ReadyToPublish` 到提交新拓扑，含 `pre_publish_delay` |
-| `activation_ms` | 提交后到 `Complete`，含 activation/RF repair 屏障与清理 |
+| `publish_ms` | 提交新拓扑的实际耗时，不含 `pre_publish_delay` 观测窗 |
+| `activation_ms` | 提交后 activation/RF repair 屏障与目标拓扑安装；不含清理 source range、停被移除节点和 `post_publish_delay` |
 | `merge_proof_ms` | direct merge 的 coverage/proof 计算 |
 | `catch_up_ms` | direct merge 等旧复制流追平的循环 |
 

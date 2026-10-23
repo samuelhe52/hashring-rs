@@ -154,9 +154,10 @@ message RangeMigration {
   uint64 changelog_replay_ms = 14;
 }
 
-// Wall-clock cost of the coordinator's work steps. Concurrent range work is
-// counted once per phase, so `changelog_replay_ms` is a sum over ranges and can
-// exceed the phase it ran in.
+// Wall-clock cost of the coordinator's work steps. Range work is concurrent,
+// so `snapshot_copy_ms` and `changelog_replay_ms` are sums over ranges and can
+// exceed the wall-clock phase they ran in. They do not overlap: a range's
+// snapshot copy stops before its changelog replay starts.
 message MigrationTimings {
   uint64 snapshot_copy_ms = 1;
   uint64 changelog_replay_ms = 2;

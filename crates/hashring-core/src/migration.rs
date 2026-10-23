@@ -57,9 +57,10 @@ pub struct RangeMigration {
 }
 
 /// The coordinator's work-step durations for one topology change, in
-/// milliseconds. Concurrent range work is counted once per phase, so
-/// `changelog_replay_ms` is a sum over ranges and can exceed the phase it ran
-/// in.
+/// milliseconds. Range work is concurrent, so `snapshot_copy_ms` and
+/// `changelog_replay_ms` are sums over ranges and can exceed the wall-clock
+/// phase they ran in. The two do not overlap: a range's snapshot copy stops
+/// before its changelog replay starts.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MigrationTimings {
     pub snapshot_copy_ms: u64,

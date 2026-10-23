@@ -459,10 +459,14 @@ replication, `stop_window`, `migration`, retries by reason, pool sizes, touched
 strata, the direct-merge flag, and the coordinator's `work_steps_ms`. The work steps are
 `snapshot_copy_ms`, `changelog_replay_ms`, `pause_writes_ms`, `verify_ms`,
 `publish_ms`, `activation_ms`, `merge_proof_ms`, and `catch_up_ms`.
-`changelog_replay_ms` is the sum over ranges, so it can exceed the phase it
-ran in; the other fields are wall-clock phase costs, and `activation_ms`
-includes RF repair to `Complete` but not the later `wait_for_full_rf`
-convergence, which `full_rf_seconds` reports separately.
+`snapshot_copy_ms` and `changelog_replay_ms` are sums over ranges, so either
+can exceed the wall-clock phase it ran in; they do not overlap, because a
+range's snapshot copy stops before its changelog replay starts. The other
+fields are wall-clock costs. `publish_ms` excludes the diagnostic
+`pre_publish_delay`, and `activation_ms` covers the activation barrier and
+the target installation but not source cleanup or stopping removed members.
+It also excludes the later `wait_for_full_rf` convergence, which
+`full_rf_seconds` reports separately.
 
 `migration` is the plan's migration volume: `keys` and `keys_moved` compare
 the base and target topologies key by key, `rate` is their quotient, `ranges`

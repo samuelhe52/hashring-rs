@@ -396,12 +396,14 @@ impl CoordinatorService {
                 .collect();
             change.timings.catch_up_ms = millis(catch_up_started.elapsed());
             change.timings.verify_ms = millis(verify_started.elapsed());
-            let publish_started = Instant::now();
             self.set_phase(MigrationPhase::ReadyToPublish).await?;
             change.phase = MigrationPhase::ReadyToPublish;
+            // The pre-publication delay is a diagnostic window for the
+            // observer, not publish work.
             if !self.pre_publish_delay.is_zero() {
                 tokio::time::sleep(self.pre_publish_delay).await;
             }
+            let publish_started = Instant::now();
             // The write fence keeps the verified old streams stable until publication.
             let mut state = self.state.write().await;
             if state.committed != snapshot.committed
@@ -435,14 +437,12 @@ impl CoordinatorService {
         }
         change.phase = MigrationPhase::Published;
         change.activation_ready = true;
-        self.store_change_timings(change.timings).await?;
+        self.store_change_timings_best_effort(&change).await;
         if !self.post_publish_delay.is_zero() {
             tokio::time::sleep(self.post_publish_delay).await;
         }
-        let activation_started = Instant::now();
-        let mut completed = self.finish_direct_merge(change).await?;
-        completed.timings.activation_ms = millis(activation_started.elapsed());
-        self.store_change_timings(completed.timings).await?;
+        let completed = self.finish_direct_merge(change).await?;
+        self.store_change_timings_best_effort(&completed).await;
         Ok(completed)
     }
 
@@ -451,6 +451,7 @@ impl CoordinatorService {
         mut change: TopologyChange,
     ) -> Result<TopologyChange, Status> {
         let deadline = Instant::now() + self.migration_timeout;
+        let activation_started = Instant::now();
         let base = change
             .base_topology
             .as_ref()
@@ -492,6 +493,10 @@ impl CoordinatorService {
             .await?;
         self.set_direct_merge_fence(&change, false, false, deadline)
             .await?;
+        // Activation is over once the target topology is installed and the
+        // fence is released; the source cleanup and member stops below are a
+        // separate work step.
+        change.timings.activation_ms = millis(activation_started.elapsed());
         self.set_phase(MigrationPhase::CleaningUp).await?;
         change.phase = MigrationPhase::CleaningUp;
         for member in removed {

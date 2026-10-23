@@ -675,7 +675,7 @@ impl CoordinatorService {
         // A retry first releases any write fence left by an interrupted attempt.
         rpc_before(deadline, source.abort_range_migration(control.clone())).await?;
         rpc_before(deadline, destination.abort_range_migration(control.clone())).await?;
-        let copied = self.copy_range(&change, &range, deadline).await?;
+        let (copied, _copy_ms) = self.copy_range(&change, &range, deadline).await?;
         if copied.source_process_instance_id != owner_instance
             || copied.destination_process_instance_id != follower_instance
         {
