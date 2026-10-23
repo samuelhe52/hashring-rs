@@ -93,11 +93,11 @@ mkdir -p "$OUT_DIR"
 
 FAILED=0
 run() {
-  local group="$1" rep="$2"
-  shift 2
+  local group="$1" rep="$2" keys="$3"
+  shift 3
   local output="$OUT_DIR/$group-$rep"
   echo "running $group repetition $rep -> $output"
-  if "$BINARY" experiment --mode scaling --output "$output" --keys "$KEYS" "$@"; then
+  if "$BINARY" experiment --mode scaling --output "$output" --keys "$keys" "$@"; then
     echo "$group $rep ok" >> "$OUT_DIR/runs.tsv"
   else
     echo "$group $rep failed" >> "$OUT_DIR/runs.tsv"
@@ -114,20 +114,20 @@ for group in $RUN_GROUPS; do
     fi
     case "$group" in
       main)
-        run "$group" "$rep" --scaling-scenario round-trip \
+        run "$group" "$rep" "$KEYS" --scaling-scenario round-trip \
           --scaling-pool-seconds 120 "${common[@]}" "${post[@]}"
         ;;
       control)
-        run "$group" "$rep" --scaling-scenario control \
+        run "$group" "$rep" "$KEYS" --scaling-scenario control \
           --scaling-pool-seconds 120 "${common[@]}" "${post[@]}"
         ;;
       diagnostic)
         # A 250 ms pre-publication delay is a diagnostic, never part of main.
-        run "$group" "$rep" --scaling-scenario round-trip \
+        run "$group" "$rep" "$KEYS" --scaling-scenario round-trip \
           --scaling-pool-seconds 120 --pre-publish-delay-ms 250 "${common[@]}" "${post[@]}"
         ;;
       policy)
-        run "$group" "$rep" --scaling-scenario round-trip \
+        run "$group" "$rep" "$KEYS" --scaling-scenario round-trip \
           --scaling-pool-seconds 120 --policy first-successor "${common[@]}" "${post[@]}"
         ;;
       open)
@@ -135,19 +135,18 @@ for group in $RUN_GROUPS; do
         # configuration; section 9 records it at 1M keys, 50k ops/s, and a
         # 33-second pool.
         post=(--scaling-post-seconds "$OPEN_POST_SECONDS")
-        run "$group" "$rep" --scaling-scenario round-trip \
+        run "$group" "$rep" "$OPEN_KEYS" --scaling-scenario round-trip \
           --scaling-load-mode open --scaling-open-rate "$OPEN_RATE" \
           --scaling-pool-seconds "$OPEN_POOL_SECONDS" \
-          --keys "$OPEN_KEYS" \
           --max-in-flight "$MAX_IN_FLIGHT" \
           --max-dedup-bytes "$OPEN_MAX_DEDUP_BYTES" "${common[@]}" "${post[@]}"
         ;;
       replace)
-        run "$group" "$rep" --scaling-scenario replace --nodes 11 \
+        run "$group" "$rep" "$KEYS" --scaling-scenario replace --nodes 11 \
           "${common[@]}" "${post[@]}"
         ;;
       churn)
-        run "$group" "$rep" --scaling-scenario churn --nodes 9 \
+        run "$group" "$rep" "$KEYS" --scaling-scenario churn --nodes 9 \
           --initial-nodes 6 "${common[@]}" "${post[@]}"
         ;;
       *)
