@@ -44,6 +44,13 @@ OPEN_POOL_SECONDS="${OPEN_POOL_SECONDS:-33}"
 # a 1M-key preload holds roughly 95 MB per node, and the open-loop writes add
 # several MB/s on top of that.
 OPEN_MAX_DEDUP_BYTES="${OPEN_MAX_DEDUP_BYTES:-268435456}"
+# Raising the dedup budget also raises what one replication batch and one
+# journaled write need. The open group therefore raises these two with it;
+# otherwise the migration journal is the first thing to fill and the nodes
+# answer with a retryable ResourceExhausted, which is the backpressure the
+# group exists to avoid.
+OPEN_MAX_PENDING_REPLICATION_BYTES="${OPEN_MAX_PENDING_REPLICATION_BYTES:-268435456}"
+OPEN_MAX_MIGRATION_JOURNAL_BYTES="${OPEN_MAX_MIGRATION_JOURNAL_BYTES:-268435456}"
 # The open group's transition already holds the load for its warmup and its
 # RF convergence, and its one-shot pools must survive the whole transition.
 OPEN_POST_SECONDS="${OPEN_POST_SECONDS:-5}"
@@ -139,7 +146,9 @@ for group in $RUN_GROUPS; do
           --scaling-load-mode open --scaling-open-rate "$OPEN_RATE" \
           --scaling-pool-seconds "$OPEN_POOL_SECONDS" \
           --max-in-flight "$MAX_IN_FLIGHT" \
-          --max-dedup-bytes "$OPEN_MAX_DEDUP_BYTES" "${common[@]}" "${post[@]}"
+          --max-dedup-bytes "$OPEN_MAX_DEDUP_BYTES" \
+          --max-pending-replication-bytes "$OPEN_MAX_PENDING_REPLICATION_BYTES" \
+          --max-migration-journal-bytes "$OPEN_MAX_MIGRATION_JOURNAL_BYTES" "${common[@]}" "${post[@]}"
         ;;
       replace)
         run "$group" "$rep" "$KEYS" --scaling-scenario replace --nodes 11 \
