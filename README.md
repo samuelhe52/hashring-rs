@@ -286,6 +286,10 @@ target/release/hashring-rs experiment --mode performance --require-clean-source 
 target/release/hashring-rs experiment --mode availability --policy first-successor \
   --output results/availability
 
+# Kill three owners in a row, replacing each one before the next failure.
+target/release/hashring-rs experiment --mode availability --availability-rounds 3 \
+  --nodes 9 --output results/availability-consecutive
+
 # Offer a fixed rate and measure the latency of that load, one stage per rate.
 target/release/hashring-rs experiment --mode latency --target-rates 5000,10000,20000 \
   --output results/latency

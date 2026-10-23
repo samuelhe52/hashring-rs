@@ -10,7 +10,7 @@ For quick-start commands, see the [README](../README.md#experiments).
 | --- | --- | --- | --- |
 | `correctness` | Starts with 9 nodes and scales to 10 under concurrent rewrites and deletes, keeping a third moving cohort as snapshot sentinels. It then scales back to 9 while restoring or deleting the mutation cohorts, and verifies present and absent keys after every stage. | 20,000 | 10 (peak) |
 | `performance` | Nominal acceptance profile | 1,000,000 | 10 |
-| `availability` | Failure and repair: 3 live nodes plus 1 replacement | 1,000 | 4 |
+| `availability` | Failure and repair: 3 live nodes plus 1 replacement, or a run of consecutive failures with `--availability-rounds` | 1,000 | 4 |
 | `latency` | Open-loop load at a series of target rates, and the latency of that load. See [the latency mode](#the-latency-mode). | 100,000 | 10 |
 | `scaling` | One continuous mixed read/write load across 9→10→9 nodes (or a grow/shrink only), with per-cohort verification. See [the scaling mode](#the-scaling-mode). | 100,000 | 10 |
 
@@ -106,6 +106,46 @@ Availability mode also records:
 - acknowledged keys preserved or lost, including a just-acknowledged tail write
   of at least 1 MiB
 - time from replacement to full RF
+
+### The availability rounds
+
+`--availability-rounds N` injects N consecutive owner failures. Every round
+
+1. picks the current owner of the probe key, which is the first key the first
+   member owns, and samples up to 128 keys that member owns,
+2. writes an identifiable value to the last of them and kills the owner,
+3. waits for the automatic failover to publish a topology without it and for the
+   read probe to succeed again,
+4. reads the sampled keys back, and the value the previous round wrote,
+5. joins a spare node, which is seeded like a scale-out node, and waits for the
+   full replication factor,
+6. records how evenly the live members, and the members that never failed, hold
+   the keys.
+
+The probe key's owner changes with every failover, so every round kills a node
+that has not failed yet. The run needs one spare node per round: the node
+count is the initial members plus the spares, so `--availability-rounds 3`
+alone starts with 3 members and 3 spares.
+
+The per-round records are in `availability_rounds`, one object per round. Each
+one holds the victim and its epoch, the time from the kill to the publication
+and to the first successful read, the longest streak of failed read probes, the
+acknowledged keys that survived, whether the previous round's value survived,
+the time from the replacement to the full replication factor, the keys every
+live member owns, and the spread of those keys (`max_over_min`,
+`range_over_mean`, `max_over_mean_minus_one`, and `cv`).
+
+The run's own figures describe its worst round: `failover_seconds` and
+`read_recovery_seconds` are the slowest round, `observed_unavailable_max_streak_ms`
+the longest streak of any round, and `unavailable_probe_count` the total of all
+rounds. `acknowledged_key_survival`, `replacement_to_full_rf_seconds`, and
+`failure_to_full_rf_seconds` describe the first round.
+
+`FirstSuccessor` guarantees that an acknowledged write survives the failure of
+one member. A run of failures is a stronger claim than that guarantee, so the
+runner only fails the run when the *first* round loses an acknowledged key.
+Later rounds report what they lost in `availability_acknowledged_lost_total`
+and in each round's own record.
 
 The `latency` mode records one measurement per target rate, and its own
 observations. See [the latency mode](#the-latency-mode).

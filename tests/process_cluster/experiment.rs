@@ -44,7 +44,7 @@ async fn experiment_runner_preserves_reproducibility_artifacts() {
             .unwrap();
     assert_eq!(manifest["config"]["node_count"], 4);
     assert_eq!(manifest["config"]["key_count"], 300);
-    assert_eq!(manifest["schema_version"], 8);
+    assert_eq!(manifest["schema_version"], 9);
     // Every node is started with the run's tuning, so it must parse.
     assert_eq!(manifest["config"]["node"]["max_dedup_bytes"], 33_554_432);
     assert_eq!(manifest["executable_blake3"].as_str().unwrap().len(), 64);
@@ -322,6 +322,78 @@ async fn availability_experiment_records_failover_loss_and_rf_repair() {
         assert!(events.contains("tail_ack_to_kill_ms"));
         assert!(events.contains("full_rf_restored"));
     }
+}
+
+#[tokio::test]
+#[ignore = "three consecutive availability failures; run with --ignored"]
+async fn availability_experiment_survives_three_consecutive_failures() {
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let output_directory = directory.path().join("consecutive");
+    let output = Command::new(env!("CARGO_BIN_EXE_hashring-rs"))
+        .args([
+            "experiment",
+            "--mode",
+            "availability",
+            "--availability-rounds",
+            "3",
+            "--nodes",
+            "6",
+            "--policy",
+            "first-successor",
+            "--output",
+            output_directory.to_str().unwrap(),
+            "--keys",
+            "200",
+            "--virtual-nodes",
+            "16",
+            "--operation-timeout-ms",
+            "10000",
+            "--migration-timeout-ms",
+            "90000",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "consecutive availability experiment failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output_directory.join("summary.json")).unwrap())
+            .unwrap();
+    assert_eq!(summary["success"], true, "{}", summary["error"]);
+    let observations = &summary["observations"];
+    assert_eq!(observations["availability_round_count"], 3);
+    let rounds = observations["availability_rounds"].as_array().unwrap();
+    assert_eq!(rounds.len(), 3);
+    // Every round killed a different node, and every round recovered.
+    let mut victims = Vec::new();
+    for round in rounds {
+        let victim = round["victim"].as_str().unwrap();
+        assert!(!victims.contains(&victim), "{victim} failed twice");
+        victims.push(victim);
+        assert!(
+            round["read_recovery_seconds"].as_f64().unwrap() < 30.0,
+            "{round} did not recover within 30 seconds"
+        );
+        assert!(round["replacement_to_full_rf_seconds"].as_f64().unwrap() > 0.0);
+        // The acknowledged keys survive every failure, and so does the value
+        // the previous round wrote.
+        assert_eq!(round["acknowledged_key_survival"]["lost"], 0, "{round}");
+        assert_eq!(round["acknowledged_key_survival"]["tail_survived"], true);
+        if round["round"].as_u64().unwrap() > 1 {
+            assert_eq!(round["previous_tail_survived"], true, "{round}");
+        }
+        // The remaining nodes hold the keys, and the run records how evenly.
+        assert!(round["balance"]["nodes"].as_u64().unwrap() >= 3);
+        assert!(round["owned_keys"].as_object().unwrap().len() >= 3);
+    }
+    assert_eq!(observations["availability_acknowledged_lost_total"], 0);
+    let events = std::fs::read_to_string(output_directory.join("events.jsonl")).unwrap();
+    assert_eq!(events.matches("\"owner_killed\"").count(), 3);
+    assert_eq!(events.matches("\"full_rf_restored\"").count(), 3);
+    assert!(events.contains("availability_rounds_complete"));
 }
 
 #[tokio::test]

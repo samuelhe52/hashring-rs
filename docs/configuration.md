@@ -115,7 +115,7 @@ replaced during the run.
 | `--config` | — | none | process | |
 | `--mode` | `mode` | `correctness` | experiment | `correctness`, `performance`, `availability`, `latency` or `scaling`. |
 | `--output` | `output` | required | experiment | New or empty directory. |
-| `--nodes` | `nodes` | 4 for availability, 10 otherwise | experiment | Peak node count. |
+| `--nodes` | `nodes` | 3 + rounds for availability, 10 otherwise | experiment | Peak node count. The `availability` mode starts with the node count minus one node per round, and uses the rest as the replacements it joins after every failure. |
 | `--keys` | `keys` | 20,000 / 1,000,000 / 1,000 / 100,000 by mode | experiment | The `latency` mode reads it as the key count of the run, which is its `--preload-keys`. |
 | `--value-bytes` | `value_bytes` | 128 | experiment | |
 | `--concurrency` | `concurrency` | 64 | experiment | The `latency` mode uses it for the preload and the check, not for the load. The `scaling` mode uses it for its read tasks and verification. |
@@ -132,6 +132,7 @@ replaced during the run.
 | `--mix` | `mix` | `90:9:1` | experiment | `latency` mode only: the `GET:PUT:DELETE` share of the requests. |
 | `--key-distribution` | `key_distribution` | `zipf:0.99` | experiment | `latency` and `scaling` modes: `uniform`, `zipf:<theta>`, or `hotspot:<key share>:<traffic share>`. |
 | `--max-in-flight` | `max_in_flight` | 4096 | experiment | `latency` mode only: how many requests may be in flight at once. A request over the limit is dropped and counted as late. |
+| `--availability-rounds` | `availability_rounds` | 1 | experiment | `availability` mode only: how many consecutive owner failures the run injects. Every round kills the current owner of the probe key and then joins a replacement, so the run needs one spare node per round. |
 | `--scaling-scenario` | `scaling_scenario` | `round-trip` | experiment | `scaling` mode only: `round-trip` (grow one, then shrink), `grow`, `shrink`, `replace` (swap one member for a spare), `churn` (grow by three, then shrink), or `control` (no membership change). |
 | `--scaling-load-mode` | `scaling_load_mode` | `closed` | experiment | `scaling` mode only: `closed` for a fixed number of workers, `open` for requests offered at `--scaling-open-rate`. |
 | `--scaling-open-rate` | `scaling_open_rate` | 0 | experiment | `scaling` mode only: total operations per second in open mode. Reads are 80%; writes are 12% rewrite, 5% fresh write, and 3% delete. The pools are sized from this rate. |

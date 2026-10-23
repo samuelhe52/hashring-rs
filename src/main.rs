@@ -554,6 +554,12 @@ struct ExperimentArgs {
     /// [default: 4096]
     #[arg(long)]
     max_in_flight: Option<usize>,
+    /// How many consecutive owner failures the availability mode injects.
+    /// Every round kills the current owner of the probe key, waits for the
+    /// failover, and then replaces it. The run needs one spare node per
+    /// round. [default: 1]
+    #[arg(long)]
+    availability_rounds: Option<u32>,
     /// The membership change a scaling run performs: round-trip, grow,
     /// shrink, replace, churn, or control. [default: round-trip]
     #[arg(long, value_enum)]

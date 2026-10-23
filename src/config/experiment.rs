@@ -43,6 +43,10 @@ pub const DEFAULT_SCALING_WRITE_RATE: u64 = 200;
 pub const DEFAULT_SCALING_POOL_SECONDS: u64 = 120;
 /// How long a `scaling` run keeps the load running after a change.
 pub const DEFAULT_SCALING_POST_SECONDS: u64 = 10;
+/// How many consecutive owner failures an `availability` run injects.
+pub const DEFAULT_AVAILABILITY_ROUNDS: u32 = 1;
+/// The members an `availability` run starts with, before it kills any.
+pub const DEFAULT_AVAILABILITY_INITIAL_NODES: usize = 3;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -80,6 +84,7 @@ pub struct ExperimentFile {
     pub mix: Option<String>,
     pub key_distribution: Option<String>,
     pub max_in_flight: Option<usize>,
+    pub availability_rounds: Option<u32>,
     pub scaling_scenario: Option<ScalingScenario>,
     pub scaling_load_mode: Option<ScalingLoadMode>,
     pub scaling_open_rate: Option<u64>,
@@ -141,13 +146,21 @@ pub fn resolve(
         .map(ScalingScenario::from)
         .or(file.scaling_scenario)
         .unwrap_or(ScalingScenario::RoundTrip);
+    let availability_rounds = args
+        .availability_rounds
+        .or(file.availability_rounds)
+        .unwrap_or(DEFAULT_AVAILABILITY_ROUNDS);
     let node_count = args.nodes.or(file.nodes).unwrap_or(match mode {
         ExperimentMode::Scaling if scaling_scenario == ScalingScenario::Replace => 11,
         ExperimentMode::Correctness
         | ExperimentMode::Performance
         | ExperimentMode::Latency
         | ExperimentMode::Scaling => 10,
-        ExperimentMode::Availability => 4,
+        // Every availability round needs a spare node to replace the one it
+        // kills, so the run's node count grows with the number of rounds.
+        ExperimentMode::Availability => {
+            DEFAULT_AVAILABILITY_INITIAL_NODES + availability_rounds as usize
+        }
     });
     let policy = args.policy.or(file.policy).unwrap_or(match mode {
         ExperimentMode::Availability => PolicyArg::FirstSuccessor,
@@ -299,6 +312,7 @@ pub fn resolve(
             .max_in_flight
             .or(file.max_in_flight)
             .unwrap_or(DEFAULT_MAX_IN_FLIGHT),
+        availability_rounds,
         scaling_scenario,
         scaling_load_mode: args
             .scaling_load_mode
@@ -411,6 +425,41 @@ mod tests {
         assert_eq!(config.initial_nodes, Some(10));
         assert!(matches!(config.scaling_load_mode, ScalingLoadMode::Open));
         assert_eq!(config.scaling_open_rate, 1000);
+    }
+
+    #[test]
+    fn availability_defaults_to_one_round_and_grows_with_the_rounds() {
+        let args = experiment_args(&["--mode", "availability", "--output", "out"]);
+        let config = resolve(&args, None, 24).unwrap();
+        assert_eq!(config.availability_rounds, 1);
+        assert_eq!(config.node_count, 4);
+
+        // Every round needs a spare node to replace the one it kills, so the
+        // run's node count grows with the number of rounds.
+        let args = experiment_args(&[
+            "--mode",
+            "availability",
+            "--availability-rounds",
+            "3",
+            "--output",
+            "out",
+        ]);
+        let config = resolve(&args, None, 24).unwrap();
+        assert_eq!(config.availability_rounds, 3);
+        assert_eq!(config.node_count, 6);
+
+        let args = experiment_args(&[
+            "--mode",
+            "availability",
+            "--availability-rounds",
+            "3",
+            "--nodes",
+            "9",
+            "--output",
+            "out",
+        ]);
+        let config = resolve(&args, None, 24).unwrap();
+        assert_eq!(config.node_count, 9);
     }
 
     #[test]

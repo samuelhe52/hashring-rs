@@ -41,6 +41,11 @@ policy: first-successor
 # key_distribution: zipf:0.99   # uniform, zipf:<theta>, hotspot:<keys>:<traffic>
 # max_in_flight: 4096   # a request over the limit is dropped, not queued
 
+# The `availability` mode only. Every round kills the current owner of the
+# probe key and then joins a replacement, so the run needs one spare node per
+# round: `nodes` is the initial members plus those spares.
+availability_rounds: 1
+
 # The `scaling` mode only.
 # scaling_scenario: round-trip   # round-trip, grow, shrink, replace, churn, or control
 # scaling_load_mode: closed      # closed or open
