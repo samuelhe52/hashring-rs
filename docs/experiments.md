@@ -412,14 +412,20 @@ their own metrics and are not mixed into the main GET histogram.
 `summary.json` holds one `<label>_transition` measurement and observation per
 change: `published_ms` and `complete_ms` from the start of the change,
 `full_rf_seconds` from `Complete` to the target epoch reaching full
-replication, `stop_window`, retries by reason, pool sizes, touched strata, the
-direct-merge flag, and the coordinator's `work_steps_ms`. The work steps are
+replication, `stop_window`, `migration`, retries by reason, pool sizes, touched
+strata, the direct-merge flag, and the coordinator's `work_steps_ms`. The work steps are
 `snapshot_copy_ms`, `changelog_replay_ms`, `pause_writes_ms`, `verify_ms`,
 `publish_ms`, `activation_ms`, `merge_proof_ms`, and `catch_up_ms`.
 `changelog_replay_ms` is the sum over ranges, so it can exceed the phase it
 ran in; the other fields are wall-clock phase costs, and `activation_ms`
 includes RF repair to `Complete` but not the later `wait_for_full_rf`
 convergence, which `full_rf_seconds` reports separately.
+
+`migration` is the plan's migration volume: `keys` and `keys_moved` compare
+the base and target topologies key by key, `rate` is their quotient, `ranges`
+is how many ranges the coordinator moved, and `snapshot_records` is how many
+records the copy path actually carried. A direct merge moves keys without
+creating ranges, so it reports zero ranges and zero records.
 
 `stop_window` is what the client saw rather than the phase timeline. During a
 change the runner samples the client's cumulative `RangeBusy` count and

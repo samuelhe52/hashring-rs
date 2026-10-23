@@ -96,6 +96,20 @@ GET 延迟按请求**发起时**所在阶段（3 次合计操作数，百分位�
 
 预载 1M 键约 30 s。`Complete` 之后到满 RF 约 9 s，是 100k 规模的约 3 倍；`post` 阶段 GET p99 从变更前的 0.83 ms 升到 4.6 ms，说明 RF 修复与负载争用。
 
+### 迁移量（阶段 6-2）
+
+每个 transition 记录 `migration`：owner 在 base 与 target 拓扑之间发生变化的键数、比例、协调器实际搬动的 range 数与快照记录数。迁移率 = `keys_moved / keys`，direct merge 不产生 range，但键仍然换主。
+
+| 变更 | 键数 | owner 变化 | 迁移率 | range 数 | snapshot records |
+|---|---|---|---|---|---|
+| 9→10 | 100,000 | 10,508 | 10.51% | 128 | 10,670 |
+| 9→10 | 1,000,000 | 105,296 | 10.53% | 128 | 105,460 |
+| 10→11 | 100,000 | 6,446 | 6.45% | 128 | 6,611 |
+| 10→11 | 1,000,000 | 64,761 | 6.48% | 128 | 64,926 |
+| 10→9（direct merge） | 100,000 | 10,508 | 10.51% | 0 | 0 |
+
+9→10 的 10.51% 接近 1/(9+1)：新增一个节点拿走环上约 1/10 的键；三次重复完全相同，因为同一 seed 的环是确定的。10→11 的 6.45% 是新增节点在这个 seed 的环上实际占的份额（期望 1/11 = 9.09%；11 节点、V=128 的 `latency` 运行测得 node-11 拥有 6,446 个键，与迁移量一致）。阶段 3/6 的「N≥10 时迁移率 ≤10%」由 10→11 的 6.45% 满足。课程验收指标的完整对照见 [acceptance-metrics.md](acceptance-metrics.md)。
+
 ### 开环尾延迟组（1M 键，offered 50k ops/s，3 次）
 
 | 指标 | open-1 | open-2 | open-3 |
@@ -375,6 +389,7 @@ S1 与 S2 在**同一个集群生命周期内连续执行**：预载一次、负
 - **停写窗口的定义以客户端实际观测为准**：按区间（S2 是全集群）记录第一次和最后一次 `RangeBusy` 的时间，再取此后第一个成功写，用这三者定义窗口；phase 只做粗粒度标注。栅栏在节点收到 RPC 后才生效，与 coordinator 的 phase 切换存在时差，再叠加轮询误差，不能拿阶段边界当停写时长。实现上由 scaling 模式每 5 ms 采样客户端的 `RangeBusy` 计数与成功写计数，写入 `<label>_transition.stop_window`（`first_range_busy_ms`、`last_range_busy_ms`、`first_write_ok_ms`、`observed_ms`、`poll_ms`）。
 - 读连续失败最长间隔
 - 每层 cohort 的实际操作量与结果分布
+- 每次 change 的迁移量：`<label>_transition.migration` 的 `keys`、`keys_moved`、`rate`、`ranges`、`snapshot_records`
 - 每节点 owner 操作计数、CPU、owned keys/ranges，观察负载转移
 
 ### 7.3 正确性指标
