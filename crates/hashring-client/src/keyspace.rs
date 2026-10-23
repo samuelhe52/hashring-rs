@@ -335,7 +335,9 @@ impl HashringClient {
         let Some(error) = error else {
             self.refresh_after_unavailable(epoch, deadline, false)
                 .await?;
-            return self.retry_delay(deadline, attempt, false).await;
+            return self
+                .retry_delay(deadline, attempt, false, RetryReason::Rpc)
+                .await;
         };
         if self
             .handle_retryable(error.clone(), epoch, deadline, attempt, false)

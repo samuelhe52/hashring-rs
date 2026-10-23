@@ -430,7 +430,13 @@ impl HashringClient {
             .collect()
     }
 
-    fn record_retry_reason(&self, reason: RetryReason) {
+    /// Counts one retry and its reason together.
+    ///
+    /// The two counters must move at the same point or they cannot be
+    /// reconciled: recording the reason first and the total after a refresh
+    /// that returns `Err` leaves `sum(retry_reasons) > retry_count`.
+    fn record_retry(&self, reason: RetryReason) {
+        self.inner.retries.fetch_add(1, Ordering::Relaxed);
         self.inner.retry_reasons[reason.index()].fetch_add(1, Ordering::Relaxed);
     }
 
@@ -616,10 +622,10 @@ impl HashringClient {
                     return Err(ClientError::deadline(false));
                 }
                 Err(_) => {
-                    self.record_retry_reason(RetryReason::Connect);
                     self.refresh_after_unavailable(epoch, deadline, false)
                         .await?;
-                    self.retry_delay(deadline, &mut attempt, false).await?;
+                    self.retry_delay(deadline, &mut attempt, false, RetryReason::Connect)
+                        .await?;
                     continue;
                 }
             };
@@ -637,10 +643,10 @@ impl HashringClient {
                 Ok(Ok(response)) => response.into_inner(),
                 Ok(Err(status)) => {
                     if retryable_status(&status) {
-                        self.record_retry_reason(RetryReason::Rpc);
                         self.refresh_after_unavailable(epoch, deadline, false)
                             .await?;
-                        self.retry_delay(deadline, &mut attempt, false).await?;
+                        self.retry_delay(deadline, &mut attempt, false, RetryReason::Rpc)
+                            .await?;
                         continue;
                     }
                     return Err(rpc_error(status, false));
@@ -791,11 +797,15 @@ impl HashringClient {
                     return Err(ClientError::deadline(unknown_write_outcome));
                 }
                 Err(_) => {
-                    self.record_retry_reason(RetryReason::Connect);
                     self.refresh_after_unavailable(epoch, deadline, unknown_write_outcome)
                         .await?;
-                    self.retry_delay(deadline, &mut attempt, unknown_write_outcome)
-                        .await?;
+                    self.retry_delay(
+                        deadline,
+                        &mut attempt,
+                        unknown_write_outcome,
+                        RetryReason::Connect,
+                    )
+                    .await?;
                     continue;
                 }
             };
@@ -823,11 +833,15 @@ impl HashringClient {
                         accumulated_write_ambiguity(unknown_write_outcome, &status);
                     if retryable_status(&status) {
                         tracing::debug!(operation = "put", request_id, attempt, epoch = epoch, code = ?status.code(), message = status.message(), "retrying node RPC status");
-                        self.record_retry_reason(RetryReason::Rpc);
                         self.refresh_after_unavailable(epoch, deadline, unknown_write_outcome)
                             .await?;
-                        self.retry_delay(deadline, &mut attempt, unknown_write_outcome)
-                            .await?;
+                        self.retry_delay(
+                            deadline,
+                            &mut attempt,
+                            unknown_write_outcome,
+                            RetryReason::Rpc,
+                        )
+                        .await?;
                         continue;
                     }
                     return Err(rpc_error(status, unknown_write_outcome));
@@ -920,11 +934,15 @@ impl HashringClient {
                     return Err(ClientError::deadline(unknown_write_outcome));
                 }
                 Err(_) => {
-                    self.record_retry_reason(RetryReason::Connect);
                     self.refresh_after_unavailable(epoch, deadline, unknown_write_outcome)
                         .await?;
-                    self.retry_delay(deadline, &mut attempt, unknown_write_outcome)
-                        .await?;
+                    self.retry_delay(
+                        deadline,
+                        &mut attempt,
+                        unknown_write_outcome,
+                        RetryReason::Connect,
+                    )
+                    .await?;
                     continue;
                 }
             };
@@ -947,11 +965,15 @@ impl HashringClient {
                         accumulated_write_ambiguity(unknown_write_outcome, &status);
                     if retryable_status(&status) {
                         tracing::debug!(operation = "delete", request_id, attempt, epoch = epoch, code = ?status.code(), message = status.message(), "retrying node RPC status");
-                        self.record_retry_reason(RetryReason::Rpc);
                         self.refresh_after_unavailable(epoch, deadline, unknown_write_outcome)
                             .await?;
-                        self.retry_delay(deadline, &mut attempt, unknown_write_outcome)
-                            .await?;
+                        self.retry_delay(
+                            deadline,
+                            &mut attempt,
+                            unknown_write_outcome,
+                            RetryReason::Rpc,
+                        )
+                        .await?;
                         continue;
                     }
                     return Err(rpc_error(status, unknown_write_outcome));
@@ -1014,20 +1036,23 @@ impl HashringClient {
         let code = ErrorCode::try_from(error.code).unwrap_or(ErrorCode::Unspecified);
         match code {
             ErrorCode::Moved => {
-                self.record_retry_reason(RetryReason::Moved);
                 let required_epoch = error.current_epoch.max(attempted_epoch.saturating_add(1));
                 self.refresh_topology_before(deadline, unknown_write_outcome, Some(required_epoch))
                     .await?;
-                self.retry_delay(deadline, attempt, unknown_write_outcome)
+                self.retry_delay(deadline, attempt, unknown_write_outcome, RetryReason::Moved)
                     .await?;
                 Ok(true)
             }
             ErrorCode::Unavailable if error.retryable => {
-                self.record_retry_reason(RetryReason::Unavailable);
                 self.refresh_after_unavailable(attempted_epoch, deadline, unknown_write_outcome)
                     .await?;
-                self.retry_delay(deadline, attempt, unknown_write_outcome)
-                    .await?;
+                self.retry_delay(
+                    deadline,
+                    attempt,
+                    unknown_write_outcome,
+                    RetryReason::Unavailable,
+                )
+                .await?;
                 Ok(true)
             }
             ErrorCode::RangeBusy
@@ -1037,9 +1062,6 @@ impl HashringClient {
             | ErrorCode::OutcomeUnknown
                 if error.retryable =>
             {
-                if let Some(reason) = RetryReason::from_error_code(code) {
-                    self.record_retry_reason(reason);
-                }
                 if error.current_epoch > attempted_epoch {
                     self.refresh_topology_before(
                         deadline,
@@ -1048,6 +1070,8 @@ impl HashringClient {
                     )
                     .await?;
                 }
+                let reason = RetryReason::from_error_code(code)
+                    .expect("the retryable group maps to a retry reason");
                 self.retry_delay_with_hint(
                     deadline,
                     attempt,
@@ -1057,16 +1081,21 @@ impl HashringClient {
                     } else {
                         Duration::ZERO
                     },
+                    reason,
                 )
                 .await?;
                 Ok(true)
             }
             ErrorCode::LeaseExpired if error.retryable => {
-                self.record_retry_reason(RetryReason::LeaseExpired);
                 self.refresh_topology_before(deadline, unknown_write_outcome, None)
                     .await?;
-                self.retry_delay(deadline, attempt, unknown_write_outcome)
-                    .await?;
+                self.retry_delay(
+                    deadline,
+                    attempt,
+                    unknown_write_outcome,
+                    RetryReason::LeaseExpired,
+                )
+                .await?;
                 Ok(true)
             }
             _ => Ok(false),
@@ -1181,8 +1210,9 @@ impl HashringClient {
         deadline: Instant,
         attempt: &mut u32,
         unknown_write_outcome: bool,
+        reason: RetryReason,
     ) -> Result<(), ClientError> {
-        self.inner.retries.fetch_add(1, Ordering::Relaxed);
+        self.record_retry(reason);
         retry_delay(deadline, attempt, unknown_write_outcome).await
     }
 
@@ -1192,8 +1222,9 @@ impl HashringClient {
         attempt: &mut u32,
         unknown_write_outcome: bool,
         minimum_delay: Duration,
+        reason: RetryReason,
     ) -> Result<(), ClientError> {
-        self.inner.retries.fetch_add(1, Ordering::Relaxed);
+        self.record_retry(reason);
         retry_delay_with_hint(deadline, attempt, unknown_write_outcome, minimum_delay).await
     }
 
