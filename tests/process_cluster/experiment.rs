@@ -552,6 +552,26 @@ async fn scaling_round_trip_defers_s1_verification_and_records_the_stop_window()
         );
     }
 
+    // The migration volume is plan-side: the share of the key space whose
+    // owner changes. The copy path also copies records; a direct merge does
+    // not create ranges at all.
+    let grow_migration = &grow["migration"];
+    let grow_rate = grow_migration["rate"].as_f64().unwrap();
+    assert!(
+        grow_rate > 0.0 && grow_rate < 0.6,
+        "a one-node grow of four members moved {grow_rate} of the keys"
+    );
+    assert_eq!(
+        grow_migration["keys_moved"].as_u64().unwrap(),
+        (grow_rate * grow_migration["keys"].as_u64().unwrap() as f64).round() as u64
+    );
+    assert!(grow_migration["snapshot_records"].as_u64().unwrap() > 0);
+    assert!(grow_migration["ranges"].as_u64().unwrap() > 0);
+    let shrink_migration = &shrink["migration"];
+    assert!(shrink_migration["rate"].as_f64().unwrap() > 0.0);
+    assert_eq!(shrink_migration["ranges"].as_u64().unwrap(), 0);
+    assert_eq!(shrink_migration["snapshot_records"].as_u64().unwrap(), 0);
+
     // The two changes never share a key, so the S2 pools cannot see a value
     // that the S1 settlement left unknown.
     let events = std::fs::read_to_string(output_directory.join("events.jsonl")).unwrap();

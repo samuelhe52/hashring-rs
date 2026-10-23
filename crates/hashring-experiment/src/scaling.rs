@@ -605,6 +605,43 @@ struct TransitionPlan {
     present_strata: BTreeSet<Stratum>,
 }
 
+/// How much of the key space one change moves: the keys whose owner differs
+/// between the base and target topologies. This is the plan's migration
+/// volume; the coordinator's copy path reports the same movement as range
+/// snapshot records, which a direct merge does not produce.
+struct MigrationStats {
+    keys: u64,
+    keys_moved: u64,
+}
+
+impl MigrationStats {
+    fn rate(&self) -> f64 {
+        if self.keys == 0 {
+            0.0
+        } else {
+            self.keys_moved as f64 / self.keys as f64
+        }
+    }
+}
+
+fn migration_stats(
+    base: &TopologySnapshot,
+    target: &TopologySnapshot,
+    keys: u64,
+) -> Result<MigrationStats> {
+    let mut keys_moved = 0;
+    for key in 0..keys {
+        let encoded = key.to_be_bytes();
+        let token = base.key_token(&encoded);
+        let base_owner = base.owner_for_token(token)?.node_id.as_str();
+        let target_owner = target.owner_for_token(token)?.node_id.as_str();
+        if base_owner != target_owner {
+            keys_moved += 1;
+        }
+    }
+    Ok(MigrationStats { keys, keys_moved })
+}
+
 struct Ledger {
     entries: Mutex<BTreeMap<u64, Allowed>>,
     strata: Arc<BTreeMap<u64, Stratum>>,
@@ -1170,6 +1207,7 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
             index,
             transitions.len(),
         )?;
+        let migration = migration_stats(&base_topology, &target_topology, config.key_count)?;
         let ledger = Arc::new(Ledger::new(Arc::clone(&plan.strata), config.value_bytes));
 
         // The new members are in the pending topology already, so they can be
@@ -1210,6 +1248,9 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                 "rewrite_keys": plan.rewrite.len(),
                 "new_keys": plan.write_new.len(),
                 "delete_keys": plan.delete.len(),
+                "migration_rate": migration.rate(),
+                "keys_moved": migration.keys_moved,
+                "ranges": staged.as_ref().map_or(0, |change| change.ranges.len()),
                 "expected_strata": plan.expected_strata.iter().map(|s| s.name()).collect::<Vec<_>>(),
                 "present_strata": plan.present_strata.iter().map(|s| s.name()).collect::<Vec<_>>(),
                 "strata_counts": stratum_counts(&plan.strata),
@@ -1548,6 +1589,15 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                 "target_epoch": target_epoch,
                 "work_steps_ms": completed.as_ref().map(|change| json!(change.timings)),
                 "stop_window": stop_window.as_ref().map(StopWindow::summary),
+                "migration": {
+                    "keys": migration.keys,
+                    "keys_moved": migration.keys_moved,
+                    "rate": migration.rate(),
+                    "ranges": completed.as_ref().map_or(0, |change| change.ranges.len()),
+                    "snapshot_records": completed
+                        .as_ref()
+                        .map_or(0, |change| change.ranges.iter().map(|range| range.snapshot_records).sum::<u64>()),
+                },
                 "retries_by_reason": retry_delta,
                 "rewrite_pool": plan.rewrite.len(),
                 "new_pool": plan.write_new.len(),
@@ -1564,6 +1614,8 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                 "published_ms": published_ms,
                 "complete_ms": complete_ms,
                 "full_rf_seconds": full_rf_seconds,
+                "migration_rate": migration.rate(),
+                "keys_moved": migration.keys_moved,
                 "target_epoch": target_epoch,
                 "retries_by_reason": retry_delta,
                 "work_steps_ms": completed.as_ref().map(|change| json!(change.timings)),
