@@ -1206,7 +1206,9 @@ async fn node_self_fences_client_operations_when_coordinator_lease_expires() {
     let ports = unused_ports(2);
     let endpoint = format!("http://127.0.0.1:{}", ports[0]);
     let members = vec![("node-1".to_owned(), ports[1])];
-    let mut coordinator = spawn_process(&coordinator_arguments(ports[0], &state, &members));
+    let mut args = coordinator_arguments(ports[0], &state, &members);
+    args.extend(["--lease-duration-ms".into(), "1000".into()]);
+    let mut coordinator = spawn_process(&args);
     wait_for_listener(ports[0]);
     let client = connect_eventually(&endpoint).await;
     let _node = spawn_process(&[
@@ -1224,7 +1226,10 @@ async fn node_self_fences_client_operations_when_coordinator_lease_expires() {
         .await
         .unwrap();
     coordinator.stop();
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    // Wait out any last grant, using this fixture's lease rather than the
+    // production default. Leave the RPC assertions below unchanged.
+    let lease = client.topology().await.timings.lease_duration();
+    tokio::time::sleep(lease + Duration::from_millis(100)).await;
     let mut node = DataNodeClient::connect(format!("http://127.0.0.1:{}", ports[1]))
         .await
         .unwrap();

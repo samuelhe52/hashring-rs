@@ -337,6 +337,16 @@ cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+The default test run skips the full correctness, latency, and availability
+experiments and the 96 MiB migration transport check. Run those four explicitly:
+
+```sh
+cargo test --test process_cluster -- --ignored
+```
+
+The node crate also has separately ignored microbenchmarks and an isolated RSS
+regression check; run those individually as described in `docs/optimizations/`.
+
 ## License
 
 Copyright (C) 2026 Samuel He, Mingyuan Chen, and Yang Chen. Licensed under the [GNU Affero General Public License v3.0](LICENSE).
