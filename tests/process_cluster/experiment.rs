@@ -377,6 +377,8 @@ async fn availability_experiment_survives_three_consecutive_failures() {
             round["read_recovery_seconds"].as_f64().unwrap() < 30.0,
             "{round} did not recover within 30 seconds"
         );
+        // The cluster serves reads and then writes again after every failure.
+        assert!(round["write_recovery_seconds"].as_f64().unwrap() > 0.0);
         assert!(round["replacement_to_full_rf_seconds"].as_f64().unwrap() > 0.0);
         // The acknowledged keys survive every failure, and so does the value
         // the previous round wrote.

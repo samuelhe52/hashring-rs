@@ -1190,6 +1190,9 @@ pub struct AvailabilityRound {
     pub kill_to_publish_seconds: f64,
     /// The seconds from the kill to the first successful read.
     pub read_recovery_seconds: f64,
+    /// The seconds the first write after the failover took, or None when the
+    /// write did not succeed.
+    pub write_recovery_seconds: Option<f64>,
     /// The longest run of consecutive failed read probes.
     pub observed_unavailable_max_streak_ms: u128,
     /// The read probes that failed.
@@ -1513,6 +1516,44 @@ async fn run_availability(context: RunContext<'_>) -> Result<u64> {
             round > 1 || config.write_ack_policy != WriteAckPolicy::FirstSuccessor || lost == 0,
             "FirstSuccessor lost {lost} acknowledged sampled keys"
         );
+        // The cluster must serve writes again, not only reads. The key is
+        // outside the sampled key space, so it never changes what the run
+        // counts.
+        let write_probe_key = config.key_count;
+        let write_probe_value =
+            deterministic_value(write_probe_key, u64::from(round), config.value_bytes);
+        // The write after a failover waits for the new first successor to be
+        // admitted, so it gets a longer deadline than the tail write.
+        let probe_writer =
+            HashringClient::connect(coordinator_endpoint.to_owned(), Duration::from_secs(30))
+                .await?;
+        let write_started = Instant::now();
+        let write_result = probe_writer
+            .put(
+                write_probe_key.to_be_bytes().to_vec(),
+                write_probe_value.clone(),
+            )
+            .await;
+        let write_recovery_seconds = match write_result {
+            Ok(_) => Some(write_started.elapsed().as_secs_f64()),
+            Err(error) => {
+                return Err(anyhow::Error::from(error)).with_context(|| {
+                    format!(
+                        "the cluster did not accept a write after the failover of round {round}"
+                    )
+                });
+            }
+        };
+        let write_read_back = reader.get(write_probe_key.to_be_bytes().to_vec()).await?;
+        ensure!(
+            write_read_back.value == write_probe_value,
+            "the write after the failover of round {round} did not read back"
+        );
+        events.record(
+            "write_after_failover",
+            json!({ "round": round, "key": write_probe_key,
+            "seconds": write_recovery_seconds }),
+        )?;
         lost_total += lost;
         unavailable_total += unavailable_probes;
         longest_unavailable_total = longest_unavailable_total.max(longest_unavailable_ms);
@@ -1644,6 +1685,7 @@ async fn run_availability(context: RunContext<'_>) -> Result<u64> {
             victim_epoch,
             kill_to_publish_seconds: failover_seconds,
             read_recovery_seconds,
+            write_recovery_seconds,
             observed_unavailable_max_streak_ms: longest_unavailable_ms,
             unavailable_probe_count: unavailable_probes,
             tail_ack_to_kill_ms,

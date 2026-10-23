@@ -116,10 +116,12 @@ Availability mode also records:
 2. writes an identifiable value to the last of them and kills the owner,
 3. waits for the automatic failover to publish a topology without it and for the
    read probe to succeed again,
-4. reads the sampled keys back, and the value the previous round wrote,
-5. joins a spare node, which is seeded like a scale-out node, and waits for the
+4. writes a key outside the sampled key space and reads it back, which measures
+   when the cluster serves writes again,
+5. reads the sampled keys back, and the value the previous round wrote,
+6. joins a spare node, which is seeded like a scale-out node, and waits for the
    full replication factor,
-6. records how evenly the live members, and the members that never failed, hold
+7. records how evenly the live members, and the members that never failed, hold
    the keys.
 
 The probe key's owner changes with every failover, so every round kills a node
@@ -129,11 +131,12 @@ alone starts with 3 members and 3 spares.
 
 The per-round records are in `availability_rounds`, one object per round. Each
 one holds the victim and its epoch, the time from the kill to the publication
-and to the first successful read, the longest streak of failed read probes, the
-acknowledged keys that survived, whether the previous round's value survived,
-the time from the replacement to the full replication factor, the keys every
-live member owns, and the spread of those keys (`max_over_min`,
-`range_over_mean`, `max_over_mean_minus_one`, and `cv`).
+and to the first successful read, the time the first write after the failure
+took, the longest streak of failed read probes, the acknowledged keys that
+survived, whether the previous round's value survived, the time from the
+replacement to the full replication factor, the keys every live member owns,
+and the spread of those keys (`max_over_min`, `range_over_mean`,
+`max_over_mean_minus_one`, and `cv`).
 
 The run's own figures describe its worst round: `failover_seconds` and
 `read_recovery_seconds` are the slowest round, `observed_unavailable_max_streak_ms`
