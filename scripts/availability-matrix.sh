@@ -13,7 +13,7 @@
 #   ./scripts/availability-matrix.sh
 #   REPS=1 ./scripts/availability-matrix.sh              # smoke the campaign
 #   KEYS=10000 ./scripts/availability-matrix.sh          # a smaller key space
-#   GROUPS="v1024" ./scripts/availability-matrix.sh      # one group only
+#   RUN_GROUPS="v1024" ./scripts/availability-matrix.sh  # one group only
 #   REQUIRE_CLEAN=0 ./scripts/availability-matrix.sh     # from a dirty tree
 #
 # Environment
@@ -24,7 +24,7 @@
 #   NODES          9: 6 initial members and 3 replacements
 #   KEYS           100000
 #   REPS           3
-#   GROUPS         v128 v512 v1024
+#   RUN_GROUPS     v128 v512 v1024
 #   REQUIRE_CLEAN  1
 
 set -euo pipefail
@@ -34,7 +34,7 @@ ROUNDS="${ROUNDS:-3}"
 NODES="${NODES:-9}"
 KEYS="${KEYS:-100000}"
 REPS="${REPS:-3}"
-GROUPS="${GROUPS:-v128 v512 v1024}"
+RUN_GROUPS="${RUN_GROUPS:-v128 v512 v1024}"
 REQUIRE_CLEAN="${REQUIRE_CLEAN:-1}"
 STAMP="$(date -u +%Y%m%d-%H%M%S)"
 OUT_DIR="${OUT_DIR:-results/availability-matrix-$STAMP}"
@@ -59,7 +59,7 @@ mkdir -p "$OUT_DIR"
   echo "nodes=$NODES"
   echo "keys=$KEYS"
   echo "reps=$REPS"
-  echo "groups=$GROUPS"
+  echo "groups=$RUN_GROUPS"
   echo "require_clean=$REQUIRE_CLEAN"
   uname -a
   if [[ -r /proc/cpuinfo ]]; then
@@ -96,7 +96,7 @@ run() {
   fi
 }
 
-for group in $GROUPS; do
+for group in $RUN_GROUPS; do
   case "$group" in
     v128) vnodes=128 ;;
     v256) vnodes=256 ;;

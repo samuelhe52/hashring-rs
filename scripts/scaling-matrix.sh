@@ -12,7 +12,7 @@
 #   ./scripts/scaling-matrix.sh
 #   REPS=1 ./scripts/scaling-matrix.sh              # smoke the matrix itself
 #   KEYS=1000000 ./scripts/scaling-matrix.sh        # the large formal scale
-#   GROUPS="main control" ./scripts/scaling-matrix.sh
+#   RUN_GROUPS="main control" ./scripts/scaling-matrix.sh
 #   REQUIRE_CLEAN=0 ./scripts/scaling-matrix.sh     # from a dirty tree, not formal
 #
 # Environment
@@ -21,7 +21,7 @@
 #   OUT_DIR        results/scaling-matrix-<UTC timestamp>
 #   KEYS           100000 (the plan's main scale; 1000000 for the large scale)
 #   REPS           3
-#   GROUPS         main control diagnostic policy open
+#   RUN_GROUPS     main control diagnostic policy open
 #   OPEN_RATE      60% of the measured closed-loop capacity, so it must be set
 #                  by the operator; the default 6000 is only a starting point
 #   OPEN_POOL_SECONDS  20; the 100k key space limits how long a high-rate open
@@ -37,7 +37,7 @@ set -euo pipefail
 BINARY="${BINARY:-target/release/hashring-rs}"
 KEYS="${KEYS:-100000}"
 REPS="${REPS:-3}"
-GROUPS="${GROUPS:-main control diagnostic policy open}"
+RUN_GROUPS="${RUN_GROUPS:-main control diagnostic policy open}"
 OPEN_RATE="${OPEN_RATE:-6000}"
 OPEN_POOL_SECONDS="${OPEN_POOL_SECONDS:-20}"
 # The open group is the only one whose write rate needs the receipt budget:
@@ -70,7 +70,7 @@ mkdir -p "$OUT_DIR"
   echo "binary=$BINARY"
   echo "keys=$KEYS"
   echo "reps=$REPS"
-  echo "groups=$GROUPS"
+  echo "groups=$RUN_GROUPS"
   echo "open_rate=$OPEN_RATE"
   echo "require_clean=$REQUIRE_CLEAN"
   uname -a
@@ -97,7 +97,7 @@ run() {
   fi
 }
 
-for group in $GROUPS; do
+for group in $RUN_GROUPS; do
   for ((rep = 1; rep <= REPS; rep++)); do
     common=(--warmup-seconds 10)
     post=(--scaling-post-seconds 10)
