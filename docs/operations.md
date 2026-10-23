@@ -114,7 +114,17 @@ their defaults in [configuration.md](configuration.md).
 
 The cluster-size limits in the README (1,024 members, 4,096 virtual nodes per
 member, 1,048,576 assignments, 16,384 moved ranges per change) keep topology
-and change snapshots under the 64 MiB control-plane message limit.
+and change snapshots under the 64 MiB control-plane message limit. The
+replica-obligation ceiling is 131,072, which covers the largest legal
+ten-member RF=3 topology (81,920 obligations).
+
+Density is expensive in practice. On a ten-node RF=3 cluster the coordinator's
+resident memory peaked at about 0.13 GB with 128 virtual nodes per member,
+1.4 GB at 1,000, 5.2 GB at 2,000, and 17 GB at 4,096, and a single-node change
+took about 107 s to publish at 1,000 virtual nodes while 2,000 and 4,096 did
+not publish within several minutes. Keep the default 128 unless a denser ring
+is worth that cost; see
+[acceptance-metrics.md](acceptance-metrics.md) for the measurements.
 
 ## ACK policies and admission
 
