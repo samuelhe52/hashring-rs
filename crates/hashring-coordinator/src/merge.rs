@@ -435,12 +435,14 @@ impl CoordinatorService {
         }
         change.phase = MigrationPhase::Published;
         change.activation_ready = true;
+        self.store_change_timings(change.timings).await?;
         if !self.post_publish_delay.is_zero() {
             tokio::time::sleep(self.post_publish_delay).await;
         }
         let activation_started = Instant::now();
         let mut completed = self.finish_direct_merge(change).await?;
         completed.timings.activation_ms = millis(activation_started.elapsed());
+        self.store_change_timings(completed.timings).await?;
         Ok(completed)
     }
 

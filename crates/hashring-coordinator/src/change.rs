@@ -236,12 +236,14 @@ impl CoordinatorService {
         tracing::debug!(change_id = %change.change_id, epoch = change.target_topology.epoch, moved_ranges = change.ranges.len(), replica_obligations = change.replica_obligations.len(), "topology published; activation pending");
         change.phase = MigrationPhase::Published;
         change.timings.publish_ms = millis(publish_started.elapsed());
+        self.store_change_timings(change.timings).await?;
         if !self.post_publish_delay.is_zero() {
             tokio::time::sleep(self.post_publish_delay).await;
         }
         let activation_started = Instant::now();
         let mut completed = self.finish_published_change(change, deadline).await?;
         completed.timings.activation_ms = millis(activation_started.elapsed());
+        self.store_change_timings(completed.timings).await?;
         Ok(completed)
     }
 
@@ -783,6 +785,10 @@ impl CoordinatorService {
             deadline,
         )
         .await?;
+        // Stop the replay clock here: the digest round trips, the comparison,
+        // and the destination commit that follow are verification and commit
+        // work, not changelog replay.
+        let replay_ms = millis(replay_started.elapsed());
         let control = RangeControlRequest {
             change_id: change.change_id.clone(),
             range_id: range.range_id.clone(),
@@ -811,9 +817,7 @@ impl CoordinatorService {
 
         let mut progress = range.clone();
         progress.changelog_watermark = final_watermark;
-        progress.changelog_replay_ms = range
-            .changelog_replay_ms
-            .saturating_add(millis(replay_started.elapsed()));
+        progress.changelog_replay_ms = range.changelog_replay_ms.saturating_add(replay_ms);
         progress.verified = true;
         Ok((progress, source_digest.digest))
     }
@@ -1338,6 +1342,35 @@ impl CoordinatorService {
             .map_err(|error| Status::internal(error.to_string()))?;
         *state = next;
         tracing::debug!(%change_id, ?phase, "topology change phase updated");
+        Ok(())
+    }
+
+    /// Persists the work-step timings of the active change.
+    ///
+    /// The execution path keeps its own copy of the change and returns it to
+    /// the caller, so without this the records that `change-status`, a
+    /// repeated `execute-change`, and a restarted coordinator read would hold
+    /// zeros.
+    pub(super) async fn store_change_timings(
+        &self,
+        timings: MigrationTimings,
+    ) -> Result<(), Status> {
+        let mut state = self.state.write().await;
+        let mut next = state.clone();
+        let change = next
+            .active_change
+            .as_mut()
+            .ok_or_else(|| Status::internal("active change disappeared"))?;
+        if change.timings == timings {
+            return Ok(());
+        }
+        change.timings = timings;
+        let change_id = change.change_id.clone();
+        self.repository
+            .store_state(&next)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        *state = next;
+        tracing::debug!(%change_id, "topology change timings updated");
         Ok(())
     }
 
