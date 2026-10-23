@@ -1,6 +1,6 @@
 # 扩缩容期间读写实验（方案 v4）
 
-> 状态：`scaling` 模式已实现，正式矩阵已在干净源码 `d0b160f` 上完成（§0.1）。原始 `results/` 不纳入 Git。
+> 状态：`scaling` 模式已实现，正式矩阵已在干净源码 `b0ce975` 上完成（§0.1）。原始 `results/` 不纳入 Git。
 > 本文整合了三轮评审意见，只保留中高价值项。
 
 ## 0. 结论先行
@@ -13,7 +13,9 @@
 
 ## 0.1 实现状态与正式结果
 
-方案条目已全部实现。正式矩阵来自干净源码 `d0b160f`：每次运行都带 `--require-clean-source`，manifest 记录的 build 与 runtime 提交、源码摘要一致。原始结果在本地 `results/scaling-formal-v3/`，不纳入 Git。主机是 24 逻辑 CPU、32 GB 的共享桌面机，桌面进程与前几轮相同。
+方案条目已全部实现。正式矩阵来自干净源码 `b0ce975`：每次运行都带 `--require-clean-source`，manifest 记录的 build 与 runtime 提交、源码摘要一致。原始结果在本地 `results/scaling-refresh-<时间戳>/`，不纳入 Git。主机是 24 逻辑 CPU、32 GB 的共享桌面机；这一轮运行期间桌面进程较忙（`loadavg` 约 5，Firefox 等占 CPU），所以**绝对吞吐低于更早 `d0b160f` 那一轮**，两组数字不能直接比较绝对值，只能看同一轮内的相对关系。
+
+这一轮的计时口径有三处修正，因此 `replay`、`满 RF s`、`停写窗口 ms` 三列与 `d0b160f` 的记录不可比：`changelog_replay_ms` 只算回放本身（不再把 digest 往返与 commit 算进去），`full_rf_seconds` 从 `Complete` 起算（含等被移除节点退出），停写窗口以每个 transition 开始时的计数为基线（第二个 transition 不再把第一个的拒绝算成自己的）。
 
 ### 已实现
 
@@ -45,56 +47,56 @@
 
 | 阶段 | 实际路径 | complete ms | published ms | 满 RF s | snapshot | replay | pause | verify | publish | activation | RangeBusy | 停写窗口 ms |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| grow | 复制 | 1855 | 1344 | 2.95 | 679 | 3767 | 8 | 645 | 10 | 473 | 23 | 804 |
-| shrink | `direct_merge` | 120 | 65 | 4.21 | 0 | 0 | 7 | 35 | 14 | 47 | 13 | 85 |
+| grow | 复制 | 2772 | 2090 | 4.45 | 1021 | 2144 | 11 | 1026 | 16 | 667 | 28 | 1098 |
+| shrink | `direct_merge` | 163 | 89 | 6.58 | 0 | 0 | 9 | 48 | 16 | 61 | 16 | 101 |
 
 - 除 `RangeBusy` 与窗口外，单位为毫秒；`replay` 是各 range 之和，可大于所在阶段。
-- shrink 的 `merge_proof_ms` = 5、`catch_up_ms` = 15。
-- 三次运行各约 5.11M 次操作、43.6 s，`late=0`；grow/shrink 期间聚合速率中位数 118.0k / 137.6k ops/s。
-- 停写窗口（客户端观测）：grow 在 713 ms 首次出现 `RangeBusy`、1347 ms 最后一次、1513 ms 首个成功写；shrink 为 0 / 78 / 85 ms。grow 的栅栏在复制与回放之后才加上（713 ms 约等于 `snapshot_copy_ms` 之后的 `PausingWrites`），一直保持到发布（1347 ms 对 `published_ms=1344`），所以窗口主体是 `Verifying`（645 ms）+ `publish`（10 ms），不是整个 change；shrink 走 direct merge，一开始就全集群停写。
+- shrink 的 `merge_proof_ms` = 6、`catch_up_ms` = 25。
+- 三次运行各约 4.2–4.5M 次操作、49.8–50.2 s，`late=0`；grow/shrink 期间聚合速率 88.7–95.4k / 98.8–101.8k ops/s，同一轮对照窗口 102.2–104.5k ops/s，所以 grow 比对照低约 7–15%，shrink 低约 0–5%。
+- 停写窗口（客户端观测）：grow 在 1060 ms 首次出现 `RangeBusy`、2096 ms 最后一次、2158 ms 首个成功写；shrink 为 44 / 95 / 139 ms。grow 的栅栏在复制与回放之后才加上（1060 ms 约等于 `snapshot_copy_ms` 之后进入 `PausingWrites`），一直保持到发布（2096 ms 对 `published_ms=2090`），所以窗口主体是 `Verifying`（1026 ms）+ `publish`（16 ms），不是整个 change；shrink 走 direct merge，栅栏在 change 开始后约 44 ms 才第一次拒绝掉写，窗口约 101 ms，不是“一开始就停写”。
 - 分层：grow 覆盖 `new_target`、`replicas_changed`、`unchanged`；shrink 覆盖 `removed_source`、`replicas_changed`、`unchanged`。S1 cohort 在 S2 开始时校验（`deferred_to_next_transition`），S2 校验通过。
 
-GET 延迟按请求**发起时**所在阶段（3 次合计操作数，百分位取 3 次中位数）：
+GET 延迟按请求**发起时**所在阶段（操作数为单次运行的平均值，百分位取 3 次中位数）：
 
 | 阶段 | 操作数 | p50 | p99 |
 |---|---|---|---|
-| `pre`（变更前） | 11,991,029 | 478 µs | 831 µs |
-| `copying_snapshot` | 259,991 | 504 µs | 869 µs |
-| `replaying_changelog` | 1,004 | 504 µs | 854 µs |
-| `pausing_writes` | 11,358 | 510 µs | 911 µs |
-| `verifying` | 256,338 | 499 µs | 881 µs |
-| `published → complete` | 184,525 | 331 µs | 870 µs |
-| `post`（含 RF 修复） | 10,569,603 | 562 µs | 1.1 ms |
+| `pre`（变更前） | 1,053,800 | 600 µs | 1.14 ms |
+| `copying_snapshot` | 91,802 | 683 µs | 1.69 ms |
+| `replaying_changelog` | 773 | 752 µs | 1.42 ms |
+| `pausing_writes` | 3,617 | 691 µs | 1.38 ms |
+| `verifying` | 94,265 | 668 µs | 1.61 ms |
+| `published → complete` | 57,033 | 321 µs | 1.02 ms |
+| `post`（含 RF 修复） | 3,013,416 | 629 µs | 1.56 ms |
 
-被栅栏拒绝的写：`pausing_writes` 中 `put_rewrite` 11 次（p50 94 ms、p99 746 ms），`verifying` 中 10 次（p99 857 ms）——写一直阻塞到发布。读在这些阶段基本不受影响。
+被栅栏拒绝的写：`pausing_writes` 中 `put_rewrite` 中位数 4 次（p50 109 ms、p99 1.21 s），`verifying` 中 2 次（p99 1.26 s）——写一直阻塞到发布。读在这些阶段基本不受影响。
 
 ### S0 对照（3 次，中位数）
 
 | 用时 s | 操作数 | late | 聚合 ops/s | GET p50 | GET p99 |
 |---|---|---|---|---|---|
-| 24.8 | 2,647,848 | 0 | 131,199 | 483 µs | 839 µs |
+| 26.1 | 2,094,280 | 0 | 80,104 | 710 µs | 1.43 ms |
 
-对照组的节点数（10）、线程预算与主组一致。主组 grow 的聚合速率比对照低约 10%（118.0k 对 131.2k），shrink 高约 5%（137.6k）；两次 change 的停写窗口分别约 0.8 s 和 0.09 s，而对照没有 `RangeBusy`。
+对照组的节点数（10）、线程预算与主组一致。主组 grow 的聚合速率比对照低约 7–15%（88.7–95.4k 对 102.2–104.5k 的测量窗口），shrink 低约 0–5%（98.8–101.8k）；两次 change 的停写窗口分别约 1.1 s 和 0.10 s，而对照没有 `RangeBusy`。
 
 ### 诊断、策略对照、S3、S4（各 1 次）
 
 | 组 | 变更 | complete ms | published ms | 满 RF s | 备注 |
 |---|---|---|---|---|---|
-| 诊断 | 9→10→9 | 2293 / 369 | 1785 / 315 | 2.95 / 3.47 | `pre_publish_delay=250`：`publish_ms` 263/265（主组 10/14），停写窗口 887/399 ms |
-| 策略 | 9→10→9 | 4693 / 112 | 1352 / 63 | 0.01 / 3.69 | `FirstSuccessor`：grow `activation_ms=3332`（主组 473），停写窗口 3304 ms |
-| S3 | 10→10 替换 | 3957 | 3028 | 2.95 | 复制路径：snapshot 1494、replay 8535、verify 1499；四个分层都有样本；停写窗口 1627 ms |
-| S4 | 6→9→6 | 4599 / 5235 | 3225 / 4133 | 2.42 / 1.30 | grow 同时新增 3 个成员；shrink `direct_merge=false`（一次移除 3 个成员时 coverage 不成立），停写窗口 1633/4217 ms |
+| 诊断 | 9→10→9 | 2720 / 422 | 2052 / 344 | 4.40 / 6.54 | `pre_publish_delay=250`：`publish_ms` 270/268（主组 16/16），停写窗口 1082/429 ms |
+| 策略 | 9→10→9 | 6809 / 189 | 2152 / 98 | 0.02 / 6.54 | `FirstSuccessor`：grow `activation_ms=4645`（主组 667），停写窗口 4635 ms |
+| S3 | 10→10 替换 | 5548 | 4285 | 4.25 | 复制路径：snapshot 2229、replay 4338、verify 2006；四个分层都有样本；停写窗口 2188 ms |
+| S4 | 6→9→6 | 6243 / 6929 | 4608 / 5616 | 3.60 / 2.01 | grow 同时新增 3 个成员；shrink `direct_merge=false`（一次移除 3 个成员时 coverage 不成立），停写窗口 2335/2827 ms |
 
-`complete ms` 列中 `/` 两侧分别是 grow 与 shrink（S3 只有一次替换）。策略组 `full_rf_seconds=0.01` 是因为 `activation_ms` 已经等了跟随副本；两份时间不能相加。
+`complete ms` 列中 `/` 两侧分别是 grow 与 shrink（S3 只有一次替换）。策略组 `full_rf_seconds=0.02` 是因为 `activation_ms` 已经等了跟随副本；两份时间不能相加。
 
 ### 1M 主组（1 次）
 
 | 阶段 | complete ms | published ms | 满 RF s | snapshot | replay | pause | verify | publish | activation | RangeBusy | 停写窗口 ms |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| grow | 2086 | 1584 | 8.96 | 861 | 4930 | 8 | 695 | 10 | 500 | 31 | 841 |
-| shrink | 140 | 70 | 9.54 | 0 | 0 | 8 | 37 | 15 | 64 | 13 | 126 |
+| grow | 2800 | 2136 | 10.60 | 1112 | 2202 | 11 | 984 | 16 | 646 | 37 | 1184 |
+| shrink | 191 | 89 | 12.37 | 0 | 0 | 8 | 49 | 15 | 87 | 16 | 146 |
 
-预载 1M 键约 30 s。`Complete` 之后到满 RF 约 9 s，是 100k 规模的约 3 倍；`post` 阶段 GET p99 从变更前的 0.83 ms 升到 4.6 ms，说明 RF 修复与负载争用。
+预载 1M 键约 30 s。`Complete` 之后到满 RF 约 11–12 s，是这一轮 100k 主组（4.45/6.58 s）的约 2 倍；`post` 阶段 GET p99 从变更前的 1.12 ms 升到 9.4 ms，说明 RF 修复与负载争用。
 
 ### 迁移量（阶段 6-2）
 
@@ -111,6 +113,8 @@ GET 延迟按请求**发起时**所在阶段（3 次合计操作数，百分位�
 9→10 的 10.51% 接近 1/(9+1)：新增一个节点拿走环上约 1/10 的键；三次重复完全相同，因为同一 seed 的环是确定的。10→11 的 6.45% 是新增节点在这个 seed 的环上实际占的份额（期望 1/11 = 9.09%；11 节点、V=128 的 `latency` 运行测得 node-11 拥有 6,446 个键，与迁移量一致）。阶段 3/6 的「N≥10 时迁移率 ≤10%」由 10→11 的 6.45% 满足。课程验收指标的完整对照见 [acceptance-metrics.md](acceptance-metrics.md)。
 
 ### 开环尾延迟组（1M 键，offered 50k ops/s，3 次）
+
+> **复现条件**：这一组必须在空闲主机上跑。脚本现在按 §9 传 `--keys 1000000`；早期脚本把它误写成 100k（见 §9 注）。在桌面进程占用 CPU 的主机上，第二个 transition 开始前要校验上一个 transition 的 cohort（1M 键约 255k 个键，满载下每次 GET 约 40 ms），需要约 43 s，超过 33 s 的一次性写池：shrink 的写在 change 开始前就耗尽，没有 `RangeBusy` 证据，运行被 §8 的有效性检查判为 invalid。这是检查按设计生效，不是代码错误。下表是 `d0b160f` 在空闲主机上的记录，本轮没有重跑。
 
 | 指标 | open-1 | open-2 | open-3 |
 |---|---|---|---|
@@ -143,27 +147,27 @@ GET 延迟（按请求发起时所在阶段；操作数为 3 次合计，百分�
 | 项 | 结果 |
 |---|---|
 | 主组 `pre_publish_delay_ms = 0` | `scaling` 模式默认即 0，逐次 manifest 记录为 0 ✔ |
-| 最后一次 `Complete` 前无池耗尽 | 14 次 scaling 运行全部成功（耗尽会判 invalid）✔ |
+| 最后一次 `Complete` 前无池耗尽 | 本轮 11 次闭环运行全部成功（耗尽会判 invalid）✔；开环组 3 次因主机负载判 invalid，见上一节 |
 | 适用分层都有实际样本 | 每次 transition 的 `touched_strata` 覆盖 `expected_strata`，运行内强制检查 ✔ |
-| 停写窗口内至少一次 `RangeBusy` | 100k 主组 grow 22–23、shrink 13–15；开环组 grow 8.3k–10k、shrink 1.5k–2.9k ✔ |
+| 停写窗口内至少一次 `RangeBusy` | 本轮 100k 主组 grow 26–30、shrink 14–16；1M 主组 grow 37、shrink 16；诊断/策略/S3/S4 同样>0 ✔ |
 | 阶段 × 分层覆盖 | 只报告，不作为判定条件 |
 
 ### 硬性标准
 
 | 项 | 结果 |
 |---|---|
-| change 正常完成并发布 | 14 次正式运行全部 `Complete`，无 `Aborted` |
+| change 正常完成并发布 | 本轮 11 次闭环运行全部 `Complete`，无 `Aborted` |
 | 正确性违规为 0 | 全量校验、S1 后中间校验、读己之写/删、发布后复读均 0 违规；探针违规计数 0 |
 | 进程无意外退出 | 被移除节点在宽限期内正常退出（`removed_node_exited`），无 `unexpected exit` |
 
 ### 局限
 
-- 共享桌面主机，桌面进程同时运行；同一配置的重复运行仍有可见波动（主组 grow `complete_ms` 1815–1869 ms，开环组 2058–2400 ms）。
+- 共享桌面主机，桌面进程同时运行；本轮桌面负载更高（`loadavg` 约 5），绝对吞吐低于更早的 `d0b160f` 记录（主组 grow `complete_ms` 2772 vs 1855），重复运行的波动同样受它影响。
 - S3/S4/诊断/策略组各只有 1 次重复，只能作为量级参考，不能当作分布。
 - 开环组在 RF 修复窗口出现负载丢弃，说明“稳态容量 60%”在修复期并不成立；容量基线只在无迁移、无修复的稳态下测得。
 - 计划 §5 中列为可选的“原始 owner RPC 探针”没有做：阻塞时长以客户端观测的 `RangeBusy` 窗口和按阶段的写延迟报告，没有把传输与重试等待分开。原始 `results/` 只有本机，不作为共享基线。
-- 开环组因一次性写入池必须在整个 transition 内存活，跑在 1M 键上；100k 键下池窗口只允许数千 ops/s（低于容量的 10%）。它的 post 窗口是 5 s（主组 10 s），以便池覆盖整个 transition。
-- 统计功效：每次运行零失败不能推出失败率上界；可用性只报告观察值（本节所有运行 0 失败）。
+- 开环组的一次性写入池必须覆盖整个 transition，包括下一个 transition 开始前对上一个 transition 的延迟校验。这个校验在满载下很慢（1M 键约 43 s），所以开环组对主机负载非常敏感：本轮在忙的主机上 3 次都被判 invalid。100k 键下池窗口只允许数千 ops/s（低于容量的 10%）。它的 post 窗口是 5 s（主组 10 s），以便池覆盖整个 transition。
+- 统计功效：每次运行零失败不能推出失败率上界；可用性只报告观察值（本轮闭环运行 0 失败）。
 
 ---
 
@@ -448,7 +452,7 @@ S1 与 S2 在**同一个集群生命周期内连续执行**：预载一次、负
 - 机器上不跑其他负载；对照组的节点数、线程预算与主组一致（本次主机是共享桌面机，见 §0.1 局限）。
 - cohort 池按“预计最长时长 × 安全系数”生成；最后一次 `Complete` 前耗尽即判该次运行 invalid，不进入统计。
 
-本次正式矩阵（`d0b160f`）的实际参数：主组、对照、诊断、策略与 S3/S4 均为 100k 键、闭环 200 写/秒、`scaling-pool-seconds=120`；S3 用 `--nodes 11`（10→10），S4 用 `--nodes 9 --initial-nodes 6`。开环组为 1M 键、`--scaling-open-rate 50000`、`--scaling-pool-seconds 33`、`--scaling-post-seconds 5`、`--max-dedup-bytes 268435456`，重复 3 次；容量基线用同一配置的 `latency` 模式测得（§0.1）。
+本次正式矩阵（`b0ce975`）的实际参数：主组、对照、诊断、策略与 S3/S4 均为 100k 键、闭环 200 写/秒、`scaling-pool-seconds=120`；S3 用 `--nodes 11`（10→10），S4 用 `--nodes 9 --initial-nodes 6`。开环组按上表为 1M 键、`--scaling-open-rate 50000`、`--scaling-pool-seconds 33`、`--scaling-post-seconds 5`、`--max-dedup-bytes 268435456`，重复 3 次；容量基线用同一配置的 `latency` 模式测得（§0.1）。矩阵脚本的 `RUN_GROUPS` 默认覆盖全部七组，开环组用 `OPEN_KEYS`（默认 1000000）而不是 `KEYS`。
 
 ---
 
