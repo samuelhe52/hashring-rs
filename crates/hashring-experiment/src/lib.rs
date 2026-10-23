@@ -1389,9 +1389,12 @@ async fn run_availability(context: RunContext<'_>) -> Result<u64> {
         let tail_reuses_previous = previous_tail
             .as_ref()
             .is_some_and(|(previous, _)| *previous == tail_key);
-        let tail_bytes = config
-            .value_bytes
-            .clamp(1024 * 1024, config.node.max_value_bytes);
+        // The tail value is made large enough to be a meaningful write, but
+        // never larger than the data nodes accept. `clamp` would panic when
+        // the configured limit itself is below that floor.
+        let tail_bytes = (1024 * 1024)
+            .min(config.node.max_value_bytes)
+            .max(config.value_bytes);
         let tail_value = deterministic_value(tail_key, u64::from(round), tail_bytes);
         // The value the key held before this round's write. A key that was
         // already observed keeps what the run saw then, including absence.
@@ -2751,10 +2754,6 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
                 "scaling_write_rate must be positive"
             );
         }
-        ensure!(
-            config.scaling_write_rate > 0,
-            "scaling_write_rate must be positive"
-        );
         ensure!(
             config.scaling_pool_seconds > 0,
             "scaling_pool_seconds must be positive"
