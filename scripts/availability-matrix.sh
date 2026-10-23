@@ -39,6 +39,14 @@ REQUIRE_CLEAN="${REQUIRE_CLEAN:-1}"
 STAMP="$(date -u +%Y%m%d-%H%M%S)"
 OUT_DIR="${OUT_DIR:-results/availability-matrix-$STAMP}"
 
+# Both guards below test paths that are relative to the project root, so the
+# script must be there before it checks them. Otherwise a run from another
+# directory reports a missing binary that is present, and the OUT_DIR guard
+# protects a directory other than the one the campaign writes to.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_ROOT"
+
 if [[ ! -x "$BINARY" ]]; then
   echo "error: '$BINARY' not found; run 'cargo build --release' first." >&2
   exit 1
@@ -48,9 +56,6 @@ if [[ -e "$OUT_DIR" ]]; then
   exit 1
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-cd "$PROJECT_ROOT"
 mkdir -p "$OUT_DIR"
 
 {

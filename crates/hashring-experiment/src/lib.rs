@@ -174,6 +174,15 @@ pub struct ExperimentConfig {
     pub node: NodeOptions,
 }
 
+impl ExperimentConfig {
+    /// The members an `availability` run starts with, before it kills any.
+    /// `validate_config` guarantees the result is at least one.
+    pub fn availability_initial_members(&self) -> usize {
+        self.node_count
+            .saturating_sub(self.availability_rounds as usize)
+    }
+}
+
 /// The `node` command's tuning flags, in their flag units.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct NodeOptions {
@@ -671,7 +680,7 @@ async fn run_cluster(
         ExperimentMode::Performance | ExperimentMode::Latency => config.node_count,
         // The availability mode starts with every node but the spares it
         // needs to replace the nodes it kills.
-        ExperimentMode::Availability => config.node_count - config.availability_rounds as usize,
+        ExperimentMode::Availability => config.availability_initial_members(),
         ExperimentMode::Scaling => {
             config
                 .initial_nodes
@@ -1232,7 +1241,9 @@ pub struct AvailabilityRound {
 pub struct KeyBalance {
     /// The number of nodes the keys were spread over.
     pub nodes: usize,
-    /// The largest share divided by the smallest one.
+    /// The largest share divided by the smallest one. When a node holds no
+    /// keys the ratio is unbounded, and this is `f64::INFINITY`; JSON has no
+    /// infinity, so it is written as `null` there.
     pub max_over_min: f64,
     /// The largest share minus the smallest one, divided by the mean.
     pub range_over_mean: f64,
@@ -1251,9 +1262,18 @@ impl KeyBalance {
         let mean = shares.iter().sum::<f64>() / shares.len() as f64;
         let max = shares.iter().copied().fold(f64::MIN, f64::max);
         let min = shares.iter().copied().fold(f64::MAX, f64::min);
+        // A node with no keys makes the ratio unbounded. Reporting 0 would
+        // read as perfect balance.
+        let max_over_min = if min > 0.0 {
+            max / min
+        } else if max > 0.0 {
+            f64::INFINITY
+        } else {
+            1.0
+        };
         Self {
             nodes: shares.len(),
-            max_over_min: if min > 0.0 { max / min } else { 0.0 },
+            max_over_min,
             range_over_mean: if mean > 0.0 { (max - min) / mean } else { 0.0 },
             max_over_mean_minus_one: if mean > 0.0 { max / mean - 1.0 } else { 0.0 },
             cv: coefficient_of_variation(shares),
@@ -1294,7 +1314,7 @@ async fn run_availability(context: RunContext<'_>) -> Result<u64> {
         ..
     } = context;
     let rounds = config.availability_rounds.max(1) as usize;
-    let initial_count = members.len() - rounds;
+    let initial_count = members.len().saturating_sub(rounds);
     ensure!(
         initial_count >= 1,
         "the availability mode needs at least one initial member"
@@ -1360,8 +1380,24 @@ async fn run_availability(context: RunContext<'_>) -> Result<u64> {
 
         // An identifiable, just-acknowledged tail makes OwnerOnly loss
         // observable when it occurs; zero loss in one run is not a durability
-        // guarantee.
-        let tail_key = *sampled.last().expect("nonempty sample was checked");
+        // guarantee. The key must differ from the previous round's, or this
+        // round's own write would overwrite the value that the previous-tail
+        // check is meant to look for.
+        let tail_key = sampled
+            .iter()
+            .rev()
+            .copied()
+            .find(|key| {
+                previous_tail
+                    .as_ref()
+                    .is_none_or(|(previous, _)| previous != key)
+            })
+            .unwrap_or_else(|| *sampled.last().expect("nonempty sample was checked"));
+        // Whether this round had to reuse the previous round's tail key, which
+        // makes the previous-tail check meaningless for it.
+        let tail_reuses_previous = previous_tail
+            .as_ref()
+            .is_some_and(|(previous, _)| *previous == tail_key);
         let tail_bytes = config
             .value_bytes
             .clamp(1024 * 1024, config.node.max_value_bytes);
@@ -1498,9 +1534,11 @@ async fn run_availability(context: RunContext<'_>) -> Result<u64> {
             }
         }
         // The value the previous round wrote is checked here as well: a
-        // failure that follows another one must not lose it either.
+        // failure that follows another one must not lose it either. A round
+        // that had to reuse the previous tail key has already overwritten it,
+        // so it reports no result rather than a loss.
         let mut previous_tail_survived = None;
-        if let Some((key, value)) = previous_tail.as_ref() {
+        if !tail_reuses_previous && let Some((key, value)) = previous_tail.as_ref() {
             previous_tail_survived = Some(match reader.get(key.to_be_bytes().to_vec()).await {
                 Ok(output) => output.value == *value,
                 Err(ClientError::Operation(failure)) if failure.code == ErrorCode::NotFound => {
@@ -1637,12 +1675,14 @@ async fn run_availability(context: RunContext<'_>) -> Result<u64> {
             );
         }
         measurements.insert(
-            "restore_full_rf".into(),
+            format!("restore_full_rf_round_{round}"),
             measurement(1, restore_started.elapsed()),
         );
-        if round > 1 {
+        if round == 1 {
+            // The run's own figures describe its first round; every round has
+            // its own entry above.
             measurements.insert(
-                format!("restore_full_rf_round_{round}"),
+                "restore_full_rf".into(),
                 measurement(1, restore_started.elapsed()),
             );
         }
@@ -2545,8 +2585,10 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
             config.node_count >= 4,
             "availability mode requires at least 4 nodes (3 initial and 1 replacement)"
         );
+        // Compare before subtracting: `--nodes 4 --availability-rounds 5`
+        // must be rejected, not overflow.
         ensure!(
-            config.node_count - config.availability_rounds as usize >= 1,
+            config.node_count > config.availability_rounds as usize,
             "availability mode needs at least one initial member besides its replacements"
         );
         ensure!(
@@ -2561,7 +2603,7 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
     let initial_count = match config.mode {
         ExperimentMode::Correctness => config.node_count - 1,
         ExperimentMode::Performance | ExperimentMode::Latency => config.node_count,
-        ExperimentMode::Availability => config.node_count - config.availability_rounds as usize,
+        ExperimentMode::Availability => config.availability_initial_members(),
         ExperimentMode::Scaling => {
             config
                 .initial_nodes
@@ -2867,6 +2909,14 @@ mod tests {
         let balance = KeyBalance::of(&[]);
         assert_eq!(balance.nodes, 0);
         assert_eq!(balance.max_over_min, 0.0);
+
+        // A node with no keys makes the ratio unbounded, not balanced.
+        let balance = KeyBalance::of(&[0.0, 10.0, 20.0]);
+        assert!(balance.max_over_min.is_infinite());
+        assert_eq!(
+            serde_json::to_value(balance).unwrap()["max_over_min"],
+            Value::Null
+        );
     }
 
     #[tokio::test]

@@ -450,11 +450,14 @@ struct ExperimentArgs {
     #[arg(long)]
     output: Option<PathBuf>,
     /// Peak node count. Correctness mode starts with one fewer node, then
-    /// scales out and in. [default: 4 for availability, 10 otherwise]
+    /// scales out and in. Availability mode starts with its rounds of spares
+    /// held back. Scaling replace needs one spare over the initial members.
+    /// [default: 3 + rounds for availability, 11 for a scaling replace, 10
+    /// otherwise]
     #[arg(long)]
     nodes: Option<usize>,
     /// Logical keys. [default: 20,000 for correctness, 1,000,000 for
-    /// performance, 1,000 for availability]
+    /// performance, 1,000 for availability, 100,000 for scaling]
     #[arg(long)]
     keys: Option<u64>,
     /// [default: 128]
@@ -572,8 +575,9 @@ struct ExperimentArgs {
     /// cohorts. Required for --scaling-load-mode open.
     #[arg(long)]
     scaling_open_rate: Option<u64>,
-    /// The nodes a scaling run starts with. [default: peak - 1 for a grow or
-    /// round trip, peak for a shrink]
+    /// The nodes a scaling run starts with. [default: peak - 1 for a grow,
+    /// round trip, or replace, peak for a shrink or control, peak - 3 for a
+    /// churn]
     #[arg(long)]
     initial_nodes: Option<usize>,
     /// The one-shot write and delete operations a scaling run offers per

@@ -392,6 +392,16 @@ async fn availability_experiment_survives_three_consecutive_failures() {
         assert!(round["owned_keys"].as_object().unwrap().len() >= 3);
     }
     assert_eq!(observations["availability_acknowledged_lost_total"], 0);
+    // The legacy measurement names describe the first round, and every round
+    // has its own entry.
+    let measurements = summary["measurements"].as_object().unwrap();
+    assert!(measurements["restore_full_rf"].is_object());
+    for round in 1..=3 {
+        assert!(
+            measurements[&format!("restore_full_rf_round_{round}")].is_object(),
+            "round {round} has no restore_full_rf measurement"
+        );
+    }
     let events = std::fs::read_to_string(output_directory.join("events.jsonl")).unwrap();
     assert_eq!(events.matches("\"owner_killed\"").count(), 3);
     assert_eq!(events.matches("\"full_rf_restored\"").count(), 3);

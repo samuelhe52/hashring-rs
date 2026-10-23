@@ -21,11 +21,11 @@
 #   OUT_DIR        results/scaling-matrix-<UTC timestamp>
 #   KEYS           100000 (the plan's main scale; 1000000 for the large scale)
 #   REPS           3
-#   RUN_GROUPS     main control diagnostic policy open
-#   OPEN_RATE      60% of the measured closed-loop capacity, so it must be set
-#                  by the operator; the default 6000 is only a starting point
-#   OPEN_POOL_SECONDS  20; the 100k key space limits how long a high-rate open
-#                  pool can last
+#   RUN_GROUPS     main control diagnostic policy replace churn open
+#   OPEN_RATE      50000; the rate must be 60% of a capacity measured under
+#                  the same configuration
+#   OPEN_POOL_SECONDS  33
+#   OPEN_KEYS      1000000; the open group is recorded at 1M keys
 #   OPEN_MAX_DEDUP_BYTES  268435456; the open group's high write rate needs
 #                  room for receipts on top of a large preload
 #   OPEN_POST_SECONDS  5; the open group's post window, so its pools last the
@@ -37,9 +37,9 @@ set -euo pipefail
 BINARY="${BINARY:-target/release/hashring-rs}"
 KEYS="${KEYS:-100000}"
 REPS="${REPS:-3}"
-RUN_GROUPS="${RUN_GROUPS:-main control diagnostic policy open}"
-OPEN_RATE="${OPEN_RATE:-6000}"
-OPEN_POOL_SECONDS="${OPEN_POOL_SECONDS:-20}"
+RUN_GROUPS="${RUN_GROUPS:-main control diagnostic policy replace churn open}"
+OPEN_RATE="${OPEN_RATE:-50000}"
+OPEN_POOL_SECONDS="${OPEN_POOL_SECONDS:-33}"
 # The open group is the only one whose write rate needs the receipt budget:
 # a 1M-key preload holds roughly 95 MB per node, and the open-loop writes add
 # several MB/s on top of that.
@@ -47,10 +47,21 @@ OPEN_MAX_DEDUP_BYTES="${OPEN_MAX_DEDUP_BYTES:-268435456}"
 # The open group's transition already holds the load for its warmup and its
 # RF convergence, and its one-shot pools must survive the whole transition.
 OPEN_POST_SECONDS="${OPEN_POST_SECONDS:-5}"
+# The open group is recorded at 1M keys in section 9; the closed groups use
+# KEYS.
+OPEN_KEYS="${OPEN_KEYS:-1000000}"
 MAX_IN_FLIGHT="${MAX_IN_FLIGHT:-4096}"
 REQUIRE_CLEAN="${REQUIRE_CLEAN:-1}"
 STAMP="$(date -u +%Y%m%d-%H%M%S)"
 OUT_DIR="${OUT_DIR:-results/scaling-matrix-$STAMP}"
+
+# Both guards below test paths that are relative to the project root, so the
+# script must be there before it checks them. Otherwise a run from another
+# directory reports a missing binary that is present, and the OUT_DIR guard
+# protects a directory other than the one the campaign writes to.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_ROOT"
 
 if [[ ! -x "$BINARY" ]]; then
   echo "error: '$BINARY' not found; run 'cargo build --release' first." >&2
@@ -61,9 +72,6 @@ if [[ -e "$OUT_DIR" ]]; then
   exit 1
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-cd "$PROJECT_ROOT"
 mkdir -p "$OUT_DIR"
 
 {
@@ -124,11 +132,13 @@ for group in $RUN_GROUPS; do
         ;;
       open)
         # The rate must be 60% of a capacity measured under the same
-        # configuration; the footnote belongs in the report.
+        # configuration; section 9 records it at 1M keys, 50k ops/s, and a
+        # 33-second pool.
         post=(--scaling-post-seconds "$OPEN_POST_SECONDS")
         run "$group" "$rep" --scaling-scenario round-trip \
           --scaling-load-mode open --scaling-open-rate "$OPEN_RATE" \
           --scaling-pool-seconds "$OPEN_POOL_SECONDS" \
+          --keys "$OPEN_KEYS" \
           --max-in-flight "$MAX_IN_FLIGHT" \
           --max-dedup-bytes "$OPEN_MAX_DEDUP_BYTES" "${common[@]}" "${post[@]}"
         ;;
