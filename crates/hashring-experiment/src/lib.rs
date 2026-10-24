@@ -1390,11 +1390,8 @@ async fn run_availability(context: RunContext<'_>) -> Result<u64> {
             .as_ref()
             .is_some_and(|(previous, _)| *previous == tail_key);
         // The tail value is made large enough to be a meaningful write, but
-        // never larger than the data nodes accept. `clamp` would panic when
-        // the configured limit itself is below that floor.
-        let tail_bytes = (1024 * 1024)
-            .min(config.node.max_value_bytes)
-            .max(config.value_bytes);
+        // never larger than the data nodes accept.
+        let tail_bytes = tail_value_bytes(config.node.max_value_bytes, config.value_bytes);
         let tail_value = deterministic_value(tail_key, u64::from(round), tail_bytes);
         // The value the key held before this round's write. A key that was
         // already observed keeps what the run saw then, including absence.
@@ -2497,6 +2494,15 @@ fn moving_keys(change: &TopologyChange, key_count: u64) -> Vec<u64> {
     moving
 }
 
+/// The size of the tail value: large enough to be a meaningful write, but
+/// never larger than the data nodes accept.
+///
+/// The value size the run writes is the floor, and the run's validation keeps
+/// it within the node's limit, so the tail never exceeds what the node takes.
+fn tail_value_bytes(max_value_bytes: usize, value_bytes: usize) -> usize {
+    (1024 * 1024).min(max_value_bytes).max(value_bytes)
+}
+
 fn deterministic_value(key: u64, round: u64, value_bytes: usize) -> Vec<u8> {
     let mut state = key ^ round.rotate_left(17) ^ 0x9e37_79b9_7f4a_7c15;
     let mut value = Vec::with_capacity(value_bytes);
@@ -2881,6 +2887,103 @@ fn unix_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scaling configuration that passes validation, so a test can change
+    /// one setting and see what the validation says about it.
+    fn scaling_config() -> ExperimentConfig {
+        ExperimentConfig {
+            mode: ExperimentMode::Scaling,
+            output_dir: PathBuf::from("out"),
+            node_count: 4,
+            key_count: 8_000,
+            value_bytes: 128,
+            concurrency: 8,
+            hash_seed: 1,
+            virtual_nodes: 16,
+            operation_timeout_ms: 30_000,
+            migration_timeout_ms: 120_000,
+            range_move_concurrency: 16,
+            replica_repair_concurrency: 4,
+            prepublication_failure_grace_ms: 30_000,
+            pre_publish_delay_ms: 0,
+            require_clean_source: false,
+            verbose: false,
+            worker_threads: 2,
+            coordinator_worker_threads: None,
+            desired_replication_factor: 2,
+            minimum_admitted_copies: 1,
+            minimum_healthy_followers: 0,
+            max_replica_lag_ms: 1_000,
+            receipt_retention_ms: 30_000,
+            lease_duration_ms: 3_000,
+            write_ack_policy: WriteAckPolicy::OwnerOnly,
+            preload_keys: None,
+            target_rates: Vec::new(),
+            warmup_seconds: 0,
+            duration_seconds: 0,
+            mix: String::new(),
+            key_distribution: "zipf:0.99".to_owned(),
+            max_in_flight: 256,
+            availability_rounds: 1,
+            scaling_scenario: ScalingScenario::Grow,
+            scaling_load_mode: ScalingLoadMode::Closed,
+            scaling_open_rate: 0,
+            initial_nodes: Some(3),
+            scaling_write_rate: 200,
+            scaling_pool_seconds: 8,
+            scaling_post_seconds: 2,
+            node: NodeOptions {
+                max_dedup_bytes: 32 * 1024 * 1024,
+                max_value_bytes: 1024 * 1024,
+                max_pending_replication_bytes: 64 * 1024 * 1024,
+                max_migration_journal_bytes: 16 * 1024 * 1024,
+                replication_stream_queue_capacity: 1_024,
+                required_ack_timeout_ms: 2_000,
+                replication_rpc_timeout_ms: 5_000,
+                replication_batch_linger_ms: 20,
+            },
+        }
+    }
+
+    #[test]
+    fn an_open_loop_run_does_not_need_the_closed_loop_write_rate() {
+        let mut config = scaling_config();
+        config.scaling_load_mode = ScalingLoadMode::Open;
+        config.scaling_open_rate = 1_000;
+        // The open-loop run takes its write rates from its open rate, so the
+        // closed-loop rate is not used and may be zero.
+        config.scaling_write_rate = 0;
+        validate_config(&config).unwrap();
+
+        // The closed-loop run paces its writes with that rate, so it cannot be
+        // zero there.
+        let mut config = scaling_config();
+        config.scaling_write_rate = 0;
+        let error = validate_config(&config).unwrap_err().to_string();
+        assert!(error.contains("scaling_write_rate"), "{error}");
+    }
+
+    #[test]
+    fn the_tail_value_never_exceeds_the_node_limit() {
+        assert_eq!(tail_value_bytes(1024 * 1024, 128), 1024 * 1024);
+        // A limit below the tail's usual size is honoured, and the limit
+        // itself is not a floor that panics.
+        assert_eq!(tail_value_bytes(512 * 1024, 128), 512 * 1024);
+        assert_eq!(tail_value_bytes(4_096, 128), 4_096);
+        // The value size the run writes is the floor.
+        assert_eq!(tail_value_bytes(4_096, 512), 4_096);
+        for max_value_bytes in [1, 64, 4_096, 512 * 1024, 1024 * 1024] {
+            for value_bytes in [1, 64, 128] {
+                if value_bytes > max_value_bytes {
+                    continue;
+                }
+                assert!(
+                    tail_value_bytes(max_value_bytes, value_bytes) <= max_value_bytes,
+                    "{max_value_bytes} {value_bytes}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn load_balance_preserves_missing_cpu_and_rejects_missing_or_reset_counters() {
