@@ -25,7 +25,7 @@
 - 开环复核组：`--scaling-load-mode open --scaling-open-rate <rate>`，固定总速率，GET:PUT:DELETE = 80:12:5:3（读 80%，rewrite 12%、新写 5%、删除 3%）；超过 `--max-in-flight` 的请求丢弃并计 `late`。每秒采样与汇总都记录 `issued`、`late`、`in_flight`。
 - 四类 cohort、按速率发放、局部 drain（只等本 transition 的写，读继续）、S1 后中间校验、最终全量校验、读己之写/删、发布后复读、按阶段与每秒指标、按原因的重试计数。
 - coordinator 工作步骤计时：`snapshot_copy_ms`、`changelog_replay_ms`、`pause_writes_ms`、`verify_ms`、`publish_ms`、`activation_ms`、`merge_proof_ms`、`catch_up_ms`，随 change 快照返回并写入 `work_steps_ms`。
-- **客户端观测的停写窗口**：变更期间每 5 ms 采样客户端的 `RangeBusy` 计数与成功写计数，写入 `<label>_transition.stop_window`：`first_range_busy_ms`、`last_range_busy_ms`、`first_write_ok_ms`、`observed_ms`、`poll_ms`。停写时长以客户端观测为准，不以 stage 边界为准。
+- **客户端观测的停写窗口**：变更期间每 5 ms 采样客户端的 `RangeBusy` 计数与成功写计数，写入 `<label>_transition.stop_window`：`first_range_busy_ms`、`last_range_busy_ms`、`first_write_ok_ms`、`busy_before_first_ok`、`observed_ms`、`poll_ms`。停写时长以客户端观测为准，不以 stage 边界为准。
 - **五个时间点**：`published_ms`、`complete_ms`、`full_rf_seconds`（`Complete` 之后到目标 epoch 满 RF），配合 `events.jsonl` 的 `migration_phase_changed` 与 `work_steps_ms` 可还原开始、发布、激活、`Complete`、满 RF。
 - 100 万键规模：`--keys 1000000` 可直接运行，池、预载和校验按该规模计算。
 
@@ -395,11 +395,11 @@ S1 与 S2 在**同一个集群生命周期内连续执行**：预载一次、负
 - 主负载 GET、PUT、DELETE 的 p50/p95/p99/max 与 `max_observed`；探针 GET（读己之写/删、发布后复读）单独直方图，不并入主负载
 - 每秒窗口：`epoch`、`issued`、`late`、`achieved_rate`、in-flight
 - 切写窗口的写尝试数、拒绝数、停写时长；首个成功写时间
-- **停写窗口的定义以客户端实际观测为准**：按区间（S2 是全集群）记录第一次和最后一次 `RangeBusy` 的时间，再取此后第一个成功写，用这三者定义窗口；phase 只做粗粒度标注。栅栏在节点收到 RPC 后才生效，与 coordinator 的 phase 切换存在时差，再叠加轮询误差，不能拿阶段边界当停写时长。实现上由 scaling 模式每 5 ms 采样客户端的 `RangeBusy` 计数与成功写计数；每次成功写还记录完成时观察到的拒绝计数，避免把同一采样间隔内先于拒绝的成功写误当成恢复，写入 `<label>_transition.stop_window`（`first_range_busy_ms`、`last_range_busy_ms`、`first_write_ok_ms`、`observed_ms`、`poll_ms`）。每个 transition 的窗口以它开始时的累计计数为基线，所以第二个 transition 不会把第一个的拒绝算成自己的，`first_range_busy_ms` 也不会被钉成 0。
+- **停写窗口的定义以客户端实际观测为准**：按区间（S2 是全集群）记录第一次和最后一次 `RangeBusy` 的时间，再取此后第一个成功写，用这三者定义窗口；phase 只做粗粒度标注。栅栏在节点收到 RPC 后才生效，与 coordinator 的 phase 切换存在时差，再叠加轮询误差，不能拿阶段边界当停写时长。实现上由 scaling 模式每 5 ms 采样客户端的 `RangeBusy` 计数与成功写计数；每次成功写记录的是**发起这次写之前**客户端已经看到的拒绝计数（不是写完成后的计数），所以一个在停写开始时就已在途的写不会把它关闭窗口；`busy_before_first_ok` 就是关闭窗口那次写开始时的拒绝计数，是 `first_write_ok_ms` 的证据。写入 `<label>_transition.stop_window`（`first_range_busy_ms`、`last_range_busy_ms`、`first_write_ok_ms`、`busy_before_first_ok`、`observed_ms`、`poll_ms`）。每个 transition 的窗口以它开始时的累计计数为基线，所以第二个 transition 不会把第一个的拒绝算成自己的，`first_range_busy_ms` 也不会被钉成 0。
 - 发布后复读在观察到 `Published` 的那一刻启动（限速、独立 client），不是整个 transition 结束后的一次终态复查，否则发布瞬间的短暂陈旧读会自愈、探针看不到。
-- 发布后复读必须真的读到键。探针等待的是"持续有进展"而不是固定时长：每次读都受客户端 operation timeout 限制，所以一个还在读的探针一定会在该时限内完成一个键；连续 `operation timeout + 间隔 + 10 s` 没有新键才算卡住。空闲时钟从探针启动时起算（不是从运行等待探针时起算），读到一个键就把截止时间往后推同样的时长，所以早期就卡住的探针会在运行结束前被放弃，并记一条 `scaling_after_publish_probe_stuck` 事件。只有值匹配或确认预期的缺失才推进读取数；GET 失败、意外缺失或错误值都会使探针和运行失败，即使后续终态复核恢复也不算通过。每个 change 的探针读取数写入 `scaling_after_publish_probes.keys_read`；读取数为 0（发布窗口内没有落到迁移分层的成功写）即判该次运行 invalid，而不是当作"没有违规"。
+- 发布后复读必须真的读到键。探针等待的是"持续有进展"而不是固定时长：每次读都受客户端 operation timeout 限制，所以一个还在读的探针一定会在该时限内完成一个键；连续 `operation timeout + 间隔 + 10 s` 没有新键才算卡住。空闲时钟从探针启动时起算（不是从运行等待探针时起算），读到一个键就把截止时间往后推同样的时长，所以早期就卡住的探针会在运行结束前被放弃。`scaling_after_publish_probe_started` 事件记录 `idle_limit_ms`；卡住时记 `scaling_after_publish_probe_stuck`（含已核验的键数）并让运行失败。只有值匹配或确认预期的缺失才推进读取数；GET 失败、意外缺失或错误值都会使探针和运行失败，即使后续终态复核恢复也不算通过。每个 change 的探针读取数写入 `scaling_after_publish_probes.keys_read`；读取数为 0（发布窗口内没有落到迁移分层的成功写）即判该次运行 invalid，而不是当作"没有违规"。
 - 重试总数与按原因计数必须对得上：`retry_count()` 等于 `retry_reasons()` 之和。建连失败记 `Connect`，可重试的 gRPC 状态记 `Rpc`，两者不再合并。
-- 开环组的实际写入速率来自 `--scaling-open-rate` 的分层拆分，`scaling_pool_plan.cohort_write_rates` 记录 rewrite/new/delete 各自的实际速率；`write_rate` 在开环下为 `null`，因为 `--scaling-write-rate` 在开环下不生效。分层拆分是整除（闭环 60/25/15，开环 12/5/3），所以 `cohort_write_rates.total` 可能比配置值略小（例如 `--scaling-write-rate 50` 实际是 30+12+7=49）；`write_rate` 记的是配置值，`cohort_write_rates` 记的是取整后的实际值。最小的一层必须至少分到 1 次操作/秒，否则该 cohort 没有键；这一点在参数校验阶段就会拒绝（开环 `open_rate * 3 / 100`，闭环 `write_rate * 15 / 100`）。
+- 开环组的实际写入速率来自 `--scaling-open-rate` 的分层拆分，`scaling_pool_plan.cohort_write_rates` 记录 rewrite/new/delete 各自的实际速率；`write_rate` 在开环下为 `null`，因为 `--scaling-write-rate` 在开环下不生效。分层拆分是整除（闭环 60/25/15，开环 12/5/3），所以 `cohort_write_rates.total` 可能比配置值略小（例如 `--scaling-write-rate 50` 实际是 30+12+7=49）；`write_rate` 记的是配置值，`cohort_write_rates` 记的是取整后的实际值。最小的一层必须至少分到 1 次操作/秒，否则该 cohort 没有键；这一点在参数校验阶段就会拒绝（闭环最小 `--scaling-write-rate 7`，开环最小 `--scaling-open-rate 34`，按最小份额 15% 与 3% 取整算出），速率上限为 1,000,000 次/秒，避免随后的份额与 pool 秒数相乘溢出。
 - 读连续失败最长间隔
 - 每层 cohort 的实际操作量与结果分布
 - 每次 change 的迁移量：`<label>_transition.migration` 的 `keys`、`keys_moved`、`rate`、`ranges`、`snapshot_records`
