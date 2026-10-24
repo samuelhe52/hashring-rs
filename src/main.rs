@@ -580,8 +580,9 @@ struct ExperimentArgs {
     /// churn]
     #[arg(long)]
     initial_nodes: Option<usize>,
-    /// The one-shot write and delete operations a scaling run offers per
-    /// second. Reads are not paced. [default: 200]
+    /// The one-shot write and delete operations a closed-loop scaling run
+    /// offers per second. An open-loop run takes its write rates from
+    /// `--scaling-open-rate`. [default: 200]
     #[arg(long)]
     scaling_write_rate: Option<u64>,
     /// How long the one-shot pools of one scaling transition must last.

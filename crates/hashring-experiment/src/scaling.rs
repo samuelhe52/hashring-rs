@@ -9,6 +9,7 @@
 //! touched before the next transition starts.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1224,7 +1225,7 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
     let mut all_entries = BTreeMap::new();
     let mut all_fresh = BTreeSet::new();
     let mut final_epoch = admin_client.refresh_topology().await?.epoch;
-    let mut re_read_handles: Vec<(Duration, tokio::task::JoinHandle<Result<()>>)> = Vec::new();
+    let mut re_read_handles: Vec<AfterPublishProbe> = Vec::new();
     let mut pending_verification: Option<(&'static str, BTreeMap<u64, Allowed>)> = None;
 
     for (index, transition) in transitions.iter().enumerate() {
@@ -1419,12 +1420,18 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
         metrics.set_phase(Phase::Pre);
         let mut stop_window: Option<StopWindow> = None;
         let mut published_ms: Option<f64> = None;
+        // Where the publication time came from: the phase was observed, or
+        // the change was only seen at completion and its completion time is
+        // the earliest moment that can be named.
+        let mut published_ms_source: Option<&'static str> = None;
         let mut complete_ms: Option<f64> = None;
         // RF repair starts at completion, so the convergence clock starts
         // there too. The removed-node waits below must not be hidden from it.
         let mut rf_started: Option<Instant> = None;
-        let mut after_publish_probe: Option<(Duration, tokio::task::JoinHandle<Result<()>>)> = None;
-        let completed = if let Some(staged) = &staged {
+        let mut after_publish_probe: Option<AfterPublishProbe> = None;
+        // The change's own throughput: the numerator and the denominator both
+        // stop when the change completes.
+        let (completed, change_seconds, change_operations) = if let Some(staged) = &staged {
             ledger.begin_publish_window();
             let mut last_phase = Phase::Pre;
             let execution_client = control.clone();
@@ -1448,8 +1455,14 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                     let phase = phase_of(current.phase);
                     if phase != last_phase {
                         if matches!(phase, Phase::Published | Phase::Complete) {
-                            published_ms
-                                .get_or_insert_with(|| started.elapsed().as_secs_f64() * 1_000.0);
+                            if published_ms.is_none() {
+                                published_ms = Some(started.elapsed().as_secs_f64() * 1_000.0);
+                                published_ms_source = Some(if phase == Phase::Published {
+                                    "observed"
+                                } else {
+                                    "completion_fallback"
+                                });
+                            }
                             // Re-read the keys written before the switch right
                             // away. A stale read after publication heals
                             // quickly, so a probe that starts after the whole
@@ -1458,12 +1471,14 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                             // starting it late is better than silently having
                             // no read-after-publish coverage.
                             if after_publish_probe.is_none() {
-                                after_publish_probe = Some(spawn_after_publish_probe_task(
+                                after_publish_probe = spawn_after_publish_probe_task(
                                     config,
                                     workload_client,
                                     &metrics,
                                     &ledger,
-                                ));
+                                    events,
+                                    transition.label,
+                                )?;
                             }
                         }
                         metrics.set_phase(phase);
@@ -1495,19 +1510,27 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                 completed.phase
             );
             complete_ms = Some(started.elapsed().as_secs_f64() * 1_000.0);
+            // The change's own throughput: both the numerator and the
+            // denominator stop here, so the stop window, the removed-node
+            // waits and the post window cannot dilute it.
+            let change_seconds = started.elapsed();
+            let change_operations = metrics.total_operations().saturating_sub(operations_before);
             // A short change can go from `Verifying` to `Complete` between two
             // polls, so the loop above may exit without ever observing a
             // published phase. Start the probe here rather than silently
             // dropping the read-after-publish coverage; the earliest time we
-            // can name is completion.
+            // can name is completion, and the source says so.
             if after_publish_probe.is_none() {
                 published_ms.get_or_insert(complete_ms.expect("just recorded"));
-                after_publish_probe = Some(spawn_after_publish_probe_task(
+                published_ms_source.get_or_insert("completion_fallback");
+                after_publish_probe = spawn_after_publish_probe_task(
                     config,
                     workload_client,
                     &metrics,
                     &ledger,
-                ));
+                    events,
+                    transition.label,
+                )?;
             }
             rf_started = Some(Instant::now());
             // The first write after the last rejection can complete after
@@ -1541,7 +1564,7 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                 }
             }
             ledger.end_publish_window();
-            Some(completed)
+            (Some(completed), change_seconds, change_operations)
         } else {
             // S0 keeps the topology unchanged. The measured baseline is the
             // post-change window with the same load.
@@ -1550,10 +1573,12 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                 json!({ "seconds": config.scaling_post_seconds }),
             )?;
             tokio::time::sleep(Duration::from_secs(config.scaling_post_seconds)).await;
-            None
+            (
+                None,
+                started.elapsed(),
+                metrics.total_operations().saturating_sub(operations_before),
+            )
         };
-        let change_seconds = started.elapsed();
-        let change_operations = metrics.total_operations().saturating_sub(operations_before);
         metrics.set_phase(Phase::Post);
         let retries_after = workload_client.retry_reasons();
         let retry_delta: BTreeMap<_, _> = retries_after
@@ -1672,6 +1697,7 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
             json!({
                 "change_seconds": change_seconds.as_secs_f64(),
                 "published_ms": published_ms,
+                "published_ms_source": published_ms_source,
                 "complete_ms": complete_ms,
                 "full_rf_seconds": full_rf_seconds,
                 "post_seconds": config.scaling_post_seconds,
@@ -1704,6 +1730,7 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                 "label": transition.label,
                 "seconds": change_seconds.as_secs_f64(),
                 "published_ms": published_ms,
+                "published_ms_source": published_ms_source,
                 "complete_ms": complete_ms,
                 "full_rf_seconds": full_rf_seconds,
                 "migration_rate": migration.rate(),
@@ -1725,11 +1752,29 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
         pending_verification.is_none(),
         "the last transition's cohorts were not verified"
     );
-    for (budget, handle) in re_read_handles {
-        tokio::time::timeout(budget, handle)
-            .await
-            .context("the read-after-publish probe did not stop")???;
+    // Every change has to show that its keys could be read after the
+    // publication. A probe that read nothing leaves the run without that
+    // evidence, so it fails the run instead of passing it quietly.
+    let idle_limit = after_publish_probe_idle_limit(
+        Duration::from_millis(config.operation_timeout_ms),
+        after_publish_probe_rate(config),
+    );
+    let mut probe_results = Vec::new();
+    for probe in re_read_handles {
+        let read = join_after_publish_probe(probe, idle_limit).await?;
+        probe_results.push(read);
     }
+    ensure!(
+        probe_results.len() == transitions.len() - usize::from(is_control(config)),
+        "the run has {} read-after-publish probes for {} changes; a change whose publish \
+         window held no write to a moved stratum has no read-after-publish evidence",
+        probe_results.len(),
+        transitions.len() - usize::from(is_control(config))
+    );
+    observations.insert(
+        "scaling_after_publish_probes".into(),
+        json!({ "probes": probe_results.len(), "keys_read": probe_results }),
+    );
     if let Some(sender) = open_reads.take() {
         sender.join().await?;
     }
@@ -1771,6 +1816,10 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
     );
 
     observations.insert("scaling_metrics".into(), metrics.summary());
+    // An open-loop run takes its write rates from its open rate, so the
+    // closed-loop rate it was also given is not what it wrote at. The plan
+    // reports the rates the run actually used.
+    let rates = cohort_rates(config);
     observations.insert(
         "scaling_pool_plan".into(),
         json!({
@@ -1778,7 +1827,17 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
             "read_distribution": distribution.name(),
             "load_mode": config.scaling_load_mode.name(),
             "open_rate": config.scaling_open_rate,
-            "write_rate": config.scaling_write_rate,
+            "write_rate": if config.scaling_load_mode == ScalingLoadMode::Open {
+                serde_json::Value::Null
+            } else {
+                json!(config.scaling_write_rate)
+            },
+            "cohort_write_rates": {
+                "rewrite": rates.rewrite,
+                "write_new": rates.write_new,
+                "delete": rates.delete,
+                "total": rates.rewrite + rates.write_new + rates.delete,
+            },
             "pool_seconds": config.scaling_pool_seconds,
             "transitions": transitions.iter().map(|t| t.label).collect::<Vec<_>>(),
         }),
@@ -1879,32 +1938,125 @@ fn after_publish_probe_rate(config: &ExperimentConfig) -> u64 {
     (write_operations_per_second(config) / 2).clamp(20, 500)
 }
 
-/// How long the probe may take for `entries` keys at `rate` reads per second.
+/// How long the probe may go without reading a key before it is stuck.
 ///
-/// The probe reads its snapshot once, serially, so its cost grows with the
-/// number of keys the change wrote. A fixed budget would time out a long
-/// change that the migration timeout explicitly allows.
-fn after_publish_probe_budget(entries: usize, rate: u64) -> Duration {
-    let pacing = entries as f64 / rate as f64;
-    Duration::from_secs_f64(pacing + 60.0).max(Duration::from_secs(120))
+/// The probe reads its keys one after another, and every read is bounded by
+/// the client's operation timeout, so a probe that is making progress always
+/// finishes a key within that timeout plus the pause between two reads. A
+/// probe that goes longer than that without a key is stuck, and the run must
+/// not wait for it forever.
+///
+/// A budget for the whole probe would have to cover the service time of every
+/// read as well as the pause between them, and the service time is not known
+/// in advance: the probe runs right after a publication, while the cluster is
+/// still repairing replicas. A fixed budget fails a run that is only slow.
+fn after_publish_probe_idle_limit(operation_timeout: Duration, rate: u64) -> Duration {
+    let pause = Duration::from_secs_f64(1.0 / rate as f64);
+    operation_timeout + pause + Duration::from_secs(10)
 }
 
+/// The read-after-publish probe of one transition and what it has to show.
+struct AfterPublishProbe {
+    label: &'static str,
+    /// The keys the probe was given to read.
+    expected: usize,
+    /// How many keys the probe has read so far.
+    progress: Arc<AtomicU64>,
+    handle: tokio::task::JoinHandle<Result<usize>>,
+}
+
+/// Starts the read-after-publish probe of one transition.
+///
+/// The probe reads the keys that were written to a moved stratum while the
+/// change was publishing, so a stale read after the publication is caught. A
+/// change whose publish window held no such write has nothing to read, and
+/// that is recorded rather than left to look like a probe that read nothing.
 fn spawn_after_publish_probe_task(
     config: &ExperimentConfig,
     workload_client: &HashringClient,
     metrics: &Arc<Metrics>,
     ledger: &Ledger,
-) -> (Duration, tokio::task::JoinHandle<Result<()>>) {
+    events: &EventLog,
+    label: &'static str,
+) -> Result<Option<AfterPublishProbe>> {
     let expected = ledger.publish_expected();
+    if expected.is_empty() {
+        events.record(
+            "scaling_after_publish_probe_skipped",
+            json!({
+                "label": label,
+                "reason": "no successful write to a moved stratum landed in the publish window",
+            }),
+        )?;
+        return Ok(None);
+    }
     let rate = after_publish_probe_rate(config);
-    let budget = after_publish_probe_budget(expected.len(), rate);
+    let progress = Arc::new(AtomicU64::new(0));
     let handle = tokio::spawn(spawn_after_publish_probe(
         workload_client.clone(),
         Arc::clone(metrics),
-        expected,
+        expected.clone(),
         rate,
+        Arc::clone(&progress),
     ));
-    (budget, handle)
+    events.record(
+        "scaling_after_publish_probe_started",
+        json!({ "label": label, "keys": expected.len(), "rate": rate }),
+    )?;
+    Ok(Some(AfterPublishProbe {
+        label,
+        expected: expected.len(),
+        progress,
+        handle,
+    }))
+}
+
+/// Waits for the read-after-publish probe and reports how many keys it read.
+///
+/// The probe is given as long as it keeps reading keys. It is given up on
+/// when it stops making progress, because a probe that reads nothing is a
+/// probe that will never finish.
+async fn join_after_publish_probe(probe: AfterPublishProbe, idle_limit: Duration) -> Result<usize> {
+    let AfterPublishProbe {
+        label,
+        expected,
+        progress,
+        mut handle,
+    } = probe;
+    let mut last = progress.load(Ordering::Acquire);
+    let mut idle = Box::pin(tokio::time::sleep(idle_limit));
+    let read = futures::future::poll_fn(|context| {
+        if let std::task::Poll::Ready(result) = std::pin::Pin::new(&mut handle).poll(context) {
+            return std::task::Poll::Ready(match result {
+                Ok(Ok(read)) => Ok(read),
+                Ok(Err(error)) => Err(error),
+                Err(error) => Err(anyhow::Error::new(error)),
+            });
+        }
+        let now = progress.load(Ordering::Acquire);
+        if now != last {
+            last = now;
+            idle.as_mut()
+                .reset(tokio::time::Instant::now() + idle_limit);
+        }
+        if idle.as_mut().poll(context).is_ready() {
+            handle.abort();
+            return std::task::Poll::Ready(Err(anyhow::anyhow!(
+                "the {label} read-after-publish probe read no key for {idle_limit:?}"
+            )));
+        }
+        std::task::Poll::Pending
+    })
+    .await;
+    let read = match read {
+        Ok(read) => read,
+        Err(error) => return Err(error.context("joining the read-after-publish probe")),
+    };
+    ensure!(
+        read > 0,
+        "the {label} read-after-publish probe read no key of the {expected} it was given"
+    );
+    Ok(read)
 }
 
 struct Transition {
@@ -2226,14 +2378,20 @@ async fn spawn_after_publish_probe(
     metrics: Arc<Metrics>,
     expected: BTreeMap<u64, Allowed>,
     rate: u64,
-) -> Result<()> {
+    progress: Arc<AtomicU64>,
+) -> Result<usize> {
     let interval = Duration::from_secs_f64(1.0 / rate as f64);
+    let mut read = 0_usize;
     for (key, allowed) in expected {
         tokio::time::sleep(interval).await;
         let phase = metrics.phase();
         let started = Instant::now();
         let result = client.get(key.to_be_bytes().to_vec()).await;
         let elapsed = started.elapsed();
+        read += 1;
+        // The watcher that waits for this probe learns that it is still going
+        // from this counter.
+        progress.fetch_add(1, Ordering::Release);
         match result {
             Ok(output) if allowed.check(Some(&output.value)) => {
                 metrics.record("probe_read_after_publish", phase, elapsed, &Ok(()));
@@ -2271,7 +2429,7 @@ async fn spawn_after_publish_probe(
             }
         }
     }
-    Ok(())
+    Ok(read)
 }
 
 async fn verify_entries(
@@ -2440,10 +2598,15 @@ mod tests {
     }
 
     #[test]
-    fn the_probe_budget_grows_with_the_keys_it_must_read() {
-        let short = after_publish_probe_budget(100, 500);
-        let long = after_publish_probe_budget(100_000, 500);
-        assert!(short >= Duration::from_secs(120));
-        assert!(long > short);
+    fn the_probe_is_given_as_long_as_it_keeps_reading_keys() {
+        // The limit covers one read's timeout and the pause between two reads,
+        // so a probe that is making progress always finishes a key within it.
+        let limit = after_publish_probe_idle_limit(Duration::from_secs(30), 20);
+        assert!(limit > Duration::from_secs(30));
+        assert!(limit < Duration::from_secs(60));
+        // A faster probe waits less between two keys, so it may go idle for
+        // less time.
+        let fast = after_publish_probe_idle_limit(Duration::from_secs(30), 500);
+        assert!(fast < limit);
     }
 }

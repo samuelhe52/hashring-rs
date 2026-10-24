@@ -635,10 +635,31 @@ async fn scaling_round_trip_defers_s1_verification_and_records_the_stop_window()
         let complete = transition["complete_ms"].as_f64().unwrap();
         assert!(published > 0.0, "{transition}");
         assert!(complete >= published, "{transition}");
+        // The publication time says where it came from, so a time that was
+        // taken at the completion is not read as an observed publication.
+        let source = transition["published_ms_source"]
+            .as_str()
+            .expect("a completed change records where its publication time came from");
+        assert!(
+            matches!(source, "observed" | "completion_fallback"),
+            "{transition}"
+        );
+        if source == "completion_fallback" {
+            assert_eq!(published, complete, "{transition}");
+        }
         assert!(
             transition["full_rf_seconds"].as_f64().unwrap() >= 0.0,
             "{transition}"
         );
+    }
+
+    // Every change re-read the keys it moved after the publication, so the
+    // run has the read-after-publish evidence it claims.
+    let probes = &summary["observations"]["scaling_after_publish_probes"];
+    let keys_read = probes["keys_read"].as_array().unwrap();
+    assert_eq!(keys_read.len(), 2, "{probes}");
+    for read in keys_read {
+        assert!(read.as_u64().unwrap() > 0, "{probes}");
     }
 
     // The migration volume is plan-side: the share of the key space whose
