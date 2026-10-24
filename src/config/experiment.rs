@@ -12,7 +12,9 @@ use hashring_core::topology::{
     DEFAULT_MAX_REPLICA_LAG_MILLIS, DEFAULT_MINIMUM_ADMITTED_COPIES,
     DEFAULT_MINIMUM_HEALTHY_FOLLOWERS, DEFAULT_RECEIPT_RETENTION_MILLIS,
 };
-use hashring_experiment::{ExperimentConfig, ExperimentMode, ScalingLoadMode, ScalingScenario};
+use hashring_experiment::{
+    ExperimentConfig, ExperimentMode, FaultScenario, ScalingLoadMode, ScalingScenario,
+};
 use serde::Deserialize;
 
 use super::{LoadedFile, node};
@@ -47,6 +49,14 @@ pub const DEFAULT_SCALING_POST_SECONDS: u64 = 10;
 pub const DEFAULT_AVAILABILITY_ROUNDS: u32 = 1;
 /// The members an `availability` run starts with, before it kills any.
 pub const DEFAULT_AVAILABILITY_INITIAL_NODES: usize = 3;
+/// The members a `fault` run starts with, before it kills any.
+pub const DEFAULT_FAULT_INITIAL_NODES: usize = 4;
+/// How many consecutive node failures a `fault` run injects.
+pub const DEFAULT_FAULT_ROUNDS: u32 = 1;
+/// How long a `fault` run runs its load before it kills the node.
+pub const DEFAULT_FAULT_PRE_SECONDS: u64 = 10;
+/// How long a `fault` run keeps its load running after recovery reaches full RF.
+pub const DEFAULT_FAULT_POST_SECONDS: u64 = 10;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -85,6 +95,10 @@ pub struct ExperimentFile {
     pub key_distribution: Option<String>,
     pub max_in_flight: Option<usize>,
     pub availability_rounds: Option<u32>,
+    pub fault_scenario: Option<FaultScenario>,
+    pub fault_rounds: Option<u32>,
+    pub fault_pre_seconds: Option<u64>,
+    pub fault_post_seconds: Option<u64>,
     pub scaling_scenario: Option<ScalingScenario>,
     pub scaling_load_mode: Option<ScalingLoadMode>,
     pub scaling_open_rate: Option<u64>,
@@ -150,6 +164,15 @@ pub fn resolve(
         .availability_rounds
         .or(file.availability_rounds)
         .unwrap_or(DEFAULT_AVAILABILITY_ROUNDS);
+    let fault_scenario = args
+        .fault_scenario
+        .map(FaultScenario::from)
+        .or(file.fault_scenario)
+        .unwrap_or(FaultScenario::Owner);
+    let fault_rounds = args
+        .fault_rounds
+        .or(file.fault_rounds)
+        .unwrap_or(DEFAULT_FAULT_ROUNDS);
     let node_count = args.nodes.or(file.nodes).unwrap_or(match mode {
         ExperimentMode::Scaling if scaling_scenario == ScalingScenario::Replace => 11,
         ExperimentMode::Correctness
@@ -161,6 +184,9 @@ pub fn resolve(
         ExperimentMode::Availability => {
             DEFAULT_AVAILABILITY_INITIAL_NODES + availability_rounds as usize
         }
+        // A fault run starts with four live members and holds back one spare
+        // per round.
+        ExperimentMode::Fault => DEFAULT_FAULT_INITIAL_NODES + fault_rounds as usize,
     });
     let policy = args.policy.or(file.policy).unwrap_or(match mode {
         ExperimentMode::Availability => PolicyArg::FirstSuccessor,
@@ -194,6 +220,7 @@ pub fn resolve(
             ExperimentMode::Availability => 1_000,
             ExperimentMode::Scaling => 100_000,
             ExperimentMode::Latency => DEFAULT_PRELOAD_KEYS,
+            ExperimentMode::Fault => 1_000,
         }),
     };
     let target_rates = if args.target_rates.is_empty() {
@@ -246,7 +273,7 @@ pub fn resolve(
             .unwrap_or(match mode {
                 // The delay runs after the writes have been paused, so a
                 // non-zero default would be measured as migration latency.
-                ExperimentMode::Scaling => 0,
+                ExperimentMode::Scaling | ExperimentMode::Fault => 0,
                 _ => DEFAULT_PRE_PUBLISH_DELAY_MS,
             }),
         require_clean_source: args.require_clean_source
@@ -299,11 +326,12 @@ pub fn resolve(
             .duration_seconds
             .or(file.duration_seconds)
             .unwrap_or(DEFAULT_DURATION_SECONDS),
-        mix: args
-            .mix
-            .clone()
-            .or(file.mix)
-            .unwrap_or(DEFAULT_MIX.to_owned()),
+        mix: args.mix.clone().or(file.mix).unwrap_or_else(|| match mode {
+            // A fault run needs enough mutations to observe a rollback,
+            // and enough reads to notice one.
+            ExperimentMode::Fault => "70:20:10".to_owned(),
+            _ => DEFAULT_MIX.to_owned(),
+        }),
         key_distribution: args
             .key_distribution
             .clone()
@@ -314,6 +342,16 @@ pub fn resolve(
             .or(file.max_in_flight)
             .unwrap_or(DEFAULT_MAX_IN_FLIGHT),
         availability_rounds,
+        fault_scenario,
+        fault_rounds,
+        fault_pre_seconds: args
+            .fault_pre_seconds
+            .or(file.fault_pre_seconds)
+            .unwrap_or(DEFAULT_FAULT_PRE_SECONDS),
+        fault_post_seconds: args
+            .fault_post_seconds
+            .or(file.fault_post_seconds)
+            .unwrap_or(DEFAULT_FAULT_POST_SECONDS),
         scaling_scenario,
         scaling_load_mode: args
             .scaling_load_mode
@@ -461,6 +499,30 @@ mod tests {
         ]);
         let config = resolve(&args, None, 24).unwrap();
         assert_eq!(config.node_count, 9);
+    }
+
+    #[test]
+    fn fault_defaults_to_one_round_and_four_initial_members() {
+        let args = experiment_args(&[
+            "--mode",
+            "fault",
+            "--fault-scenario",
+            "follower",
+            "--output",
+            "out",
+        ]);
+        let config = resolve(&args, None, 24).unwrap();
+        assert!(matches!(config.mode, ExperimentMode::Fault));
+        assert_eq!(config.fault_scenario, FaultScenario::Follower);
+        assert_eq!(config.fault_rounds, 1);
+        assert_eq!(config.node_count, 5);
+        assert_eq!(config.fault_initial_members(), 4);
+        assert_eq!(config.key_count, 1_000);
+        assert_eq!(config.mix, "70:20:10");
+        assert_eq!(config.fault_pre_seconds, 10);
+        assert_eq!(config.fault_post_seconds, 10);
+        assert_eq!(config.pre_publish_delay_ms, 0);
+        assert!(matches!(config.write_ack_policy, WriteAckPolicy::OwnerOnly));
     }
 
     #[test]

@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tonic::transport::Channel;
 
+mod fault;
 mod latency;
 mod scaling;
 
@@ -51,6 +52,19 @@ pub enum ExperimentMode {
     Availability,
     Latency,
     Scaling,
+    /// Continuous mixed load across a follower or owner failure, with a
+    /// request ledger and post-recovery verification.
+    Fault,
+}
+
+/// The node a `fault` run removes while its load keeps running.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FaultScenario {
+    /// Kill a node that owns the load's keys.
+    Owner,
+    /// Kill a node that is only a follower for the load's keys.
+    Follower,
 }
 
 /// The membership change a `scaling` run performs.
@@ -139,6 +153,16 @@ pub struct ExperimentConfig {
     /// Every round kills the current owner of the probe key and then replaces
     /// it, so the run needs one spare node per round.
     pub availability_rounds: u32,
+    /// Whether a `fault` run kills an owner or a follower.
+    pub fault_scenario: FaultScenario,
+    /// How many consecutive node failures a `fault` run injects. Every round
+    /// replaces its victim, so the run needs one spare node per round.
+    pub fault_rounds: u32,
+    /// How long the `fault` mode runs its load before it kills the node.
+    pub fault_pre_seconds: u64,
+    /// How long the `fault` mode keeps running its load after recovery has
+    /// reached full RF.
+    pub fault_post_seconds: u64,
     /// The membership change a `scaling` run performs.
     pub scaling_scenario: ScalingScenario,
     /// How a `scaling` run offers its load.
@@ -167,6 +191,11 @@ impl ExperimentConfig {
     pub fn availability_initial_members(&self) -> usize {
         self.node_count
             .saturating_sub(self.availability_rounds as usize)
+    }
+
+    /// The members a `fault` run starts with, before it kills any.
+    pub fn fault_initial_members(&self) -> usize {
+        self.node_count.saturating_sub(self.fault_rounds as usize)
     }
 }
 
@@ -668,6 +697,8 @@ async fn run_cluster(
         // The availability mode starts with every node but the spares it
         // needs to replace the nodes it kills.
         ExperimentMode::Availability => config.availability_initial_members(),
+        // A fault run likewise holds back one replacement per round.
+        ExperimentMode::Fault => config.fault_initial_members(),
         ExperimentMode::Scaling => {
             config
                 .initial_nodes
@@ -933,6 +964,9 @@ async fn run_cluster(
         }
         if matches!(context.config.mode, ExperimentMode::Scaling) {
             return scaling::run(context).await;
+        }
+        if matches!(context.config.mode, ExperimentMode::Fault) {
+            return fault::run(context).await;
         }
     }
 
@@ -2621,6 +2655,37 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
             "availability mode cannot keep AllReplicas writable after one node fails"
         );
     }
+    if matches!(config.mode, ExperimentMode::Fault) {
+        ensure!(config.fault_rounds >= 1, "fault_rounds must be at least 1");
+        ensure!(
+            config.node_count > config.fault_rounds as usize,
+            "fault mode needs at least one initial member besides its replacements"
+        );
+        ensure!(
+            config.fault_initial_members() >= 4,
+            "fault mode requires at least 4 initial members"
+        );
+        ensure!(
+            config.fault_initial_members() >= config.desired_replication_factor as usize,
+            "fault mode needs at least desired replication factor initial members"
+        );
+        ensure!(
+            config.desired_replication_factor == 3,
+            "fault mode requires desired_replication_factor=3"
+        );
+        ensure!(
+            config.write_ack_policy != WriteAckPolicy::AllReplicas,
+            "fault mode cannot keep AllReplicas writable after one node fails"
+        );
+        ensure!(
+            config.fault_pre_seconds > 0 && config.fault_post_seconds > 0,
+            "fault_pre_seconds and fault_post_seconds must be positive"
+        );
+        ensure!(
+            config.key_count >= 32,
+            "fault mode needs at least 32 keys to select a failure cohort"
+        );
+    }
     // Only the scaling mode reads this; the other modes derive their initial
     // membership from their own rules, so an explicit value would be silently
     // ignored.
@@ -2632,6 +2697,7 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
         ExperimentMode::Correctness => config.node_count - 1,
         ExperimentMode::Performance | ExperimentMode::Latency => config.node_count,
         ExperimentMode::Availability => config.availability_initial_members(),
+        ExperimentMode::Fault => config.fault_initial_members(),
         ExperimentMode::Scaling => {
             config
                 .initial_nodes
@@ -2933,6 +2999,10 @@ mod tests {
             key_distribution: "zipf:0.99".to_owned(),
             max_in_flight: 256,
             availability_rounds: 1,
+            fault_scenario: FaultScenario::Owner,
+            fault_rounds: 1,
+            fault_pre_seconds: 1,
+            fault_post_seconds: 1,
             scaling_scenario: ScalingScenario::Grow,
             scaling_load_mode: ScalingLoadMode::Closed,
             scaling_open_rate: 0,

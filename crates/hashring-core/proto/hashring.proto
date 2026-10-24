@@ -580,6 +580,9 @@ message DeleteResponse {
   OperationError error = 2;
   // The request's precondition did not hold, so nothing was written.
   bool condition_failed = 3;
+  // The tombstone's version, so a caller can order a delete against the
+  // writes and reads it observed. Absent when the delete did not apply.
+  RecordVersion version = 4;
 }
 
 // One page of the live keys a node owns, in token order. A page ends only

@@ -646,6 +646,7 @@ dependencies = [
  "hashring-client",
  "hashring-core",
  "hdrhistogram",
+ "hex",
  "rand",
  "serde",
  "serde_json",

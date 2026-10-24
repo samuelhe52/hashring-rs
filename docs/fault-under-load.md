@@ -1,0 +1,165 @@
+# 负载中的节点故障、重试回执与同键历史
+
+本文记录 `docs/TODO.md` 第 4、5、7、8 项的实现、验证方法和结果。原始结果仍在本地 `results/`（或本轮的 `/tmp/opencode/`），不纳入 Git；这里只保留配置、源码标识、数值和限制。
+
+## 源码与运行条件
+
+- 代码基线：`d7a4654`，验证时工作树包含本文对应的未提交修改；因此这些是**实现验证运行**，不是干净源码上的正式基线。`manifest.json` 记录了实际的 dirty 状态、二进制摘要和配置。
+- 主机：当前开发机，24 逻辑 CPU；`--worker-threads 2`，驱动与每个数据节点共享主机。
+- 编译：debug profile（`cargo run --quiet -- experiment ...`）。绝对吞吐只用于同轮内比较。
+- 公共配置：5 节点（4 个初始成员 + 1 个替换节点）、RF=3、`OwnerOnly`、128 B 值、seed 1、128 个虚拟节点、30 s 操作期限、120 s 迁移期限、`GET:PUT:DELETE=70:20:10`、16 个负载 worker。
+- 故障前负载 5 s，满 RF 恢复后继续负载 5 s。故障后的替换与 RF 修复都在负载持续期间完成。
+
+## 实现
+
+### `fault` 实验模式
+
+新增 `experiment --mode fault`，两个场景：
+
+- `--fault-scenario follower`：选出一个节点，只使用它作为跟随副本（owner 不是它）的键。杀死该节点后，这些键的 owner 仍须是原来的节点；负载继续写入和读取。
+- `--fault-scenario owner`：选出被一个节点拥有的键，杀死该 owner，负载跨自动选主、替换加入和 RF 修复持续运行。
+
+每个请求写入 `requests.jsonl`，字段包括逻辑请求号、worker、键、操作、值（hex）、调用/完成 Unix 毫秒与耗时、调用前后的拓扑 epoch、结果、错误码、`KnownNotApplied/MayHaveApplied`、返回版本、RPC 重试次数和按原因的重试计数。`summary.json` 的 `fault_rounds` 记录：
+
+- 受害者、受害 epoch、选中键数、涉及的 range 数；
+- 故障前所选 range 的 `current_rf`、`live_rf`、`writable`、`under_replicated`、跟随副本的 `stream_head/stream_cursor/last_ack_sequence/lag`；
+- 从 kill 到发布、到首次成功读/写/删、从替换开始到满 RF、从 kill 到满 RF；
+- 故障期间和发布后的 `live_rf`、under-replicated、not-writable range 数；
+- 请求量、错误、重试（含 `ResourceExhausted` 容量背压）、`MayHaveApplied`、回退、无法解释的读；
+- 新 owner 分布和最终校验结果。
+
+### 历史模型
+
+每个键维护一个单寄存器模型：
+
+- 成功 PUT/DELETE 把可能状态收窄为唯一值+版本（DELETE 也返回 tombstone 版本，见 `DeleteResponse.version`）；
+- `MayHaveApplied` 的 PUT/DELETE 保留“旧状态”和“新值/缺失”两个分支；
+- 故障后的读如果命中唯一状态则正常；如果命中历史中确认过的旧状态，记为一次回退，并按 `older_value_reappeared`、`acknowledged_delete_lost`、`acknowledged_value_lost` 分类；
+- 历史中不可能出现的值记为 `impossible_reads`，运行失败；
+- `OwnerOnly` 的 owner 故障允许回退，回退单独计数；follower 故障不允许回退，因为 owner 一直存活，出现回退即失败。
+
+### 回执重试测试
+
+`tests/process_cluster/retry.rs` 新增两个真实进程测试。它们用 `put_with_mutation_id` / `delete_with_mutation_id` 固定 mutation ID，第一次成功响应被驱动主动丢弃（等价于响应丢失，mutation 已应用），随后：
+
+1. 完成 3→4 成员迁移，或 `FirstSuccessor` 下杀死 owner 并提升原第一跟随副本；
+2. 用同一 mutation ID 和 payload 重试，断言返回原版本；
+3. 写入同键更新值，再重试旧请求，断言新值仍在；
+4. 用同一 ID 但不同 payload 重试，断言得到 `MutationIdConflict`；
+5. PUT 与 DELETE 都覆盖；
+6. 测试把 `retry-trace.jsonl` 和同键并发历史写到 `target/test-artifacts/<测试名>-<pid>/`，可在测试结束后检查；`target/` 不纳入 Git。
+
+`FirstSuccessor` 场景在注入 owner 故障前等待 follower 的 `stream_head == stream_cursor`，即 mutation 及其回执已经到达将被提升的副本，从而把去重验证与“允许的异步尾部丢失”分开。
+
+### 同键并发历史测试
+
+`tests/process_cluster/history.rs` 用 4 个独立客户端对同一组键并发执行 PUT/GET/DELETE，每个操作记录调用/完成时间、参数、返回值、版本和拓扑 epoch。检查器按 owner 分配的版本对 mutation 排序，然后要求：
+
+- 任一 mutation 完成早于另一个开始，则版本顺序一致；
+- 任一读都能找到一个合法串行化点：它之前的 mutation 都在读完成前开始，它之后的 mutation 都在读开始后才完成；
+- 返回值和版本必须与串行化点的状态一致。
+
+两个测试分别覆盖单一 owner epoch，以及无故障的 3→4 成员交接（交接前和交接后各一轮并发历史，中间等待满 RF）。
+
+## 结果
+
+### Follower 丢失（3 次，同一配置）
+
+| 运行 | 受害节点 | 选中键 | range | kill→发布 s | 首次读/写 s | kill→满 RF s | 请求 | 应用错误 | 回退 | 不可解释读 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | node-1 | 576 | 180 | 5.38 | 5.00 / 5.00 | 15.06 | 128,446 | 0 | 0 | 0 |
+| 2 | node-1 | 576 | 180 | 5.66 | 5.00 / 5.00 | 15.33 | 128,049 | 0 | 0 | 0 |
+| 3 | node-1 | 576 | 180 | 5.67 | 5.00 / 5.00 | 15.33 | 128,813 | 0 | 0 | 0 |
+
+三组都满足：
+
+- 发布后所选 180 个 range 的 owner 全部不变；
+- `put_ok` 与 `get_ok`/`get_not_found` 在故障期间持续增长，说明 `OwnerOnly` + `minimum_admitted_copies=1` 没有因为副本数下降而拒绝这些写；
+- 未出现应用层错误。客户端仍会因 `RangeBusy`（切换栅栏）和 `ResourceExhausted`（复制容量背压）内部重试：三次分别有 503/527/526 次 `resource_exhausted` 重试，按容量背压单独记录；
+- 自动移除后、替换前，所选 range 的 `live_rf` 最低为 1/3，180 个 range 均为 under-replicated，但没有不可写 range；替换并满 RF 后全部恢复；
+- 回退与不可解释读均为 0。
+
+### Owner 丢失（3 次，同一配置）
+
+| 运行 | 受害节点 | 选中键 | range | kill→发布 s | 首次读/写 s | kill→满 RF s | 请求 | 回退 | 不可解释读 | `MayHaveApplied` |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | node-1 | 208 | 84 | 5.66 | 10.69 / 10.69 | 15.29 | 129,174 | 6 | 0 | 4 |
+| 2 | node-1 | 208 | 84 | 5.82 | 11.01 / 11.01 | 15.54 | 128,424 | 7 | 0 | 3 |
+| 3 | node-1 | 208 | 84 | 5.64 | 10.82 / 10.82 | 15.19 | 128,442 | 7 | 0 | 6 |
+
+- 读和写都在约 10.7–11.0 s 恢复：kill 后约 5.7 s 发布新拓扑，客户端再完成重路由并等到新 owner 可写。
+- 三次都记录了 `OwnerOnly` 下可回退的已确认写入（6/7/7 个键），没有历史无法解释的值；回退按旧值重现、已确认删除丢失、已确认值丢失分类。
+- 应用层错误只有少量 `rpc:Unknown`（其中一次另有 1 次 `rpc:Cancelled`），均来自被杀死进程上的在途 RPC；没有 `ReplicaNotReady`/`Unavailable` 计数泄漏到最终结果。
+- 发布后所选 range 仍有 69/84 under-replicated，随后通过替换和 RF 修复在 15.2–15.5 s（从 kill 起算）内恢复满 RF。
+- 新 owner 分布在幸存节点和替换节点之间，`new_owner_counts` 随运行记录。
+
+### 多次 owner 故障与不同 seed
+
+`--seed 7 --fault-rounds 2 --nodes 6 --keys 512` 连续杀死两个 owner：
+
+| 轮 | 受害节点 | 选中键 | kill→发布 s | 回退 | 回退分类 | kill→满 RF s |
+|---|---|---|---|---|---|---|
+| 1 | node-1 | 141 | 5.83 | 6 | 旧值重现 4、已确认值丢失 2 | 15.35 |
+| 2 | node-3 | 121 | 5.14 | 6 | 旧值重现 3、已确认删除丢失 2、已确认值丢失 1 | 14.88 |
+
+两轮都没有不可解释读，且第二轮在第一次替换完成后的新拓扑上选择新的 owner，说明多轮扫描和按轮记录可用。
+
+### 回执重试与同键历史
+
+以下测试均通过：
+
+```
+cargo test --test process_cluster retry::
+cargo test --test process_cluster history::
+```
+
+- `response_loss_retry_after_migration_reuses_result_and_keeps_newer_value`
+- `response_loss_retry_after_owner_promotion_reuses_result_and_keeps_newer_value`
+- `concurrent_same_key_histories_are_linearizable_within_one_owner_epoch`
+- `concurrent_same_key_histories_are_linearizable_across_a_membership_handoff`
+
+同键并发测试共 4 客户端 × 40 次操作、在两个键之间轮转（约 80 次/键），迁移场景在交接前和交接后各一轮；检查器没有发现违反实时顺序的 mutation 或无法解释的读取。
+
+## 复现
+
+Follower：
+
+```
+cargo run -- experiment \
+  --mode fault --fault-scenario follower \
+  --nodes 5 --keys 1000 --concurrency 16 \
+  --fault-pre-seconds 5 --fault-post-seconds 5 \
+  --operation-timeout-ms 30000 --migration-timeout-ms 120000 \
+  --worker-threads 2 --output results/fault-follower
+```
+
+Owner（把 `follower` 换成 `owner`）：
+
+```
+cargo run -- experiment \
+  --mode fault --fault-scenario owner \
+  --nodes 5 --keys 1000 --concurrency 16 \
+  --fault-pre-seconds 5 --fault-post-seconds 5 \
+  --operation-timeout-ms 30000 --migration-timeout-ms 120000 \
+  --worker-threads 2 --output results/fault-owner
+```
+
+多轮 owner 故障：
+
+```
+cargo run -- experiment \
+  --mode fault --fault-scenario owner --seed 7 --fault-rounds 2 \
+  --nodes 6 --keys 512 --concurrency 8 \
+  --fault-pre-seconds 2 --fault-post-seconds 2 \
+  --operation-timeout-ms 10000 --migration-timeout-ms 120000 \
+  --worker-threads 2 --output results/fault-owner-multi
+```
+
+## 限制
+
+- 这些运行来自含未提交修改的 debug 构建，不能当作干净源码上的正式性能基线；正式复测应使用 `--require-clean-source`、release 构建和空闲主机。
+- `fault` 模式的 `ResourceExhausted` 计数包含客户端内部重试；一次跟随副本丢失仍可能触发复制容量背压，本文按 TODO 要求单独记录，不要求故障期间零阻塞。
+- follower 场景中，被杀死节点对其他 range 仍是 owner；这些键不在本场景的判定范围内，按“附带 owner 故障”单独记录并重新同步模型，不作为 follower 丢失的通过/失败条件。
+- 回执重试测试把“响应丢失”实现为：mutation 已成功应用，驱动丢弃成功响应后换 epoch 重试。它验证了服务端回执、迁移/提升携带回执和客户端复用 mutation ID，但没有在传输层真实丢弃一个 TCP/HTTP2 响应；客户端内部的每一次 RPC attempt 也没有逐条持久化，`retry-trace.jsonl` 只关联逻辑请求、mutation ID、epoch 和最终结果。
+- 同键历史检查器针对单寄存器，按版本排序 mutation；它覆盖单 owner epoch 和“无故障迁移前后”的交接，不覆盖 owner 故障期间的严格线性一致性（那部分按 `OwnerOnly` 允许回退的契约单独处理）。
+- 故障实验使用 seed 1 的三次重复和 seed 7 的一次两轮运行；更多 seed/受害节点组合仍可继续扩展。

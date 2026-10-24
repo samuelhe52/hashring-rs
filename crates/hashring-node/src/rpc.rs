@@ -839,6 +839,7 @@ impl DataNode for DataNodeService {
                     .err();
                 return Ok(Response::new(DeleteResponse {
                     current_epoch: epoch,
+                    version: error.is_none().then_some(version),
                     error,
                     ..Default::default()
                 }));
@@ -889,6 +890,7 @@ impl DataNode for DataNodeService {
                     .err();
                 return Ok(Response::new(DeleteResponse {
                     current_epoch: epoch,
+                    version: error.is_none().then_some(version),
                     error,
                     ..Default::default()
                 }));
@@ -1125,6 +1127,7 @@ impl DataNode for DataNodeService {
             .err();
         Ok(Response::new(DeleteResponse {
             current_epoch,
+            version: error.is_none().then_some(version),
             error,
             ..Default::default()
         }))

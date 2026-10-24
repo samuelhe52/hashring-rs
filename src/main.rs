@@ -19,7 +19,8 @@ use hashring_core::{
     },
 };
 use hashring_experiment::{
-    ExperimentConfig, ExperimentMode, ScalingLoadMode, ScalingScenario, run_experiment,
+    ExperimentConfig, ExperimentMode, FaultScenario, ScalingLoadMode, ScalingScenario,
+    run_experiment,
 };
 use hashring_node::DataNodeService;
 use serde::Deserialize;
@@ -380,6 +381,23 @@ enum ExperimentModeArg {
     Availability,
     Latency,
     Scaling,
+    Fault,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum FaultScenarioArg {
+    Owner,
+    Follower,
+}
+
+impl From<FaultScenarioArg> for FaultScenario {
+    fn from(scenario: FaultScenarioArg) -> Self {
+        match scenario {
+            FaultScenarioArg::Owner => FaultScenario::Owner,
+            FaultScenarioArg::Follower => FaultScenario::Follower,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, ValueEnum)]
@@ -430,6 +448,7 @@ impl From<ExperimentModeArg> for ExperimentMode {
             ExperimentModeArg::Availability => ExperimentMode::Availability,
             ExperimentModeArg::Latency => ExperimentMode::Latency,
             ExperimentModeArg::Scaling => ExperimentMode::Scaling,
+            ExperimentModeArg::Fault => ExperimentMode::Fault,
         }
     }
 }
@@ -563,6 +582,23 @@ struct ExperimentArgs {
     /// round. [default: 1]
     #[arg(long)]
     availability_rounds: Option<u32>,
+    /// Whether a fault run kills an owner or a follower of the load's keys.
+    /// [default: owner]
+    #[arg(long, value_enum)]
+    fault_scenario: Option<FaultScenarioArg>,
+    /// How many consecutive node failures a fault run injects. Every round
+    /// replaces its victim, so the run needs one spare node per round.
+    /// [default: 1]
+    #[arg(long)]
+    fault_rounds: Option<u32>,
+    /// How long a fault run keeps its load running before it kills the node.
+    /// [default: 10]
+    #[arg(long)]
+    fault_pre_seconds: Option<u64>,
+    /// How long a fault run keeps its load running after recovery reaches full
+    /// RF. [default: 10]
+    #[arg(long)]
+    fault_post_seconds: Option<u64>,
     /// The membership change a scaling run performs: round-trip, grow,
     /// shrink, replace, churn, or control. [default: round-trip]
     #[arg(long, value_enum)]

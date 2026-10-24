@@ -334,5 +334,9 @@ async fn execute_while_writing_moving_keys(
 mod availability;
 #[path = "process_cluster/experiment.rs"]
 mod experiment;
+#[path = "process_cluster/history.rs"]
+mod history;
 #[path = "process_cluster/migration.rs"]
 mod migration;
+#[path = "process_cluster/retry.rs"]
+mod retry;

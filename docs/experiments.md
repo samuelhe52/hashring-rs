@@ -13,6 +13,7 @@ For quick-start commands, see the [README](../README.md#experiments).
 | `availability` | Failure and repair: 3 live nodes plus 1 replacement, or a run of consecutive failures with `--availability-rounds` | 1,000 | 4 |
 | `latency` | Open-loop load at a series of target rates, and the latency of that load. See [the latency mode](#the-latency-mode). | 100,000 | 10 |
 | `scaling` | One continuous mixed read/write load across 9→10→9 nodes (or a grow/shrink only), with per-cohort verification. See [the scaling mode](#the-scaling-mode). | 100,000 | 10 |
+| `fault` | A continuous mixed load across the loss of a follower or an owner, with a per-request ledger and post-recovery verification. See [fault-under-load.md](fault-under-load.md). | 1,000 | 4 + one spare per round |
 
 Every mode defaults to 128-byte values, concurrency 64, seed 1, 128 virtual
 nodes, and a 30-second operation deadline. The default ACK policy is
@@ -169,6 +170,31 @@ All of these are local process measurements, not service-level guarantees.
 
 If a concurrent writer fails, the runner records the error and waits for the
 migration outcome before it writes the summary.
+
+## The fault mode
+
+`fault` keeps a mixed load running across one or more node failures. It starts
+with four members and holds back one spare per `--fault-rounds`.
+
+- `--fault-scenario follower` selects keys whose owner stays alive and whose
+  selected victim is a follower, kills that victim, and checks that the owner
+  never changes and that the load keeps writing and reading.
+- `--fault-scenario owner` selects the keys a victim owns, kills it, and follows
+  the automatic promotion, replacement join, and RF repair.
+
+Every request is written to `requests.jsonl`: logical request number, key,
+operation and payload, invocation and completion times, result, error code,
+`KnownNotApplied`/`MayHaveApplied`, returned version, start/end topology epoch,
+and retries by reason. A per-key history model verifies reads against the
+recorded mutations. `summary.json` reports the affected ranges and their
+pre-failure replica progress, publication and first-read/write recovery, the
+minimum observed `live_rf`, replacement and failure to full-RF times, new owner
+distribution, capacity backpressure, `MayHaveApplied` count, and rollbacks.
+Under `OwnerOnly`, a rollback after an owner failure is counted and classified;
+a rollback after a follower failure, or an impossible value in either scenario,
+fails the run.
+
+See [fault-under-load.md](fault-under-load.md) for the validation experiments.
 
 ## The latency mode
 
