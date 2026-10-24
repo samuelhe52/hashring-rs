@@ -104,7 +104,9 @@ Availability mode also records:
 - failover publication time and first recovered read
 - sampled read-unavailability probes
 - acknowledged keys preserved or lost, including a just-acknowledged tail write
-  of up to 1 MiB, never larger than the value limit the data nodes were given
+  of `value_bytes`, or of the smaller of 1 MiB and the node's value limit when
+  `value_bytes` is below 1 MiB, never larger than the value limit the data
+  nodes were given
 - time from replacement to full RF
 
 ### The availability rounds
@@ -144,8 +146,9 @@ Two fields are `null` rather than a number when the run cannot name one:
 `previous_tail_survived` when the round had to reuse the previous round's tail
 key, so its own write replaced the value that check looks for, and
 `max_over_min` when a member holds no keys, which makes the ratio unbounded.
-`tail_bytes` is the size of the value the round wrote, which is `value_bytes`
-when that is larger than 1 MiB and the node's limit otherwise.
+`tail_bytes` is the size of the value the round wrote: `value_bytes` when that
+is larger than 1 MiB, and otherwise the smaller of 1 MiB and the node's value
+limit.
 
 The run's own figures describe its worst round: `failover_seconds` and
 `read_recovery_seconds` are the slowest round, `observed_unavailable_max_streak_ms`
@@ -422,6 +425,12 @@ Reads are unpaced and use `--key-distribution`. Writes and deletes are paced at
 fresh write, and delete, and the pools are sized from
 `--scaling-pool-seconds`. A pool that empties before the last transition
 completes makes the run invalid rather than changing the mix halfway through.
+The split is whole operations per second, so the cohorts together offer
+slightly less than the configured rate when the shares do not divide it:
+`scaling_pool_plan.write_rate` is the configured rate and
+`scaling_pool_plan.cohort_write_rates` is the rounded rate each cohort
+actually got. A rate that rounds the smallest share down to zero leaves a
+cohort without a key, so it is rejected when the configuration is checked.
 
 `--scaling-scenario` picks the change:
 
@@ -444,6 +453,10 @@ total of `--scaling-open-rate` operations per second: 80% GET, 12% rewrite,
 `--max-in-flight` is dropped and counted as `late`, and its latency starts at
 the time it was due. The per-second `metrics_sampled` events report `issued`,
 `late`, and `in_flight` alongside the phase, and the summary has their totals.
+An open-loop run does not use `--scaling-write-rate`, so
+`scaling_pool_plan.write_rate` is `null` there and
+`scaling_pool_plan.cohort_write_rates` reports the shares the open rate was
+split into.
 
 The runner starts with `--initial-nodes` (default: peak - 1 for grow,
 round-trip, and replace; peak for shrink and control; peak - 3 for churn),
@@ -477,9 +490,14 @@ destination checks and the state lock) but not the diagnostic
 `activation_ms` covers the activation barrier and the target installation but
 not source cleanup or stopping removed members. It also excludes the later
 `wait_for_full_rf` convergence, which `full_rf_seconds` reports separately.
-The timings are written in the same durable write as the phase they belong to,
-so a repeated `execute-change`, a `change-status` read, and a restarted
-coordinator all see what the first `execute-change` returned.
+The publication and the activation are written with the phase they belong to:
+`publish_ms` is stored with `Published`, and `activation_ms` with `CleaningUp`
+and `Complete`. The steps before the publication are measured in their own
+phase and stored with the `Published` write, so a change that is aborted keeps
+none of them and a change that is published keeps all of them. Every one of
+those writes is a single durable write, so a repeated `execute-change`, a
+`change-status` read, and a restarted coordinator all see what the first
+`execute-change` returned.
 
 `published_ms_source` says where `published_ms` came from. It is `observed`
 when the runner saw the change publish, and `completion_fallback` when a short

@@ -137,7 +137,7 @@ replaced during the run.
 | `--scaling-load-mode` | `scaling_load_mode` | `closed` | experiment | `scaling` mode only: `closed` for a fixed number of workers, `open` for requests offered at `--scaling-open-rate`. |
 | `--scaling-open-rate` | `scaling_open_rate` | 0 | experiment | `scaling` mode only: total operations per second in open mode. Reads are 80%; writes are 12% rewrite, 5% fresh write, and 3% delete. The pools are sized from this rate. |
 | `--initial-nodes` | `initial_nodes` | peak - 1 for grow/round-trip/replace, peak for shrink/control, peak - 3 for churn | experiment | `scaling` mode only: the nodes the run starts with. |
-| `--scaling-write-rate` | `scaling_write_rate` | 200 | experiment | `scaling` mode only: closed-loop one-shot write and delete operations per second. Reads are not paced. |
+| `--scaling-write-rate` | `scaling_write_rate` | 200 | experiment | `scaling` mode only: closed-loop one-shot write and delete operations per second. Reads are not paced. The rate is split 60/25/15 across rewrite, fresh write, and delete, so it has to be high enough to give every cohort an operation. |
 | `--scaling-pool-seconds` | `scaling_pool_seconds` | 120 | experiment | `scaling` mode only: how long the one-shot pools of one transition must last. |
 | `--scaling-post-seconds` | `scaling_post_seconds` | 10 | experiment | `scaling` mode only: how long the load keeps running after a change. In `control` it is the measured baseline window. |
 | `--worker-threads` | `worker_threads` | CPUs / (nodes + 2), at least 2 | process | For the driver and each node. |

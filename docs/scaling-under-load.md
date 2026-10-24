@@ -383,7 +383,7 @@ S1 与 S2 在**同一个集群生命周期内连续执行**：预载一次、负
 | `merge_proof_ms` | direct merge 的 coverage/proof 计算 |
 | `catch_up_ms` | direct merge 等旧复制流追平的循环 |
 
-这些是 coordinator 侧的墙钟，不含客户端重试等待，也不含 `wait_for_full_rf` 在 `Complete` 之后的收敛时间。字段为 0 表示该路径不经过这一步（例如 S2 direct merge 的 `snapshot_copy_ms`/`changelog_replay_ms`）。计时与阶段变更在同一次持久化写中落库：发布时 `publish_ms` 随 `Published` 阶段一起写入，activation 之后 `activation_ms` 随 `CleaningUp`/`Complete` 一起写入。所以 `change-status`、重复的 `execute-change`、以及重启后从 redb 读到的记录，都和 `execute-change` 的返回值一致；不存在"阶段已落库、计时还没写"的窗口。另外 `<label>_transition` 还有 `published_ms`、`published_ms_source`、`complete_ms`、`full_rf_seconds`：前两个从 change 开始计时，`full_rf_seconds` 从 `Complete`（含之后等被移除节点退出的时间）到目标 epoch 满 RF。短 change 可能从 `Verifying` 直接跳到 `Complete`，此时探针仍会启动，`published_ms` 取完成时刻，`published_ms_source` 记为 `completion_fallback`，正常观测到发布时为 `observed`。
+这些是 coordinator 侧的墙钟，不含客户端重试等待，也不含 `wait_for_full_rf` 在 `Complete` 之后的收敛时间。字段为 0 表示该路径不经过这一步（例如 S2 direct merge 的 `snapshot_copy_ms`/`changelog_replay_ms`）。计时与阶段变更在同一次持久化写中落库：发布时 `publish_ms` 随 `Published` 阶段一起写入，activation 之后 `activation_ms` 随 `CleaningUp`/`Complete` 一起写入；发布之前的步骤在自己的阶段里测量，随 `Published` 那次写入一起落库，所以被 abort 的 change 不保留已测步骤。因此 `change-status`、重复的 `execute-change`、以及重启后从 redb 读到的记录，都和 `execute-change` 的返回值一致；不存在"阶段已落库、计时还没写"的窗口。另外 `<label>_transition` 还有 `published_ms`、`published_ms_source`、`complete_ms`、`full_rf_seconds`：前两个从 change 开始计时，`full_rf_seconds` 从 `Complete`（含之后等被移除节点退出的时间）到目标 epoch 满 RF。短 change 可能从 `Verifying` 直接跳到 `Complete`，此时探针仍会启动，`published_ms` 取完成时刻，`published_ms_source` 记为 `completion_fallback`，正常观测到发布时为 `observed`。
 
 恢复路径的 `activation_ms` 只覆盖"恢复时的重做"：在 `Published`/`CleaningUp` 恢复的 change 不会重测发布，`publish_ms` 保持首次发布写入的值；`activation_ms` 度量的是重新安装与重新激活，而不是原始 activation。租约等待也不计入（它是一段安全等待）。
 
@@ -397,9 +397,9 @@ S1 与 S2 在**同一个集群生命周期内连续执行**：预载一次、负
 - 切写窗口的写尝试数、拒绝数、停写时长；首个成功写时间
 - **停写窗口的定义以客户端实际观测为准**：按区间（S2 是全集群）记录第一次和最后一次 `RangeBusy` 的时间，再取此后第一个成功写，用这三者定义窗口；phase 只做粗粒度标注。栅栏在节点收到 RPC 后才生效，与 coordinator 的 phase 切换存在时差，再叠加轮询误差，不能拿阶段边界当停写时长。实现上由 scaling 模式每 5 ms 采样客户端的 `RangeBusy` 计数与成功写计数，写入 `<label>_transition.stop_window`（`first_range_busy_ms`、`last_range_busy_ms`、`first_write_ok_ms`、`observed_ms`、`poll_ms`）。每个 transition 的窗口以它开始时的累计计数为基线，所以第二个 transition 不会把第一个的拒绝算成自己的，`first_range_busy_ms` 也不会被钉成 0。
 - 发布后复读在观察到 `Published` 的那一刻启动（限速、独立 client），不是整个 transition 结束后的一次终态复查，否则发布瞬间的短暂陈旧读会自愈、探针看不到。
-- 发布后复读必须真的读到键。探针等待的是"持续有进展"而不是固定时长：每次读都受客户端 operation timeout 限制，所以一个还在读的探针一定会在该时限内完成一个键；连续 `operation timeout + 间隔 + 10 s` 没有新键才算卡住。每个 change 的探针读取数写入 `scaling_after_publish_probes.keys_read`；读取数为 0（发布窗口内没有落到迁移分层的成功写）即判该次运行 invalid，而不是当作"没有违规"。
+- 发布后复读必须真的读到键。探针等待的是"持续有进展"而不是固定时长：每次读都受客户端 operation timeout 限制，所以一个还在读的探针一定会在该时限内完成一个键；连续 `operation timeout + 间隔 + 10 s` 没有新键才算卡住。空闲时钟从探针启动时起算（不是从运行等待探针时起算），读到一个键就把截止时间往后推同样的时长，所以早期就卡住的探针会在运行结束前被放弃，并记一条 `scaling_after_publish_probe_stuck` 事件。每个 change 的探针读取数写入 `scaling_after_publish_probes.keys_read`；读取数为 0（发布窗口内没有落到迁移分层的成功写）即判该次运行 invalid，而不是当作"没有违规"。
 - 重试总数与按原因计数必须对得上：`retry_count()` 等于 `retry_reasons()` 之和。建连失败记 `Connect`，可重试的 gRPC 状态记 `Rpc`，两者不再合并。
-- 开环组的实际写入速率来自 `--scaling-open-rate` 的分层拆分，`scaling_pool_plan.cohort_write_rates` 记录 rewrite/new/delete 各自的实际速率；`write_rate` 在开环下为 `null`，因为 `--scaling-write-rate` 在开环下不生效。
+- 开环组的实际写入速率来自 `--scaling-open-rate` 的分层拆分，`scaling_pool_plan.cohort_write_rates` 记录 rewrite/new/delete 各自的实际速率；`write_rate` 在开环下为 `null`，因为 `--scaling-write-rate` 在开环下不生效。分层拆分是整除（闭环 60/25/15，开环 12/5/3），所以 `cohort_write_rates.total` 可能比配置值略小（例如 `--scaling-write-rate 50` 实际是 30+12+7=49）；`write_rate` 记的是配置值，`cohort_write_rates` 记的是取整后的实际值。最小的一层必须至少分到 1 次操作/秒，否则该 cohort 没有键；这一点在参数校验阶段就会拒绝（开环 `open_rate * 3 / 100`，闭环 `write_rate * 15 / 100`）。
 - 读连续失败最长间隔
 - 每层 cohort 的实际操作量与结果分布
 - 每次 change 的迁移量：`<label>_transition.migration` 的 `keys`、`keys_moved`、`rate`、`ranges`、`snapshot_records`

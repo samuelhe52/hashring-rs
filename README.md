@@ -57,6 +57,9 @@ cargo run -- replica-status  # per-range owner, followers, lag, and repair state
 
 `--member` is only read when the state file is first created. To restart the
 coordinator, pass just `--state`. Everything else is loaded from the file.
+Passing `--member` on a restart compares those flags with the stored topology,
+so a cluster whose membership or configuration changed since the store was
+created has to be restarted with `--state` alone.
 
 ## Redis clients
 
