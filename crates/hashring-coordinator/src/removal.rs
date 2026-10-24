@@ -115,6 +115,7 @@ impl CoordinatorService {
         state: &mut ClusterState,
         change: &TopologyChange,
         publication: RemovalPublication,
+        timings: MigrationTimings,
     ) -> Result<(), Status> {
         if state
             .active_change
@@ -142,6 +143,9 @@ impl CoordinatorService {
         let active = next.active_change.as_mut().expect("checked above");
         active.phase = MigrationPhase::Published;
         active.activation_ready = true;
+        // The timings measured so far ride along with the phase change, so a
+        // crash cannot keep the phase and lose the work it took to get there.
+        active.timings = timings;
         reconcile_replica_repairs(&mut next)
             .map_err(|error| Status::internal(error.to_string()))?;
         self.repository

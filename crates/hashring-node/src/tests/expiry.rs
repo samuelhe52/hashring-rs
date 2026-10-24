@@ -418,8 +418,7 @@ async fn a_deadline_reaches_a_follower_and_a_replica_read_agrees() {
         .replicate_mutation(Request::new(replication_entry(
             &topology,
             key.to_vec(),
-            1,
-            1,
+            (1, 1),
             b"value",
             false,
             Some(expires_at),
@@ -452,8 +451,7 @@ async fn a_deadline_reaches_a_follower_and_a_replica_read_agrees() {
         .replicate_mutation(Request::new(replication_entry(
             &topology,
             key.clone(),
-            2,
-            2,
+            (2, 2),
             b"second",
             false,
             Some(now_unix_millis()),

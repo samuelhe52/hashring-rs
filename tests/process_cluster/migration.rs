@@ -1152,6 +1152,7 @@ async fn destination_restart_before_publication_aborts_change() {
     let mut coordinator_args = coordinator_arguments(coordinator_port, &state, &initial_members);
     coordinator_args.extend(["--pre-publish-delay-ms".into(), "2000".into()]);
     let mut coordinator = spawn_process(&coordinator_args);
+    wait_for_listener(coordinator_port);
     let client = connect_eventually(&coordinator_endpoint).await;
     let mut node_1 = spawn_process(&[
         "node".into(),
@@ -1206,17 +1207,18 @@ async fn destination_restart_before_publication_aborts_change() {
         plan.target_topology.epoch.to_string(),
     ]);
 
-    let mut ready = false;
+    let mut ready = None;
     for _ in 0..1_000 {
         if let Ok(Some(change)) = client.topology_change().await
             && change.phase == MigrationPhase::ReadyToPublish
         {
-            ready = true;
+            ready = Some(change);
             break;
         }
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
-    assert!(ready, "migration never reached pre-publication fence");
+    let ready = ready.expect("migration never reached pre-publication fence");
+    assert!(ready.timings.snapshot_copy_ms > 0, "{:?}", ready.timings);
     node_2.stop();
     node_2 = spawn_process(&[
         "node".into(),
@@ -1229,17 +1231,18 @@ async fn destination_restart_before_publication_aborts_change() {
     ]);
     wait_for_listener(ports[2]);
 
-    let mut aborted = false;
+    let mut aborted = None;
     for _ in 0..1_000 {
         if let Ok(Some(change)) = client.topology_change().await
             && change.phase == MigrationPhase::Aborted
         {
-            aborted = true;
+            aborted = Some(change);
             break;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    assert!(aborted, "replacement destination was published");
+    let aborted = aborted.expect("replacement destination was published");
+    assert_eq!(aborted.timings, ready.timings);
     client.refresh_topology().await.unwrap();
     assert_eq!(client.topology().await.epoch, 1);
     for index in (0_u64..1_000).step_by(29) {
@@ -1254,6 +1257,13 @@ async fn destination_restart_before_publication_aborts_change() {
     }
 
     executor.stop();
+    coordinator.stop();
+    coordinator = spawn_process(&coordinator_args);
+    wait_for_listener(coordinator_port);
+    let restarted = connect_eventually(&coordinator_endpoint).await;
+    let stored = restarted.topology_change().await.unwrap().unwrap();
+    assert_eq!(stored.phase, MigrationPhase::Aborted);
+    assert_eq!(stored.timings, ready.timings);
     node_1.stop();
     node_2.stop();
     coordinator.stop();

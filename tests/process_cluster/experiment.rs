@@ -44,7 +44,7 @@ async fn experiment_runner_preserves_reproducibility_artifacts() {
             .unwrap();
     assert_eq!(manifest["config"]["node_count"], 4);
     assert_eq!(manifest["config"]["key_count"], 300);
-    assert_eq!(manifest["schema_version"], 8);
+    assert_eq!(manifest["schema_version"], 9);
     // Every node is started with the run's tuning, so it must parse.
     assert_eq!(manifest["config"]["node"]["max_dedup_bytes"], 33_554_432);
     assert_eq!(manifest["executable_blake3"].as_str().unwrap().len(), 64);
@@ -322,4 +322,369 @@ async fn availability_experiment_records_failover_loss_and_rf_repair() {
         assert!(events.contains("tail_ack_to_kill_ms"));
         assert!(events.contains("full_rf_restored"));
     }
+}
+
+#[tokio::test]
+#[ignore = "three consecutive availability failures; run with --ignored"]
+async fn availability_experiment_survives_three_consecutive_failures() {
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let output_directory = directory.path().join("consecutive");
+    let output = Command::new(env!("CARGO_BIN_EXE_hashring-rs"))
+        .args([
+            "experiment",
+            "--mode",
+            "availability",
+            "--availability-rounds",
+            "3",
+            "--nodes",
+            "6",
+            "--policy",
+            "first-successor",
+            "--output",
+            output_directory.to_str().unwrap(),
+            "--keys",
+            "200",
+            "--virtual-nodes",
+            "16",
+            "--operation-timeout-ms",
+            "10000",
+            "--migration-timeout-ms",
+            "90000",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "consecutive availability experiment failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output_directory.join("summary.json")).unwrap())
+            .unwrap();
+    assert_eq!(summary["success"], true, "{}", summary["error"]);
+    let observations = &summary["observations"];
+    assert_eq!(observations["availability_round_count"], 3);
+    let rounds = observations["availability_rounds"].as_array().unwrap();
+    assert_eq!(rounds.len(), 3);
+    // Every round killed a different node, and every round recovered.
+    let mut victims = Vec::new();
+    for round in rounds {
+        let victim = round["victim"].as_str().unwrap();
+        assert!(!victims.contains(&victim), "{victim} failed twice");
+        victims.push(victim);
+        assert!(
+            round["read_recovery_seconds"].as_f64().unwrap() < 30.0,
+            "{round} did not recover within 30 seconds"
+        );
+        // The cluster serves reads and then writes again after every failure.
+        assert!(round["write_recovery_seconds"].as_f64().unwrap() > 0.0);
+        assert!(round["replacement_to_full_rf_seconds"].as_f64().unwrap() > 0.0);
+        // The acknowledged keys survive every failure, and so does the value
+        // the previous round wrote.
+        assert_eq!(round["acknowledged_key_survival"]["lost"], 0, "{round}");
+        assert_eq!(round["acknowledged_key_survival"]["tail_survived"], true);
+        if round["round"].as_u64().unwrap() > 1 {
+            assert_eq!(round["previous_tail_survived"], true, "{round}");
+        }
+        // The remaining nodes hold the keys, and the run records how evenly.
+        assert!(round["balance"]["nodes"].as_u64().unwrap() >= 3);
+        assert!(round["owned_keys"].as_object().unwrap().len() >= 3);
+    }
+    assert_eq!(observations["availability_acknowledged_lost_total"], 0);
+    // The legacy measurement names describe the first round, and every round
+    // has its own entry.
+    let measurements = summary["measurements"].as_object().unwrap();
+    assert!(measurements["restore_full_rf"].is_object());
+    for round in 1..=3 {
+        assert!(
+            measurements[&format!("restore_full_rf_round_{round}")].is_object(),
+            "round {round} has no restore_full_rf measurement"
+        );
+    }
+    let events = std::fs::read_to_string(output_directory.join("events.jsonl")).unwrap();
+    assert_eq!(events.matches("\"owner_killed\"").count(), 3);
+    assert_eq!(events.matches("\"full_rf_restored\"").count(), 3);
+    assert!(events.contains("availability_rounds_complete"));
+}
+
+#[tokio::test]
+async fn scaling_control_experiment_runs_closed_and_open_loads() {
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    for (label, load_mode, keys, open_rate) in [
+        ("closed", "closed", "2000", &[] as &[&str]),
+        ("open", "open", "3000", &["--scaling-open-rate", "200"]),
+    ] {
+        let output_directory = directory.path().join(label);
+        let mut arguments = vec![
+            "experiment",
+            "--mode",
+            "scaling",
+            "--scaling-scenario",
+            "control",
+            "--scaling-load-mode",
+            load_mode,
+            "--output",
+            output_directory.to_str().unwrap(),
+            "--nodes",
+            "3",
+            "--keys",
+            keys,
+            "--concurrency",
+            "8",
+            "--scaling-write-rate",
+            "20",
+            "--scaling-pool-seconds",
+            "30",
+            "--warmup-seconds",
+            "1",
+            "--scaling-post-seconds",
+            "2",
+            "--max-in-flight",
+            "256",
+            "--virtual-nodes",
+            "16",
+        ];
+        arguments.extend_from_slice(open_rate);
+        let output = Command::new(env!("CARGO_BIN_EXE_hashring-rs"))
+            .args(&arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{label} scaling control experiment failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let summary: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output_directory.join("summary.json")).unwrap())
+                .unwrap();
+        assert_eq!(summary["success"], true);
+        let transition = &summary["observations"]["control_transition"];
+        assert_eq!(transition["control"], true);
+        assert_eq!(transition["direct_merge"], false);
+        assert!(transition["work_steps_ms"].is_null());
+        assert_eq!(transition["retries_by_reason"]["range_busy"], 0);
+        assert_eq!(
+            summary["observations"]["scaling_metrics"]["load_mode"],
+            load_mode
+        );
+        if load_mode == "open" {
+            assert!(
+                summary["observations"]["scaling_metrics"]["issued"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+        }
+        let events = std::fs::read_to_string(output_directory.join("events.jsonl")).unwrap();
+        assert!(events.contains("scaling_control_window_started"));
+        assert!(events.contains("scaling_transition_complete"));
+    }
+}
+
+#[tokio::test]
+async fn scaling_open_loop_round_trip_drains_its_own_writes() {
+    // Reads keep running across a transition, so the local drain may only
+    // wait for the write batches. At this rate the reads are always in
+    // flight, which is the case a drain over all requests cannot finish.
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let output_directory = directory.path().join("open-round-trip");
+    let output = Command::new(env!("CARGO_BIN_EXE_hashring-rs"))
+        .args([
+            "experiment",
+            "--mode",
+            "scaling",
+            "--scaling-scenario",
+            "round-trip",
+            "--scaling-load-mode",
+            "open",
+            "--scaling-open-rate",
+            "6000",
+            "--output",
+            output_directory.to_str().unwrap(),
+            "--nodes",
+            "4",
+            "--desired-replication-factor",
+            "2",
+            "--keys",
+            "80000",
+            "--concurrency",
+            "8",
+            "--scaling-pool-seconds",
+            "20",
+            "--warmup-seconds",
+            "1",
+            "--scaling-post-seconds",
+            "2",
+            "--max-in-flight",
+            "256",
+            "--virtual-nodes",
+            "16",
+            "--operation-timeout-ms",
+            "30000",
+            "--migration-timeout-ms",
+            "120000",
+            "--max-dedup-bytes",
+            "33554432",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "open-loop round-trip failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output_directory.join("summary.json")).unwrap())
+            .unwrap();
+    assert_eq!(summary["success"], true);
+    let metrics = &summary["observations"]["scaling_metrics"];
+    assert_eq!(metrics["load_mode"], "open");
+    assert!(metrics["issued"].as_u64().unwrap() > 0);
+    assert_eq!(metrics["in_flight"], 0);
+    let grow = &summary["observations"]["grow_transition"];
+    assert_eq!(grow["verification"], "deferred_to_next_transition");
+    let shrink = &summary["observations"]["shrink_transition"];
+    assert_eq!(shrink["verification"], "passed");
+    for transition in [grow, shrink] {
+        assert!(transition["stop_window"]["observed_ms"].as_f64().unwrap() > 0.0);
+    }
+}
+
+#[tokio::test]
+async fn scaling_round_trip_defers_s1_verification_and_records_the_stop_window() {
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let output_directory = directory.path().join("round-trip");
+    let output = Command::new(env!("CARGO_BIN_EXE_hashring-rs"))
+        .args([
+            "experiment",
+            "--mode",
+            "scaling",
+            "--scaling-scenario",
+            "round-trip",
+            "--output",
+            output_directory.to_str().unwrap(),
+            "--nodes",
+            "4",
+            "--desired-replication-factor",
+            "2",
+            "--keys",
+            "8000",
+            "--concurrency",
+            "8",
+            "--scaling-write-rate",
+            "200",
+            "--scaling-pool-seconds",
+            "8",
+            "--warmup-seconds",
+            "1",
+            "--scaling-post-seconds",
+            "2",
+            "--max-in-flight",
+            "256",
+            "--virtual-nodes",
+            "16",
+            "--operation-timeout-ms",
+            "30000",
+            "--migration-timeout-ms",
+            "120000",
+            "--max-dedup-bytes",
+            "33554432",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "round-trip scaling experiment failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output_directory.join("summary.json")).unwrap())
+            .unwrap();
+    assert_eq!(summary["success"], true);
+
+    // S1's cohorts are verified at the start of S2, so a violation cannot be
+    // attributed to the wrong change.
+    let grow = &summary["observations"]["grow_transition"];
+    assert_eq!(grow["verification"], "deferred_to_next_transition");
+    let shrink = &summary["observations"]["shrink_transition"];
+    assert_eq!(shrink["verification"], "passed");
+    assert_eq!(shrink["direct_merge"], true);
+    assert!(
+        grow["retries_by_reason"]["range_busy"].as_u64().unwrap() > 0,
+        "the grow change produced no client-observed RangeBusy rejection"
+    );
+
+    // The write stop is defined by what the client saw, not by the phases.
+    // Publication, completion, and the RF convergence after completion are
+    // separate time points.
+    for transition in [grow, shrink] {
+        let window = &transition["stop_window"];
+        let first = window["first_range_busy_ms"].as_f64().unwrap();
+        let last = window["last_range_busy_ms"].as_f64().unwrap();
+        let first_ok = window["first_write_ok_ms"].as_f64().unwrap();
+        assert!(first <= last, "{window}");
+        assert!(last <= first_ok, "{window}");
+        assert!(window["observed_ms"].as_f64().unwrap() > 0.0, "{window}");
+        let published = transition["published_ms"]
+            .as_f64()
+            .expect("a completed change records a publication time");
+        let complete = transition["complete_ms"].as_f64().unwrap();
+        assert!(published > 0.0, "{transition}");
+        assert!(complete >= published, "{transition}");
+        // The publication time says where it came from, so a time that was
+        // taken at the completion is not read as an observed publication.
+        let source = transition["published_ms_source"]
+            .as_str()
+            .expect("a completed change records where its publication time came from");
+        assert!(
+            matches!(source, "observed" | "completion_fallback"),
+            "{transition}"
+        );
+        if source == "completion_fallback" {
+            assert_eq!(published, complete, "{transition}");
+        }
+        assert!(
+            transition["full_rf_seconds"].as_f64().unwrap() >= 0.0,
+            "{transition}"
+        );
+    }
+
+    // Every change re-read the keys it moved after the publication, so the
+    // run has the read-after-publish evidence it claims.
+    let probes = &summary["observations"]["scaling_after_publish_probes"];
+    let keys_read = probes["keys_read"].as_array().unwrap();
+    assert_eq!(keys_read.len(), 2, "{probes}");
+    for read in keys_read {
+        assert!(read.as_u64().unwrap() > 0, "{probes}");
+    }
+
+    // The migration volume is plan-side: the share of the key space whose
+    // owner changes. The copy path also copies records; a direct merge does
+    // not create ranges at all.
+    let grow_migration = &grow["migration"];
+    let grow_rate = grow_migration["rate"].as_f64().unwrap();
+    assert!(
+        grow_rate > 0.0 && grow_rate < 0.6,
+        "a one-node grow of four members moved {grow_rate} of the keys"
+    );
+    assert_eq!(
+        grow_migration["keys_moved"].as_u64().unwrap(),
+        (grow_rate * grow_migration["keys"].as_u64().unwrap() as f64).round() as u64
+    );
+    assert!(grow_migration["snapshot_records"].as_u64().unwrap() > 0);
+    assert!(grow_migration["ranges"].as_u64().unwrap() > 0);
+    let shrink_migration = &shrink["migration"];
+    assert!(shrink_migration["rate"].as_f64().unwrap() > 0.0);
+    assert_eq!(shrink_migration["ranges"].as_u64().unwrap(), 0);
+    assert_eq!(shrink_migration["snapshot_records"].as_u64().unwrap(), 0);
+
+    // The two changes never share a key, so the S2 pools cannot see a value
+    // that the S1 settlement left unknown.
+    let events = std::fs::read_to_string(output_directory.join("events.jsonl")).unwrap();
+    assert!(events.contains("scaling_cohorts_verified"));
+    assert!(events.contains("removed_node_exited"));
 }

@@ -7,6 +7,7 @@ impl CoordinatorService {
         retry_transient: bool,
     ) -> Result<TopologyChange, Status> {
         let deadline = Instant::now() + self.migration_timeout;
+        let pause_started = Instant::now();
         self.set_phase(MigrationPhase::PausingWrites).await?;
         change.phase = MigrationPhase::PausingWrites;
         if let Err(error) = self.policy_fence_members(&change, true, deadline).await {
@@ -14,7 +15,12 @@ impl CoordinatorService {
                 .abort_after_error(&change, error, retry_transient)
                 .await;
         }
-        if let Err(error) = self.set_phase(MigrationPhase::Verifying).await {
+        change.timings.pause_writes_ms = millis(pause_started.elapsed());
+        let verify_started = Instant::now();
+        if let Err(error) = self
+            .set_phase_with_timings(MigrationPhase::Verifying, Some(change.timings))
+            .await
+        {
             return self
                 .abort_after_error(&change, error, retry_transient)
                 .await;
@@ -54,7 +60,11 @@ impl CoordinatorService {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         }
-        if let Err(error) = self.set_phase(MigrationPhase::ReadyToPublish).await {
+        change.timings.verify_ms = millis(verify_started.elapsed());
+        if let Err(error) = self
+            .set_phase_with_timings(MigrationPhase::ReadyToPublish, Some(change.timings))
+            .await
+        {
             return self
                 .abort_after_error(&change, error, retry_transient)
                 .await;
@@ -63,6 +73,9 @@ impl CoordinatorService {
         if !self.pre_publish_delay.is_zero() {
             tokio::time::sleep(self.pre_publish_delay).await;
         }
+        // The pre-publication delay is a diagnostic window for the observer,
+        // not publish work, so it must not inflate `publish_ms`.
+        let publish_started = Instant::now();
         // Recheck after the optional pre-publication delay while all old owners are fenced.
         {
             let status = tokio::time::timeout_at(
@@ -103,10 +116,16 @@ impl CoordinatorService {
                         "policy transition changed before publication",
                     ));
                 }
-                next.active_change
+                // The timings measured so far are measured up to the durable
+                // write that carries them, so the write cannot leave the phase
+                // behind without the work it took to get there.
+                change.timings.publish_ms = millis(publish_started.elapsed());
+                let active = next
+                    .active_change
                     .as_mut()
-                    .expect("active transition was checked")
-                    .phase = MigrationPhase::Published;
+                    .expect("active transition was checked");
+                active.phase = MigrationPhase::Published;
+                active.timings = change.timings;
                 next.committed = change.target_topology.clone();
                 // Identical placements plus the catch-up barrier preserve admission proof.
                 for admission in &mut next.replica_admissions {

@@ -57,6 +57,9 @@ cargo run -- replica-status  # per-range owner, followers, lag, and repair state
 
 `--member` is only read when the state file is first created. To restart the
 coordinator, pass just `--state`. Everything else is loaded from the file.
+Passing `--member` on a restart compares those flags with the stored topology,
+so a cluster whose membership or configuration changed since the store was
+created has to be restarted with `--state` alone.
 
 ## Redis clients
 
@@ -286,9 +289,18 @@ target/release/hashring-rs experiment --mode performance --require-clean-source 
 target/release/hashring-rs experiment --mode availability --policy first-successor \
   --output results/availability
 
+# Kill three owners in a row, replacing each one before the next failure.
+target/release/hashring-rs experiment --mode availability --availability-rounds 3 \
+  --nodes 9 --output results/availability-consecutive
+
 # Offer a fixed rate and measure the latency of that load, one stage per rate.
 target/release/hashring-rs experiment --mode latency --target-rates 5000,10000,20000 \
   --output results/latency
+
+# Keep mixed reads and writes running across 9 -> 10 -> 9 nodes, and verify
+# every cohort after each change.
+target/release/hashring-rs experiment --mode scaling \
+  --output results/scaling
 ```
 
 Experiment settings can also come from a YAML file whose keys are the flag

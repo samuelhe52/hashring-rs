@@ -55,7 +55,7 @@ impl Dispatcher {
             .first()
             .and_then(|value| parse_integer(value))
         {
-            args.next()?;
+            args.next_required()?;
             protocol = match version {
                 2 => Protocol::Resp2,
                 3 => Protocol::Resp3,
@@ -71,7 +71,7 @@ impl Dispatcher {
         let mut name = None;
         while let Some(option) = args.next_keyword() {
             match option.as_str() {
-                "auth" => credentials = Some((args.next()?, args.next()?)),
+                "auth" => credentials = Some((args.next_required()?, args.next_required()?)),
                 "setname" => name = Some(args.next_owned()?),
                 _ => return Err(RedisError::syntax()),
             }
@@ -101,7 +101,7 @@ impl Dispatcher {
     /// `AUTH password` and `AUTH user password` are both accepted; the gateway
     /// has one password and one user, `default`.
     fn auth(&self, connection: &mut Connection, mut args: Args<'_>) -> RedisResult<Reply> {
-        let first = args.next()?;
+        let first = args.next_required()?;
         let credentials = match args.next_optional() {
             Some(password) => (Some(first), password),
             None => (None, first),
@@ -251,7 +251,7 @@ fn echo(mut args: Args<'_>) -> RedisResult<Reply> {
 
 fn select(mut args: Args<'_>) -> RedisResult<Reply> {
     // Every key lives in one flat namespace, so only database 0 exists.
-    match parse_integer(args.next()?) {
+    match parse_integer(args.next_required()?) {
         Some(0) => Ok(Reply::status()),
         _ => Err(RedisError::new(
             "ERR",
@@ -280,8 +280,8 @@ fn client_subcommand(
         // Clients send `CLIENT SETINFO lib-name ...` on connect and expect a
         // plain OK; nothing is recorded.
         "setinfo" => {
-            args.next()?;
-            args.next()?;
+            args.next_required()?;
+            args.next_required()?;
             args.finish()?;
             Ok(Reply::status())
         }
@@ -333,7 +333,7 @@ fn command_command(dispatcher: &Dispatcher, mut args: Args<'_>) -> RedisResult<R
 fn config(mut args: Args<'_>) -> RedisResult<Reply> {
     match args.next_keyword().as_deref() {
         Some("get") => {
-            let pattern = super::glob::Pattern::new(keyword(args.next()?).as_bytes());
+            let pattern = super::glob::Pattern::new(keyword(args.next_required()?).as_bytes());
             Ok(Reply::Map(
                 config_entries()
                     .into_iter()

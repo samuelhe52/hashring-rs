@@ -1,7 +1,3 @@
-// Public tonic and redb APIs use concrete error types whose context is more
-// useful here than erasing or boxing them solely to reduce enum size.
-#![allow(clippy::result_large_err)]
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     future::Future,
@@ -27,7 +23,7 @@ use hashring_core::{
     limits::DEFAULT_MIGRATION_PAGE_BYTES,
     migration::{
         MAX_MIGRATION_RANGES, MAX_REPLICA_OBLIGATIONS, MigrationError, MigrationPhase,
-        RangeMigration, TopologyChange,
+        MigrationTimings, RangeMigration, TopologyChange,
     },
     proto::{
         self, ApplyDedupBatchRequest, ApplyMigrationBatchRequest, ChangelogPageRequest,
@@ -393,7 +389,7 @@ pub enum RepositoryError {
     #[error("database error: {0}")]
     Database(#[from] redb::DatabaseError),
     #[error("transaction error: {0}")]
-    Transaction(#[from] redb::TransactionError),
+    Transaction(#[source] Box<redb::TransactionError>),
     #[error("table error: {0}")]
     Table(#[from] redb::TableError),
     #[error("storage error: {0}")]
@@ -410,8 +406,17 @@ pub enum RepositoryError {
     InvalidState(String),
     #[error("the coordinator store is empty; bootstrap members are required")]
     MissingBootstrap,
-    #[error("configured bootstrap topology differs from durable topology")]
+    #[error(
+        "configured bootstrap topology differs from durable topology; the store already holds a \
+         topology, so restart without --member or with the configuration file to use it"
+    )]
     BootstrapMismatch,
+}
+
+impl From<redb::TransactionError> for RepositoryError {
+    fn from(error: redb::TransactionError) -> Self {
+        Self::Transaction(Box::new(error))
+    }
 }
 
 pub trait CoordinatorRepository: Send + Sync {

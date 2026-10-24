@@ -5,8 +5,8 @@
 //! connection must have authenticated unless the command is part of the
 //! handshake. A handler then reads its arguments through [`args::Args`].
 //!
-//! Commands that answer from the gateway live in [`connection`]; the ones that
-//! reach the cluster live in [`strings`], [`keys`] and [`keyspace`] and go
+//! Commands that answer from the gateway live in `connection`; the ones that
+//! reach the cluster live in `strings`, `keys` and `keyspace` and go
 //! through [`store::Store`], which routes each key to its owner through
 //! [`hashring_client`] and makes every read-modify-write conditional on the
 //! version it read. See docs/redis-compatibility.md for the semantics this

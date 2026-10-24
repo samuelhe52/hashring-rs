@@ -10,8 +10,9 @@ For quick-start commands, see the [README](../README.md#experiments).
 | --- | --- | --- | --- |
 | `correctness` | Starts with 9 nodes and scales to 10 under concurrent rewrites and deletes, keeping a third moving cohort as snapshot sentinels. It then scales back to 9 while restoring or deleting the mutation cohorts, and verifies present and absent keys after every stage. | 20,000 | 10 (peak) |
 | `performance` | Nominal acceptance profile | 1,000,000 | 10 |
-| `availability` | Failure and repair: 3 live nodes plus 1 replacement | 1,000 | 4 |
+| `availability` | Failure and repair: 3 live nodes plus 1 replacement, or a run of consecutive failures with `--availability-rounds` | 1,000 | 4 |
 | `latency` | Open-loop load at a series of target rates, and the latency of that load. See [the latency mode](#the-latency-mode). | 100,000 | 10 |
+| `scaling` | One continuous mixed read/write load across 9→10→9 nodes (or a grow/shrink only), with per-cohort verification. See [the scaling mode](#the-scaling-mode). | 100,000 | 10 |
 
 Every mode defaults to 128-byte values, concurrency 64, seed 1, 128 virtual
 nodes, and a 30-second operation deadline. The default ACK policy is
@@ -103,8 +104,63 @@ Availability mode also records:
 - failover publication time and first recovered read
 - sampled read-unavailability probes
 - acknowledged keys preserved or lost, including a just-acknowledged tail write
-  of at least 1 MiB
+  of `value_bytes`, or of the smaller of 1 MiB and the node's value limit when
+  `value_bytes` is below 1 MiB, never larger than the value limit the data
+  nodes were given
 - time from replacement to full RF
+
+### The availability rounds
+
+`--availability-rounds N` injects N consecutive owner failures. Every round
+
+1. picks the current owner of the probe key, which is the first key the first
+   member owns, and samples up to 128 keys that member owns,
+2. writes an identifiable value to the last sampled key, which is the last one
+   that is not the previous round's tail key so that this round's write cannot
+   overwrite the value the previous-tail check looks for, and kills the owner,
+3. waits for the automatic failover to publish a topology without it and for the
+   read probe to succeed again,
+4. writes a key outside the sampled key space and reads it back, which measures
+   when the cluster serves writes again,
+5. reads the sampled keys back, and the value the previous round wrote,
+6. joins a spare node, which is seeded like a scale-out node, and waits for the
+   full replication factor,
+7. records how evenly the live members, and the members that never failed, hold
+   the keys.
+
+The probe key's owner changes with every failover, so every round kills a node
+that has not failed yet. The run needs one spare node per round: the node
+count is the initial members plus the spares, so `--availability-rounds 3`
+alone starts with 3 members and 3 spares.
+
+The per-round records are in `availability_rounds`, one object per round. Each
+one holds the victim and its epoch, the time from the kill to the publication
+and to the first successful read, the time the first write after the failure
+took, the longest streak of failed read probes, the acknowledged keys that
+survived, whether the previous round's value survived, the time from the
+replacement to the full replication factor, the keys every live member owns,
+and the spread of those keys (`max_over_min`, `range_over_mean`,
+`max_over_mean_minus_one`, and `cv`).
+
+Two fields are `null` rather than a number when the run cannot name one:
+`previous_tail_survived` when the round had to reuse the previous round's tail
+key, so its own write replaced the value that check looks for, and
+`max_over_min` when a member holds no keys, which makes the ratio unbounded.
+`tail_bytes` is the size of the value the round wrote: `value_bytes` when that
+is larger than 1 MiB, and otherwise the smaller of 1 MiB and the node's value
+limit.
+
+The run's own figures describe its worst round: `failover_seconds` and
+`read_recovery_seconds` are the slowest round, `observed_unavailable_max_streak_ms`
+the longest streak of any round, and `unavailable_probe_count` the total of all
+rounds. `acknowledged_key_survival`, `replacement_to_full_rf_seconds`, and
+`failure_to_full_rf_seconds` describe the first round.
+
+`FirstSuccessor` guarantees that an acknowledged write survives the failure of
+one member. A run of failures is a stronger claim than that guarantee, so the
+runner only fails the run when the *first* round loses an acknowledged key.
+Later rounds report what they lost in `availability_acknowledged_lost_total`
+and in each round's own record.
 
 The `latency` mode records one measurement per target rate, and its own
 observations. See [the latency mode](#the-latency-mode).
@@ -346,6 +402,145 @@ fails it fails.
   answer different questions. The first is how fast a request goes when
   nothing else is happening; the second is how fast it goes when the cluster
   is at the rate the stage asked for.
+
+## The scaling mode
+
+`scaling` keeps a mixed read/write load running while membership changes. It
+exists to answer what happens to reads and writes *during* a scale, which the
+`correctness` mode does not: that mode mutates moving keys once and has no
+sustained GET load.
+
+The load has four cohorts, so every key's expected final state is known without
+a read/write race:
+
+| Cohort | Before | During | Checked after |
+| --- | --- | --- | --- |
+| `read` | `v0` | GET only | still `v0` |
+| `rewrite` | `v0` | one PUT to `v1` | `v1` |
+| `write_new` | absent | one PUT to `v1` | `v1` |
+| `delete` | `v0` | one DELETE | absent |
+
+Reads are unpaced and use `--key-distribution`. Writes and deletes are paced at
+`--scaling-write-rate` operations per second, split 60/25/15 across rewrite,
+fresh write, and delete, and the pools are sized from
+`--scaling-pool-seconds`. A pool that empties before the last transition
+completes makes the run invalid rather than changing the mix halfway through.
+The split is whole operations per second, so the cohorts together offer
+slightly less than the configured rate when the shares do not divide it:
+`scaling_pool_plan.write_rate` is the configured rate and
+`scaling_pool_plan.cohort_write_rates` is the rounded rate each cohort
+actually got. A rate that rounds the smallest share down to zero leaves a
+cohort without a key, so it is rejected when the configuration is checked.
+
+`--scaling-scenario` picks the change:
+
+- `round-trip` (default): grow by one node, then shrink back, in one cluster
+  and one uninterrupted load.
+- `grow`: one scale-out.
+- `shrink`: one scale-in, starting with every peak node.
+- `replace`: swap the last initial member for one spare peak member, keeping
+  the member count. This always copies ranges and starts one extra process.
+- `churn`: grow by three nodes at once, then shrink back, so multiple ranges
+  move in each change.
+- `control`: change no membership and measure the same load for
+  `--scaling-post-seconds` after the warmup. This is the S0 baseline for a
+  round-trip run.
+
+`--scaling-load-mode` selects how the load is offered. `closed` (the default)
+runs `--concurrency` read workers and paced write workers. `open` offers a
+total of `--scaling-open-rate` operations per second: 80% GET, 12% rewrite,
+5% fresh write, and 3% delete. A request that cannot be sent within
+`--max-in-flight` is dropped and counted as `late`, and its latency starts at
+the time it was due. The per-second `metrics_sampled` events report `issued`,
+`late`, and `in_flight` alongside the phase, and the summary has their totals.
+An open-loop run does not use `--scaling-write-rate`, so
+`scaling_pool_plan.write_rate` is `null` there and
+`scaling_pool_plan.cohort_write_rates` reports the shares the open rate was
+split into.
+
+The runner starts with `--initial-nodes` (default: peak - 1 for grow,
+round-trip, and replace; peak for shrink and control; peak - 3 for churn),
+warms up for `--warmup-seconds`, stages the change, starts any new node,
+executes the change, polls its phases, waits for the target epoch to reach
+full replication, and keeps the load running for `--scaling-post-seconds`. It
+then stops that transition's write cohorts, drains those writes, and verifies
+the cohorts before the next transition. Reads continue across the whole run,
+so the local drain waits for the write batches only; the final drain after the
+read senders stop waits for everything.
+`--pre-publish-delay-ms` defaults to 0 here, because the delay runs after
+writes are paused and would be measured as migration latency.
+
+A successful write or delete is followed by a GET of the same key, and keys
+changed before publication are read again after it. Those probe GETs have
+their own metrics and are not mixed into the main GET histogram.
+
+`summary.json` holds one `<label>_transition` measurement and observation per
+change: `published_ms` and `complete_ms` from the start of the change,
+`full_rf_seconds` from `Complete` to the target epoch reaching full
+replication, `stop_window`, `migration`, retries by reason, pool sizes, touched
+strata, the direct-merge flag, and the coordinator's `work_steps_ms`. The work steps are
+`snapshot_copy_ms`, `changelog_replay_ms`, `pause_writes_ms`, `verify_ms`,
+`publish_ms`, `activation_ms`, `merge_proof_ms`, and `catch_up_ms`.
+`snapshot_copy_ms` and `changelog_replay_ms` are sums over ranges, so either
+can exceed the wall-clock phase it ran in; they do not overlap, because a
+range's snapshot copy stops before its changelog replay starts. The other
+fields are wall-clock costs. `publish_ms` covers the publication work (the
+destination checks and the state lock) but not the diagnostic
+`pre_publish_delay` and not the durable write that carries it, and
+`activation_ms` covers the activation barrier and the target installation but
+not source cleanup or stopping removed members. It also excludes the later
+`wait_for_full_rf` convergence, which `full_rf_seconds` reports separately.
+The publication and the activation are written with the phase they belong to:
+`publish_ms` is stored with `Published`, and `activation_ms` with `CleaningUp`
+and `Complete`. Completed steps before publication are persisted when they
+finish, together with any phase change at that boundary, so status reads and
+aborted changes retain the work already measured.
+An interrupted attempt keeps those timings while cleanup is pending; starting
+a fresh copy attempt clears them. Every one of those writes is a single
+durable write, so a repeated `execute-change`, a `change-status` read, and a
+restarted coordinator all see what the first `execute-change` returned.
+
+`published_ms_source` says where `published_ms` came from. It is `observed`
+when the runner saw the change publish, and `completion_fallback` when a short
+change went from `Verifying` to `Complete` between two polls: the probe still
+runs, but the earliest moment that can be named is the completion, and
+`published_ms` then equals `complete_ms`.
+
+Every change also gets `scaling_after_publish_probes`: the number of probes and
+the keys each one verified. Only a matching value or an expected absence counts;
+a wrong value, an unexpected absence, or a failed GET fails the probe and the
+run, even if a later verification succeeds. A probe with nothing to read is
+not evidence, so a change whose publish window held no successful write to a
+moved stratum fails the run rather than passing without the read-after-publish
+check.
+
+`migration` is the plan's migration volume: `keys` and `keys_moved` compare
+the base and target topologies key by key, `rate` is their quotient, `ranges`
+is how many ranges the coordinator moved, and `snapshot_records` is how many
+records the copy path actually carried. A direct merge moves keys without
+creating ranges, so it reports zero ranges and zero records.
+
+`stop_window` is what the client saw rather than the phase timeline. During a
+change the runner samples the client's cumulative `RangeBusy` count and
+successful write count every 5 ms. Each successful write also records the
+rejection count it observed at completion, so a success before a rejection
+cannot close the window merely because both occurred in the same poll.
+The runner reports `first_range_busy_ms`,
+`last_range_busy_ms`, `first_write_ok_ms`, `observed_ms`, and `poll_ms`. A
+node only fences a range when it receives the command, so the phase boundary
+is not the stop; a transition with no rejection leaves the window empty.
+
+`observations.scaling_metrics` holds the per-phase operation and latency
+totals, and `events.jsonl` holds one `metrics_sampled` event per second plus
+the phase transitions. The full
+protocol, cohorts, and pass criteria are in
+[scaling-under-load.md](scaling-under-load.md).
+
+The mode runs every process on one host and is a local measurement, not a
+service-level guarantee. `--require-clean-source` marks a formal run.
+`scripts/scaling-matrix.sh` runs the formal groups (main, S0 control,
+250 ms diagnostic, FirstSuccessor policy, open loop, and optionally replace
+and churn) with a fresh output directory per repetition.
 
 ## Diagnostics and profiling
 

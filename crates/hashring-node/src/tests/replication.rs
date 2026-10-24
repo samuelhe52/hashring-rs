@@ -7,7 +7,7 @@ async fn followers_accept_cluster_values_above_their_local_write_limit() {
     let mut service = service_for("node-2", topology.clone());
     service.max_value_bytes = 8;
     let value = b"larger-than-eight";
-    let entry = replication_entry(&topology, key.clone(), 1, 1, value, false, None);
+    let entry = replication_entry(&topology, key.clone(), (1, 1), value, false, None);
     let applied = service
         .replicate_mutation(Request::new(entry))
         .await
@@ -20,7 +20,7 @@ async fn followers_accept_cluster_values_above_their_local_write_limit() {
             .as_ref(),
         value
     );
-    let next = replication_entry(&topology, key, 2, 2, b"next", false, None);
+    let next = replication_entry(&topology, key, (2, 2), b"next", false, None);
     let applied = service
         .replicate_mutation(Request::new(next))
         .await
@@ -73,7 +73,7 @@ async fn follower_applies_only_contiguous_authorized_replication() {
     let topology = replication_topology(3);
     let key = key_with_placement(&topology, |replicas| replicas[1..].contains(&"node-2"));
     let service = service_for("node-2", topology.clone());
-    let put = replication_entry(&topology, key.clone(), 1, 10, b"value", false, None);
+    let put = replication_entry(&topology, key.clone(), (1, 10), b"value", false, None);
 
     let applied = service
         .replicate_mutation(Request::new(put.clone()))
@@ -115,7 +115,7 @@ async fn follower_applies_only_contiguous_authorized_replication() {
         tonic::Code::AlreadyExists
     );
 
-    let gap = replication_entry(&topology, key.clone(), 3, 12, b"later", false, None);
+    let gap = replication_entry(&topology, key.clone(), (3, 12), b"later", false, None);
     assert_eq!(
         service
             .replicate_mutation(Request::new(gap))
@@ -124,7 +124,7 @@ async fn follower_applies_only_contiguous_authorized_replication() {
             .code(),
         tonic::Code::Aborted
     );
-    let stale_version = replication_entry(&topology, key.clone(), 2, 10, b"later", false, None);
+    let stale_version = replication_entry(&topology, key.clone(), (2, 10), b"later", false, None);
     assert_eq!(
         service
             .replicate_mutation(Request::new(stale_version))
@@ -134,7 +134,7 @@ async fn follower_applies_only_contiguous_authorized_replication() {
         tonic::Code::FailedPrecondition
     );
 
-    let delete = replication_entry(&topology, key.clone(), 2, 11, b"", true, None);
+    let delete = replication_entry(&topology, key.clone(), (2, 11), b"", true, None);
     let applied = service
         .replicate_mutation(Request::new(delete))
         .await
@@ -150,9 +150,9 @@ async fn follower_applies_a_replication_batch_in_order() {
     let key = key_with_placement(&topology, |replicas| replicas[1..].contains(&"node-2"));
     let service = service_for("node-2", topology.clone());
     let entries = vec![
-        replication_entry(&topology, key.clone(), 1, 10, b"one", false, None),
-        replication_entry(&topology, key.clone(), 2, 11, b"two", false, None),
-        replication_entry(&topology, key.clone(), 3, 12, b"", true, None),
+        replication_entry(&topology, key.clone(), (1, 10), b"one", false, None),
+        replication_entry(&topology, key.clone(), (2, 11), b"two", false, None),
+        replication_entry(&topology, key.clone(), (3, 12), b"", true, None),
     ];
     let applied = service
         .replicate_mutations(Request::new(ReplicationBatch { entries }))
@@ -178,8 +178,8 @@ async fn replication_batch_acknowledges_prefix_before_a_gap() {
     let topology = replication_topology(3);
     let key = key_with_placement(&topology, |replicas| replicas[1..].contains(&"node-2"));
     let service = service_for("node-2", topology.clone());
-    let first = replication_entry(&topology, key.clone(), 1, 10, b"one", false, None);
-    let gap = replication_entry(&topology, key.clone(), 3, 11, b"three", false, None);
+    let first = replication_entry(&topology, key.clone(), (1, 10), b"one", false, None);
+    let gap = replication_entry(&topology, key.clone(), (3, 11), b"three", false, None);
     // Replay also returns the applied prefix; the failing suffix alone still errors.
     for _ in 0..2 {
         let response = service
@@ -281,7 +281,7 @@ async fn full_stream_checkpoint_repairs_a_gap_without_replaying_old_entries() {
     let key = key_with_placement(&topology, |replicas| {
         replicas[0] == "node-1" && replicas.contains(&"node-2")
     });
-    let old = replication_entry(&topology, key.clone(), 1, 1, b"stale", false, None);
+    let old = replication_entry(&topology, key.clone(), (1, 1), b"stale", false, None);
     assert_eq!(
         follower
             .replicate_mutation(Request::new(old))
@@ -299,7 +299,7 @@ async fn full_stream_checkpoint_repairs_a_gap_without_replaying_old_entries() {
             .records
             .contains_key(key.as_slice())
     );
-    let gap = replication_entry(&topology, key.clone(), 7, 7, b"gap", false, None);
+    let gap = replication_entry(&topology, key.clone(), (7, 7), b"gap", false, None);
     assert_eq!(
         follower
             .replicate_mutation(Request::new(gap))
@@ -308,7 +308,7 @@ async fn full_stream_checkpoint_repairs_a_gap_without_replaying_old_entries() {
             .code(),
         tonic::Code::Aborted
     );
-    let next = replication_entry(&topology, key.clone(), 6, 6, b"current", false, None);
+    let next = replication_entry(&topology, key.clone(), (6, 6), b"current", false, None);
     follower
         .replicate_mutation(Request::new(next))
         .await
@@ -330,7 +330,14 @@ async fn follower_rejects_stale_wrong_owner_and_out_of_coverage_entries() {
     let outside_key = key_with_placement(&topology, |replicas| !replicas.contains(&"node-2"));
     let service = service_for("node-2", topology.clone());
 
-    let mut stale = replication_entry(&topology, follower_key.clone(), 1, 1, b"value", false, None);
+    let mut stale = replication_entry(
+        &topology,
+        follower_key.clone(),
+        (1, 1),
+        b"value",
+        false,
+        None,
+    );
     stale.topology_epoch = 0;
     stale.version.as_mut().unwrap().topology_epoch = 0;
     assert_eq!(
@@ -342,8 +349,14 @@ async fn follower_rejects_stale_wrong_owner_and_out_of_coverage_entries() {
         tonic::Code::FailedPrecondition
     );
 
-    let mut oversized_id =
-        replication_entry(&topology, follower_key.clone(), 1, 1, b"value", false, None);
+    let mut oversized_id = replication_entry(
+        &topology,
+        follower_key.clone(),
+        (1, 1),
+        b"value",
+        false,
+        None,
+    );
     oversized_id.mutation_id = "x".repeat(MAX_MUTATION_ID_BYTES + 1);
     assert_eq!(
         service
@@ -354,8 +367,14 @@ async fn follower_rejects_stale_wrong_owner_and_out_of_coverage_entries() {
         tonic::Code::InvalidArgument
     );
 
-    let mut wrong_owner =
-        replication_entry(&topology, follower_key.clone(), 1, 1, b"value", false, None);
+    let mut wrong_owner = replication_entry(
+        &topology,
+        follower_key.clone(),
+        (1, 1),
+        b"value",
+        false,
+        None,
+    );
     let incorrect_node_id = topology
         .members
         .iter()
@@ -374,7 +393,14 @@ async fn follower_rejects_stale_wrong_owner_and_out_of_coverage_entries() {
         tonic::Code::FailedPrecondition
     );
 
-    let outside = replication_entry(&topology, outside_key.clone(), 1, 1, b"value", false, None);
+    let outside = replication_entry(
+        &topology,
+        outside_key.clone(),
+        (1, 1),
+        b"value",
+        false,
+        None,
+    );
     assert_eq!(
         service
             .replicate_mutation(Request::new(outside))
@@ -572,30 +598,34 @@ fn owner_assigns_independent_contiguous_sequences_per_follower() {
     let token = state.topology.key_token(&key);
     let first = prepare_replication_entries(
         &mut state,
-        &key,
-        &value_record(b"one", &version),
-        [1; 32],
-        "mutation-1".into(),
-        token,
-        DEFAULT_MAX_PENDING_REPLICATION_BYTES,
-        &[],
+        ReplicationWrite {
+            key: &key,
+            record: &value_record(b"one", &version),
+            request_fingerprint: [1; 32],
+            mutation_id: "mutation-1".into(),
+            token,
+            max_pending_bytes: DEFAULT_MAX_PENDING_REPLICATION_BYTES,
+            ack_awaited_followers: &[],
+        },
     )
     .unwrap();
     let second = prepare_replication_entries(
         &mut state,
-        &key,
-        &value_record(
-            b"two",
-            &RecordVersion {
-                owner_sequence: 2,
-                ..version
-            },
-        ),
-        [2; 32],
-        "mutation-2".into(),
-        token,
-        DEFAULT_MAX_PENDING_REPLICATION_BYTES,
-        &[],
+        ReplicationWrite {
+            key: &key,
+            record: &value_record(
+                b"two",
+                &RecordVersion {
+                    owner_sequence: 2,
+                    ..version
+                },
+            ),
+            request_fingerprint: [2; 32],
+            mutation_id: "mutation-2".into(),
+            token,
+            max_pending_bytes: DEFAULT_MAX_PENDING_REPLICATION_BYTES,
+            ack_awaited_followers: &[],
+        },
     )
     .unwrap();
 
@@ -1064,7 +1094,7 @@ async fn older_replicated_delete_cannot_erase_newer_seeded_value() {
         },
     );
 
-    let delete = replication_entry(&topology, key.clone(), 1, 10, b"", true, None);
+    let delete = replication_entry(&topology, key.clone(), (1, 10), b"", true, None);
     service
         .replicate_mutation(Request::new(delete))
         .await
@@ -1533,13 +1563,13 @@ async fn unreachable_streams_do_not_copy_unbudgeted_payloads() {
     });
     let bytes = replication_mutation_bytes(&mutation);
     let retained = Arc::new(Semaphore::new(DEFAULT_MAX_PENDING_REPLICATION_BYTES));
-    let budget = Arc::new(ReplicationBudget(
-        retained
+    let budget = Arc::new(ReplicationBudget {
+        _permit: retained
             .clone()
             .acquire_many_owned(bytes as u32)
             .await
             .unwrap(),
-    ));
+    });
     let active = Arc::new(Semaphore::new(DEFAULT_MAX_PENDING_REPLICATION_BYTES));
     let failed = Arc::new(StdMutex::new(HashSet::new()));
     let before = rss_kib();
@@ -1561,14 +1591,16 @@ async fn unreachable_streams_do_not_copy_unbudgeted_payloads() {
             .await
             .unwrap();
         tasks.push(tokio::spawn(deliver_replication_stream(
-            service.state.clone(),
-            failed.clone(),
-            active.clone(),
-            DEFAULT_REPLICATION_RPC_TIMEOUT,
-            std::time::Duration::ZERO,
-            service.pressure.clone(),
-            (1, "node-1".into(), follower),
-            receiver,
+            ReplicationStream {
+                state: service.state.clone(),
+                failed_streams: failed.clone(),
+                active_rpc_budget: active.clone(),
+                rpc_timeout: DEFAULT_REPLICATION_RPC_TIMEOUT,
+                batch_linger: std::time::Duration::ZERO,
+                pressure: service.pressure.clone(),
+                stream_key: (1, "node-1".into(), follower),
+                entries: receiver,
+            },
         )));
     }
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1625,13 +1657,15 @@ async fn delivery_publishes_partial_ack_and_retries_suffix_after_capacity_return
         let token = topology.key_token(&key);
         let prepared = prepare_replication_entries(
             &mut state,
-            &key,
-            &value_record(&[sequence as u8], &version),
-            [sequence as u8; 32],
-            format!("mutation-{sequence}"),
-            token,
-            DEFAULT_MAX_PENDING_REPLICATION_BYTES,
-            &[],
+            ReplicationWrite {
+                key: &key,
+                record: &value_record(&[sequence as u8], &version),
+                request_fingerprint: [sequence as u8; 32],
+                mutation_id: format!("mutation-{sequence}"),
+                token,
+                max_pending_bytes: DEFAULT_MAX_PENDING_REPLICATION_BYTES,
+                ack_awaited_followers: &[],
+            },
         )
         .unwrap()
         .pop()
@@ -1640,13 +1674,13 @@ async fn delivery_publishes_partial_ack_and_retries_suffix_after_capacity_return
         sender
             .send(PendingReplication {
                 prepared,
-                _budget: Arc::new(ReplicationBudget(
-                    retained
+                _budget: Arc::new(ReplicationBudget {
+                    _permit: retained
                         .clone()
                         .acquire_many_owned(bytes as u32)
                         .await
                         .unwrap(),
-                )),
+                }),
             })
             .await
             .unwrap();
@@ -1660,16 +1694,16 @@ async fn delivery_publishes_partial_ack_and_retries_suffix_after_capacity_return
     drop(sender);
     let failed = Arc::new(StdMutex::new(HashSet::new()));
     let active = Arc::new(Semaphore::new(DEFAULT_MAX_PENDING_REPLICATION_BYTES));
-    let delivery = tokio::spawn(deliver_replication_stream(
-        owner.state.clone(),
-        failed.clone(),
-        active.clone(),
-        DEFAULT_REPLICATION_RPC_TIMEOUT,
-        std::time::Duration::ZERO,
-        owner.pressure.clone(),
-        (topology.epoch, "node-1".into(), "node-2".into()),
-        receiver,
-    ));
+    let delivery = tokio::spawn(deliver_replication_stream(ReplicationStream {
+        state: owner.state.clone(),
+        failed_streams: failed.clone(),
+        active_rpc_budget: active.clone(),
+        rpc_timeout: DEFAULT_REPLICATION_RPC_TIMEOUT,
+        batch_linger: std::time::Duration::ZERO,
+        pressure: owner.pressure.clone(),
+        stream_key: (topology.epoch, "node-1".into(), "node-2".into()),
+        entries: receiver,
+    }));
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
             if *progress.borrow_and_update() == 1 {
@@ -1760,7 +1794,7 @@ async fn linger_test_entry(sequence: u64, ack_awaited: bool) -> PendingReplicati
             mutation,
             ack_awaited,
         },
-        _budget: Arc::new(ReplicationBudget(budget)),
+        _budget: Arc::new(ReplicationBudget { _permit: budget }),
     }
 }
 

@@ -6,7 +6,12 @@ use thiserror::Error;
 use crate::topology::{Member, TopologyConfig, TopologyError, TopologySnapshot, WriteAckPolicy};
 
 pub const MAX_MIGRATION_RANGES: usize = 16_384;
-pub const MAX_REPLICA_OBLIGATIONS: usize = 16_384;
+/// The ceiling on follower obligations, which is roughly
+/// `members * virtual_nodes * (replication_factor - 1)`. The ring allows up to
+/// [`crate::topology::MAX_VIRTUAL_NODES`] (4096) per member, so a ten-member
+/// RF=3 cluster needs 81,920; the ceiling leaves room above that rather than
+/// rejecting a legal topology.
+pub const MAX_REPLICA_OBLIGATIONS: usize = 131_072;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum MigrationPhase {
@@ -45,7 +50,27 @@ pub struct RangeMigration {
     pub source_cleaned: bool,
     pub snapshot_records: u64,
     pub changelog_watermark: u64,
+    /// Time this range spent replaying its changelog, summed over every
+    /// replay.
+    pub changelog_replay_ms: u64,
     pub verified: bool,
+}
+
+/// The coordinator's work-step durations for one topology change, in
+/// milliseconds. Range work is concurrent, so `snapshot_copy_ms` and
+/// `changelog_replay_ms` are sums over ranges and can exceed the wall-clock
+/// phase they ran in. The two do not overlap: a range's snapshot copy stops
+/// before its changelog replay starts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MigrationTimings {
+    pub snapshot_copy_ms: u64,
+    pub changelog_replay_ms: u64,
+    pub pause_writes_ms: u64,
+    pub verify_ms: u64,
+    pub publish_ms: u64,
+    pub activation_ms: u64,
+    pub merge_proof_ms: u64,
+    pub catch_up_ms: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -73,6 +98,7 @@ pub struct TopologyChange {
     pub failed_node_id: Option<String>,
     pub activation_ready: bool,
     pub direct_merge: bool,
+    pub timings: MigrationTimings,
 }
 
 #[derive(Debug, Error)]
@@ -163,6 +189,7 @@ impl TopologyChange {
             failed_node_id: None,
             activation_ready: false,
             direct_merge: false,
+            timings: MigrationTimings::default(),
         })
     }
 }
@@ -219,6 +246,7 @@ pub fn topology_delta(
                 source_cleaned: false,
                 snapshot_records: 0,
                 changelog_watermark: 0,
+                changelog_replay_ms: 0,
                 verified: false,
             });
         }
@@ -310,7 +338,38 @@ impl From<&RangeMigration> for crate::proto::RangeMigration {
             source_cleaned: range.source_cleaned,
             snapshot_records: range.snapshot_records,
             changelog_watermark: range.changelog_watermark,
+            changelog_replay_ms: range.changelog_replay_ms,
             verified: range.verified,
+        }
+    }
+}
+
+impl From<&MigrationTimings> for crate::proto::MigrationTimings {
+    fn from(timings: &MigrationTimings) -> Self {
+        Self {
+            snapshot_copy_ms: timings.snapshot_copy_ms,
+            changelog_replay_ms: timings.changelog_replay_ms,
+            pause_writes_ms: timings.pause_writes_ms,
+            verify_ms: timings.verify_ms,
+            publish_ms: timings.publish_ms,
+            activation_ms: timings.activation_ms,
+            merge_proof_ms: timings.merge_proof_ms,
+            catch_up_ms: timings.catch_up_ms,
+        }
+    }
+}
+
+impl From<crate::proto::MigrationTimings> for MigrationTimings {
+    fn from(timings: crate::proto::MigrationTimings) -> Self {
+        Self {
+            snapshot_copy_ms: timings.snapshot_copy_ms,
+            changelog_replay_ms: timings.changelog_replay_ms,
+            pause_writes_ms: timings.pause_writes_ms,
+            verify_ms: timings.verify_ms,
+            publish_ms: timings.publish_ms,
+            activation_ms: timings.activation_ms,
+            merge_proof_ms: timings.merge_proof_ms,
+            catch_up_ms: timings.catch_up_ms,
         }
     }
 }
@@ -352,6 +411,7 @@ impl From<crate::proto::RangeMigration> for RangeMigration {
             source_cleaned: range.source_cleaned,
             snapshot_records: range.snapshot_records,
             changelog_watermark: range.changelog_watermark,
+            changelog_replay_ms: range.changelog_replay_ms,
             verified: range.verified,
         }
     }
@@ -374,6 +434,7 @@ impl From<&TopologyChange> for crate::proto::TopologyChangeSnapshot {
             failed_node_id: change.failed_node_id.clone().unwrap_or_default(),
             activation_ready: change.activation_ready,
             direct_merge: change.direct_merge,
+            timings: Some((&change.timings).into()),
         }
     }
 }
@@ -405,6 +466,7 @@ impl TryFrom<crate::proto::TopologyChangeSnapshot> for TopologyChange {
             failed_node_id: (!change.failed_node_id.is_empty()).then_some(change.failed_node_id),
             activation_ready: change.activation_ready,
             direct_merge: change.direct_merge,
+            timings: change.timings.map(Into::into).unwrap_or_default(),
         })
     }
 }

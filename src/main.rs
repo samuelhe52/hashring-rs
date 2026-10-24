@@ -18,7 +18,9 @@ use hashring_core::{
         WriteAvailabilityGuard,
     },
 };
-use hashring_experiment::{ExperimentConfig, ExperimentMode, run_experiment};
+use hashring_experiment::{
+    ExperimentConfig, ExperimentMode, ScalingLoadMode, ScalingScenario, run_experiment,
+};
 use hashring_node::DataNodeService;
 use serde::Deserialize;
 use tonic::transport::Server;
@@ -377,6 +379,47 @@ enum ExperimentModeArg {
     Performance,
     Availability,
     Latency,
+    Scaling,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum ScalingScenarioArg {
+    RoundTrip,
+    Grow,
+    Shrink,
+    Replace,
+    Churn,
+    Control,
+}
+
+impl From<ScalingScenarioArg> for ScalingScenario {
+    fn from(scenario: ScalingScenarioArg) -> Self {
+        match scenario {
+            ScalingScenarioArg::RoundTrip => ScalingScenario::RoundTrip,
+            ScalingScenarioArg::Grow => ScalingScenario::Grow,
+            ScalingScenarioArg::Shrink => ScalingScenario::Shrink,
+            ScalingScenarioArg::Replace => ScalingScenario::Replace,
+            ScalingScenarioArg::Churn => ScalingScenario::Churn,
+            ScalingScenarioArg::Control => ScalingScenario::Control,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum ScalingLoadModeArg {
+    Closed,
+    Open,
+}
+
+impl From<ScalingLoadModeArg> for ScalingLoadMode {
+    fn from(mode: ScalingLoadModeArg) -> Self {
+        match mode {
+            ScalingLoadModeArg::Closed => ScalingLoadMode::Closed,
+            ScalingLoadModeArg::Open => ScalingLoadMode::Open,
+        }
+    }
 }
 
 impl From<ExperimentModeArg> for ExperimentMode {
@@ -386,6 +429,7 @@ impl From<ExperimentModeArg> for ExperimentMode {
             ExperimentModeArg::Performance => ExperimentMode::Performance,
             ExperimentModeArg::Availability => ExperimentMode::Availability,
             ExperimentModeArg::Latency => ExperimentMode::Latency,
+            ExperimentModeArg::Scaling => ExperimentMode::Scaling,
         }
     }
 }
@@ -406,11 +450,14 @@ struct ExperimentArgs {
     #[arg(long)]
     output: Option<PathBuf>,
     /// Peak node count. Correctness mode starts with one fewer node, then
-    /// scales out and in. [default: 4 for availability, 10 otherwise]
+    /// scales out and in. Availability mode starts with its rounds of spares
+    /// held back. Scaling replace needs one spare over the initial members.
+    /// [default: 3 + rounds for availability, 11 for a scaling replace, 10
+    /// otherwise]
     #[arg(long)]
     nodes: Option<usize>,
     /// Logical keys. [default: 20,000 for correctness, 1,000,000 for
-    /// performance, 1,000 for availability]
+    /// performance, 1,000 for availability, 100,000 for scaling]
     #[arg(long)]
     keys: Option<u64>,
     /// [default: 128]
@@ -510,6 +557,42 @@ struct ExperimentArgs {
     /// [default: 4096]
     #[arg(long)]
     max_in_flight: Option<usize>,
+    /// How many consecutive owner failures the availability mode injects.
+    /// Every round kills the current owner of the probe key, waits for the
+    /// failover, and then replaces it. The run needs one spare node per
+    /// round. [default: 1]
+    #[arg(long)]
+    availability_rounds: Option<u32>,
+    /// The membership change a scaling run performs: round-trip, grow,
+    /// shrink, replace, churn, or control. [default: round-trip]
+    #[arg(long, value_enum)]
+    scaling_scenario: Option<ScalingScenarioArg>,
+    /// How a scaling run offers its load: closed or open. [default: closed]
+    #[arg(long, value_enum)]
+    scaling_load_mode: Option<ScalingLoadModeArg>,
+    /// The total operation rate of an open-loop scaling run. The read share is
+    /// 80%, and writes are split across the rewrite, fresh-write, and delete
+    /// cohorts. Required for --scaling-load-mode open.
+    #[arg(long)]
+    scaling_open_rate: Option<u64>,
+    /// The nodes a scaling run starts with. [default: peak - 1 for a grow,
+    /// round trip, or replace, peak for a shrink or control, peak - 3 for a
+    /// churn]
+    #[arg(long)]
+    initial_nodes: Option<usize>,
+    /// The one-shot write and delete operations a closed-loop scaling run
+    /// offers per second. An open-loop run takes its write rates from
+    /// `--scaling-open-rate`. [default: 200]
+    #[arg(long)]
+    scaling_write_rate: Option<u64>,
+    /// How long the one-shot pools of one scaling transition must last.
+    /// [default: 120]
+    #[arg(long)]
+    scaling_pool_seconds: Option<u64>,
+    /// How long a scaling run keeps the load running after a change.
+    /// [default: 10]
+    #[arg(long)]
+    scaling_post_seconds: Option<u64>,
     /// Forwarded to every data node the run starts.
     #[command(flatten)]
     node_tuning: NodeTuningArgs,

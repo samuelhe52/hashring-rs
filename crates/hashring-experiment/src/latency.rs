@@ -531,11 +531,13 @@ impl LoadRunner {
             Arc::clone(&self.metrics),
             events.clone(),
             self.client.clone(),
-            stage.clone(),
-            warmup,
-            start,
-            end,
-            retries_before,
+            SampleWindow {
+                stage: stage.clone(),
+                warmup,
+                start,
+                end,
+                retries_before,
+            },
         ));
         let (issued, late, saturated_windows) = self.drive(stage, start, end).await?;
         // Empty warmup is allowed; an empty measured phase is invalid.
@@ -662,7 +664,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 
 /// Sleep until just before the absolute deadline, then spin. Adapt the margin
 /// to the kernel's last overshoot; Tokio's millisecond timer is too coarse.
-fn wait_until(due: Instant, margin: &mut Duration) {
+pub(super) fn wait_until(due: Instant, margin: &mut Duration) {
     let coarse = due.checked_sub(*margin).unwrap_or(due);
     let now = Instant::now();
     if coarse > now {
@@ -819,18 +821,29 @@ fn complete_errors(errors: &BTreeMap<String, u64>) -> BTreeMap<String, u64> {
     complete
 }
 
-/// Write one event per second, including warmup.
-#[allow(clippy::too_many_arguments)]
-async fn sample_windows(
-    metrics: Arc<Metrics>,
-    events: EventLog,
-    client: HashringClient,
+/// One stage's sampling timeline, including its warmup.
+struct SampleWindow {
     stage: StageSettings,
     warmup: bool,
     start: Instant,
     end: Instant,
     retries_before: u64,
+}
+
+/// Write one event per second, including warmup.
+async fn sample_windows(
+    metrics: Arc<Metrics>,
+    events: EventLog,
+    client: HashringClient,
+    window: SampleWindow,
 ) {
+    let SampleWindow {
+        stage,
+        warmup,
+        start,
+        end,
+        retries_before,
+    } = window;
     let mut window_start = start;
     let mut retries_seen = retries_before;
     while window_start < end {

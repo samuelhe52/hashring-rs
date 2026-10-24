@@ -151,12 +151,10 @@ fn key_with_placement(topology: &TopologySnapshot, predicate: impl Fn(&[&str]) -
         .expect("test topology should contain a matching placement")
 }
 
-#[allow(clippy::too_many_arguments)]
 fn replication_entry(
     topology: &TopologySnapshot,
     key: Vec<u8>,
-    stream_sequence: u64,
-    owner_sequence: u64,
+    (stream_sequence, owner_sequence): (u64, u64),
     value: &[u8],
     deleted: bool,
     expires_at_unix_millis: Option<u64>,

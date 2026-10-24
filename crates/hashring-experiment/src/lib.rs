@@ -26,14 +26,68 @@ use serde_json::{Value, json};
 use tonic::transport::Channel;
 
 mod latency;
+mod scaling;
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+/// The cluster a mode runs against and the outputs it fills in.
+pub(crate) struct RunContext<'a> {
+    pub config: &'a ExperimentConfig,
+    pub members: &'a [Member],
+    pub initial_count: usize,
+    pub ports: &'a [u16],
+    pub coordinator_endpoint: &'a str,
+    pub admin_client: &'a HashringClient,
+    pub workload_client: &'a HashringClient,
+    pub processes: &'a mut ProcessGroup,
+    pub events: &'a EventLog,
+    pub measurements: &'a mut BTreeMap<String, Measurement>,
+    pub observations: &'a mut BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExperimentMode {
     Correctness,
     Performance,
     Availability,
     Latency,
+    Scaling,
+}
+
+/// The membership change a `scaling` run performs.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScalingScenario {
+    /// Grow by one node, then shrink back, in one cluster and one load.
+    RoundTrip,
+    Grow,
+    Shrink,
+    /// Replace one node with another at the same member count.
+    Replace,
+    /// Grow by several nodes at once, then shrink back.
+    Churn,
+    /// Keep the topology unchanged and measure the load alone.
+    Control,
+}
+
+/// How a `scaling` run offers its load.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScalingLoadMode {
+    /// A fixed number of workers, each sending its next request when the
+    /// previous one returns.
+    Closed,
+    /// Requests due at fixed offsets from the start of the run. A request that
+    /// cannot be sent within `max_in_flight` is dropped and counted as late.
+    Open,
+}
+
+impl ScalingLoadMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Open => "open",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -81,8 +135,39 @@ pub struct ExperimentConfig {
     pub key_distribution: String,
     /// How many requests the `latency` mode may have in flight at once.
     pub max_in_flight: usize,
-    /// Forwarded to every data node the run starts.
+    /// How many consecutive owner failures the `availability` mode injects.
+    /// Every round kills the current owner of the probe key and then replaces
+    /// it, so the run needs one spare node per round.
+    pub availability_rounds: u32,
+    /// The membership change a `scaling` run performs.
+    pub scaling_scenario: ScalingScenario,
+    /// How a `scaling` run offers its load.
+    pub scaling_load_mode: ScalingLoadMode,
+    /// The total operation rate of an open-loop `scaling` run. Zero in closed
+    /// loop mode.
+    pub scaling_open_rate: u64,
+    /// The nodes a `scaling` run starts with. `None` derives it from the
+    /// scenario: one fewer than the peak for a grow or a round trip, the peak
+    /// for a shrink, and three fewer than the peak for a churn.
+    pub initial_nodes: Option<usize>,
+    /// The one-shot write and delete operations a `scaling` run offers per
+    /// second. Reads are not paced.
+    pub scaling_write_rate: u64,
+    /// How long the one-shot pools of one `scaling` transition must last.
+    pub scaling_pool_seconds: u64,
+    /// How long a `scaling` run keeps the load running after a change.
+    pub scaling_post_seconds: u64,
+    /// Forwarded to every data node.
     pub node: NodeOptions,
+}
+
+impl ExperimentConfig {
+    /// The members an `availability` run starts with, before it kills any.
+    /// `validate_config` guarantees the result is at least one.
+    pub fn availability_initial_members(&self) -> usize {
+        self.node_count
+            .saturating_sub(self.availability_rounds as usize)
+    }
 }
 
 /// The `node` command's tuning flags, in their flag units.
@@ -461,7 +546,7 @@ pub async fn run_experiment(
         runtime_tree_hash.as_deref(),
     );
     let manifest = ExperimentManifest {
-        schema_version: 8,
+        schema_version: 9,
         started_unix_ms: unix_ms(),
         executable_path: executable.display().to_string(),
         executable_blake3: file_digest(&executable)?,
@@ -580,7 +665,19 @@ async fn run_cluster(
     let initial_count = match config.mode {
         ExperimentMode::Correctness => config.node_count - 1,
         ExperimentMode::Performance | ExperimentMode::Latency => config.node_count,
-        ExperimentMode::Availability => 3,
+        // The availability mode starts with every node but the spares it
+        // needs to replace the nodes it kills.
+        ExperimentMode::Availability => config.availability_initial_members(),
+        ExperimentMode::Scaling => {
+            config
+                .initial_nodes
+                .unwrap_or_else(|| match config.scaling_scenario {
+                    ScalingScenario::Shrink | ScalingScenario::Control => config.node_count,
+                    ScalingScenario::Grow | ScalingScenario::RoundTrip => config.node_count - 1,
+                    ScalingScenario::Replace => config.node_count - 1,
+                    ScalingScenario::Churn => config.node_count.saturating_sub(3),
+                })
+        }
     };
     let initial_members = &members[..initial_count];
     let mut processes =
@@ -814,33 +911,29 @@ async fn run_cluster(
         }),
     )?;
 
-    if matches!(config.mode, ExperimentMode::Availability) {
-        return run_availability(
+    {
+        let context = RunContext {
             config,
-            &members,
-            &ports,
-            &coordinator_endpoint,
-            &admin_client,
-            &mut processes,
+            members: &members,
+            initial_count,
+            ports: &ports,
+            coordinator_endpoint: &coordinator_endpoint,
+            admin_client: &admin_client,
+            workload_client: &workload_client,
+            processes: &mut processes,
             events,
             measurements,
             observations,
-        )
-        .await;
-    }
-
-    if matches!(config.mode, ExperimentMode::Latency) {
-        return run_latency(
-            config,
-            &members,
-            &admin_client,
-            &workload_client,
-            &mut processes,
-            events,
-            measurements,
-            observations,
-        )
-        .await;
+        };
+        if matches!(context.config.mode, ExperimentMode::Availability) {
+            return run_availability(context).await;
+        }
+        if matches!(context.config.mode, ExperimentMode::Latency) {
+            return run_latency(context).await;
+        }
+        if matches!(context.config.mode, ExperimentMode::Scaling) {
+            return scaling::run(context).await;
+        }
     }
 
     if matches!(config.mode, ExperimentMode::Correctness) {
@@ -1080,18 +1173,139 @@ async fn wait_for_full_rf(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_availability(
-    config: &ExperimentConfig,
-    members: &[Member],
-    ports: &[u16],
-    coordinator_endpoint: &str,
-    admin_client: &HashringClient,
-    processes: &mut ProcessGroup,
-    events: &EventLog,
-    measurements: &mut BTreeMap<String, Measurement>,
-    observations: &mut BTreeMap<String, Value>,
-) -> Result<u64> {
+/// One injected failure and everything the run measured about it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AvailabilityRound {
+    /// The round's number, starting at 1.
+    pub round: u32,
+    /// The node the round killed.
+    pub victim: String,
+    /// The committed epoch the victim owned when it was killed.
+    pub victim_epoch: u64,
+    /// The seconds from the kill to the failover's publication.
+    pub kill_to_publish_seconds: f64,
+    /// The seconds from the kill to the first successful read.
+    pub read_recovery_seconds: f64,
+    /// The seconds the first write after the failover took, or None when the
+    /// write did not succeed.
+    pub write_recovery_seconds: Option<f64>,
+    /// The longest run of consecutive failed read probes.
+    pub observed_unavailable_max_streak_ms: u128,
+    /// The read probes that failed.
+    pub unavailable_probe_count: u64,
+    /// The milliseconds between the tail write's acknowledgement and the kill.
+    pub tail_ack_to_kill_ms: u128,
+    /// The key whose just-acknowledged value the round watches.
+    pub tail_key: u64,
+    /// The size of that value in bytes.
+    pub tail_bytes: usize,
+    /// The seconds the tail write took.
+    pub tail_put_seconds: f64,
+    /// The sampled keys that survived the failure, and the ones that did not.
+    pub acknowledged_key_survival: Value,
+    /// Whether the previous round's tail value is still readable.
+    pub previous_tail_survived: Option<bool>,
+    /// The seconds from the replacement's start to the full replication factor.
+    pub replacement_to_full_rf_seconds: f64,
+    /// The seconds from the kill to the full replication factor.
+    pub failure_to_full_rf_seconds: f64,
+    /// The live members at the end of the round.
+    pub live_members: Vec<String>,
+    /// The keys each live member owns.
+    pub owned_keys: BTreeMap<String, u64>,
+    /// How evenly the keys were spread over the live members.
+    pub balance: KeyBalance,
+    /// The members that never failed, when there are any.
+    pub survivors: Vec<String>,
+    /// The keys each surviving member owns.
+    pub survivor_owned_keys: BTreeMap<String, u64>,
+    /// How evenly the keys were spread over the surviving members.
+    pub survivor_balance: Option<KeyBalance>,
+}
+
+/// How evenly a set of keys was spread over a set of nodes.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+pub struct KeyBalance {
+    /// The number of nodes the keys were spread over.
+    pub nodes: usize,
+    /// The largest share divided by the smallest one. When a node holds no
+    /// keys the ratio is unbounded, and this is `f64::INFINITY`; JSON has no
+    /// infinity, so it is written as `null` there.
+    pub max_over_min: f64,
+    /// The largest share minus the smallest one, divided by the mean.
+    pub range_over_mean: f64,
+    /// The largest share divided by the mean, minus one.
+    pub max_over_mean_minus_one: f64,
+    /// The standard deviation of the shares divided by the mean.
+    pub cv: f64,
+}
+
+impl KeyBalance {
+    /// The spread of the given shares. An empty set has no spread.
+    fn of(shares: &[f64]) -> Self {
+        if shares.is_empty() {
+            return Self::default();
+        }
+        let mean = shares.iter().sum::<f64>() / shares.len() as f64;
+        let max = shares.iter().copied().fold(f64::MIN, f64::max);
+        let min = shares.iter().copied().fold(f64::MAX, f64::min);
+        // A node with no keys makes the ratio unbounded. Reporting 0 would
+        // read as perfect balance.
+        let max_over_min = if min > 0.0 {
+            max / min
+        } else if max > 0.0 {
+            f64::INFINITY
+        } else {
+            1.0
+        };
+        Self {
+            nodes: shares.len(),
+            max_over_min,
+            range_over_mean: if mean > 0.0 { (max - min) / mean } else { 0.0 },
+            max_over_mean_minus_one: if mean > 0.0 { max / mean - 1.0 } else { 0.0 },
+            cv: coefficient_of_variation(shares),
+        }
+    }
+}
+
+/// The keys a set of members owns, and how evenly they hold them.
+fn owned_key_balance(
+    topology: &TopologySnapshot,
+    key_space: u64,
+    only: Option<&[String]>,
+) -> (BTreeMap<String, u64>, KeyBalance) {
+    let counts = owned_key_counts(topology, key_space);
+    let counts: BTreeMap<String, u64> = match only {
+        Some(members) => counts
+            .into_iter()
+            .filter(|(node, _)| members.contains(node))
+            .collect(),
+        None => counts,
+    };
+    let shares: Vec<f64> = counts.values().map(|count| *count as f64).collect();
+    let balance = KeyBalance::of(&shares);
+    (counts, balance)
+}
+
+async fn run_availability(context: RunContext<'_>) -> Result<u64> {
+    let RunContext {
+        config,
+        members,
+        ports,
+        coordinator_endpoint,
+        admin_client,
+        processes,
+        events,
+        measurements,
+        observations,
+        ..
+    } = context;
+    let rounds = config.availability_rounds.max(1) as usize;
+    let initial_count = members.len().saturating_sub(rounds);
+    ensure!(
+        initial_count >= 1,
+        "the availability mode needs at least one initial member"
+    );
     let topology = admin_client.refresh_topology().await?;
     let owner_keys: Vec<_> = (0..config.key_count)
         .filter(|key| {
@@ -1109,210 +1323,485 @@ async fn run_availability(
         "failover_sample_selected",
         json!({ "owner": members[0].node_id, "keys": owner_keys }),
     )?;
+    // The probe key decides which node each round kills: its owner changes
+    // with every failover, so every round kills a node that has not failed
+    // yet.
+    let probe_key = owner_keys[0];
 
-    // An identifiable, just-acknowledged tail makes OwnerOnly loss observable
-    // when it occurs; zero loss in one run is not a durability guarantee.
-    let tail_key = *owner_keys.last().expect("nonempty sample was checked");
-    let tail_bytes = config
-        .value_bytes
-        .clamp(1024 * 1024, config.node.max_value_bytes);
-    let tail_value = deterministic_value(tail_key, 1, tail_bytes);
-    let tail_put_started = Instant::now();
-    let writer =
-        HashringClient::connect(coordinator_endpoint.to_owned(), Duration::from_secs(10)).await?;
-    writer
-        .put(tail_key.to_be_bytes().to_vec(), tail_value.clone())
-        .await?;
-    let tail_put_seconds = tail_put_started.elapsed().as_secs_f64();
-    let tail_ack_at = Instant::now();
-    let failed_at = Instant::now();
-    let (exit, kill_signalled_at) = processes.kill(&members[0].node_id)?;
-    let tail_ack_to_kill_ms = kill_signalled_at.duration_since(tail_ack_at).as_millis();
-    events.record(
-        "owner_killed",
-        json!({ "node_id": members[0].node_id, "exit": exit,
+    // The value each sampled key is expected to hold, as the run last saw it.
+    // `None` means the run observed the key absent. The oracle follows what a
+    // failure left behind, so a loss the policy allows is not reported again
+    // by a later round that samples the same key.
+    let mut expected_values: BTreeMap<u64, Option<Vec<u8>>> = BTreeMap::new();
+    // The previous round's tail key and the value the run expects it to hold
+    // now, which is the observed value when the policy allowed the write to
+    // be lost.
+    let mut previous_tail: Option<(u64, Option<Vec<u8>>)> = None;
+    let mut killed: Vec<String> = Vec::new();
+    let mut round_records: Vec<AvailabilityRound> = Vec::new();
+    let mut lost_total = 0u64;
+    let mut unavailable_total = 0u64;
+    let mut longest_unavailable_total = 0u128;
+    let mut slowest_read_recovery = 0.0_f64;
+    let mut slowest_failover = 0.0_f64;
+    let mut final_epoch = 0u64;
+    let started = Instant::now();
+
+    for round in 1..=rounds {
+        let round = round as u32;
+        let topology = admin_client.refresh_topology().await?;
+        let victim = topology.owner(&probe_key.to_be_bytes())?.node_id.clone();
+        let victim_epoch = topology.epoch;
+        let sampled: Vec<u64> = (0..config.key_count)
+            .filter(|key| {
+                topology
+                    .owner(&key.to_be_bytes())
+                    .is_ok_and(|owner| owner.node_id == victim)
+            })
+            .take(128)
+            .collect();
+        ensure!(
+            !sampled.is_empty(),
+            "availability dataset has no keys owned by {victim}"
+        );
+        events.record(
+            "failover_sample_selected",
+            json!({ "round": round, "owner": victim, "keys": sampled }),
+        )?;
+
+        // An identifiable, just-acknowledged tail makes OwnerOnly loss
+        // observable when it occurs; zero loss in one run is not a durability
+        // guarantee. The key must differ from the previous round's, or this
+        // round's own write would overwrite the value that the previous-tail
+        // check is meant to look for.
+        let tail_key = sampled
+            .iter()
+            .rev()
+            .copied()
+            .find(|key| {
+                previous_tail
+                    .as_ref()
+                    .is_none_or(|(previous, _)| previous != key)
+            })
+            .unwrap_or_else(|| *sampled.last().expect("nonempty sample was checked"));
+        // Whether this round had to reuse the previous round's tail key, which
+        // makes the previous-tail check meaningless for it.
+        let tail_reuses_previous = previous_tail
+            .as_ref()
+            .is_some_and(|(previous, _)| *previous == tail_key);
+        // The tail value is made large enough to be a meaningful write, but
+        // never larger than the data nodes accept.
+        let tail_bytes = tail_value_bytes(config.node.max_value_bytes, config.value_bytes);
+        let tail_value = deterministic_value(tail_key, u64::from(round), tail_bytes);
+        // The value the key held before this round's write. A key that was
+        // already observed keeps what the run saw then, including absence.
+        let prior_tail_value = expected_values
+            .get(&tail_key)
+            .cloned()
+            .unwrap_or_else(|| Some(deterministic_value(tail_key, 0, config.value_bytes)));
+        let tail_put_started = Instant::now();
+        let writer =
+            HashringClient::connect(coordinator_endpoint.to_owned(), Duration::from_secs(10))
+                .await?;
+        writer
+            .put(tail_key.to_be_bytes().to_vec(), tail_value.clone())
+            .await?;
+        let tail_put_seconds = tail_put_started.elapsed().as_secs_f64();
+        expected_values.insert(tail_key, Some(tail_value.clone()));
+        let tail_ack_at = Instant::now();
+        let failed_at = Instant::now();
+        let (exit, kill_signalled_at) = processes.kill(&victim)?;
+        let tail_ack_to_kill_ms = kill_signalled_at.duration_since(tail_ack_at).as_millis();
+        events.record(
+            "owner_killed",
+            json!({ "round": round, "node_id": victim, "exit": exit,
             "tail_key": tail_key, "tail_bytes": tail_bytes,
             "tail_put_seconds": tail_put_seconds,
             "tail_ack_to_kill_ms": tail_ack_to_kill_ms }),
-    )?;
-    let probe =
-        HashringClient::connect(coordinator_endpoint.to_owned(), Duration::from_millis(250))
-            .await?;
-    let probe_key = owner_keys[0].to_be_bytes().to_vec();
-    let failover_deadline = Instant::now() + Duration::from_secs(30);
-    let mut first_unavailable: Option<Instant> = None;
-    let mut longest_unavailable_ms = 0u128;
-    let mut unavailable_probes = 0u64;
-    let mut published_seconds = None;
-    loop {
-        processes.ensure_running()?;
-        let available = matches!(
-            probe.get(probe_key.clone()).await,
-            Ok(_)
-                | Err(ClientError::Operation(hashring_client::OperationFailure {
-                    code: ErrorCode::NotFound,
-                    ..
-                }))
-        );
-        if available {
-            if let Some(started) = first_unavailable.take() {
-                longest_unavailable_ms = longest_unavailable_ms.max(started.elapsed().as_millis());
+        )?;
+        let probe =
+            HashringClient::connect(coordinator_endpoint.to_owned(), Duration::from_millis(250))
+                .await?;
+        let probe_bytes = probe_key.to_be_bytes().to_vec();
+        let failover_deadline = Instant::now() + Duration::from_secs(30);
+        let mut first_unavailable: Option<Instant> = None;
+        let mut longest_unavailable_ms = 0u128;
+        let mut unavailable_probes = 0u64;
+        let mut published_seconds = None;
+        loop {
+            processes.ensure_running()?;
+            let available = matches!(
+                probe.get(probe_bytes.clone()).await,
+                Ok(_)
+                    | Err(ClientError::Operation(hashring_client::OperationFailure {
+                        code: ErrorCode::NotFound,
+                        ..
+                    }))
+            );
+            if available {
+                if let Some(started) = first_unavailable.take() {
+                    longest_unavailable_ms =
+                        longest_unavailable_ms.max(started.elapsed().as_millis());
+                }
+            } else {
+                unavailable_probes += 1;
+                first_unavailable.get_or_insert_with(Instant::now);
             }
-        } else {
-            unavailable_probes += 1;
-            first_unavailable.get_or_insert_with(Instant::now);
+            let current = admin_client.refresh_topology().await?;
+            if published_seconds.is_none()
+                && current.epoch > topology.epoch
+                && !current
+                    .members
+                    .iter()
+                    .any(|member| member.node_id == victim)
+            {
+                let seconds = failed_at.elapsed().as_secs_f64();
+                published_seconds = Some(seconds);
+                events.record(
+                    "failover_published",
+                    json!({ "round": round, "seconds": seconds, "epoch": current.epoch }),
+                )?;
+            }
+            if published_seconds.is_some() && available {
+                break;
+            }
+            ensure!(
+                Instant::now() < failover_deadline,
+                "automatic failover did not publish and resolve the read probe within 30 seconds"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let current = admin_client.refresh_topology().await?;
-        if published_seconds.is_none()
-            && current.epoch > topology.epoch
-            && !current
-                .members
-                .iter()
-                .any(|member| member.node_id == members[0].node_id)
-        {
-            let seconds = failed_at.elapsed().as_secs_f64();
-            published_seconds = Some(seconds);
-            events.record(
-                "failover_published",
-                json!({ "seconds": seconds, "epoch": current.epoch }),
-            )?;
+        if let Some(started) = first_unavailable {
+            longest_unavailable_ms = longest_unavailable_ms.max(started.elapsed().as_millis());
         }
-        if published_seconds.is_some() && available {
-            break;
-        }
-        ensure!(
-            Instant::now() < failover_deadline,
-            "automatic failover did not publish and resolve the read probe within 30 seconds"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    if let Some(started) = first_unavailable {
-        longest_unavailable_ms = longest_unavailable_ms.max(started.elapsed().as_millis());
-    }
-    let failover_seconds = published_seconds.expect("loop exits only after publication");
-    let read_recovery_seconds = failed_at.elapsed().as_secs_f64();
-    observations.insert("failover_seconds".into(), json!(failover_seconds));
-    observations.insert("read_recovery_seconds".into(), json!(read_recovery_seconds));
-    observations.insert(
-        "observed_unavailable_max_streak_ms".into(),
-        json!(longest_unavailable_ms),
-    );
-    observations.insert("unavailable_probe_count".into(), json!(unavailable_probes));
-    events.record(
-        "failover_read_recovered",
-        json!({
-            "seconds": failover_seconds,
-            "read_recovery_seconds": read_recovery_seconds,
-            "observed_unavailable_max_streak_ms": longest_unavailable_ms,
-            "unavailable_probe_count": unavailable_probes,
-        }),
-    )?;
+        let failover_seconds = published_seconds.expect("loop exits only after publication");
+        let read_recovery_seconds = failed_at.elapsed().as_secs_f64();
+        events.record(
+            "failover_read_recovered",
+            json!({
+                "round": round,
+                "seconds": failover_seconds,
+                "read_recovery_seconds": read_recovery_seconds,
+                "observed_unavailable_max_streak_ms": longest_unavailable_ms,
+                "unavailable_probe_count": unavailable_probes,
+            }),
+        )?;
 
-    let reader =
-        HashringClient::connect(coordinator_endpoint.to_owned(), Duration::from_secs(5)).await?;
-    let mut lost = 0u64;
-    let mut tail_survived = true;
-    for key in &owner_keys {
-        match reader.get(key.to_be_bytes().to_vec()).await {
-            Ok(output) if *key == tail_key => {
-                if output.value != tail_value {
+        let reader =
+            HashringClient::connect(coordinator_endpoint.to_owned(), Duration::from_secs(5))
+                .await?;
+        let mut lost = 0u64;
+        let mut tail_survived = true;
+        for key in &sampled {
+            let expected = expected_values
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| Some(deterministic_value(*key, 0, config.value_bytes)));
+            match reader.get(key.to_be_bytes().to_vec()).await {
+                Ok(output) if *key == tail_key => {
+                    if output.value != tail_value {
+                        // The policy may allow losing the just-acknowledged
+                        // write. The key must then hold what it held before
+                        // it, and the oracle follows the observed value.
+                        ensure!(
+                            Some(&output.value) == prior_tail_value.as_ref(),
+                            "tail key {key} has a value other than the acknowledged or prior value"
+                        );
+                        expected_values.insert(*key, Some(output.value));
+                        lost += 1;
+                        tail_survived = false;
+                    }
+                }
+                Ok(output) => {
                     ensure!(
-                        output.value == deterministic_value(*key, 0, config.value_bytes),
-                        "tail key {key} has a value other than the acknowledged or prior value"
+                        expected.as_deref() == Some(output.value.as_slice()),
+                        "surviving key {key} has an unexpected value"
                     );
-                    lost += 1;
-                    tail_survived = false;
+                    expected_values.insert(*key, Some(output.value));
                 }
-            }
-            Ok(output) => ensure!(
-                output.value == deterministic_value(*key, 0, config.value_bytes),
-                "surviving key {key} has an unexpected value"
-            ),
-            Err(ClientError::Operation(failure)) if failure.code == ErrorCode::NotFound => {
-                lost += 1;
-                if *key == tail_key {
-                    tail_survived = false;
+                Err(ClientError::Operation(failure)) if failure.code == ErrorCode::NotFound => {
+                    // A key the oracle already knew absent is not a new loss.
+                    if expected.is_some() {
+                        lost += 1;
+                    }
+                    expected_values.insert(*key, None);
+                    if *key == tail_key {
+                        tail_survived = false;
+                    }
                 }
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("reading acknowledged key {key} after failover"));
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("reading acknowledged key {key} after failover"));
+                }
             }
         }
-    }
-    ensure!(
-        config.write_ack_policy != WriteAckPolicy::FirstSuccessor || lost == 0,
-        "FirstSuccessor lost {lost} acknowledged sampled keys"
-    );
-    observations.insert(
-        "acknowledged_key_survival".into(),
-        json!({
-            "sampled": owner_keys.len(), "preserved": owner_keys.len() as u64 - lost,
-            "lost": lost, "policy": config.write_ack_policy,
-            "tail_key": tail_key, "tail_survived": tail_survived,
-        }),
-    );
-    events.record(
-        "acknowledged_key_survival_checked",
-        observations["acknowledged_key_survival"].clone(),
-    )?;
-
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let change = admin_client.topology_change().await?;
-        if change.is_none_or(|change| change.phase.is_terminal()) {
-            break;
+        // The value the previous round left is checked here as well: a
+        // failure that follows another one must not lose it either. A round
+        // that had to reuse the previous tail key has already overwritten it,
+        // so it reports no result rather than a loss.
+        let mut previous_tail_survived = None;
+        if !tail_reuses_previous && let Some((key, expected)) = previous_tail.as_ref() {
+            previous_tail_survived = Some(match reader.get(key.to_be_bytes().to_vec()).await {
+                Ok(output) => Some(&output.value) == expected.as_ref(),
+                Err(ClientError::Operation(failure)) if failure.code == ErrorCode::NotFound => {
+                    expected.is_none()
+                }
+                Err(error) => {
+                    eprintln!("the previous round's tail key could not be read: {error}");
+                    false
+                }
+            });
         }
         ensure!(
-            Instant::now() < deadline,
-            "failover change did not complete"
+            round > 1 || config.write_ack_policy != WriteAckPolicy::FirstSuccessor || lost == 0,
+            "FirstSuccessor lost {lost} acknowledged sampled keys"
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let replacement = &members[3];
-    let target = vec![members[1].clone(), members[2].clone(), replacement.clone()];
-    let change = admin_client.begin_topology_change(target).await?;
-    let restore_started = Instant::now();
-    spawn_node(
-        processes,
-        replacement.node_id.clone(),
-        ports[4],
-        coordinator_endpoint,
-    )?;
-    wait_for_listener(ports[4], processes).await?;
-    let completed = admin_client
-        .execute_topology_change(
-            change.change_id,
-            change.base_epoch,
-            change.target_topology.epoch,
+        // The cluster must serve writes again, not only reads. The key is
+        // outside the sampled key space, so it never changes what the run
+        // counts.
+        let write_probe_key = config.key_count;
+        let write_probe_value =
+            deterministic_value(write_probe_key, u64::from(round), config.value_bytes);
+        // The write after a failover waits for the new first successor to be
+        // admitted, so it gets a longer deadline than the tail write.
+        let probe_writer =
+            HashringClient::connect(coordinator_endpoint.to_owned(), Duration::from_secs(30))
+                .await?;
+        let write_started = Instant::now();
+        let write_result = probe_writer
+            .put(
+                write_probe_key.to_be_bytes().to_vec(),
+                write_probe_value.clone(),
+            )
+            .await;
+        let write_recovery_seconds = match write_result {
+            Ok(_) => Some(write_started.elapsed().as_secs_f64()),
+            Err(error) => {
+                return Err(anyhow::Error::from(error)).with_context(|| {
+                    format!(
+                        "the cluster did not accept a write after the failover of round {round}"
+                    )
+                });
+            }
+        };
+        let write_read_back = reader.get(write_probe_key.to_be_bytes().to_vec()).await?;
+        ensure!(
+            write_read_back.value == write_probe_value,
+            "the write after the failover of round {round} did not read back"
+        );
+        events.record(
+            "write_after_failover",
+            json!({ "round": round, "key": write_probe_key,
+            "seconds": write_recovery_seconds }),
+        )?;
+        lost_total += lost;
+        unavailable_total += unavailable_probes;
+        longest_unavailable_total = longest_unavailable_total.max(longest_unavailable_ms);
+        slowest_read_recovery = slowest_read_recovery.max(read_recovery_seconds);
+        slowest_failover = slowest_failover.max(failover_seconds);
+        if round == 1 {
+            // The run's own figures describe its first failure; every round
+            // has its own record below.
+            observations.insert(
+                "acknowledged_key_survival".into(),
+                json!({
+                    "sampled": sampled.len(), "preserved": sampled.len() as u64 - lost,
+                    "lost": lost, "policy": config.write_ack_policy,
+                    "tail_key": tail_key, "tail_survived": tail_survived,
+                }),
+            );
+        }
+        events.record(
+            "acknowledged_key_survival_checked",
+            json!({
+                "round": round,
+                "sampled": sampled.len(), "preserved": sampled.len() as u64 - lost,
+                "lost": lost, "policy": config.write_ack_policy,
+                "tail_key": tail_key, "tail_survived": tail_survived,
+                "previous_tail_survived": previous_tail_survived,
+            }),
+        )?;
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let change = admin_client.topology_change().await?;
+            if change.is_none_or(|change| change.phase.is_terminal()) {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "failover change did not complete"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // The replacement joins like a scale-out node: it is seeded from the
+        // admitted copies and the membership returns to its size.
+        let live = admin_client.refresh_topology().await?.members;
+        let spare = &members[initial_count + round as usize - 1];
+        let spare_port = ports[initial_count + round as usize];
+        let mut target = live.clone();
+        target.push(spare.clone());
+        let change = admin_client.begin_topology_change(target).await?;
+        let restore_started = Instant::now();
+        spawn_node(
+            processes,
+            spare.node_id.clone(),
+            spare_port,
+            coordinator_endpoint,
+        )?;
+        wait_for_listener(spare_port, processes).await?;
+        let completed = admin_client
+            .execute_topology_change(
+                change.change_id,
+                change.base_epoch,
+                change.target_topology.epoch,
+            )
+            .await?;
+        wait_for_full_rf(
+            admin_client,
+            config.desired_replication_factor,
+            Duration::from_millis(config.migration_timeout_ms),
+            processes,
         )
         .await?;
-    wait_for_full_rf(
-        admin_client,
-        config.desired_replication_factor,
-        Duration::from_millis(config.migration_timeout_ms),
-        processes,
-    )
-    .await?;
-    let restored_seconds = restore_started.elapsed().as_secs_f64();
+        let restored_seconds = restore_started.elapsed().as_secs_f64();
+        // Sample the recovery time once. The balance analysis below hashes the
+        // whole key space twice, and sampling again after it would make the
+        // per-round record disagree with the run-level figure.
+        let failure_to_full_rf_seconds = failed_at.elapsed().as_secs_f64();
+        if round == 1 {
+            observations.insert(
+                "replacement_to_full_rf_seconds".into(),
+                json!(restored_seconds),
+            );
+            observations.insert(
+                "failure_to_full_rf_seconds".into(),
+                json!(failure_to_full_rf_seconds),
+            );
+        }
+        measurements.insert(
+            format!("restore_full_rf_round_{round}"),
+            measurement(1, restore_started.elapsed()),
+        );
+        if round == 1 {
+            // The run's own figures describe its first round; every round has
+            // its own entry above.
+            measurements.insert(
+                "restore_full_rf".into(),
+                measurement(1, restore_started.elapsed()),
+            );
+        }
+        events.record(
+            "full_rf_restored",
+            json!({ "round": round, "epoch": completed.target_topology.epoch,
+        "replacement_to_full_rf_seconds": restored_seconds }),
+        )?;
+        final_epoch = completed.target_topology.epoch;
+
+        // The balance of the live members, and of the ones that never failed.
+        let topology = admin_client.refresh_topology().await?;
+        let live_members: Vec<String> = topology
+            .members
+            .iter()
+            .map(|member| member.node_id.clone())
+            .collect();
+        let (owned_keys, balance) = owned_key_balance(&topology, config.key_count, None);
+        killed.push(victim.clone());
+        let survivors: Vec<String> = members[..initial_count]
+            .iter()
+            .map(|member| member.node_id.clone())
+            .filter(|node_id| !killed.contains(node_id))
+            .collect();
+        let (survivor_owned_keys, survivor_balance) = if survivors.is_empty() {
+            (BTreeMap::new(), None)
+        } else {
+            let (counts, balance) =
+                owned_key_balance(&topology, config.key_count, Some(&survivors));
+            (counts, Some(balance))
+        };
+        events.record(
+            "availability_round_balanced",
+            json!({ "round": round, "owned_keys": owned_keys, "balance": balance,
+        "survivor_owned_keys": survivor_owned_keys, "survivor_balance": survivor_balance }),
+        )?;
+        round_records.push(AvailabilityRound {
+            round,
+            victim: victim.clone(),
+            victim_epoch,
+            kill_to_publish_seconds: failover_seconds,
+            read_recovery_seconds,
+            write_recovery_seconds,
+            observed_unavailable_max_streak_ms: longest_unavailable_ms,
+            unavailable_probe_count: unavailable_probes,
+            tail_ack_to_kill_ms,
+            tail_key,
+            tail_bytes,
+            tail_put_seconds,
+            acknowledged_key_survival: json!({
+                "sampled": sampled.len(), "preserved": sampled.len() as u64 - lost,
+                "lost": lost, "policy": config.write_ack_policy,
+                "tail_key": tail_key, "tail_survived": tail_survived,
+            }),
+            previous_tail_survived,
+            replacement_to_full_rf_seconds: restored_seconds,
+            failure_to_full_rf_seconds,
+            live_members,
+            owned_keys,
+            balance,
+            survivors,
+            survivor_owned_keys,
+            survivor_balance,
+        });
+        previous_tail = Some((
+            tail_key,
+            expected_values
+                .get(&tail_key)
+                .cloned()
+                .unwrap_or_else(|| Some(tail_value.clone())),
+        ));
+    }
+
+    observations.insert("availability_round_count".into(), json!(rounds));
     observations.insert(
-        "replacement_to_full_rf_seconds".into(),
-        json!(restored_seconds),
+        "availability_rounds".into(),
+        serde_json::to_value(&round_records)?,
+    );
+    // The run's own figures describe its worst round, so a single failure
+    // and a sequence of them are read the same way.
+    observations.insert("failover_seconds".into(), json!(slowest_failover));
+    observations.insert("read_recovery_seconds".into(), json!(slowest_read_recovery));
+    observations.insert(
+        "observed_unavailable_max_streak_ms".into(),
+        json!(longest_unavailable_total),
+    );
+    observations.insert("unavailable_probe_count".into(), json!(unavailable_total));
+    observations.insert(
+        "availability_max_read_recovery_seconds".into(),
+        json!(slowest_read_recovery),
     );
     observations.insert(
-        "failure_to_full_rf_seconds".into(),
-        json!(failed_at.elapsed().as_secs_f64()),
+        "availability_observed_unavailable_max_streak_ms".into(),
+        json!(longest_unavailable_total),
     );
-    measurements.insert(
-        "restore_full_rf".into(),
-        measurement(1, restore_started.elapsed()),
+    observations.insert(
+        "availability_unavailable_probe_count".into(),
+        json!(unavailable_total),
+    );
+    observations.insert(
+        "availability_acknowledged_lost_total".into(),
+        json!(lost_total),
+    );
+    observations.insert(
+        "availability_total_seconds".into(),
+        json!(started.elapsed().as_secs_f64()),
     );
     events.record(
-        "full_rf_restored",
-        json!({ "epoch": completed.target_topology.epoch,
-        "replacement_to_full_rf_seconds": restored_seconds }),
+        "availability_rounds_complete",
+        json!({ "rounds": rounds, "lost": lost_total,
+        "seconds": started.elapsed().as_secs_f64() }),
     )?;
-    Ok(completed.target_topology.epoch)
+    Ok(final_epoch)
 }
 
 /// Records the ring the cluster runs right now.
@@ -1341,17 +1830,18 @@ struct NodeCounters {
 
 /// Runs the `latency` mode: one stage per target rate, and a check of the key
 /// space the load left behind.
-#[allow(clippy::too_many_arguments)]
-async fn run_latency(
-    config: &ExperimentConfig,
-    members: &[Member],
-    admin_client: &HashringClient,
-    workload_client: &HashringClient,
-    processes: &mut ProcessGroup,
-    events: &EventLog,
-    measurements: &mut BTreeMap<String, Measurement>,
-    observations: &mut BTreeMap<String, Value>,
-) -> Result<u64> {
+async fn run_latency(context: RunContext<'_>) -> Result<u64> {
+    let RunContext {
+        config,
+        members,
+        admin_client,
+        workload_client,
+        processes,
+        events,
+        measurements,
+        observations,
+        ..
+    } = context;
     ensure!(
         !config.target_rates.is_empty(),
         "the latency mode needs at least one target rate"
@@ -2004,6 +2494,15 @@ fn moving_keys(change: &TopologyChange, key_count: u64) -> Vec<u64> {
     moving
 }
 
+/// The size of the tail value: large enough to be a meaningful write, but
+/// never larger than the data nodes accept.
+///
+/// The value size the run writes is the floor, and the run's validation keeps
+/// it within the node's limit, so the tail never exceeds what the node takes.
+fn tail_value_bytes(max_value_bytes: usize, value_bytes: usize) -> usize {
+    (1024 * 1024).min(max_value_bytes).max(value_bytes)
+}
+
 fn deterministic_value(key: u64, round: u64, value_bytes: usize) -> Vec<u8> {
     let mut state = key ^ round.rotate_left(17) ^ 0x9e37_79b9_7f4a_7c15;
     let mut value = Vec::with_capacity(value_bytes);
@@ -2100,8 +2599,18 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
     ensure!(config.node_count >= 2, "node_count must be at least 2");
     if matches!(config.mode, ExperimentMode::Availability) {
         ensure!(
-            config.node_count == 4,
-            "availability mode requires exactly 4 nodes (3 initial and 1 replacement)"
+            config.availability_rounds >= 1,
+            "availability_rounds must be at least 1"
+        );
+        ensure!(
+            config.node_count >= 4,
+            "availability mode requires at least 4 nodes (3 initial and 1 replacement)"
+        );
+        // Compare before subtracting: `--nodes 4 --availability-rounds 5`
+        // must be rejected, not overflow.
+        ensure!(
+            config.node_count > config.availability_rounds as usize,
+            "availability mode needs at least one initial member besides its replacements"
         );
         ensure!(
             config.desired_replication_factor == 3,
@@ -2112,10 +2621,27 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
             "availability mode cannot keep AllReplicas writable after one node fails"
         );
     }
+    // Only the scaling mode reads this; the other modes derive their initial
+    // membership from their own rules, so an explicit value would be silently
+    // ignored.
+    ensure!(
+        config.initial_nodes.is_none() || matches!(config.mode, ExperimentMode::Scaling),
+        "initial_nodes only applies to the scaling mode"
+    );
     let initial_count = match config.mode {
         ExperimentMode::Correctness => config.node_count - 1,
         ExperimentMode::Performance | ExperimentMode::Latency => config.node_count,
-        ExperimentMode::Availability => 3,
+        ExperimentMode::Availability => config.availability_initial_members(),
+        ExperimentMode::Scaling => {
+            config
+                .initial_nodes
+                .unwrap_or_else(|| match config.scaling_scenario {
+                    ScalingScenario::Shrink | ScalingScenario::Control => config.node_count,
+                    ScalingScenario::Grow | ScalingScenario::RoundTrip => config.node_count - 1,
+                    ScalingScenario::Replace => config.node_count - 1,
+                    ScalingScenario::Churn => config.node_count.saturating_sub(3),
+                })
+        }
     };
     ensure!(
         initial_count >= config.desired_replication_factor as usize,
@@ -2171,6 +2697,86 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
          mutation's retries",
         config.receipt_retention_ms
     );
+    if matches!(config.mode, ExperimentMode::Scaling) {
+        ensure!(
+            initial_count <= config.node_count,
+            "initial_nodes exceeds the peak node count"
+        );
+        match config.scaling_scenario {
+            ScalingScenario::Grow => ensure!(
+                initial_count < config.node_count,
+                "a grow run needs fewer initial nodes than the peak"
+            ),
+            ScalingScenario::Shrink => {
+                ensure!(
+                    initial_count == config.node_count,
+                    "a shrink run starts with every peak node"
+                );
+                ensure!(
+                    config.node_count > config.desired_replication_factor as usize,
+                    "a shrink run needs more nodes than the desired replication factor"
+                );
+            }
+            ScalingScenario::RoundTrip => ensure!(
+                initial_count + 1 == config.node_count,
+                "a round trip starts with one fewer node than the peak"
+            ),
+            ScalingScenario::Replace => ensure!(
+                initial_count + 1 == config.node_count,
+                "a replace run starts with one fewer node than the peak so one spare member can \
+                 replace an initial member"
+            ),
+            ScalingScenario::Churn => ensure!(
+                initial_count + 2 <= config.node_count,
+                "a churn run needs at least two more peak nodes than its initial membership"
+            ),
+            ScalingScenario::Control => ensure!(
+                initial_count == config.node_count,
+                "a control run starts with every peak node and changes no membership"
+            ),
+        }
+        if config.scaling_load_mode == ScalingLoadMode::Open {
+            ensure!(
+                config.scaling_open_rate > 0,
+                "an open-loop scaling run needs a positive scaling_open_rate"
+            );
+            ensure!(
+                config.scaling_open_rate * 3 / 100 > 0 && config.scaling_open_rate * 12 / 100 > 0,
+                "an open-loop scaling run needs a rate high enough to offer every write cohort"
+            );
+            ensure!(
+                config.max_in_flight > 0,
+                "an open-loop scaling run needs a positive max_in_flight"
+            );
+        } else {
+            ensure!(
+                config.scaling_open_rate == 0,
+                "scaling_open_rate only applies to an open-loop scaling run"
+            );
+            // Only the closed loop paces writes with this rate; an open-loop
+            // run takes its write rates from scaling_open_rate.
+            ensure!(
+                config.scaling_write_rate > 0,
+                "scaling_write_rate must be positive"
+            );
+            // Every write cohort gets a share of the rate, and the shares are
+            // whole operations per second. A rate that rounds the smallest
+            // share down to zero would leave the cohort without a key, which
+            // is only noticed when the run builds its plan.
+            ensure!(
+                config.scaling_write_rate * 15 / 100 > 0,
+                "a closed-loop scaling run needs a rate high enough to offer every write cohort"
+            );
+        }
+        ensure!(
+            config.scaling_pool_seconds > 0,
+            "scaling_pool_seconds must be positive"
+        );
+        ensure!(
+            config.scaling_post_seconds > 0,
+            "scaling_post_seconds must be positive"
+        );
+    }
     Ok(())
 }
 
@@ -2290,6 +2896,118 @@ fn unix_ms() -> u128 {
 mod tests {
     use super::*;
 
+    /// A scaling configuration that passes validation, so a test can change
+    /// one setting and see what the validation says about it.
+    fn scaling_config() -> ExperimentConfig {
+        ExperimentConfig {
+            mode: ExperimentMode::Scaling,
+            output_dir: PathBuf::from("out"),
+            node_count: 4,
+            key_count: 8_000,
+            value_bytes: 128,
+            concurrency: 8,
+            hash_seed: 1,
+            virtual_nodes: 16,
+            operation_timeout_ms: 30_000,
+            migration_timeout_ms: 120_000,
+            range_move_concurrency: 16,
+            replica_repair_concurrency: 4,
+            prepublication_failure_grace_ms: 30_000,
+            pre_publish_delay_ms: 0,
+            require_clean_source: false,
+            verbose: false,
+            worker_threads: 2,
+            coordinator_worker_threads: None,
+            desired_replication_factor: 2,
+            minimum_admitted_copies: 1,
+            minimum_healthy_followers: 0,
+            max_replica_lag_ms: 1_000,
+            receipt_retention_ms: 30_000,
+            lease_duration_ms: 3_000,
+            write_ack_policy: WriteAckPolicy::OwnerOnly,
+            preload_keys: None,
+            target_rates: Vec::new(),
+            warmup_seconds: 0,
+            duration_seconds: 0,
+            mix: String::new(),
+            key_distribution: "zipf:0.99".to_owned(),
+            max_in_flight: 256,
+            availability_rounds: 1,
+            scaling_scenario: ScalingScenario::Grow,
+            scaling_load_mode: ScalingLoadMode::Closed,
+            scaling_open_rate: 0,
+            initial_nodes: Some(3),
+            scaling_write_rate: 200,
+            scaling_pool_seconds: 8,
+            scaling_post_seconds: 2,
+            node: NodeOptions {
+                max_dedup_bytes: 32 * 1024 * 1024,
+                max_value_bytes: 1024 * 1024,
+                max_pending_replication_bytes: 64 * 1024 * 1024,
+                max_migration_journal_bytes: 16 * 1024 * 1024,
+                replication_stream_queue_capacity: 1_024,
+                required_ack_timeout_ms: 2_000,
+                replication_rpc_timeout_ms: 5_000,
+                replication_batch_linger_ms: 20,
+            },
+        }
+    }
+
+    #[test]
+    fn an_open_loop_run_does_not_need_the_closed_loop_write_rate() {
+        let mut config = scaling_config();
+        config.scaling_load_mode = ScalingLoadMode::Open;
+        config.scaling_open_rate = 1_000;
+        // The open-loop run takes its write rates from its open rate, so the
+        // closed-loop rate is not used and may be zero.
+        config.scaling_write_rate = 0;
+        validate_config(&config).unwrap();
+
+        // The closed-loop run paces its writes with that rate, so it cannot be
+        // zero there.
+        let mut config = scaling_config();
+        config.scaling_write_rate = 0;
+        let error = validate_config(&config).unwrap_err().to_string();
+        assert!(error.contains("scaling_write_rate"), "{error}");
+    }
+
+    #[test]
+    fn a_closed_loop_run_needs_a_rate_that_every_cohort_can_use() {
+        // The shares are whole operations per second, so a rate that rounds
+        // the smallest share down would leave a cohort without a key.
+        let mut config = scaling_config();
+        config.scaling_write_rate = 6;
+        let error = validate_config(&config).unwrap_err().to_string();
+        assert!(error.contains("every write cohort"), "{error}");
+
+        // The smallest rate that gives every cohort an operation is accepted.
+        let mut config = scaling_config();
+        config.scaling_write_rate = 7;
+        validate_config(&config).unwrap();
+    }
+
+    #[test]
+    fn the_tail_value_never_exceeds_the_node_limit() {
+        assert_eq!(tail_value_bytes(1024 * 1024, 128), 1024 * 1024);
+        // A limit below the tail's usual size is honoured, and the limit
+        // itself is not a floor that panics.
+        assert_eq!(tail_value_bytes(512 * 1024, 128), 512 * 1024);
+        assert_eq!(tail_value_bytes(4_096, 128), 4_096);
+        // The value size the run writes is the floor.
+        assert_eq!(tail_value_bytes(4_096, 512), 4_096);
+        for max_value_bytes in [1, 64, 4_096, 512 * 1024, 1024 * 1024] {
+            for value_bytes in [1, 64, 128] {
+                if value_bytes > max_value_bytes {
+                    continue;
+                }
+                assert!(
+                    tail_value_bytes(max_value_bytes, value_bytes) <= max_value_bytes,
+                    "{max_value_bytes} {value_bytes}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn load_balance_preserves_missing_cpu_and_rejects_missing_or_reset_counters() {
         let owned = BTreeMap::from([("node-1".to_owned(), 10)]);
@@ -2320,6 +3038,35 @@ mod tests {
         after.get_mut("node-1").unwrap().ops_handled = 10;
         assert!(load_balance(&owned, &before, &after, 2.0).is_err());
         assert!(load_balance(&owned, &BTreeMap::new(), &after, 2.0).is_err());
+    }
+
+    #[test]
+    fn key_balance_reports_the_spread_of_the_shares() {
+        let balance = KeyBalance::of(&[10.0, 10.0, 10.0]);
+        assert_eq!(balance.nodes, 3);
+        assert_eq!(balance.max_over_min, 1.0);
+        assert_eq!(balance.range_over_mean, 0.0);
+        assert_eq!(balance.max_over_mean_minus_one, 0.0);
+        assert_eq!(balance.cv, 0.0);
+
+        let balance = KeyBalance::of(&[10.0, 20.0, 30.0]);
+        assert_eq!(balance.max_over_min, 3.0);
+        assert_eq!(balance.range_over_mean, 1.0);
+        assert_eq!(balance.max_over_mean_minus_one, 0.5);
+        assert!((balance.cv - 0.408248).abs() < 1e-6);
+
+        // A set with no shares has no spread.
+        let balance = KeyBalance::of(&[]);
+        assert_eq!(balance.nodes, 0);
+        assert_eq!(balance.max_over_min, 0.0);
+
+        // A node with no keys makes the ratio unbounded, not balanced.
+        let balance = KeyBalance::of(&[0.0, 10.0, 20.0]);
+        assert!(balance.max_over_min.is_infinite());
+        assert_eq!(
+            serde_json::to_value(balance).unwrap()["max_over_min"],
+            Value::Null
+        );
     }
 
     #[tokio::test]

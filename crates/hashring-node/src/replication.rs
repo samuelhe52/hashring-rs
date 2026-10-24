@@ -87,20 +87,33 @@ pub(super) fn required_followers(
     Ok(desired.into_iter().map(str::to_owned).collect())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// One mutation as it is fanned out to the followers that must store it.
+pub(super) struct ReplicationWrite<'a> {
+    pub key: &'a [u8],
+    pub record: &'a Record,
+    pub request_fingerprint: [u8; 32],
+    pub mutation_id: String,
+    pub token: u64,
+    pub max_pending_bytes: usize,
+    pub ack_awaited_followers: &'a [String],
+}
+
 /// Fans out the record a mutation produced, not the request that produced it:
 /// a follower stores exactly what the owner stored, so a write that kept the
 /// owner's deadline does not reach a follower as one that clears it.
 pub(super) fn prepare_replication_entries(
     state: &mut NodeState,
-    key: &[u8],
-    record: &Record,
-    request_fingerprint: [u8; 32],
-    mutation_id: String,
-    token: u64,
-    max_pending_bytes: usize,
-    ack_awaited_followers: &[String],
+    write: ReplicationWrite<'_>,
 ) -> Result<Vec<PreparedReplication>, ()> {
+    let ReplicationWrite {
+        key,
+        record,
+        request_fingerprint,
+        mutation_id,
+        token,
+        max_pending_bytes,
+        ack_awaited_followers,
+    } = write;
     let follower_ids: Vec<_> = state
         .topology
         .replica_node_ids_for_token(token)
@@ -350,7 +363,7 @@ impl ReplicationDispatcher {
                 self.retained_budget
                     .clone()
                     .try_acquire_many_owned(bytes)
-                    .map(ReplicationBudget)
+                    .map(|permit| ReplicationBudget { _permit: permit })
                     .map(Arc::new)
                     .map_err(|_| {
                         self.record_reservation_rejection(
@@ -368,16 +381,16 @@ impl ReplicationDispatcher {
             }
             let sender = streams.entry(stream_key.clone()).or_insert_with(|| {
                 let (sender, receiver) = mpsc::channel(self.stream_queue_capacity);
-                tokio::spawn(deliver_replication_stream(
-                    self.state.clone(),
-                    self.failed_streams.clone(),
-                    self.active_rpc_budget.clone(),
-                    self.rpc_timeout,
-                    self.batch_linger,
-                    self.pressure.clone(),
-                    stream_key.clone(),
-                    receiver,
-                ));
+                tokio::spawn(deliver_replication_stream(ReplicationStream {
+                    state: self.state.clone(),
+                    failed_streams: self.failed_streams.clone(),
+                    active_rpc_budget: self.active_rpc_budget.clone(),
+                    rpc_timeout: self.rpc_timeout,
+                    batch_linger: self.batch_linger,
+                    pressure: self.pressure.clone(),
+                    stream_key: stream_key.clone(),
+                    entries: receiver,
+                }));
                 sender
             });
             let queue = sender.clone().try_reserve_owned().map_err(|_| {
@@ -472,17 +485,28 @@ pub(super) async fn collect_replication_batch(
     (batch, batch_bytes, None)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn deliver_replication_stream(
-    state: Arc<RwLock<NodeState>>,
-    failed_streams: Arc<StdMutex<HashSet<ReplicationStreamKey>>>,
-    active_rpc_budget: Arc<Semaphore>,
-    rpc_timeout: std::time::Duration,
-    batch_linger: std::time::Duration,
-    pressure: Arc<NodePressureStats>,
-    stream_key: ReplicationStreamKey,
-    mut entries: mpsc::Receiver<PendingReplication>,
-) {
+pub(super) struct ReplicationStream {
+    pub state: Arc<RwLock<NodeState>>,
+    pub failed_streams: Arc<StdMutex<HashSet<ReplicationStreamKey>>>,
+    pub active_rpc_budget: Arc<Semaphore>,
+    pub rpc_timeout: std::time::Duration,
+    pub batch_linger: std::time::Duration,
+    pub pressure: Arc<NodePressureStats>,
+    pub stream_key: ReplicationStreamKey,
+    pub entries: mpsc::Receiver<PendingReplication>,
+}
+
+pub(super) async fn deliver_replication_stream(stream: ReplicationStream) {
+    let ReplicationStream {
+        state,
+        failed_streams,
+        active_rpc_budget,
+        rpc_timeout,
+        batch_linger,
+        pressure,
+        stream_key,
+        mut entries,
+    } = stream;
     let mut client = None;
     let mut carry: Option<PendingReplication> = None;
     loop {

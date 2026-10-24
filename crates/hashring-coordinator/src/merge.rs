@@ -331,12 +331,16 @@ impl CoordinatorService {
             return Err(error);
         }
         let deadline = Instant::now() + self.migration_timeout;
+        let pause_started = Instant::now();
         self.set_phase(MigrationPhase::PausingWrites).await?;
         change.phase = MigrationPhase::PausingWrites;
         let result = async {
             self.set_direct_merge_fence(&change, true, true, deadline)
                 .await?;
-            self.set_phase(MigrationPhase::Verifying).await?;
+            change.timings.pause_writes_ms = millis(pause_started.elapsed());
+            let verify_started = Instant::now();
+            self.set_phase_with_timings(MigrationPhase::Verifying, Some(change.timings))
+                .await?;
             change.phase = MigrationPhase::Verifying;
             let snapshot = self.state.read().await.clone();
             if !can_direct_merge(&snapshot, &change) {
@@ -353,7 +357,12 @@ impl CoordinatorService {
                     Instant::now(),
                 )?;
             }
+            let proof_started = Instant::now();
             let (required, candidates) = merge_proof(&snapshot, &change)?;
+            change.timings.merge_proof_ms = millis(proof_started.elapsed());
+            self.set_phase_with_timings(MigrationPhase::Verifying, Some(change.timings))
+                .await?;
+            let catch_up_started = Instant::now();
             let mut caught_up = BTreeSet::new();
             for pair in &required {
                 loop {
@@ -388,11 +397,17 @@ impl CoordinatorService {
                 .filter(|(_, pairs)| pairs.is_subset(&caught_up))
                 .map(|(admission, _)| admission)
                 .collect();
-            self.set_phase(MigrationPhase::ReadyToPublish).await?;
+            change.timings.catch_up_ms = millis(catch_up_started.elapsed());
+            change.timings.verify_ms = millis(verify_started.elapsed());
+            self.set_phase_with_timings(MigrationPhase::ReadyToPublish, Some(change.timings))
+                .await?;
             change.phase = MigrationPhase::ReadyToPublish;
+            // The pre-publication delay is a diagnostic window for the
+            // observer, not publish work.
             if !self.pre_publish_delay.is_zero() {
                 tokio::time::sleep(self.pre_publish_delay).await;
             }
+            let publish_started = Instant::now();
             // The write fence keeps the verified old streams stable until publication.
             let mut state = self.state.write().await;
             if state.committed != snapshot.committed
@@ -408,12 +423,17 @@ impl CoordinatorService {
                     "merge coverage changed before publication",
                 ));
             }
+            // The publication timing is measured up to the durable write that
+            // carries it, so the write cannot leave the phase behind without
+            // the timing that describes it.
+            change.timings.publish_ms = millis(publish_started.elapsed());
             self.publish_removed_topology(
                 &mut state,
                 &change,
                 RemovalPublication::Graceful {
                     admissions: carried,
                 },
+                change.timings,
             )?;
             Ok::<(), Status>(())
         }
@@ -428,7 +448,8 @@ impl CoordinatorService {
         if !self.post_publish_delay.is_zero() {
             tokio::time::sleep(self.post_publish_delay).await;
         }
-        self.finish_direct_merge(change).await
+        let completed = self.finish_direct_merge(change).await?;
+        Ok(completed)
     }
 
     pub(super) async fn finish_direct_merge(
@@ -436,6 +457,7 @@ impl CoordinatorService {
         mut change: TopologyChange,
     ) -> Result<TopologyChange, Status> {
         let deadline = Instant::now() + self.migration_timeout;
+        let activation_started = Instant::now();
         let base = change
             .base_topology
             .as_ref()
@@ -477,7 +499,12 @@ impl CoordinatorService {
             .await?;
         self.set_direct_merge_fence(&change, false, false, deadline)
             .await?;
-        self.set_phase(MigrationPhase::CleaningUp).await?;
+        // Activation is over once the target topology is installed and the
+        // fence is released; the source cleanup and member stops below are a
+        // separate work step.
+        change.timings.activation_ms = millis(activation_started.elapsed());
+        self.set_phase_with_timings(MigrationPhase::CleaningUp, Some(change.timings))
+            .await?;
         change.phase = MigrationPhase::CleaningUp;
         for member in removed {
             if change.stopped_node_ids.contains(&member.node_id) {
@@ -542,7 +569,8 @@ impl CoordinatorService {
             self.store_stopped_node(&member.node_id).await?;
             change.stopped_node_ids.push(member.node_id);
         }
-        self.set_phase(MigrationPhase::Complete).await?;
+        self.set_phase_with_timings(MigrationPhase::Complete, Some(change.timings))
+            .await?;
         change.phase = MigrationPhase::Complete;
         Ok(change)
     }

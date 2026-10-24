@@ -71,6 +71,18 @@ pub(super) fn is_absence_status(status: &Status) -> bool {
     status.code() == tonic::Code::Unavailable
 }
 
+pub(super) fn millis(elapsed: Duration) -> u64 {
+    elapsed.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+pub(super) fn replay_millis(change: &TopologyChange) -> u64 {
+    change
+        .ranges
+        .iter()
+        .map(|range| range.changelog_replay_ms)
+        .sum()
+}
+
 pub(super) async fn try_map_bounded<I, F, Fut, T, E>(
     items: I,
     concurrency: usize,

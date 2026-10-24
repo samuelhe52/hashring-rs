@@ -386,6 +386,29 @@ async fn policy_strengthening_waits_for_admitted_caught_up_followers() {
         .await
         .unwrap();
     assert_eq!(applied.phase, MigrationPhase::Complete);
+    // A policy change publishes and activates like any other change, so its
+    // work-step timings are measured and stored.
+    assert!(applied.timings.publish_ms > 0, "{:?}", applied.timings);
+    assert!(applied.timings.activation_ms > 0, "{:?}", applied.timings);
+    assert!(applied.timings.verify_ms > 0, "{:?}", applied.timings);
+    // The timings the change reports and the ones the coordinator keeps are
+    // the same, so a repeated execute and a change-status read the same
+    // record.
+    let stored = client
+        .topology_change()
+        .await
+        .unwrap()
+        .expect("the completed change is still the active one");
+    assert_eq!(stored.timings, applied.timings);
+    let repeated = client
+        .execute_topology_change(
+            &first.change_id,
+            first.base_epoch,
+            first.target_topology.epoch,
+        )
+        .await
+        .unwrap();
+    assert_eq!(repeated.timings, applied.timings);
     let put = client
         .put(b"policy-key".to_vec(), b"first".to_vec())
         .await
@@ -400,11 +423,148 @@ async fn policy_strengthening_waits_for_admitted_caught_up_followers() {
         .await
         .unwrap();
     assert_eq!(applied.phase, MigrationPhase::Complete);
+    assert!(applied.timings.publish_ms > 0, "{:?}", applied.timings);
+    assert!(applied.timings.activation_ms > 0, "{:?}", applied.timings);
+    let stored = client
+        .topology_change()
+        .await
+        .unwrap()
+        .expect("the completed change is still the active one");
+    assert_eq!(stored.timings, applied.timings);
     let put = client
         .put(b"policy-key".to_vec(), b"all".to_vec())
         .await
         .unwrap();
     assert_eq!(put.topology_epoch, applied.target_topology.epoch);
+}
+
+#[tokio::test]
+async fn a_policy_change_keeps_its_timings_across_a_coordinator_restart() {
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("policy-restart-coordinator.redb");
+    let ports = unused_ports(4);
+    let coordinator_port = ports[0];
+    let endpoint = format!("http://127.0.0.1:{coordinator_port}");
+    let members: Vec<_> = (1..=3)
+        .map(|index| (format!("node-{index}"), ports[index]))
+        .collect();
+    let mut args = coordinator_arguments(coordinator_port, &state, &members);
+    let min_copies = args
+        .iter()
+        .position(|arg| arg == "--minimum-admitted-copies")
+        .unwrap();
+    args[min_copies + 1] = "2".into();
+    let min_healthy = args
+        .iter()
+        .position(|arg| arg == "--minimum-healthy-followers")
+        .unwrap();
+    args[min_healthy + 1] = "1".into();
+    let vnodes = args
+        .iter()
+        .position(|arg| arg == "--virtual-nodes")
+        .unwrap();
+    args[vnodes + 1] = "1".into();
+    let mut coordinator = spawn_process(&args);
+    wait_for_listener(coordinator_port);
+    let client = connect_eventually(&endpoint).await;
+    let _nodes: Vec<_> = members
+        .iter()
+        .map(|(node_id, port)| {
+            spawn_process(&[
+                "node".into(),
+                "--id".into(),
+                node_id.clone(),
+                "--listen".into(),
+                format!("127.0.0.1:{port}"),
+                "--coordinator".into(),
+                endpoint.clone(),
+            ])
+        })
+        .collect();
+    let ready = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let mut coordinator = CoordinatorClient::connect(endpoint.clone()).await.unwrap();
+            let status = coordinator
+                .get_replica_status(Empty {})
+                .await
+                .unwrap()
+                .into_inner();
+            if !status.ranges.is_empty()
+                && status.ranges.iter().all(|range| {
+                    range.followers.len() == 2
+                        && range.followers.iter().all(|follower| {
+                            follower.admitted
+                                && follower.lag_known
+                                && follower.stream_head == follower.stream_cursor
+                        })
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(ready.is_ok(), "replica admission did not become ready");
+
+    let policy = client
+        .begin_write_policy_change(WriteAckPolicy::FirstSuccessor)
+        .await
+        .unwrap();
+    let applied = client
+        .execute_topology_change(
+            &policy.change_id,
+            policy.base_epoch,
+            policy.target_topology.epoch,
+        )
+        .await
+        .unwrap();
+    assert_eq!(applied.phase, MigrationPhase::Complete);
+    // The policy change measures every step it takes, and the timings are
+    // stored with the phase they belong to.
+    assert!(applied.timings.pause_writes_ms > 0, "{:?}", applied.timings);
+    assert!(applied.timings.verify_ms > 0, "{:?}", applied.timings);
+    assert!(applied.timings.publish_ms > 0, "{:?}", applied.timings);
+    assert!(applied.timings.activation_ms > 0, "{:?}", applied.timings);
+
+    // The change-status read and a repeated execute report the same timings,
+    // because both read the stored change.
+    let stored = client
+        .topology_change()
+        .await
+        .unwrap()
+        .expect("the completed change is still the active one");
+    assert_eq!(stored.timings, applied.timings);
+    let repeated = client
+        .execute_topology_change(
+            &policy.change_id,
+            policy.base_epoch,
+            policy.target_topology.epoch,
+        )
+        .await
+        .unwrap();
+    assert_eq!(repeated.timings, applied.timings);
+
+    // The timings are in the durable store, so a coordinator that restarts on
+    // that store reads the same ones back.
+    coordinator.stop();
+    let _restart = spawn_process(&[
+        "coordinator".into(),
+        "--listen".into(),
+        format!("127.0.0.1:{coordinator_port}"),
+        "--state".into(),
+        state.display().to_string(),
+    ]);
+    wait_for_listener(coordinator_port);
+    let restarted = connect_eventually(&endpoint).await;
+    let stored = restarted
+        .topology_change()
+        .await
+        .unwrap()
+        .expect("the completed change survived the restart");
+    assert_eq!(stored.change_id, applied.change_id);
+    assert_eq!(stored.timings, applied.timings);
 }
 
 #[tokio::test]
