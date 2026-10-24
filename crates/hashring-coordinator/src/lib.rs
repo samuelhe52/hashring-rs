@@ -406,7 +406,10 @@ pub enum RepositoryError {
     InvalidState(String),
     #[error("the coordinator store is empty; bootstrap members are required")]
     MissingBootstrap,
-    #[error("configured bootstrap topology differs from durable topology")]
+    #[error(
+        "configured bootstrap topology differs from durable topology; the store already holds a \
+         topology, so restart without --member or with the configuration file to use it"
+    )]
     BootstrapMismatch,
 }
 
