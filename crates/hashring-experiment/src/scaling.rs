@@ -1995,8 +1995,8 @@ struct AfterPublishProbe {
     expected: usize,
     /// How long the probe may go without reading a key.
     idle_limit: Duration,
-    /// Whether the watchdog gave up on the probe.
-    stuck: Arc<AtomicBool>,
+    /// What the watchdog saw and how it ended.
+    report: Arc<ProbeReport>,
     /// The probe's task. It is aborted when the probe is dropped.
     handle: Option<tokio::task::JoinHandle<Result<usize>>>,
     /// The watchdog that gives up on a probe which stops reading keys.
@@ -2046,9 +2046,21 @@ fn spawn_after_publish_probe_task(
     let rate = after_publish_probe_rate(config);
     let idle_limit =
         after_publish_probe_idle_limit(Duration::from_millis(config.operation_timeout_ms), rate);
+    // Record the start before the tasks exist. An event that cannot be written
+    // must not leave a probe running with no owner left to stop it.
+    events.record(
+        "scaling_after_publish_probe_started",
+        json!({
+            "label": label,
+            "keys": expected.len(),
+            "rate": rate,
+            "idle_limit_ms": idle_limit.as_millis() as u64,
+        }),
+    )?;
     // The probe reports every key it reads, so the watchdog can tell a probe
     // that is still working from one that stopped.
     let (progress, progress_updates) = tokio::sync::watch::channel(ProbeState::Reading(0));
+    let report = Arc::new(ProbeReport::default());
     let client = workload_client.clone();
     let handle = tokio::spawn(spawn_after_publish_probe(
         move |key: u64| {
@@ -2065,32 +2077,35 @@ fn spawn_after_publish_probe_task(
         rate,
         progress,
     ));
-    let stuck = Arc::new(AtomicBool::new(false));
     let watchdog = tokio::spawn(watch_after_publish_probe(
         label,
         progress_updates,
         handle.abort_handle(),
-        Arc::clone(&stuck),
+        Arc::clone(&report),
         idle_limit,
         events.clone(),
     ));
-    events.record(
-        "scaling_after_publish_probe_started",
-        json!({
-            "label": label,
-            "keys": expected.len(),
-            "rate": rate,
-            "idle_limit_ms": idle_limit.as_millis() as u64,
-        }),
-    )?;
     Ok(Some(AfterPublishProbe {
         label,
         expected: expected.len(),
         idle_limit,
-        stuck,
+        report,
         handle: Some(handle),
         watchdog: Some(watchdog),
     }))
+}
+
+/// What a probe's watchdog saw and how it ended.
+///
+/// The run reads it when the probe is joined: a probe that was given up on can
+/// then say how many keys it verified before it stopped, instead of claiming
+/// that it never read one.
+#[derive(Default)]
+struct ProbeReport {
+    /// The most keys the watchdog saw verified.
+    verified: AtomicU64,
+    /// Whether the watchdog gave up on the probe.
+    stuck: AtomicBool,
 }
 
 /// What a read-after-publish probe is doing.
@@ -2116,7 +2131,7 @@ async fn watch_after_publish_probe(
     label: &'static str,
     mut progress: tokio::sync::watch::Receiver<ProbeState>,
     abort: tokio::task::AbortHandle,
-    stuck: Arc<AtomicBool>,
+    report: Arc<ProbeReport>,
     idle_limit: Duration,
     events: EventLog,
 ) {
@@ -2134,6 +2149,7 @@ async fn watch_after_publish_probe(
                     ProbeState::Finished => return,
                     ProbeState::Reading(count) => {
                         read = count;
+                        report.verified.store(count, Ordering::Release);
                         deadline = tokio::time::Instant::now() + idle_limit;
                     }
                 }
@@ -2145,17 +2161,22 @@ async fn watch_after_publish_probe(
                         // The probe read a key after the deadline was set, so
                         // it is making progress and the deadline was stale.
                         read = count;
+                        report.verified.store(count, Ordering::Release);
                         deadline = tokio::time::Instant::now() + idle_limit;
                         continue;
                     }
                     ProbeState::Reading(_) => {}
                 }
-                stuck.store(true, Ordering::Release);
+                // The store of the count must precede the store of the verdict,
+                // so a reader of the verdict also sees the final count.
+                report.verified.store(read, Ordering::Release);
+                report.stuck.store(true, Ordering::Release);
                 if let Err(error) = events.record(
                     "scaling_after_publish_probe_stuck",
                     json!({
                         "label": label,
                         "idle_limit_ms": idle_limit.as_millis() as u64,
+                        "verified": read,
                     }),
                 ) {
                     eprintln!("scaling after-publish probe event failed: {error:#}");
@@ -2170,13 +2191,14 @@ async fn watch_after_publish_probe(
 /// Waits for the read-after-publish probe and reports how many keys it read.
 ///
 /// The probe is given as long as it keeps reading keys. It is given up on
-/// when it stops making progress, because a probe that reads nothing is a
-/// probe that will never finish.
+/// when it stops making progress, because a probe that is not reading will
+/// never finish. A change whose probe read every key it was given passes;
+/// anything else fails the run.
 async fn join_after_publish_probe(mut probe: AfterPublishProbe) -> Result<usize> {
     let label = probe.label;
     let expected = probe.expected;
     let idle_limit = probe.idle_limit;
-    let stuck = Arc::clone(&probe.stuck);
+    let report = Arc::clone(&probe.report);
     let handle = probe
         .handle
         .take()
@@ -2184,9 +2206,11 @@ async fn join_after_publish_probe(mut probe: AfterPublishProbe) -> Result<usize>
     let read = match handle.await {
         Ok(Ok(read)) => read,
         Ok(Err(error)) => return Err(error.context("the read-after-publish probe failed")),
-        Err(error) if error.is_cancelled() && stuck.load(Ordering::Acquire) => {
+        Err(error) if error.is_cancelled() && report.stuck.load(Ordering::Acquire) => {
+            let verified = report.verified.load(Ordering::Acquire);
             return Err(anyhow::anyhow!(
-                "the {label} read-after-publish probe read no key for {idle_limit:?}"
+                "the {label} read-after-publish probe made no progress for {idle_limit:?} \
+                 after verifying {verified} of its {expected} keys"
             ));
         }
         Err(error) => {
@@ -2870,17 +2894,18 @@ mod tests {
             let _progress = progress;
             std::future::pending::<()>().await;
         });
-        let stuck = Arc::new(AtomicBool::new(false));
+        let report = Arc::new(ProbeReport::default());
         let watchdog = tokio::spawn(watch_after_publish_probe(
             "grow",
             updates,
             probe.abort_handle(),
-            Arc::clone(&stuck),
+            Arc::clone(&report),
             Duration::from_millis(50),
             events.clone(),
         ));
         watchdog.await.unwrap();
-        assert!(stuck.load(Ordering::Acquire));
+        assert!(report.stuck.load(Ordering::Acquire));
+        assert_eq!(report.verified.load(Ordering::Acquire), 0);
         // The probe was aborted, so joining it reports the cancellation.
         let error = probe.await.unwrap_err();
         assert!(error.is_cancelled());
@@ -2902,17 +2927,49 @@ mod tests {
             sender.send_replace(ProbeState::Finished);
             5_usize
         });
-        let stuck = Arc::new(AtomicBool::new(false));
+        let report = Arc::new(ProbeReport::default());
         let watchdog = tokio::spawn(watch_after_publish_probe(
             "grow",
             updates,
             probe.abort_handle(),
-            Arc::clone(&stuck),
+            Arc::clone(&report),
             Duration::from_millis(50),
             events.clone(),
         ));
         watchdog.await.unwrap();
-        assert!(!stuck.load(Ordering::Acquire));
+        assert!(!report.stuck.load(Ordering::Acquire));
+        // The watchdog sees every state the probe publishes, but a burst of
+        // updates may already have moved on to `Finished` when it wakes, so
+        // the count it reports is a lower bound.
+        assert!(report.verified.load(Ordering::Acquire) > 0);
         assert_eq!(probe.await.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_stuck_probe_reports_the_keys_it_had_verified() {
+        let directory = tempfile::tempdir().unwrap();
+        let events = EventLog::open(&directory.path().join("events.jsonl")).unwrap();
+        let (progress, updates) = tokio::sync::watch::channel(ProbeState::Reading(0));
+        // The probe verifies two keys and then stops without finishing.
+        let sender = progress.clone();
+        let probe = tokio::spawn(async move {
+            for read in 1..=2_u64 {
+                sender.send_replace(ProbeState::Reading(read));
+            }
+            std::future::pending::<()>().await;
+        });
+        let report = Arc::new(ProbeReport::default());
+        let watchdog = tokio::spawn(watch_after_publish_probe(
+            "grow",
+            updates,
+            probe.abort_handle(),
+            Arc::clone(&report),
+            Duration::from_millis(50),
+            events.clone(),
+        ));
+        watchdog.await.unwrap();
+        assert!(report.stuck.load(Ordering::Acquire));
+        assert_eq!(report.verified.load(Ordering::Acquire), 2);
+        assert!(probe.await.unwrap_err().is_cancelled());
     }
 }
