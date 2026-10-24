@@ -40,6 +40,10 @@ enum Interrupted {
     /// The owner could not answer for this epoch, or not at all: `None` for a
     /// transport failure. The walk catches up and starts over.
     Retry(Option<OperationError>),
+    /// The owner could not be reached at all: the connection failed. It is
+    /// counted as a connect retry and not as a generic rpc one, so a walk
+    /// that lost its connection is told apart from one that got an answer.
+    Connect,
     Failed(ClientError),
 }
 
@@ -92,9 +96,7 @@ impl HashringClient {
             match self.first_key(&owners, epoch, start, deadline).await {
                 Ok(key) => return Ok(key),
                 Err(Interrupted::Failed(error)) => return Err(error),
-                Err(Interrupted::Retry(error)) => {
-                    self.recover(error, epoch, deadline, &mut attempt).await?
-                }
+                Err(failure) => self.recover(failure, epoch, deadline, &mut attempt).await?,
             }
         }
     }
@@ -147,8 +149,8 @@ impl HashringClient {
             let page = match self.list_page(&endpoint, request, deadline).await {
                 Ok(page) => page,
                 Err(Interrupted::Failed(error)) => return Err(error),
-                Err(Interrupted::Retry(error)) => {
-                    self.recover(error, epoch, deadline, &mut attempt).await?;
+                Err(failure) => {
+                    self.recover(failure, epoch, deadline, &mut attempt).await?;
                     continue;
                 }
             };
@@ -206,9 +208,7 @@ impl HashringClient {
                     return Ok((keys, count));
                 }
                 Err(Interrupted::Failed(error)) => return Err(error),
-                Err(Interrupted::Retry(error)) => {
-                    self.recover(error, epoch, deadline, &mut attempt).await?
-                }
+                Err(failure) => self.recover(failure, epoch, deadline, &mut attempt).await?,
             }
         }
     }
@@ -305,7 +305,7 @@ impl HashringClient {
             Err(ClientError::DeadlineExceeded { .. }) => {
                 return Err(ClientError::deadline(false).into());
             }
-            Err(_) => return Err(Interrupted::Retry(None)),
+            Err(_) => return Err(Interrupted::Connect),
         };
         let response =
             tokio::time::timeout(remaining(deadline, false)?, client.list_keys(request)).await;
@@ -327,25 +327,35 @@ impl HashringClient {
     /// waiting cannot fix.
     async fn recover(
         &self,
-        error: Option<OperationError>,
+        failure: Interrupted,
         epoch: u64,
         deadline: Instant,
         attempt: &mut u32,
     ) -> Result<(), ClientError> {
-        let Some(error) = error else {
-            self.refresh_after_unavailable(epoch, deadline, false)
-                .await?;
-            return self
-                .retry_delay(deadline, attempt, false, RetryReason::Rpc)
-                .await;
-        };
-        if self
-            .handle_retryable(error.clone(), epoch, deadline, attempt, false)
-            .await?
-        {
-            return Ok(());
+        match failure {
+            Interrupted::Failed(error) => Err(error),
+            Interrupted::Connect => {
+                self.refresh_after_unavailable(epoch, deadline, false)
+                    .await?;
+                self.retry_delay(deadline, attempt, false, RetryReason::Connect)
+                    .await
+            }
+            Interrupted::Retry(None) => {
+                self.refresh_after_unavailable(epoch, deadline, false)
+                    .await?;
+                self.retry_delay(deadline, attempt, false, RetryReason::Rpc)
+                    .await
+            }
+            Interrupted::Retry(Some(error)) => {
+                if self
+                    .handle_retryable(error.clone(), epoch, deadline, attempt, false)
+                    .await?
+                {
+                    return Ok(());
+                }
+                Err(OperationFailure::from(error).into())
+            }
         }
-        Err(OperationFailure::from(error).into())
     }
 }
 
