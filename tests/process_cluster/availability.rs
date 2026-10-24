@@ -386,6 +386,29 @@ async fn policy_strengthening_waits_for_admitted_caught_up_followers() {
         .await
         .unwrap();
     assert_eq!(applied.phase, MigrationPhase::Complete);
+    // A policy change publishes and activates like any other change, so its
+    // work-step timings are measured and stored.
+    assert!(applied.timings.publish_ms > 0, "{:?}", applied.timings);
+    assert!(applied.timings.activation_ms > 0, "{:?}", applied.timings);
+    assert!(applied.timings.verify_ms > 0, "{:?}", applied.timings);
+    // The timings the change reports and the ones the coordinator keeps are
+    // the same, so a repeated execute and a change-status read the same
+    // record.
+    let stored = client
+        .topology_change()
+        .await
+        .unwrap()
+        .expect("the completed change is still the active one");
+    assert_eq!(stored.timings, applied.timings);
+    let repeated = client
+        .execute_topology_change(
+            &first.change_id,
+            first.base_epoch,
+            first.target_topology.epoch,
+        )
+        .await
+        .unwrap();
+    assert_eq!(repeated.timings, applied.timings);
     let put = client
         .put(b"policy-key".to_vec(), b"first".to_vec())
         .await
@@ -400,6 +423,14 @@ async fn policy_strengthening_waits_for_admitted_caught_up_followers() {
         .await
         .unwrap();
     assert_eq!(applied.phase, MigrationPhase::Complete);
+    assert!(applied.timings.publish_ms > 0, "{:?}", applied.timings);
+    assert!(applied.timings.activation_ms > 0, "{:?}", applied.timings);
+    let stored = client
+        .topology_change()
+        .await
+        .unwrap()
+        .expect("the completed change is still the active one");
+    assert_eq!(stored.timings, applied.timings);
     let put = client
         .put(b"policy-key".to_vec(), b"all".to_vec())
         .await

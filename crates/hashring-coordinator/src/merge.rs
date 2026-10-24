@@ -419,14 +419,18 @@ impl CoordinatorService {
                     "merge coverage changed before publication",
                 ));
             }
+            // The publication timing is measured up to the durable write that
+            // carries it, so the write cannot leave the phase behind without
+            // the timing that describes it.
+            change.timings.publish_ms = millis(publish_started.elapsed());
             self.publish_removed_topology(
                 &mut state,
                 &change,
                 RemovalPublication::Graceful {
                     admissions: carried,
                 },
+                change.timings,
             )?;
-            change.timings.publish_ms = millis(publish_started.elapsed());
             Ok::<(), Status>(())
         }
         .await;
@@ -437,12 +441,10 @@ impl CoordinatorService {
         }
         change.phase = MigrationPhase::Published;
         change.activation_ready = true;
-        self.store_change_timings_best_effort(&change).await;
         if !self.post_publish_delay.is_zero() {
             tokio::time::sleep(self.post_publish_delay).await;
         }
         let completed = self.finish_direct_merge(change).await?;
-        self.store_change_timings_best_effort(&completed).await;
         Ok(completed)
     }
 
@@ -497,7 +499,8 @@ impl CoordinatorService {
         // fence is released; the source cleanup and member stops below are a
         // separate work step.
         change.timings.activation_ms = millis(activation_started.elapsed());
-        self.set_phase(MigrationPhase::CleaningUp).await?;
+        self.set_phase_with_timings(MigrationPhase::CleaningUp, Some(change.timings))
+            .await?;
         change.phase = MigrationPhase::CleaningUp;
         for member in removed {
             if change.stopped_node_ids.contains(&member.node_id) {
@@ -562,7 +565,8 @@ impl CoordinatorService {
             self.store_stopped_node(&member.node_id).await?;
             change.stopped_node_ids.push(member.node_id);
         }
-        self.set_phase(MigrationPhase::Complete).await?;
+        self.set_phase_with_timings(MigrationPhase::Complete, Some(change.timings))
+            .await?;
         change.phase = MigrationPhase::Complete;
         Ok(change)
     }
