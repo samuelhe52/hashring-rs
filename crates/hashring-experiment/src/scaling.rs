@@ -404,8 +404,17 @@ impl Metrics {
         }
     }
 
-    fn record_write_success(&self, busy: u64) {
-        self.write_ok_after_busy.fetch_max(busy, Ordering::Release);
+    /// Records a successful write and the rejection count the client knew when
+    /// that write started.
+    ///
+    /// The count is read before the request is sent, so it is a lower bound on
+    /// what the write saw: a write that was already in flight when a rejection
+    /// happened does not claim it. Reading it after the write would make the
+    /// count an upper bound and let a success that started before the stop
+    /// close the stop window too early.
+    fn record_write_success(&self, busy_before: u64) {
+        self.write_ok_after_busy
+            .fetch_max(busy_before, Ordering::Release);
         self.writes_ok.fetch_add(1, Ordering::Release);
     }
 
@@ -535,6 +544,9 @@ struct StopWindow {
     first_busy_ms: Option<f64>,
     last_busy_ms: Option<f64>,
     first_ok_ms: Option<f64>,
+    /// The rejections the client knew when the write that closed the window
+    /// started.
+    first_ok_busy: Option<u64>,
 }
 
 impl StopWindow {
@@ -570,6 +582,7 @@ impl StopWindow {
             && write_ok_after_busy >= busy
         {
             self.first_ok_ms = Some(now_ms);
+            self.first_ok_busy = Some(write_ok_after_busy);
         }
         self.previous_busy = busy;
     }
@@ -584,6 +597,11 @@ impl StopWindow {
             "first_range_busy_ms": self.first_busy_ms,
             "last_range_busy_ms": self.last_busy_ms,
             "first_write_ok_ms": self.first_ok_ms,
+            // The evidence behind `first_write_ok_ms`: the client had seen
+            // this many rejections when that write started, so the write
+            // cannot have been the one that was already in flight when the
+            // stop began.
+            "busy_before_first_ok": self.first_ok_busy,
             "observed_ms": self
                 .first_busy_ms
                 .zip(self.first_ok_ms)
@@ -1087,6 +1105,11 @@ fn start_open_writes_for(
                 let probe_tx = probe_tx.clone();
                 handle.spawn(async move {
                     let phase = metrics.phase();
+                    // Read the rejection count before the write for the same
+                    // reason the closed loop does: only a rejection the client
+                    // already knew when the write started is evidence that the
+                    // write happened after the stop.
+                    let busy_before = client.retry_reason_count(RetryReason::RangeBusy);
                     let result = match cohort {
                         Cohort::Rewrite | Cohort::WriteNew => client
                             .put(
@@ -1100,9 +1123,7 @@ fn start_open_writes_for(
                         }
                     };
                     if result.is_ok() {
-                        metrics.record_write_success(
-                            client.retry_reason_count(RetryReason::RangeBusy),
-                        );
+                        metrics.record_write_success(busy_before);
                     }
                     let elapsed = Instant::now().saturating_duration_since(due);
                     ledger.record(key, cohort, &result);
@@ -2461,6 +2482,10 @@ fn start_writes(context: WriteContext<'_>) {
                     }
                     let phase = metrics.phase();
                     metrics.issued.fetch_add(1, Ordering::Relaxed);
+                    // The rejection count is read before the write, so the
+                    // success can only claim a rejection the client already
+                    // knew about when it started.
+                    let busy_before = client.retry_reason_count(RetryReason::RangeBusy);
                     let started = Instant::now();
                     let result = match cohort {
                         Cohort::Rewrite | Cohort::WriteNew => client
@@ -2475,9 +2500,7 @@ fn start_writes(context: WriteContext<'_>) {
                         }
                     };
                     if result.is_ok() {
-                        metrics.record_write_success(
-                            client.retry_reason_count(RetryReason::RangeBusy),
-                        );
+                        metrics.record_write_success(busy_before);
                     }
                     let elapsed = started.elapsed();
                     ledger.record(key, cohort, &result);
@@ -2738,6 +2761,7 @@ mod tests {
         window.observe(30.0, 8, 14, 8);
         assert_eq!(window.first_ok_ms, Some(30.0));
         assert_eq!(window.summary()["observed_ms"], 20.0);
+        assert_eq!(window.summary()["busy_before_first_ok"], 8);
         // A later rejection invalidates that success, too.
         window.observe(40.0, 9, 14, 8);
         assert!(!window.closed());
@@ -2749,6 +2773,7 @@ mod tests {
         window.observe(10.0, 1, 1, 2);
         window.observe(20.0, 2, 1, 2);
         assert_eq!(window.last_busy_ms, Some(20.0));
+        assert_eq!(window.summary()["busy_before_first_ok"], 2);
         assert!(window.closed());
     }
 
