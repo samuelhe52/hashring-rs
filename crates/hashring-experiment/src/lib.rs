@@ -2759,6 +2759,14 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
                 config.scaling_write_rate > 0,
                 "scaling_write_rate must be positive"
             );
+            // Every write cohort gets a share of the rate, and the shares are
+            // whole operations per second. A rate that rounds the smallest
+            // share down to zero would leave the cohort without a key, which
+            // is only noticed when the run builds its plan.
+            ensure!(
+                config.scaling_write_rate * 15 / 100 > 0,
+                "a closed-loop scaling run needs a rate high enough to offer every write cohort"
+            );
         }
         ensure!(
             config.scaling_pool_seconds > 0,
@@ -2961,6 +2969,21 @@ mod tests {
         config.scaling_write_rate = 0;
         let error = validate_config(&config).unwrap_err().to_string();
         assert!(error.contains("scaling_write_rate"), "{error}");
+    }
+
+    #[test]
+    fn a_closed_loop_run_needs_a_rate_that_every_cohort_can_use() {
+        // The shares are whole operations per second, so a rate that rounds
+        // the smallest share down would leave a cohort without a key.
+        let mut config = scaling_config();
+        config.scaling_write_rate = 6;
+        let error = validate_config(&config).unwrap_err().to_string();
+        assert!(error.contains("every write cohort"), "{error}");
+
+        // The smallest rate that gives every cohort an operation is accepted.
+        let mut config = scaling_config();
+        config.scaling_write_rate = 7;
+        validate_config(&config).unwrap();
     }
 
     #[test]
