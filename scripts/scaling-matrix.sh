@@ -49,6 +49,12 @@ OPEN_MAX_DEDUP_BYTES="${OPEN_MAX_DEDUP_BYTES:-268435456}"
 # otherwise the migration journal is the first thing to fill and the nodes
 # answer with a retryable ResourceExhausted, which is the backpressure the
 # group exists to avoid.
+#
+# These are per-node memory ceilings, not extra memory: the node holds at most
+# what it has already received. The open group therefore lets every one of its
+# nodes hold up to 256 MB of receipts, 256 MB of pending replication, and
+# 256 MB of migration journal, so a host that runs the open group next to
+# anything else needs that much headroom per node.
 OPEN_MAX_PENDING_REPLICATION_BYTES="${OPEN_MAX_PENDING_REPLICATION_BYTES:-268435456}"
 OPEN_MAX_MIGRATION_JOURNAL_BYTES="${OPEN_MAX_MIGRATION_JOURNAL_BYTES:-268435456}"
 # The open group's transition already holds the load for its warmup and its

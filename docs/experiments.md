@@ -104,7 +104,7 @@ Availability mode also records:
 - failover publication time and first recovered read
 - sampled read-unavailability probes
 - acknowledged keys preserved or lost, including a just-acknowledged tail write
-  of at least 1 MiB
+  of up to 1 MiB, never larger than the value limit the data nodes were given
 - time from replacement to full RF
 
 ### The availability rounds
@@ -113,7 +113,9 @@ Availability mode also records:
 
 1. picks the current owner of the probe key, which is the first key the first
    member owns, and samples up to 128 keys that member owns,
-2. writes an identifiable value to the last of them and kills the owner,
+2. writes an identifiable value to the last sampled key, which is the last one
+   that is not the previous round's tail key so that this round's write cannot
+   overwrite the value the previous-tail check looks for, and kills the owner,
 3. waits for the automatic failover to publish a topology without it and for the
    read probe to succeed again,
 4. writes a key outside the sampled key space and reads it back, which measures
@@ -137,6 +139,13 @@ survived, whether the previous round's value survived, the time from the
 replacement to the full replication factor, the keys every live member owns,
 and the spread of those keys (`max_over_min`, `range_over_mean`,
 `max_over_mean_minus_one`, and `cv`).
+
+Two fields are `null` rather than a number when the run cannot name one:
+`previous_tail_survived` when the round had to reuse the previous round's tail
+key, so its own write replaced the value that check looks for, and
+`max_over_min` when a member holds no keys, which makes the ratio unbounded.
+`tail_bytes` is the size of the value the round wrote, which is `value_bytes`
+when that is larger than 1 MiB and the node's limit otherwise.
 
 The run's own figures describe its worst round: `failover_seconds` and
 `read_recovery_seconds` are the slowest round, `observed_unavailable_max_streak_ms`
@@ -462,11 +471,26 @@ strata, the direct-merge flag, and the coordinator's `work_steps_ms`. The work s
 `snapshot_copy_ms` and `changelog_replay_ms` are sums over ranges, so either
 can exceed the wall-clock phase it ran in; they do not overlap, because a
 range's snapshot copy stops before its changelog replay starts. The other
-fields are wall-clock costs. `publish_ms` excludes the diagnostic
-`pre_publish_delay`, and `activation_ms` covers the activation barrier and
-the target installation but not source cleanup or stopping removed members.
-It also excludes the later `wait_for_full_rf` convergence, which
-`full_rf_seconds` reports separately.
+fields are wall-clock costs. `publish_ms` covers the publication work (the
+destination checks and the state lock) but not the diagnostic
+`pre_publish_delay` and not the durable write that carries it, and
+`activation_ms` covers the activation barrier and the target installation but
+not source cleanup or stopping removed members. It also excludes the later
+`wait_for_full_rf` convergence, which `full_rf_seconds` reports separately.
+The timings are written in the same durable write as the phase they belong to,
+so a repeated `execute-change`, a `change-status` read, and a restarted
+coordinator all see what the first `execute-change` returned.
+
+`published_ms_source` says where `published_ms` came from. It is `observed`
+when the runner saw the change publish, and `completion_fallback` when a short
+change went from `Verifying` to `Complete` between two polls: the probe still
+runs, but the earliest moment that can be named is the completion, and
+`published_ms` then equals `complete_ms`.
+
+Every change also gets `scaling_after_publish_probes`: the number of probes and
+the keys each one read. A probe with nothing to read is not evidence, so a
+change whose publish window held no successful write to a moved stratum fails
+the run rather than passing without the read-after-publish check.
 
 `migration` is the plan's migration volume: `keys` and `keys_moved` compare
 the base and target topologies key by key, `rate` is their quotient, `ranges`

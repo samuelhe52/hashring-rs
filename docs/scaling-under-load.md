@@ -17,6 +17,8 @@
 
 这一轮的计时口径有三处修正，因此 `replay`、`满 RF s`、`停写窗口 ms` 三列与 `d0b160f` 的记录不可比：`changelog_replay_ms` 只算回放本身（不再把 digest 往返与 commit 算进去），`full_rf_seconds` 从 `Complete` 起算（含等被移除节点退出），停写窗口以每个 transition 开始时的计数为基线（第二个 transition 不再把第一个的拒绝算成自己的）。
 
+> **上一轮之后的计时口径修正**：`publish_ms` 现在覆盖发布工作一直到承载它的那次持久化写之前，写本身不计入；policy 路径也测量 `pause_writes_ms`、`verify_ms`、`publish_ms` 与 `activation_ms`；计时与阶段变更在同一次持久化写中落库。下表是修正之前的口径，只作为量级参考。
+
 ### 已实现
 
 - 场景：`round-trip` / `grow` / `shrink` / `replace`（S3 等成员数替换）/ `churn`（S4 多节点连续迁移）/ `control`（S0 无迁移对照）。
@@ -374,14 +376,17 @@ S1 与 S2 在**同一个集群生命周期内连续执行**：预载一次、负
 |---|---|
 | `snapshot_copy_ms` | 所有 range 的 snapshot 复制（含 dedup）耗时之和，不含该 range 的 changelog 回放；并发迁移时可能大于 `CopyingSnapshot` 阶段墙钟 |
 | `changelog_replay_ms` | 所有 range 的 `replay_changelog` 耗时之和；不含之后的 digest 往返与 destination commit（它们属于 `verify_ms`）；并发迁移时可能大于所在阶段 |
-| `pause_writes_ms` | `PausingWrites` 阶段墙钟（direct merge 时含加栅栏） |
-| `verify_ms` | `Verifying` 阶段墙钟（复制路径含最终回放、digest 与提交） |
-| `publish_ms` | 提交新拓扑的实际耗时，不含 `pre_publish_delay` 观测窗 |
+| `pause_writes_ms` | `PausingWrites` 阶段墙钟（direct merge 时含加栅栏；policy change 时含向每个成员发暂停栅栏） |
+| `verify_ms` | `Verifying` 阶段墙钟（复制路径含最终回放、digest 与提交；policy change 含等待 follower 追平的屏障） |
+| `publish_ms` | 提交新拓扑的工作耗时（目标实例校验、状态锁与一致性检查），不含 `pre_publish_delay` 观测窗，也不含承载该计时的这次持久化写本身 |
 | `activation_ms` | 提交后 activation/RF repair 屏障与目标拓扑安装；不含清理 source range、停被移除节点和 `post_publish_delay` |
 | `merge_proof_ms` | direct merge 的 coverage/proof 计算 |
 | `catch_up_ms` | direct merge 等旧复制流追平的循环 |
 
-这些是 coordinator 侧的墙钟，不含客户端重试等待，也不含 `wait_for_full_rf` 在 `Complete` 之后的收敛时间。字段为 0 表示该路径不经过这一步（例如 S2 direct merge 的 `snapshot_copy_ms`/`changelog_replay_ms`）。计时在发布后与 activation 后各写回一次持久化的 active change，所以 `change-status`、重复的 `execute-change`、以及重启后从 redb 读到的记录，都和 `execute-change` 的返回值一致。另外 `<label>_transition` 还有 `published_ms`、`complete_ms`、`full_rf_seconds`：前两个从 change 开始计时，最后一个从 `Complete`（含之后等被移除节点退出的时间）到目标 epoch 满 RF。
+这些是 coordinator 侧的墙钟，不含客户端重试等待，也不含 `wait_for_full_rf` 在 `Complete` 之后的收敛时间。字段为 0 表示该路径不经过这一步（例如 S2 direct merge 的 `snapshot_copy_ms`/`changelog_replay_ms`）。计时与阶段变更在同一次持久化写中落库：发布时 `publish_ms` 随 `Published` 阶段一起写入，activation 之后 `activation_ms` 随 `CleaningUp`/`Complete` 一起写入。所以 `change-status`、重复的 `execute-change`、以及重启后从 redb 读到的记录，都和 `execute-change` 的返回值一致；不存在"阶段已落库、计时还没写"的窗口。另外 `<label>_transition` 还有 `published_ms`、`published_ms_source`、`complete_ms`、`full_rf_seconds`：前两个从 change 开始计时，`full_rf_seconds` 从 `Complete`（含之后等被移除节点退出的时间）到目标 epoch 满 RF。短 change 可能从 `Verifying` 直接跳到 `Complete`，此时探针仍会启动，`published_ms` 取完成时刻，`published_ms_source` 记为 `completion_fallback`，正常观测到发布时为 `observed`。
+
+恢复路径的 `activation_ms` 只覆盖"恢复时的重做"：在 `Published`/`CleaningUp` 恢复的 change 不会重测发布，`publish_ms` 保持首次发布写入的值；`activation_ms` 度量的是重新安装与重新激活，而不是原始 activation。租约等待也不计入（它是一段安全等待）。
+
 
 ### 7.2 负载指标
 
@@ -392,6 +397,9 @@ S1 与 S2 在**同一个集群生命周期内连续执行**：预载一次、负
 - 切写窗口的写尝试数、拒绝数、停写时长；首个成功写时间
 - **停写窗口的定义以客户端实际观测为准**：按区间（S2 是全集群）记录第一次和最后一次 `RangeBusy` 的时间，再取此后第一个成功写，用这三者定义窗口；phase 只做粗粒度标注。栅栏在节点收到 RPC 后才生效，与 coordinator 的 phase 切换存在时差，再叠加轮询误差，不能拿阶段边界当停写时长。实现上由 scaling 模式每 5 ms 采样客户端的 `RangeBusy` 计数与成功写计数，写入 `<label>_transition.stop_window`（`first_range_busy_ms`、`last_range_busy_ms`、`first_write_ok_ms`、`observed_ms`、`poll_ms`）。每个 transition 的窗口以它开始时的累计计数为基线，所以第二个 transition 不会把第一个的拒绝算成自己的，`first_range_busy_ms` 也不会被钉成 0。
 - 发布后复读在观察到 `Published` 的那一刻启动（限速、独立 client），不是整个 transition 结束后的一次终态复查，否则发布瞬间的短暂陈旧读会自愈、探针看不到。
+- 发布后复读必须真的读到键。探针等待的是"持续有进展"而不是固定时长：每次读都受客户端 operation timeout 限制，所以一个还在读的探针一定会在该时限内完成一个键；连续 `operation timeout + 间隔 + 10 s` 没有新键才算卡住。每个 change 的探针读取数写入 `scaling_after_publish_probes.keys_read`；读取数为 0（发布窗口内没有落到迁移分层的成功写）即判该次运行 invalid，而不是当作"没有违规"。
+- 重试总数与按原因计数必须对得上：`retry_count()` 等于 `retry_reasons()` 之和。建连失败记 `Connect`，可重试的 gRPC 状态记 `Rpc`，两者不再合并。
+- 开环组的实际写入速率来自 `--scaling-open-rate` 的分层拆分，`scaling_pool_plan.cohort_write_rates` 记录 rewrite/new/delete 各自的实际速率；`write_rate` 在开环下为 `null`，因为 `--scaling-write-rate` 在开环下不生效。
 - 读连续失败最长间隔
 - 每层 cohort 的实际操作量与结果分布
 - 每次 change 的迁移量：`<label>_transition.migration` 的 `keys`、`keys_moved`、`rate`、`ranges`、`snapshot_records`
@@ -469,7 +477,7 @@ S1 与 S2 在**同一个集群生命周期内连续执行**：预载一次、负
    - 阶段观察与每秒采样。
 3. 复用 `latency.rs` 的直方图与开环调度器；新写满足台账要求的执行器。
 4. 客户端增加**按原因/通道的重试计数**与应用层错误分类，拓扑刷新单独计数；保留 `MutationOutcome` 区分。
-5. coordinator **工作步骤计时**已落地：每次 change 在 coordinator 内记录快照复制、changelog 回放、暂停、finalize/digest、发布与 activation 的墙钟，写入 `TopologyChangeSnapshot.timings`；experiment 将其写入 `<label>_transition.work_steps_ms`。`changelog_replay_ms` 是各 range 之和，并发时会大于所在阶段。
+5. coordinator **工作步骤计时**已落地：每次 change 在 coordinator 内记录快照复制、changelog 回放、暂停、finalize/digest、发布与 activation 的墙钟，写入 `TopologyChangeSnapshot.timings`；experiment 将其写入 `<label>_transition.work_steps_ms`。`changelog_replay_ms` 是各 range 之和，并发时会大于所在阶段；`snapshot_copy_ms` 同样按 range 求和，且只算快照复制本身，不含该 range 的回放。计时随阶段变更在同一次持久化写中落库。
 6. `wait_for_full_rf` 增加目标 epoch 检查；汇总五个时间点（`published_ms`、`complete_ms`、`full_rf_seconds`）。
 7. 更新 `docs/experiments.md`；实验完成后把配置、结果、限制写入 Git 跟踪文档（如 `docs/scaling-under-load.md`），并回链 `docs/TODO.md` 第 3 项；原始 `results/` 不纳入 Git。
 8. 测试：§4.2 期望状态表、分层选择与场景适用层已有单元测试；S1→S2 状态衔接（延迟校验、独立池）、停写窗口与开环局部 drain 由 `tests/process_cluster/experiment.rs` 的往返测试与开环往返测试覆盖。
