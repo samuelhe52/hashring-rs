@@ -2602,6 +2602,28 @@ fn reserve_ports(count: usize) -> Result<Vec<u16>> {
 /// is far above any rate the harness can drive on one host.
 const MAX_SCALING_RATE: u64 = 1_000_000;
 
+/// The longest one-shot pool window a scaling run accepts.
+///
+/// A pool is sized as the cohort's rate multiplied by this window, so a long
+/// window at a high rate would overflow that product. A pool only has to
+/// outlast one transition, and a day is far beyond any transition.
+const MAX_SCALING_POOL_SECONDS: u64 = 86_400;
+
+/// The most keys an experiment preloads.
+///
+/// The scaling plan multiplies the key count by the read share and adds the
+/// write quotas to it, so an absurd count would overflow those products. This
+/// ceiling is far above the largest run the harness is used for.
+const MAX_KEY_COUNT: u64 = 100_000_000;
+
+// The accepted maximums are only safe because the products the scaling plan
+// makes from them stay in range. Check that at compile time, so raising a
+// ceiling without checking the arithmetic cannot compile.
+const _: () = {
+    assert!(MAX_SCALING_RATE * 60 / 100 * MAX_SCALING_POOL_SECONDS < u64::MAX);
+    assert!(MAX_KEY_COUNT * 60 < u64::MAX);
+};
+
 /// The smallest rate that still offers the smallest write cohort one operation
 /// per second when the rate is split into whole operations.
 ///
@@ -2677,6 +2699,12 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
     ensure!(
         usize::try_from(config.key_count).is_ok(),
         "key_count exceeds the platform address space"
+    );
+    // The key space is multiplied by a share and extended by the write pools,
+    // so a count near the integer limit would overflow those products.
+    ensure!(
+        config.key_count <= MAX_KEY_COUNT,
+        "key_count must not exceed {MAX_KEY_COUNT}"
     );
     if matches!(config.mode, ExperimentMode::Latency) {
         ensure!(
@@ -2800,6 +2828,11 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
         ensure!(
             config.scaling_pool_seconds > 0,
             "scaling_pool_seconds must be positive"
+        );
+        // The pool sizes are the cohort rates multiplied by this window.
+        ensure!(
+            config.scaling_pool_seconds <= MAX_SCALING_POOL_SECONDS,
+            "scaling_pool_seconds must not exceed {MAX_SCALING_POOL_SECONDS}"
         );
         ensure!(
             config.scaling_post_seconds > 0,
@@ -3045,6 +3078,30 @@ mod tests {
         // The ceiling itself is accepted and still splits without overflowing.
         let mut config = scaling_config();
         config.scaling_write_rate = MAX_SCALING_RATE;
+        validate_config(&config).unwrap();
+    }
+
+    #[test]
+    fn the_pool_window_and_key_space_are_bounded_before_the_plan_multiplies_them() {
+        // The plan sizes each pool as the cohort rate times the window.
+        let mut config = scaling_config();
+        config.scaling_pool_seconds = MAX_SCALING_POOL_SECONDS + 1;
+        let error = validate_config(&config).unwrap_err().to_string();
+        assert!(
+            error.contains("scaling_pool_seconds must not exceed"),
+            "{error}"
+        );
+        let mut config = scaling_config();
+        config.scaling_pool_seconds = MAX_SCALING_POOL_SECONDS;
+        validate_config(&config).unwrap();
+
+        // It splits the key space by a share and extends it by the pools.
+        let mut config = scaling_config();
+        config.key_count = MAX_KEY_COUNT + 1;
+        let error = validate_config(&config).unwrap_err().to_string();
+        assert!(error.contains("key_count must not exceed"), "{error}");
+        let mut config = scaling_config();
+        config.key_count = MAX_KEY_COUNT;
         validate_config(&config).unwrap();
     }
 

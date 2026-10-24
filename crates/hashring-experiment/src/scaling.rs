@@ -2293,9 +2293,15 @@ fn build_transition_plan(
 
     let write_rate = cohort_rates(config);
     let pool_seconds = config.scaling_pool_seconds;
-    let rewrite_quota = (write_rate.rewrite * pool_seconds) as usize;
-    let new_quota = (write_rate.write_new * pool_seconds) as usize;
-    let delete_quota = (write_rate.delete * pool_seconds) as usize;
+    // The configuration bounds the rate and the window, so these products fit
+    // a u64. Converting them to a usize is still fallible on a platform with a
+    // smaller address space, and a truncated quota would be a wrong plan.
+    let rewrite_quota = usize::try_from(write_rate.rewrite * pool_seconds)
+        .context("the rewrite pool does not fit the platform address space")?;
+    let new_quota = usize::try_from(write_rate.write_new * pool_seconds)
+        .context("the fresh-write pool does not fit the platform address space")?;
+    let delete_quota = usize::try_from(write_rate.delete * pool_seconds)
+        .context("the delete pool does not fit the platform address space")?;
     ensure!(
         rewrite_quota > 0 && new_quota > 0 && delete_quota > 0,
         "the scaling write rate is too low to give every cohort a key; raise it or raise --scaling-pool-seconds"
