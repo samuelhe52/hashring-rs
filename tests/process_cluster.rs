@@ -11,7 +11,7 @@ use std::{
 
 use hashring_client::{ClientConfig, ClientError, HashringClient, MutationOutcome};
 use hashring_core::{
-    migration::{MigrationPhase, RangeMigration, TopologyChange},
+    migration::{MigrationPhase, MigrationTimings, RangeMigration, TopologyChange},
     proto::{
         Empty, ErrorCode, GetRequest, coordinator_client::CoordinatorClient,
         data_node_client::DataNodeClient,
@@ -63,6 +63,38 @@ fn spawn_process(arguments: &[String]) -> Process {
             .stderr(Stdio::null())
             .spawn()
             .unwrap(),
+    )
+}
+
+/// Runs a process that is expected to exit on its own, and returns whether it
+/// succeeded together with its stderr.
+///
+/// The process is killed when it is still running at the deadline, so a
+/// startup check that no longer fails is a test failure instead of a hang.
+fn run_to_exit(arguments: &[String], timeout: Duration) -> (bool, String) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hashring-rs"))
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("process did not exit within {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
     )
 }
 
@@ -163,6 +195,23 @@ fn promoted_members(members: &[(String, u16)]) -> Vec<Member> {
             endpoint: format!("http://127.0.0.1:{port}"),
         })
         .collect()
+}
+
+/// The change's work-step timings, summed.
+///
+/// Every step is truncated to whole milliseconds, so a step that is fast on
+/// the machine running the test is legitimately zero. A test can only require
+/// that the change measured and stored some work, not that one particular step
+/// stayed above the truncation.
+fn total_work_ms(timings: &MigrationTimings) -> u64 {
+    timings.snapshot_copy_ms
+        + timings.changelog_replay_ms
+        + timings.pause_writes_ms
+        + timings.verify_ms
+        + timings.publish_ms
+        + timings.activation_ms
+        + timings.merge_proof_ms
+        + timings.catch_up_ms
 }
 
 fn token_in_range(token: u64, range: &RangeMigration) -> bool {

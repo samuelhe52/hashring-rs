@@ -1374,6 +1374,29 @@ impl CoordinatorService {
         self.set_phase_with_timings(phase, None).await
     }
 
+    /// Stores the change's work-step timings without changing its phase.
+    ///
+    /// A step can finish inside a phase that a later phase boundary would only
+    /// record afterwards. The direct merge's proof runs inside `Verifying`,
+    /// and its timing still has to be durable before the change moves on, so
+    /// it is written on its own.
+    pub(super) async fn store_timings(&self, timings: MigrationTimings) -> Result<(), Status> {
+        let mut state = self.state.write().await;
+        let mut next = state.clone();
+        let change = next
+            .active_change
+            .as_mut()
+            .ok_or_else(|| Status::internal("active change disappeared"))?;
+        change.timings = timings;
+        let change_id = change.change_id.clone();
+        self.repository
+            .store_state(&next)
+            .map_err(|error| Status::internal(error.to_string()))?;
+        *state = next;
+        tracing::debug!(%change_id, "topology change timings updated");
+        Ok(())
+    }
+
     /// Sets the phase of the active change and stores it together with its
     /// work-step timings in one durable write.
     ///

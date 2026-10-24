@@ -387,10 +387,9 @@ async fn policy_strengthening_waits_for_admitted_caught_up_followers() {
         .unwrap();
     assert_eq!(applied.phase, MigrationPhase::Complete);
     // A policy change publishes and activates like any other change, so its
-    // work-step timings are measured and stored.
-    assert!(applied.timings.publish_ms > 0, "{:?}", applied.timings);
-    assert!(applied.timings.activation_ms > 0, "{:?}", applied.timings);
-    assert!(applied.timings.verify_ms > 0, "{:?}", applied.timings);
+    // work-step timings are measured and stored. The steps are whole
+    // milliseconds, so only their total is a reliable lower bound.
+    assert!(total_work_ms(&applied.timings) > 0, "{:?}", applied.timings);
     // The timings the change reports and the ones the coordinator keeps are
     // the same, so a repeated execute and a change-status read the same
     // record.
@@ -423,8 +422,7 @@ async fn policy_strengthening_waits_for_admitted_caught_up_followers() {
         .await
         .unwrap();
     assert_eq!(applied.phase, MigrationPhase::Complete);
-    assert!(applied.timings.publish_ms > 0, "{:?}", applied.timings);
-    assert!(applied.timings.activation_ms > 0, "{:?}", applied.timings);
+    assert!(total_work_ms(&applied.timings) > 0, "{:?}", applied.timings);
     let stored = client
         .topology_change()
         .await
@@ -522,11 +520,9 @@ async fn a_policy_change_keeps_its_timings_across_a_coordinator_restart() {
         .unwrap();
     assert_eq!(applied.phase, MigrationPhase::Complete);
     // The policy change measures every step it takes, and the timings are
-    // stored with the phase they belong to.
-    assert!(applied.timings.pause_writes_ms > 0, "{:?}", applied.timings);
-    assert!(applied.timings.verify_ms > 0, "{:?}", applied.timings);
-    assert!(applied.timings.publish_ms > 0, "{:?}", applied.timings);
-    assert!(applied.timings.activation_ms > 0, "{:?}", applied.timings);
+    // stored with the phase they belong to. A step is truncated to whole
+    // milliseconds, so the total is what the test can require to be non-zero.
+    assert!(total_work_ms(&applied.timings) > 0, "{:?}", applied.timings);
 
     // The change-status read and a repeated execute report the same timings,
     // because both read the stored change.
@@ -549,7 +545,7 @@ async fn a_policy_change_keeps_its_timings_across_a_coordinator_restart() {
     // The timings are in the durable store, so a coordinator that restarts on
     // that store reads the same ones back.
     coordinator.stop();
-    let _restart = spawn_process(&[
+    let mut restart = spawn_process(&[
         "coordinator".into(),
         "--listen".into(),
         format!("127.0.0.1:{coordinator_port}"),
@@ -565,6 +561,19 @@ async fn a_policy_change_keeps_its_timings_across_a_coordinator_restart() {
         .expect("the completed change survived the restart");
     assert_eq!(stored.change_id, applied.change_id);
     assert_eq!(stored.timings, applied.timings);
+
+    // The flags a fresh cluster was created with are compared with the stored
+    // topology, so they cannot restart a cluster whose policy changed since.
+    // The error has to say which restart works instead.
+    restart.stop();
+    let member_restart = coordinator_arguments(coordinator_port, &state, &members);
+    let (success, stderr) = run_to_exit(&member_restart, Duration::from_secs(10));
+    assert!(!success, "a --member restart started on a changed store");
+    assert!(
+        stderr.contains("configured bootstrap topology differs from durable topology"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("restart without --member"), "{stderr}");
 }
 
 #[tokio::test]
