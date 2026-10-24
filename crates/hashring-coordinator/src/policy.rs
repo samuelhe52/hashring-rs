@@ -17,7 +17,10 @@ impl CoordinatorService {
         }
         change.timings.pause_writes_ms = millis(pause_started.elapsed());
         let verify_started = Instant::now();
-        if let Err(error) = self.set_phase(MigrationPhase::Verifying).await {
+        if let Err(error) = self
+            .set_phase_with_timings(MigrationPhase::Verifying, Some(change.timings))
+            .await
+        {
             return self
                 .abort_after_error(&change, error, retry_transient)
                 .await;
@@ -58,7 +61,10 @@ impl CoordinatorService {
             }
         }
         change.timings.verify_ms = millis(verify_started.elapsed());
-        if let Err(error) = self.set_phase(MigrationPhase::ReadyToPublish).await {
+        if let Err(error) = self
+            .set_phase_with_timings(MigrationPhase::ReadyToPublish, Some(change.timings))
+            .await
+        {
             return self
                 .abort_after_error(&change, error, retry_transient)
                 .await;

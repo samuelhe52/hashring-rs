@@ -124,7 +124,8 @@ impl CoordinatorService {
         change.timings.snapshot_copy_ms = snapshot_copy_ms;
         change.timings.changelog_replay_ms = replay_millis(&change);
 
-        self.set_phase(MigrationPhase::ReplayingChangelog).await?;
+        self.set_phase_with_timings(MigrationPhase::ReplayingChangelog, Some(change.timings))
+            .await?;
         change.phase = MigrationPhase::ReplayingChangelog;
         let pause_started = Instant::now();
         self.set_phase(MigrationPhase::PausingWrites).await?;
@@ -150,7 +151,10 @@ impl CoordinatorService {
         change.timings.pause_writes_ms = millis(pause_started.elapsed());
 
         let verify_started = Instant::now();
-        if let Err(error) = self.set_phase(MigrationPhase::Verifying).await {
+        if let Err(error) = self
+            .set_phase_with_timings(MigrationPhase::Verifying, Some(change.timings))
+            .await
+        {
             return self
                 .abort_after_error(&change, error, retry_transient)
                 .await;
@@ -185,7 +189,8 @@ impl CoordinatorService {
         change.timings.verify_ms = millis(verify_started.elapsed());
         change.timings.changelog_replay_ms = replay_millis(&change);
 
-        self.set_phase(MigrationPhase::ReadyToPublish).await?;
+        self.set_phase_with_timings(MigrationPhase::ReadyToPublish, Some(change.timings))
+            .await?;
         change.phase = MigrationPhase::ReadyToPublish;
         // The pre-publication delay is a diagnostic window for the observer,
         // not publish work, so it must not inflate `publish_ms`.
@@ -499,7 +504,8 @@ impl CoordinatorService {
         {
             // Keep a network-interrupted change recoverable. Resetting is durable,
             // and the next pass repeats cleanup before it copies anything.
-            self.set_phase(MigrationPhase::Resetting).await?;
+            self.set_phase_with_timings(MigrationPhase::Resetting, Some(change.timings))
+                .await?;
             if let Err(cleanup) = self
                 .clear_prepublication_nodes(change, Instant::now() + self.migration_timeout)
                 .await
@@ -1212,8 +1218,10 @@ impl CoordinatorService {
             range.source_cleaned = false;
             range.snapshot_records = 0;
             range.changelog_watermark = 0;
+            range.changelog_replay_ms = 0;
             range.verified = false;
         }
+        active.timings = MigrationTimings::default();
         active.phase = MigrationPhase::CopyingSnapshot;
         self.repository
             .store_state(&next)
@@ -1261,7 +1269,8 @@ impl CoordinatorService {
         &self,
         change: &TopologyChange,
     ) -> Result<(), Status> {
-        self.set_phase(MigrationPhase::Aborting).await?;
+        self.set_phase_with_timings(MigrationPhase::Aborting, Some(change.timings))
+            .await?;
         self.finish_abort(change).await
     }
 

@@ -502,6 +502,27 @@ fn initializes_once_then_loads_durable_value() {
 }
 
 #[tokio::test]
+async fn a_fresh_prepublication_attempt_clears_the_previous_attempts_timings() {
+    let committed = topology();
+    let mut config = committed.config();
+    config.write_availability_guard.max_replica_lag_millis += 1;
+    let mut change =
+        TopologyChange::plan_with_config(&committed, committed.members.clone(), config).unwrap();
+    change.phase = MigrationPhase::Resetting;
+    change.timings.pause_writes_ms = 17;
+    change.timings.verify_ms = 23;
+    let repository = Arc::new(MemoryRepository::default());
+    let mut state = load_or_initialize(repository.as_ref(), Some(committed)).unwrap();
+    state.active_change = Some(change.clone());
+    let service = CoordinatorService::new(state, repository.clone(), Duration::from_secs(1));
+    let reset = service.reset_prepublication_attempt(&change).await.unwrap();
+    assert_eq!(reset.phase, MigrationPhase::CopyingSnapshot);
+    assert_eq!(reset.timings, MigrationTimings::default());
+    let restarted = load_or_initialize(repository.as_ref(), None).unwrap();
+    assert_eq!(restarted.active_change.unwrap().timings, reset.timings);
+}
+
+#[tokio::test]
 async fn recovery_block_reason_does_not_outlive_its_change() {
     for terminal in [MigrationPhase::Complete, MigrationPhase::Aborted] {
         let repository = Arc::new(MemoryRepository::default());

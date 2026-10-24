@@ -492,12 +492,13 @@ not source cleanup or stopping removed members. It also excludes the later
 `wait_for_full_rf` convergence, which `full_rf_seconds` reports separately.
 The publication and the activation are written with the phase they belong to:
 `publish_ms` is stored with `Published`, and `activation_ms` with `CleaningUp`
-and `Complete`. The steps before the publication are measured in their own
-phase and stored with the `Published` write, so a change that is aborted keeps
-none of them and a change that is published keeps all of them. Every one of
-those writes is a single durable write, so a repeated `execute-change`, a
-`change-status` read, and a restarted coordinator all see what the first
-`execute-change` returned.
+and `Complete`. Completed steps before publication are persisted when they
+finish, together with any phase change at that boundary, so status reads and
+aborted changes retain the work already measured.
+An interrupted attempt keeps those timings while cleanup is pending; starting
+a fresh copy attempt clears them. Every one of those writes is a single
+durable write, so a repeated `execute-change`, a `change-status` read, and a
+restarted coordinator all see what the first `execute-change` returned.
 
 `published_ms_source` says where `published_ms` came from. It is `observed`
 when the runner saw the change publish, and `completion_fallback` when a short
@@ -506,9 +507,12 @@ runs, but the earliest moment that can be named is the completion, and
 `published_ms` then equals `complete_ms`.
 
 Every change also gets `scaling_after_publish_probes`: the number of probes and
-the keys each one read. A probe with nothing to read is not evidence, so a
-change whose publish window held no successful write to a moved stratum fails
-the run rather than passing without the read-after-publish check.
+the keys each one verified. Only a matching value or an expected absence counts;
+a wrong value, an unexpected absence, or a failed GET fails the probe and the
+run, even if a later verification succeeds. A probe with nothing to read is
+not evidence, so a change whose publish window held no successful write to a
+moved stratum fails the run rather than passing without the read-after-publish
+check.
 
 `migration` is the plan's migration volume: `keys` and `keys_moved` compare
 the base and target topologies key by key, `rate` is their quotient, `ranges`
@@ -518,7 +522,10 @@ creating ranges, so it reports zero ranges and zero records.
 
 `stop_window` is what the client saw rather than the phase timeline. During a
 change the runner samples the client's cumulative `RangeBusy` count and
-successful write count every 5 ms, and reports `first_range_busy_ms`,
+successful write count every 5 ms. Each successful write also records the
+rejection count it observed at completion, so a success before a rejection
+cannot close the window merely because both occurred in the same poll.
+The runner reports `first_range_busy_ms`,
 `last_range_busy_ms`, `first_write_ok_ms`, `observed_ms`, and `poll_ms`. A
 node only fences a range when it receives the command, so the phase boundary
 is not the stop; a transition with no rejection leaves the window empty.

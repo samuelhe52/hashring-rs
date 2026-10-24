@@ -339,7 +339,8 @@ impl CoordinatorService {
                 .await?;
             change.timings.pause_writes_ms = millis(pause_started.elapsed());
             let verify_started = Instant::now();
-            self.set_phase(MigrationPhase::Verifying).await?;
+            self.set_phase_with_timings(MigrationPhase::Verifying, Some(change.timings))
+                .await?;
             change.phase = MigrationPhase::Verifying;
             let snapshot = self.state.read().await.clone();
             if !can_direct_merge(&snapshot, &change) {
@@ -359,6 +360,8 @@ impl CoordinatorService {
             let proof_started = Instant::now();
             let (required, candidates) = merge_proof(&snapshot, &change)?;
             change.timings.merge_proof_ms = millis(proof_started.elapsed());
+            self.set_phase_with_timings(MigrationPhase::Verifying, Some(change.timings))
+                .await?;
             let catch_up_started = Instant::now();
             let mut caught_up = BTreeSet::new();
             for pair in &required {
@@ -396,7 +399,8 @@ impl CoordinatorService {
                 .collect();
             change.timings.catch_up_ms = millis(catch_up_started.elapsed());
             change.timings.verify_ms = millis(verify_started.elapsed());
-            self.set_phase(MigrationPhase::ReadyToPublish).await?;
+            self.set_phase_with_timings(MigrationPhase::ReadyToPublish, Some(change.timings))
+                .await?;
             change.phase = MigrationPhase::ReadyToPublish;
             // The pre-publication delay is a diagnostic window for the
             // observer, not publish work.

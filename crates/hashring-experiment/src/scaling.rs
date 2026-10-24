@@ -9,6 +9,7 @@
 //! touched before the next transition starts.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -301,6 +302,9 @@ struct Metrics {
     /// Successful PUT and DELETE completions. The write-stop window uses it
     /// to find the first write that went through after the last rejection.
     writes_ok: AtomicU64,
+    /// Highest RangeBusy count observed at a successful write completion.
+    /// Unlike two sampled counters, this establishes the event order.
+    write_ok_after_busy: AtomicU64,
     max_in_flight: usize,
     state: Mutex<MetricState>,
 }
@@ -318,6 +322,7 @@ impl Metrics {
             in_flight: AtomicU64::new(0),
             in_flight_writes: AtomicU64::new(0),
             writes_ok: AtomicU64::new(0),
+            write_ok_after_busy: AtomicU64::new(0),
             max_in_flight,
             state: Mutex::new(MetricState {
                 window: BTreeMap::new(),
@@ -397,10 +402,11 @@ impl Metrics {
                 .entry(format!("{key}|{reason}"))
                 .or_insert(0) += 1;
         }
-        drop(state);
-        if result.is_ok() && matches!(kind, "put_rewrite" | "put_new" | "delete") {
-            self.writes_ok.fetch_add(1, Ordering::Relaxed);
-        }
+    }
+
+    fn record_write_success(&self, busy: u64) {
+        self.write_ok_after_busy.fetch_max(busy, Ordering::Release);
+        self.writes_ok.fetch_add(1, Ordering::Release);
     }
 
     fn writes_ok(&self) -> u64 {
@@ -525,7 +531,7 @@ impl Metrics {
 #[derive(Default)]
 struct StopWindow {
     previous_busy: u64,
-    previous_writes: u64,
+    initial_writes: u64,
     first_busy_ms: Option<f64>,
     last_busy_ms: Option<f64>,
     first_ok_ms: Option<f64>,
@@ -539,14 +545,14 @@ impl StopWindow {
     fn starting(busy: u64, writes_ok: u64) -> Self {
         Self {
             previous_busy: busy,
-            previous_writes: writes_ok,
+            initial_writes: writes_ok,
             ..Self::default()
         }
     }
 
     /// Samples cumulative counters. `now_ms` is measured from the start of the
     /// change.
-    fn observe(&mut self, now_ms: f64, busy: u64, writes_ok: u64) {
+    fn observe(&mut self, now_ms: f64, busy: u64, writes_ok: u64, write_ok_after_busy: u64) {
         if busy > self.previous_busy {
             self.first_busy_ms.get_or_insert(now_ms);
             self.last_busy_ms = Some(now_ms);
@@ -554,18 +560,18 @@ impl StopWindow {
             // completed before it is not the first write after the stop.
             self.first_ok_ms = None;
         }
-        // Check the success independently of the branch above: a rejection and
-        // the first successful write can land in the same sample interval, and
-        // an `else if` would drop that sample and then advance the baseline
-        // past it, leaving the window open forever.
+        // A success in the same sample may have preceded the rejection. Only
+        // close when a completion observed at least this rejection count.
+        // Keep that evidence across polls: the success can be observed before
+        // the poll catches up with the rejection counter.
         if self.last_busy_ms.is_some()
             && self.first_ok_ms.is_none()
-            && writes_ok > self.previous_writes
+            && writes_ok > self.initial_writes
+            && write_ok_after_busy >= busy
         {
             self.first_ok_ms = Some(now_ms);
         }
         self.previous_busy = busy;
-        self.previous_writes = writes_ok;
     }
 
     /// Whether more sampling cannot change the summary.
@@ -1093,6 +1099,11 @@ fn start_open_writes_for(
                             client.delete(key.to_be_bytes().to_vec()).await.map(|_| ())
                         }
                     };
+                    if result.is_ok() {
+                        metrics.record_write_success(
+                            client.retry_reason_count(RetryReason::RangeBusy),
+                        );
+                    }
                     let elapsed = Instant::now().saturating_duration_since(due);
                     ledger.record(key, cohort, &result);
                     metrics.record(cohort.metric_name(), phase, elapsed, &result);
@@ -1437,15 +1448,16 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
             let change_id = staged.change_id.clone();
             let base_epoch = staged.base_epoch;
             let target_epoch = staged.target_topology.epoch;
+            // Capture the baseline before execution can produce a rejection.
+            let mut window = StopWindow::starting(
+                workload_client.retry_reason_count(RetryReason::RangeBusy),
+                metrics.writes_ok(),
+            );
             let execution = tokio::spawn(async move {
                 execution_client
                     .execute_topology_change(change_id, base_epoch, target_epoch)
                     .await
             });
-            let mut window = StopWindow::starting(
-                workload_client.retry_reason_count(RetryReason::RangeBusy),
-                metrics.writes_ok(),
-            );
             loop {
                 if execution.is_finished() {
                     break;
@@ -1497,6 +1509,7 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                     started.elapsed().as_secs_f64() * 1_000.0,
                     workload_client.retry_reason_count(RetryReason::RangeBusy),
                     metrics.writes_ok(),
+                    metrics.write_ok_after_busy.load(Ordering::Acquire),
                 );
             }
             let completed = execution
@@ -1541,6 +1554,7 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                     started.elapsed().as_secs_f64() * 1_000.0,
                     workload_client.retry_reason_count(RetryReason::RangeBusy),
                     metrics.writes_ok(),
+                    metrics.write_ok_after_busy.load(Ordering::Acquire),
                 );
             }
             stop_window = Some(window);
@@ -2014,8 +2028,17 @@ fn spawn_after_publish_probe_task(
     // The probe reports every key it reads, so the watchdog can tell a probe
     // that is still working from one that stopped.
     let (progress, progress_updates) = tokio::sync::watch::channel(ProbeState::Reading(0));
+    let client = workload_client.clone();
     let handle = tokio::spawn(spawn_after_publish_probe(
-        workload_client.clone(),
+        move |key: u64| {
+            let client = client.clone();
+            async move {
+                client
+                    .get(key.to_be_bytes().to_vec())
+                    .await
+                    .map(|output| output.value)
+            }
+        },
         Arc::clone(metrics),
         expected.clone(),
         rate,
@@ -2150,8 +2173,8 @@ async fn join_after_publish_probe(mut probe: AfterPublishProbe) -> Result<usize>
         }
     };
     ensure!(
-        read > 0,
-        "the {label} read-after-publish probe read no key of the {expected} it was given"
+        read == expected && read > 0,
+        "the {label} read-after-publish probe verified {read} of its {expected} keys"
     );
     Ok(read)
 }
@@ -2451,6 +2474,11 @@ fn start_writes(context: WriteContext<'_>) {
                             client.delete(key.to_be_bytes().to_vec()).await.map(|_| ())
                         }
                     };
+                    if result.is_ok() {
+                        metrics.record_write_success(
+                            client.retry_reason_count(RetryReason::RangeBusy),
+                        );
+                    }
                     let elapsed = started.elapsed();
                     ledger.record(key, cohort, &result);
                     metrics.record(cohort.metric_name(), phase, elapsed, &result);
@@ -2470,27 +2498,27 @@ fn start_writes(context: WriteContext<'_>) {
     }
 }
 
-async fn spawn_after_publish_probe(
-    client: HashringClient,
+async fn spawn_after_publish_probe<F, Fut>(
+    mut get: F,
     metrics: Arc<Metrics>,
     expected: BTreeMap<u64, Allowed>,
     rate: u64,
     progress: tokio::sync::watch::Sender<ProbeState>,
-) -> Result<usize> {
+) -> Result<usize>
+where
+    F: FnMut(u64) -> Fut,
+    Fut: Future<Output = Result<Vec<u8>, ClientError>>,
+{
     let interval = Duration::from_secs_f64(1.0 / rate as f64);
     let mut read = 0_usize;
     for (key, allowed) in expected {
         tokio::time::sleep(interval).await;
         let phase = metrics.phase();
         let started = Instant::now();
-        let result = client.get(key.to_be_bytes().to_vec()).await;
+        let result = get(key).await;
         let elapsed = started.elapsed();
-        read += 1;
-        // The watchdog that watches this probe learns that it is still going
-        // from this count.
-        progress.send_replace(ProbeState::Reading(read as u64));
         match result {
-            Ok(output) if allowed.check(Some(&output.value)) => {
+            Ok(value) if allowed.check(Some(&value)) => {
                 metrics.record("probe_read_after_publish", phase, elapsed, &Ok(()));
             }
             Err(error) if is_not_found(&error) && allowed.check(None) => {
@@ -2510,6 +2538,7 @@ async fn spawn_after_publish_probe(
                         allowed.describe()
                     ),
                 );
+                return Err(anyhow!("key {key} had the wrong value after publication"));
             }
             Err(error) if is_not_found(&error) => {
                 metrics.violation(
@@ -2520,11 +2549,17 @@ async fn spawn_after_publish_probe(
                     ),
                 );
                 metrics.record("probe_read_after_publish", phase, elapsed, &Err(error));
+                return Err(anyhow!("key {key} was missing after publication"));
             }
             Err(error) => {
+                let detail = format!("key {key} could not be verified after publication: {error}");
                 metrics.record("probe_read_after_publish", phase, elapsed, &Err(error));
+                return Err(anyhow!(detail));
             }
         }
+        // Only a checked value or an expected absence is evidence of a read.
+        read += 1;
+        progress.send_replace(ProbeState::Reading(read as u64));
     }
     // The probe is done, so the watchdog must not give up on it.
     progress.send_replace(ProbeState::Finished);
@@ -2683,10 +2718,100 @@ mod tests {
     #[test]
     fn a_rejection_and_a_success_in_one_sample_still_close_the_stop_window() {
         let mut window = StopWindow::starting(0, 0);
-        window.observe(10.0, 1, 1);
+        window.observe(10.0, 1, 1, 1);
         assert_eq!(window.first_busy_ms, Some(10.0));
         assert_eq!(window.first_ok_ms, Some(10.0));
         assert!(window.closed());
+    }
+
+    #[test]
+    fn a_success_before_the_rejection_does_not_close_the_stop_window() {
+        let mut window = StopWindow::starting(7, 12);
+        // Both counters advance in one poll, but the success saw only the
+        // previous rejection count: it happened before the new rejection.
+        window.observe(10.0, 8, 13, 7);
+        assert_eq!(window.first_busy_ms, Some(10.0));
+        assert_eq!(window.first_ok_ms, None);
+        assert!(!window.closed());
+        window.observe(20.0, 8, 13, 7);
+        assert!(!window.closed());
+        window.observe(30.0, 8, 14, 8);
+        assert_eq!(window.first_ok_ms, Some(30.0));
+        assert_eq!(window.summary()["observed_ms"], 20.0);
+        // A later rejection invalidates that success, too.
+        window.observe(40.0, 9, 14, 8);
+        assert!(!window.closed());
+    }
+
+    #[test]
+    fn a_success_is_kept_when_the_busy_sample_catches_up_later() {
+        let mut window = StopWindow::starting(0, 0);
+        window.observe(10.0, 1, 1, 2);
+        window.observe(20.0, 2, 1, 2);
+        assert_eq!(window.last_busy_ms, Some(20.0));
+        assert!(window.closed());
+    }
+
+    #[tokio::test]
+    async fn publication_probe_counts_only_verified_keys_and_rejects_read_failures() {
+        for failure in [
+            Ok(vec![99]),
+            Err(ClientError::DeadlineExceeded {
+                outcome: MutationOutcome::KnownNotApplied,
+            }),
+            Err(hashring_client::OperationFailure {
+                code: ErrorCode::NotFound,
+                message: "missing".into(),
+                retryable: false,
+                outcome: MutationOutcome::KnownNotApplied,
+            }
+            .into()),
+        ] {
+            let metrics = Arc::new(Metrics::new(Duration::from_secs(1), false, 1).unwrap());
+            let expected =
+                BTreeMap::from([(1, Allowed::Value(vec![1])), (2, Allowed::Value(vec![2]))]);
+            let mut responses = [Ok(vec![1]), failure].into_iter();
+            let (progress, updates) = tokio::sync::watch::channel(ProbeState::Reading(0));
+            let result = spawn_after_publish_probe(
+                |_| std::future::ready(responses.next().unwrap()),
+                metrics,
+                expected,
+                500,
+                progress,
+            )
+            .await;
+            assert!(result.is_err(), "an unverified key must fail the probe");
+            assert_eq!(*updates.borrow(), ProbeState::Reading(1));
+        }
+    }
+
+    #[tokio::test]
+    async fn publication_probe_accepts_a_checked_value_and_expected_absence() {
+        let metrics = Arc::new(Metrics::new(Duration::from_secs(1), false, 1).unwrap());
+        let expected = BTreeMap::from([(1, Allowed::Value(vec![1])), (2, Allowed::Missing)]);
+        let (progress, updates) = tokio::sync::watch::channel(ProbeState::Reading(0));
+        let result = spawn_after_publish_probe(
+            |key| {
+                std::future::ready(if key == 1 {
+                    Ok(vec![1])
+                } else {
+                    Err(hashring_client::OperationFailure {
+                        code: ErrorCode::NotFound,
+                        message: "deleted".into(),
+                        retryable: false,
+                        outcome: MutationOutcome::KnownNotApplied,
+                    }
+                    .into())
+                })
+            },
+            metrics,
+            expected,
+            500,
+            progress,
+        )
+        .await;
+        assert_eq!(result.unwrap(), 2);
+        assert_eq!(*updates.borrow(), ProbeState::Finished);
     }
 
     #[test]
