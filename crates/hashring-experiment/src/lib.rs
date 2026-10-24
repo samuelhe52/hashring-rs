@@ -2595,6 +2595,23 @@ fn reserve_ports(count: usize) -> Result<Vec<u16>> {
         .collect()
 }
 
+/// The most write operations per second a scaling run accepts.
+///
+/// The rate is split into whole operations per second and multiplied by the
+/// pool seconds, so an absurd rate would overflow those products. This ceiling
+/// is far above any rate the harness can drive on one host.
+const MAX_SCALING_RATE: u64 = 1_000_000;
+
+/// The smallest rate that still offers the smallest write cohort one operation
+/// per second when the rate is split into whole operations.
+///
+/// The share is the one `scaling::cohort_rates` splits the rate with: 15% for
+/// the closed loop's delete cohort and 3% for the open loop's, so the two
+/// definitions have to stay in step.
+fn minimum_scaling_rate(smallest_share_percent: u64) -> u64 {
+    100_u64.div_ceil(smallest_share_percent)
+}
+
 fn validate_config(config: &ExperimentConfig) -> Result<()> {
     ensure!(config.node_count >= 2, "node_count must be at least 2");
     if matches!(config.mode, ExperimentMode::Availability) {
@@ -2735,14 +2752,24 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
                 "a control run starts with every peak node and changes no membership"
             ),
         }
+        // The rates are split into whole operations per second and multiplied
+        // by the pool seconds, so a rate near the integer limit would overflow
+        // those products instead of failing cleanly.
+        ensure!(
+            config.scaling_open_rate <= MAX_SCALING_RATE
+                && config.scaling_write_rate <= MAX_SCALING_RATE,
+            "scaling rates must not exceed {MAX_SCALING_RATE} operations per second"
+        );
         if config.scaling_load_mode == ScalingLoadMode::Open {
             ensure!(
                 config.scaling_open_rate > 0,
                 "an open-loop scaling run needs a positive scaling_open_rate"
             );
+            let minimum = minimum_scaling_rate(3);
             ensure!(
-                config.scaling_open_rate * 3 / 100 > 0 && config.scaling_open_rate * 12 / 100 > 0,
-                "an open-loop scaling run needs a rate high enough to offer every write cohort"
+                config.scaling_open_rate >= minimum,
+                "an open-loop scaling run needs a rate of at least {minimum} to offer every \
+                 write cohort"
             );
             ensure!(
                 config.max_in_flight > 0,
@@ -2763,9 +2790,11 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
             // whole operations per second. A rate that rounds the smallest
             // share down to zero would leave the cohort without a key, which
             // is only noticed when the run builds its plan.
+            let minimum = minimum_scaling_rate(15);
             ensure!(
-                config.scaling_write_rate * 15 / 100 > 0,
-                "a closed-loop scaling run needs a rate high enough to offer every write cohort"
+                config.scaling_write_rate >= minimum,
+                "a closed-loop scaling run needs a rate of at least {minimum} to offer every \
+                 write cohort"
             );
         }
         ensure!(
@@ -2978,11 +3007,44 @@ mod tests {
         let mut config = scaling_config();
         config.scaling_write_rate = 6;
         let error = validate_config(&config).unwrap_err().to_string();
-        assert!(error.contains("every write cohort"), "{error}");
+        assert!(error.contains("at least 7"), "{error}");
 
         // The smallest rate that gives every cohort an operation is accepted.
         let mut config = scaling_config();
         config.scaling_write_rate = 7;
+        validate_config(&config).unwrap();
+
+        // The open loop shares its rate the same way, and its smallest share
+        // is 3%.
+        let mut config = scaling_config();
+        config.scaling_load_mode = ScalingLoadMode::Open;
+        config.scaling_open_rate = 33;
+        let error = validate_config(&config).unwrap_err().to_string();
+        assert!(error.contains("at least 34"), "{error}");
+        let mut config = scaling_config();
+        config.scaling_load_mode = ScalingLoadMode::Open;
+        config.scaling_open_rate = 34;
+        validate_config(&config).unwrap();
+    }
+
+    #[test]
+    fn an_absurd_scaling_rate_is_rejected_instead_of_overflowing() {
+        // The rate is multiplied by its share and by the pool seconds, so a
+        // value near the integer limit would overflow those products.
+        let mut config = scaling_config();
+        config.scaling_write_rate = u64::MAX;
+        let error = validate_config(&config).unwrap_err().to_string();
+        assert!(error.contains("must not exceed"), "{error}");
+
+        let mut config = scaling_config();
+        config.scaling_load_mode = ScalingLoadMode::Open;
+        config.scaling_open_rate = u64::MAX;
+        let error = validate_config(&config).unwrap_err().to_string();
+        assert!(error.contains("must not exceed"), "{error}");
+
+        // The ceiling itself is accepted and still splits without overflowing.
+        let mut config = scaling_config();
+        config.scaling_write_rate = MAX_SCALING_RATE;
         validate_config(&config).unwrap();
     }
 
