@@ -9,7 +9,6 @@
 //! touched before the next transition starts.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1755,13 +1754,9 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
     // Every change has to show that its keys could be read after the
     // publication. A probe that read nothing leaves the run without that
     // evidence, so it fails the run instead of passing it quietly.
-    let idle_limit = after_publish_probe_idle_limit(
-        Duration::from_millis(config.operation_timeout_ms),
-        after_publish_probe_rate(config),
-    );
     let mut probe_results = Vec::new();
     for probe in re_read_handles {
-        let read = join_after_publish_probe(probe, idle_limit).await?;
+        let read = join_after_publish_probe(probe).await?;
         probe_results.push(read);
     }
     ensure!(
@@ -1913,6 +1908,9 @@ struct CohortRates {
 }
 
 /// The per-cohort write rates of the run's load mode.
+///
+/// The shares are whole operations per second, so the cohorts together offer
+/// slightly less than the configured rate when the shares do not divide it.
 fn cohort_rates(config: &ExperimentConfig) -> CohortRates {
     let (total, rewrite, write_new, delete) = match config.scaling_load_mode {
         ScalingLoadMode::Closed => (config.scaling_write_rate, 60, 25, 15),
@@ -1960,9 +1958,29 @@ struct AfterPublishProbe {
     label: &'static str,
     /// The keys the probe was given to read.
     expected: usize,
-    /// How many keys the probe has read so far.
-    progress: Arc<AtomicU64>,
-    handle: tokio::task::JoinHandle<Result<usize>>,
+    /// How long the probe may go without reading a key.
+    idle_limit: Duration,
+    /// Whether the watchdog gave up on the probe.
+    stuck: Arc<AtomicBool>,
+    /// The probe's task. It is aborted when the probe is dropped.
+    handle: Option<tokio::task::JoinHandle<Result<usize>>>,
+    /// The watchdog that gives up on a probe which stops reading keys.
+    watchdog: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for AfterPublishProbe {
+    fn drop(&mut self) {
+        // A probe that is dropped before it finished would keep reading keys
+        // and writing metrics after the run moved on, so both of its tasks
+        // are aborted here. The joined path consumes the handle first, so an
+        // aborted handle is only ever a task that is still running.
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+        if let Some(watchdog) = self.watchdog.take() {
+            watchdog.abort();
+        }
+    }
 }
 
 /// Starts the read-after-publish probe of one transition.
@@ -1991,24 +2009,118 @@ fn spawn_after_publish_probe_task(
         return Ok(None);
     }
     let rate = after_publish_probe_rate(config);
-    let progress = Arc::new(AtomicU64::new(0));
+    let idle_limit =
+        after_publish_probe_idle_limit(Duration::from_millis(config.operation_timeout_ms), rate);
+    // The probe reports every key it reads, so the watchdog can tell a probe
+    // that is still working from one that stopped.
+    let (progress, progress_updates) = tokio::sync::watch::channel(ProbeState::Reading(0));
     let handle = tokio::spawn(spawn_after_publish_probe(
         workload_client.clone(),
         Arc::clone(metrics),
         expected.clone(),
         rate,
-        Arc::clone(&progress),
+        progress,
+    ));
+    let stuck = Arc::new(AtomicBool::new(false));
+    let watchdog = tokio::spawn(watch_after_publish_probe(
+        label,
+        progress_updates,
+        handle.abort_handle(),
+        Arc::clone(&stuck),
+        idle_limit,
+        events.clone(),
     ));
     events.record(
         "scaling_after_publish_probe_started",
-        json!({ "label": label, "keys": expected.len(), "rate": rate }),
+        json!({
+            "label": label,
+            "keys": expected.len(),
+            "rate": rate,
+            "idle_limit_ms": idle_limit.as_millis() as u64,
+        }),
     )?;
     Ok(Some(AfterPublishProbe {
         label,
         expected: expected.len(),
-        progress,
-        handle,
+        idle_limit,
+        stuck,
+        handle: Some(handle),
+        watchdog: Some(watchdog),
     }))
+}
+
+/// What a read-after-publish probe is doing.
+///
+/// The probe publishes every key it reads, so the watchdog can tell a probe
+/// that is still working from one that stopped. The last state is the one the
+/// probe leaves behind when it read every key it was given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeState {
+    /// The probe read this many keys and is still reading.
+    Reading(u64),
+    /// The probe read every key it was given.
+    Finished,
+}
+
+/// Gives up on a probe that stops reading keys.
+///
+/// The clock starts with the probe rather than with the moment the run waits
+/// for it, so a probe that stopped early is given up on while the run is
+/// still going. Every key the probe reads moves the deadline, so the limit
+/// covers the time between two keys instead of the whole probe.
+async fn watch_after_publish_probe(
+    label: &'static str,
+    mut progress: tokio::sync::watch::Receiver<ProbeState>,
+    abort: tokio::task::AbortHandle,
+    stuck: Arc<AtomicBool>,
+    idle_limit: Duration,
+    events: EventLog,
+) {
+    let mut read = 0_u64;
+    let mut deadline = tokio::time::Instant::now() + idle_limit;
+    loop {
+        tokio::select! {
+            update = progress.changed() => {
+                if update.is_err() {
+                    // The probe ended without saying so, so there is nothing
+                    // left to watch.
+                    return;
+                }
+                match *progress.borrow() {
+                    ProbeState::Finished => return,
+                    ProbeState::Reading(count) => {
+                        read = count;
+                        deadline = tokio::time::Instant::now() + idle_limit;
+                    }
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                match *progress.borrow() {
+                    ProbeState::Finished => return,
+                    ProbeState::Reading(count) if count != read => {
+                        // The probe read a key after the deadline was set, so
+                        // it is making progress and the deadline was stale.
+                        read = count;
+                        deadline = tokio::time::Instant::now() + idle_limit;
+                        continue;
+                    }
+                    ProbeState::Reading(_) => {}
+                }
+                stuck.store(true, Ordering::Release);
+                if let Err(error) = events.record(
+                    "scaling_after_publish_probe_stuck",
+                    json!({
+                        "label": label,
+                        "idle_limit_ms": idle_limit.as_millis() as u64,
+                    }),
+                ) {
+                    eprintln!("scaling after-publish probe event failed: {error:#}");
+                }
+                abort.abort();
+                return;
+            }
+        }
+    }
 }
 
 /// Waits for the read-after-publish probe and reports how many keys it read.
@@ -2016,41 +2128,26 @@ fn spawn_after_publish_probe_task(
 /// The probe is given as long as it keeps reading keys. It is given up on
 /// when it stops making progress, because a probe that reads nothing is a
 /// probe that will never finish.
-async fn join_after_publish_probe(probe: AfterPublishProbe, idle_limit: Duration) -> Result<usize> {
-    let AfterPublishProbe {
-        label,
-        expected,
-        progress,
-        mut handle,
-    } = probe;
-    let mut last = progress.load(Ordering::Acquire);
-    let mut idle = Box::pin(tokio::time::sleep(idle_limit));
-    let read = futures::future::poll_fn(|context| {
-        if let std::task::Poll::Ready(result) = std::pin::Pin::new(&mut handle).poll(context) {
-            return std::task::Poll::Ready(match result {
-                Ok(Ok(read)) => Ok(read),
-                Ok(Err(error)) => Err(error),
-                Err(error) => Err(anyhow::Error::new(error)),
-            });
-        }
-        let now = progress.load(Ordering::Acquire);
-        if now != last {
-            last = now;
-            idle.as_mut()
-                .reset(tokio::time::Instant::now() + idle_limit);
-        }
-        if idle.as_mut().poll(context).is_ready() {
-            handle.abort();
-            return std::task::Poll::Ready(Err(anyhow::anyhow!(
+async fn join_after_publish_probe(mut probe: AfterPublishProbe) -> Result<usize> {
+    let label = probe.label;
+    let expected = probe.expected;
+    let idle_limit = probe.idle_limit;
+    let stuck = Arc::clone(&probe.stuck);
+    let handle = probe
+        .handle
+        .take()
+        .expect("a probe always has the task it was started with");
+    let read = match handle.await {
+        Ok(Ok(read)) => read,
+        Ok(Err(error)) => return Err(error.context("the read-after-publish probe failed")),
+        Err(error) if error.is_cancelled() && stuck.load(Ordering::Acquire) => {
+            return Err(anyhow::anyhow!(
                 "the {label} read-after-publish probe read no key for {idle_limit:?}"
-            )));
+            ));
         }
-        std::task::Poll::Pending
-    })
-    .await;
-    let read = match read {
-        Ok(read) => read,
-        Err(error) => return Err(error.context("joining the read-after-publish probe")),
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context("joining the read-after-publish probe"));
+        }
     };
     ensure!(
         read > 0,
@@ -2378,7 +2475,7 @@ async fn spawn_after_publish_probe(
     metrics: Arc<Metrics>,
     expected: BTreeMap<u64, Allowed>,
     rate: u64,
-    progress: Arc<AtomicU64>,
+    progress: tokio::sync::watch::Sender<ProbeState>,
 ) -> Result<usize> {
     let interval = Duration::from_secs_f64(1.0 / rate as f64);
     let mut read = 0_usize;
@@ -2389,9 +2486,9 @@ async fn spawn_after_publish_probe(
         let result = client.get(key.to_be_bytes().to_vec()).await;
         let elapsed = started.elapsed();
         read += 1;
-        // The watcher that waits for this probe learns that it is still going
-        // from this counter.
-        progress.fetch_add(1, Ordering::Release);
+        // The watchdog that watches this probe learns that it is still going
+        // from this count.
+        progress.send_replace(ProbeState::Reading(read as u64));
         match result {
             Ok(output) if allowed.check(Some(&output.value)) => {
                 metrics.record("probe_read_after_publish", phase, elapsed, &Ok(()));
@@ -2429,6 +2526,8 @@ async fn spawn_after_publish_probe(
             }
         }
     }
+    // The probe is done, so the watchdog must not give up on it.
+    progress.send_replace(ProbeState::Finished);
     Ok(read)
 }
 
@@ -2608,5 +2707,62 @@ mod tests {
         // less time.
         let fast = after_publish_probe_idle_limit(Duration::from_secs(30), 500);
         assert!(fast < limit);
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_stops_reading_keys_is_given_up_on() {
+        let directory = tempfile::tempdir().unwrap();
+        let events = EventLog::open(&directory.path().join("events.jsonl")).unwrap();
+        let (progress, updates) = tokio::sync::watch::channel(ProbeState::Reading(0));
+        // A probe that never finishes a key keeps its channel open and sends
+        // nothing, so the watchdog sees no progress at all.
+        let probe = tokio::spawn(async move {
+            let _progress = progress;
+            std::future::pending::<()>().await;
+        });
+        let stuck = Arc::new(AtomicBool::new(false));
+        let watchdog = tokio::spawn(watch_after_publish_probe(
+            "grow",
+            updates,
+            probe.abort_handle(),
+            Arc::clone(&stuck),
+            Duration::from_millis(50),
+            events.clone(),
+        ));
+        watchdog.await.unwrap();
+        assert!(stuck.load(Ordering::Acquire));
+        // The probe was aborted, so joining it reports the cancellation.
+        let error = probe.await.unwrap_err();
+        assert!(error.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_keeps_reading_keys_is_left_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let events = EventLog::open(&directory.path().join("events.jsonl")).unwrap();
+        let (progress, updates) = tokio::sync::watch::channel(ProbeState::Reading(0));
+        let sender = progress.clone();
+        // The probe reads a key every 10 ms, which is well inside the limit,
+        // and then says that it is done.
+        let probe = tokio::spawn(async move {
+            for read in 1..=5_u64 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                sender.send_replace(ProbeState::Reading(read));
+            }
+            sender.send_replace(ProbeState::Finished);
+            5_usize
+        });
+        let stuck = Arc::new(AtomicBool::new(false));
+        let watchdog = tokio::spawn(watch_after_publish_probe(
+            "grow",
+            updates,
+            probe.abort_handle(),
+            Arc::clone(&stuck),
+            Duration::from_millis(50),
+            events.clone(),
+        ));
+        watchdog.await.unwrap();
+        assert!(!stuck.load(Ordering::Acquire));
+        assert_eq!(probe.await.unwrap(), 5);
     }
 }
