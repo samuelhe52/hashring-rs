@@ -514,6 +514,13 @@ not evidence, so a change whose publish window held no successful write to a
 moved stratum fails the run rather than passing without the read-after-publish
 check.
 
+A probe is given up on when it stops making progress, not after a fixed total:
+the idle limit is `operation timeout + the pause between two reads + 10 s`, it
+starts when the probe starts, and every verified key moves it forward. The
+`scaling_after_publish_probe_started` event records `idle_limit_ms`, and a probe
+that stops first records `scaling_after_publish_probe_stuck` with the keys it
+had verified, then fails the run.
+
 `migration` is the plan's migration volume: `keys` and `keys_moved` compare
 the base and target topologies key by key, `rate` is their quotient, `ranges`
 is how many ranges the coordinator moved, and `snapshot_records` is how many
@@ -523,12 +530,16 @@ creating ranges, so it reports zero ranges and zero records.
 `stop_window` is what the client saw rather than the phase timeline. During a
 change the runner samples the client's cumulative `RangeBusy` count and
 successful write count every 5 ms. Each successful write also records the
-rejection count it observed at completion, so a success before a rejection
-cannot close the window merely because both occurred in the same poll.
+rejection count the client had already seen when that write started, so a
+success before a rejection cannot close the window merely because both occurred
+in the same poll.
 The runner reports `first_range_busy_ms`,
-`last_range_busy_ms`, `first_write_ok_ms`, `observed_ms`, and `poll_ms`. A
-node only fences a range when it receives the command, so the phase boundary
-is not the stop; a transition with no rejection leaves the window empty.
+`last_range_busy_ms`, `first_write_ok_ms`, `busy_before_first_ok`,
+`observed_ms`, and `poll_ms`. `busy_before_first_ok` is the evidence behind
+`first_write_ok_ms`: the rejections the client knew about when that write
+started. A node only fences a range when it receives the command, so the phase
+boundary is not the stop; a transition with no rejection leaves the window
+empty.
 
 `observations.scaling_metrics` holds the per-phase operation and latency
 totals, and `events.jsonl` holds one `metrics_sampled` event per second plus

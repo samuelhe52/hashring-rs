@@ -360,8 +360,7 @@ impl CoordinatorService {
             let proof_started = Instant::now();
             let (required, candidates) = merge_proof(&snapshot, &change)?;
             change.timings.merge_proof_ms = millis(proof_started.elapsed());
-            self.set_phase_with_timings(MigrationPhase::Verifying, Some(change.timings))
-                .await?;
+            self.store_timings(change.timings).await?;
             let catch_up_started = Instant::now();
             let mut caught_up = BTreeSet::new();
             for pair in &required {

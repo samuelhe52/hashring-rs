@@ -629,6 +629,13 @@ async fn scaling_round_trip_defers_s1_verification_and_records_the_stop_window()
         assert!(first <= last, "{window}");
         assert!(last <= first_ok, "{window}");
         assert!(window["observed_ms"].as_f64().unwrap() > 0.0, "{window}");
+        // The write that closed the window had seen at least one rejection
+        // when it started, so it cannot be a write that was already in flight
+        // when the stop began.
+        assert!(
+            window["busy_before_first_ok"].as_u64().unwrap() >= 1,
+            "{window}"
+        );
         let published = transition["published_ms"]
             .as_f64()
             .expect("a completed change records a publication time");
