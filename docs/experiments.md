@@ -196,12 +196,16 @@ failure. Capacity backpressure is split into the requests that ended with a
 capacity error and the retries the client made because of capacity.
 Under `OwnerOnly`, a rollback after an owner failure is counted and classified;
 a rollback after a follower failure, or an impossible value in either scenario,
-fails the run. The history of acknowledged states is bounded per key, and a
-read the shortened history can no longer explain is reported as inconclusive
-rather than as an impossible value: such a read is not a verified read, so it
-fails the round in either scenario. The checks of a round are collected, and a
-round that fails ends the run with its own record and the records of the
-rounds before it still in the summary.
+fails the run. The history of acknowledged states is bounded per key by
+`--fault-acknowledged-window` (4096 states by default, and a state that is
+acknowledged again moves to the back of the window), and a read the shortened
+history can no longer explain is reported as inconclusive rather than as an
+impossible value: such a read is not a verified read, so it fails the round in
+either scenario. The window has to cover the writes one key takes during the
+load, and `dropped_acknowledged_states` in each round says whether it did. The
+checks of a round are collected, and a round that fails ends the run with its
+own record and the records of the rounds before it still in the summary,
+together with the reasons in `observations.fault_failures`.
 
 See [fault-under-load.md](fault-under-load.md) for the validation experiments.
 
