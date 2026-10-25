@@ -9,7 +9,7 @@
 //! then verify every key the run touched.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::File,
     io::{BufWriter, Write},
     sync::{
@@ -374,7 +374,7 @@ struct KeyModel {
     /// A later read that matches one of these but not `possible` is a rollback
     /// rather than an arbitrary value. The list is bounded, and the states it
     /// dropped are counted.
-    acknowledged: Vec<AcknowledgedState>,
+    acknowledged: VecDeque<AcknowledgedState>,
     /// How many acknowledged states the bound dropped.
     dropped_acknowledged: u64,
     rolled_back: bool,
@@ -384,7 +384,7 @@ impl KeyModel {
     fn new(state: PossibleState) -> Self {
         let mut model = Self {
             possible: Vec::new(),
-            acknowledged: Vec::new(),
+            acknowledged: VecDeque::new(),
             dropped_acknowledged: 0,
             rolled_back: false,
         };
@@ -399,16 +399,31 @@ impl KeyModel {
 
     /// Keeps an acknowledged state, and forgets the oldest one when the key's
     /// history is full.
+    ///
+    /// The window holds the most recently acknowledged states: a state that is
+    /// acknowledged again moves to the back, so a rollback to it is still
+    /// recognized after newer writes pushed it out of the window.
     fn remember(&mut self, state: &PossibleState) {
         let acknowledged = AcknowledgedState::of(state);
-        if self.acknowledged.contains(&acknowledged) {
+        if let Some(position) = self
+            .acknowledged
+            .iter()
+            .position(|entry| *entry == acknowledged)
+        {
+            if position + 1 != self.acknowledged.len() {
+                let entry = self
+                    .acknowledged
+                    .remove(position)
+                    .expect("the position is inside the window");
+                self.acknowledged.push_back(entry);
+            }
             return;
         }
         if self.acknowledged.len() >= MAX_ACKNOWLEDGED_STATES_PER_KEY {
-            self.acknowledged.remove(0);
+            self.acknowledged.pop_front();
             self.dropped_acknowledged += 1;
         }
-        self.acknowledged.push(acknowledged);
+        self.acknowledged.push_back(acknowledged);
     }
 
     fn on_put(&mut self, value: Vec<u8>, version: RecordVersion) {
@@ -925,6 +940,86 @@ async fn run_worker(context: WorkerContext) -> Result<WorkerStats> {
     Ok(stats)
 }
 
+/// The checks one round of a fault run has to pass.
+///
+/// The checks are collected instead of raised one by one: a round that fails
+/// ends the run, and the run then reports everything the round found instead
+/// of only the first problem.
+struct RoundChecks<'a> {
+    round: u32,
+    scenario: FaultScenario,
+    write_ack_policy: WriteAckPolicy,
+    mix: &'a OperationMix,
+    reads_after_kill: u64,
+    writes_after_kill: u64,
+    owner_unchanged: bool,
+}
+
+impl RoundChecks<'_> {
+    /// The problems the round found. An empty list means the round passed.
+    fn failures(&self, stats: &WorkerStats) -> Vec<String> {
+        let mut failures = Vec::new();
+        if stats.impossible > 0 {
+            failures.push(format!(
+                "round {} observed {} values the history does not allow: {:?}",
+                self.round, stats.impossible, stats.violations
+            ));
+        }
+        if stats.requests() == 0 {
+            failures.push(format!(
+                "round {} completed no requests under load",
+                self.round
+            ));
+        }
+        // The load has to keep working after the failure, not only before it:
+        // a run whose writes stopped at the kill would still have completed
+        // requests before it.
+        for (operation, completed) in [
+            (Operation::Get, self.reads_after_kill),
+            (Operation::Put, self.writes_after_kill),
+        ] {
+            if self.mix.offers(operation) && completed == 0 {
+                failures.push(format!(
+                    "round {}: the load completed no {} after the kill",
+                    self.round,
+                    operation.name()
+                ));
+            }
+        }
+        if !self.owner_unchanged {
+            failures.push(format!(
+                "round {}: killing a follower changed the owner of a selected key",
+                self.round
+            ));
+        }
+        if (self.scenario == FaultScenario::Follower
+            || self.write_ack_policy != WriteAckPolicy::OwnerOnly)
+            && stats.rollbacks > 0
+        {
+            failures.push(format!(
+                "round {} rolled back {} acknowledged changes: {:?}",
+                self.round, stats.rollbacks, stats.rollback_kinds
+            ));
+        }
+        if stats.undecidable > 0 {
+            // A read the history cannot explain is not a verified read. The
+            // run does not count it as a pass, in either scenario: under
+            // `OwnerOnly` a rollback is allowed, but once the history has been
+            // shortened it cannot be told apart from an impossible value, and
+            // a follower loss allows no rollback at all.
+            failures.push(format!(
+                "round {}: {} reads cannot be verified, because the acknowledged history of their \
+                 keys was shortened ({} states dropped): {:?}",
+                self.round,
+                stats.undecidable,
+                stats.dropped_acknowledged,
+                stats.undecidable_samples
+            ));
+        }
+        failures
+    }
+}
+
 /// One injected failure and everything the run measured about it.
 ///
 /// Every duration is counted from the kill of the victim, so the figures of
@@ -954,7 +1049,9 @@ struct FaultRound {
     /// The milliseconds from the kill to the last failed request.
     last_failure_after_kill_ms: Option<u64>,
     failures_after_kill: u64,
-    /// The reads, writes and deletes the load completed after the kill.
+    /// The reads, writes and deletes the load completed after the kill. A
+    /// read that found no record counts as a successful read: the field says
+    /// that the read path still works, not that the data was there.
     reads_after_kill: u64,
     writes_after_kill: u64,
     deletes_after_kill: u64,
@@ -966,7 +1063,8 @@ struct FaultRound {
     load: Value,
     rollbacks: u64,
     /// The reads the history cannot explain, because the bounded history had
-    /// already dropped a state the read may have rolled back to.
+    /// already dropped a state the read may have rolled back to. A run with
+    /// such a read does not count as a pass.
     undecidable_reads: u64,
     undecidable_samples: Vec<String>,
     impossible_reads: u64,
@@ -1089,6 +1187,11 @@ fn ranges_for_keys(
     (json!({ "ranges": ranges }), count)
 }
 
+/// What the cohort's ranges looked like in one sample of the replica status.
+///
+/// The reasons a range was not writable are counted per range, so the caller
+/// adds them up over its samples: the sum counts the (poll, range) pairs that
+/// were blocked, not the number of distinct ranges.
 fn cohort_replica_stats(
     status: &ReplicaStatusResponse,
     topology: &TopologySnapshot,
@@ -1201,6 +1304,7 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
         .collect();
     let mut rounds = Vec::new();
     let mut killed = BTreeSet::new();
+    let mut failures: Vec<String> = Vec::new();
     let mut total_rollbacks = 0_u64;
     let mut total_impossible = 0_u64;
     let mut total_undecidable = 0_u64;
@@ -1558,11 +1662,11 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
                 "min_live_rf_during_failure": (min_live_rf != usize::MAX).then_some(min_live_rf),
                 "max_under_replicated_ranges_during_failure": max_under_replicated,
                 "max_not_writable_ranges_during_failure": writable_false,
-                "write_block_reasons_during_failure": block_reasons,
+                "write_block_reason_samples_during_failure": block_reasons,
                 "min_live_rf_after_publish": post_failure_min_live_rf,
                 "under_replicated_ranges_after_publish": post_failure_under_replicated,
                 "not_writable_ranges_after_publish": post_failure_not_writable,
-                "write_block_reasons_after_publish": post_failure_block_reasons,
+                "write_block_reason_samples_after_publish": post_failure_block_reasons,
             }),
             kill_to_publish_seconds,
             read_recovery_seconds,
@@ -1596,52 +1700,22 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
         rounds.push(record);
         killed.insert(victim.node_id.clone());
 
-        ensure!(
-            stats.impossible == 0,
-            "round {round} observed {} values the history does not allow: {:?}",
-            stats.impossible,
-            stats.violations
-        );
-        ensure!(
-            stats.requests() > 0,
-            "round {round} completed no requests under load"
-        );
-        // The load has to keep working after the failure, not only before it:
-        // a run whose writes stopped at the kill would still have completed
-        // requests before it.
-        for (operation, completed) in [
-            (Operation::Get, reads_after_kill),
-            (Operation::Put, writes_after_kill),
-        ] {
-            ensure!(
-                !mix.offers(operation) || completed > 0,
-                "round {round}: the load completed no {} after the kill",
-                operation.name()
-            );
-        }
-        if config.fault_scenario == FaultScenario::Follower {
-            // The owner of every selected key stayed alive, so a read that does
-            // not match the key's current state is a rollback the scenario does
-            // not allow. A read the shortened history cannot explain is such a
-            // rollback too, so it fails the round as well.
-            ensure!(
-                stats.undecidable == 0,
-                "round {round}: follower loss left {} reads the history cannot explain",
-                stats.undecidable
-            );
-        }
-        ensure!(
+        // The checks of a round. A round that fails ends the run, but its
+        // record and the rounds before it stay in the summary: the evidence of
+        // a failed run is the reason it failed.
+        let round_failures = RoundChecks {
+            round,
+            scenario: config.fault_scenario,
+            write_ack_policy: config.write_ack_policy,
+            mix: &mix,
+            reads_after_kill,
+            writes_after_kill,
             owner_unchanged,
-            "round {round}: killing a follower changed the owner of a selected key"
-        );
-        if config.fault_scenario == FaultScenario::Follower
-            || config.write_ack_policy != WriteAckPolicy::OwnerOnly
-        {
-            ensure!(
-                stats.rollbacks == 0,
-                "round {round} rolled back {} acknowledged changes",
-                stats.rollbacks
-            );
+        }
+        .failures(&stats);
+        if !round_failures.is_empty() {
+            failures.extend(round_failures);
+            break;
         }
     }
 
@@ -1676,8 +1750,12 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
             "undecidable_reads": total_undecidable,
             "requests": total_requests,
             "seconds": started.elapsed().as_secs_f64(),
+            "failures": failures,
         }),
     )?;
+    // The rounds are in the observations before the run fails, so a failed run
+    // still says what it saw.
+    ensure!(failures.is_empty(), "{}", failures.join("; "));
     Ok(rounds.last().map_or(0, |round| round.final_epoch))
 }
 
@@ -1756,6 +1834,33 @@ mod tests {
     }
 
     #[test]
+    fn a_state_that_is_acknowledged_again_stays_in_the_window() {
+        let mut model = KeyModel::new(PossibleState::absent(None));
+        for sequence in 1..=MAX_ACKNOWLEDGED_STATES_PER_KEY as u64 + 1 {
+            model.on_put(sequence.to_be_bytes().to_vec(), version(sequence));
+        }
+        let oldest = PossibleState::present(1_u64.to_be_bytes().to_vec(), version(1));
+        // The window is full, so the oldest state left it.
+        assert!(
+            !model
+                .acknowledged
+                .iter()
+                .any(|entry| *entry == AcknowledgedState::of(&oldest))
+        );
+
+        // Acknowledging it again makes it one of the most recent states, so it
+        // is kept instead of being the first one dropped.
+        model.on_put(
+            oldest.value.clone().expect("the state has a value"),
+            oldest.version.clone().expect("the state has a version"),
+        );
+        assert_eq!(
+            model.acknowledged.back(),
+            Some(&AcknowledgedState::of(&oldest))
+        );
+    }
+
+    #[test]
     fn a_read_the_history_never_held_is_impossible() {
         let mut model = KeyModel::new(PossibleState::absent(None));
         model.on_put(b"value".to_vec(), version(1));
@@ -1763,5 +1868,95 @@ mod tests {
             model.observe(Some(b"other"), Some(&version(9))),
             Observation::Impossible
         );
+    }
+
+    fn checks<'a>(mix: &'a OperationMix, scenario: FaultScenario) -> RoundChecks<'a> {
+        RoundChecks {
+            round: 1,
+            scenario,
+            write_ack_policy: WriteAckPolicy::OwnerOnly,
+            mix,
+            reads_after_kill: 10,
+            writes_after_kill: 10,
+            owner_unchanged: true,
+        }
+    }
+
+    #[test]
+    fn a_round_that_survived_the_failure_passes_its_checks() {
+        let mix = OperationMix::parse("70:20:10").unwrap();
+        let mut stats = WorkerStats::default();
+        stats.ops.insert("get_ok".to_owned(), 10);
+        stats.ops.insert("put_ok".to_owned(), 10);
+        assert!(
+            checks(&mix, FaultScenario::Follower)
+                .failures(&stats)
+                .is_empty(),
+            "{:?}",
+            checks(&mix, FaultScenario::Follower).failures(&stats)
+        );
+    }
+
+    #[test]
+    fn a_load_that_stopped_at_the_kill_fails_the_round() {
+        let mix = OperationMix::parse("70:20:10").unwrap();
+        let mut stats = WorkerStats::default();
+        stats.ops.insert("get_ok".to_owned(), 10);
+        stats.ops.insert("put_ok".to_owned(), 10);
+        let mut round = checks(&mix, FaultScenario::Follower);
+        round.writes_after_kill = 0;
+        let failures = round.failures(&stats);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].contains("no put after the kill"),
+            "{failures:?}"
+        );
+    }
+
+    #[test]
+    fn a_read_the_run_cannot_verify_fails_the_round_in_both_scenarios() {
+        // The owner scenario allows a rollback, but a read the shortened
+        // history cannot explain is not a verified read, so the run does not
+        // count it as a pass.
+        let mix = OperationMix::parse("70:20:10").unwrap();
+        let mut stats = WorkerStats::default();
+        stats.ops.insert("get_ok".to_owned(), 10);
+        stats.ops.insert("put_ok".to_owned(), 10);
+        stats.undecidable = 3;
+        stats.dropped_acknowledged = 44;
+        stats.undecidable_samples = vec!["GET key 7 returned a value".to_owned()];
+        for scenario in [FaultScenario::Owner, FaultScenario::Follower] {
+            let failures = checks(&mix, scenario).failures(&stats);
+            assert_eq!(failures.len(), 1, "{scenario:?}: {failures:?}");
+            assert!(failures[0].contains("cannot be verified"), "{failures:?}");
+            // The message says that the history was shortened, so a reader
+            // does not mistake it for a rollback the follower loss caused.
+            assert!(failures[0].contains("44 states dropped"), "{failures:?}");
+        }
+    }
+
+    #[test]
+    fn a_rollback_the_policy_forbids_fails_the_round() {
+        let mix = OperationMix::parse("70:20:10").unwrap();
+        let mut stats = WorkerStats::default();
+        stats.ops.insert("get_ok".to_owned(), 10);
+        stats.ops.insert("put_ok".to_owned(), 10);
+        stats.rollbacks = 2;
+        stats
+            .rollback_kinds
+            .insert("older_value_reappeared".to_owned(), 2);
+
+        // `OwnerOnly` allows a rollback after an owner failure.
+        assert!(
+            checks(&mix, FaultScenario::Owner)
+                .failures(&stats)
+                .is_empty(),
+            "{:?}",
+            checks(&mix, FaultScenario::Owner).failures(&stats)
+        );
+        // A follower loss allows none.
+        let failures = checks(&mix, FaultScenario::Follower).failures(&stats);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("rolled back 2"), "{failures:?}");
     }
 }
