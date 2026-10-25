@@ -17,6 +17,6 @@ The model now keeps an index of the window's states as 64-bit fingerprints with 
 
 ## Tradeoff
 
-The fingerprint index adds about 25 B per state on top of the 66 B digest pair (an 8-byte key, an 8-byte count, and hash-table overhead), so the driver's bound is roughly 95 B per state and `keys × window × ~95 B` overall (see the [fault document](../fault-under-load.md#历史模型)). Hashing the state per write is cheaper than the scan it replaces but not free; it is the price of not storing a second copy of the state in the set.
+The fingerprint index adds about 25 B per state on top of the 66 B digest pair (an 8-byte key, an 8-byte count, and hash-table overhead), so the driver's bound is roughly 95 B per state and `keys × window × ~95 B` overall (see the [fault document](../fault-under-load.md#历史模型)). Hashing the state per write is cheaper than the scan it replaces but not free; it is the price of not storing a second copy of the state in the index.
 
 A re-acknowledgement still scans the window once. That keeps the order exact — a state that is acknowledged again really is the most recent one — instead of approximating it with a plain arrival-order eviction, which would let a state that is current for the key fall out of the window while it is still recent.
