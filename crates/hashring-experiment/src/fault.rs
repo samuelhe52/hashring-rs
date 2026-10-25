@@ -9,8 +9,9 @@
 //! then verify every key the run touched.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     fs::File,
+    hash::{DefaultHasher, Hash, Hasher},
     io::{BufWriter, Write},
     sync::{
         Arc, Mutex,
@@ -272,7 +273,7 @@ impl PossibleState {
 /// The acknowledged history keeps one digest per state instead of the whole
 /// value, so a long run does not grow the driver's memory with the size of
 /// the data it wrote.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ValueDigest([u8; 32]);
 
 impl ValueDigest {
@@ -282,7 +283,7 @@ impl ValueDigest {
 }
 
 /// The digest of a record version.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct VersionDigest([u8; 32]);
 
 impl VersionDigest {
@@ -296,7 +297,7 @@ impl VersionDigest {
 }
 
 /// One state the run acknowledged, kept as digests.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct AcknowledgedState {
     /// `None` when the key was absent.
     value: Option<ValueDigest>,
@@ -338,6 +339,18 @@ impl AcknowledgedState {
             _ => false,
         }
     }
+
+    /// A fingerprint for the window's membership set.
+    ///
+    /// The set holds a 64-bit hash rather than a second copy of the state,
+    /// which keeps the window's memory close to the digests themselves. A
+    /// collision makes the window scan for a state it does not hold and then
+    /// treat the state as new, so it only costs the scan the set avoids.
+    fn fingerprint(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -360,11 +373,18 @@ enum Observation {
 #[derive(Clone, Debug)]
 struct KeyModel {
     possible: Vec<PossibleState>,
-    /// Every state a definite mutation or a pre-read established, as digests.
-    /// A later read that matches one of these but not `possible` is a rollback
-    /// rather than an arbitrary value. The list is bounded by `window`, and the
-    /// states it dropped are counted.
+    /// Every state a definite mutation or a pre-read established, as digests,
+    /// in the order each was last acknowledged. A later read that matches one
+    /// of these but not `possible` is a rollback rather than an arbitrary
+    /// value. The list is bounded by `window`, and the states it dropped are
+    /// counted.
     acknowledged: VecDeque<AcknowledgedState>,
+    /// The states `acknowledged` holds, as fingerprints, so acknowledging a
+    /// state the window has never held does not scan the window: only a state
+    /// that is already in it needs its position. A fingerprint is one hash
+    /// instead of a second copy of the state, and a collision only costs the
+    /// scan it avoids.
+    known: HashSet<u64>,
     /// How many acknowledged states the bound dropped.
     dropped_acknowledged: u64,
     /// How many acknowledged states the key keeps. It has to cover the writes
@@ -379,6 +399,7 @@ impl KeyModel {
         let mut model = Self {
             possible: Vec::new(),
             acknowledged: VecDeque::new(),
+            known: HashSet::new(),
             dropped_acknowledged: 0,
             window,
             rolled_back: false,
@@ -400,12 +421,18 @@ impl KeyModel {
     /// recognized after newer writes pushed it out of the window.
     fn remember(&mut self, state: &PossibleState) {
         let acknowledged = AcknowledgedState::of(state);
-        if let Some(position) = self
-            .acknowledged
-            .iter()
-            .position(|entry| *entry == acknowledged)
-        {
-            if position + 1 != self.acknowledged.len() {
+        let fingerprint = acknowledged.fingerprint();
+        if self.known.contains(&fingerprint) {
+            // A state the window already holds is acknowledged again, which is
+            // rare: find its place in the order and move it to the back. A
+            // fingerprint hit that finds no state is a collision, and the
+            // state is new after all.
+            if let Some(position) = self
+                .acknowledged
+                .iter()
+                .position(|entry| *entry == acknowledged)
+                && position + 1 != self.acknowledged.len()
+            {
                 let entry = self
                     .acknowledged
                     .remove(position)
@@ -414,10 +441,13 @@ impl KeyModel {
             }
             return;
         }
-        if self.acknowledged.len() >= self.window {
-            self.acknowledged.pop_front();
+        if self.acknowledged.len() >= self.window
+            && let Some(evicted) = self.acknowledged.pop_front()
+        {
+            self.known.remove(&evicted.fingerprint());
             self.dropped_acknowledged += 1;
         }
+        self.known.insert(fingerprint);
         self.acknowledged.push_back(acknowledged);
     }
 
@@ -577,7 +607,8 @@ struct WorkerStats {
     undecidable_samples: Vec<String>,
     impossible: u64,
     violations: Vec<String>,
-    /// The acknowledged states the bounded history dropped.
+    /// The acknowledged states the bounded history dropped, over the whole
+    /// run: a key keeps its model across rounds.
     dropped_acknowledged: u64,
     models: BTreeMap<u64, KeyModel>,
 }
@@ -1006,8 +1037,8 @@ impl RoundChecks<'_> {
             // keys of these reads dropped.
             failures.push(format!(
                 "round {}: {} reads cannot be verified, because the acknowledged history was \
-                 shortened: {} states were dropped in total across the round's keys, so a read \
-                 cannot be told apart from a rollback to a dropped state: {:?}",
+                 shortened: {} states have been dropped in total from the history of the round's \
+                 keys, so a read cannot be told apart from a rollback to a dropped state: {:?}",
                 self.round,
                 stats.undecidable,
                 stats.dropped_acknowledged,
@@ -1066,7 +1097,10 @@ struct FaultRound {
     undecidable_reads: u64,
     undecidable_samples: Vec<String>,
     impossible_reads: u64,
-    /// The acknowledged states the bounded history dropped.
+    /// The acknowledged states this round dropped. The history of a key is
+    /// cumulative over the run, so the round reports the difference from the
+    /// start of its own load, and the run's total is in
+    /// `observations.fault_dropped_acknowledged_states`.
     dropped_acknowledged_states: u64,
     violations: Vec<String>,
     new_owner_counts: BTreeMap<String, u64>,
@@ -1239,7 +1273,7 @@ fn cohort_replica_stats(
     )
 }
 
-fn load_json(stats: &WorkerStats, elapsed: Duration) -> Value {
+fn load_json(stats: &WorkerStats, elapsed: Duration, dropped_acknowledged: u64) -> Value {
     json!({
         "requests": stats.requests(),
         "seconds": elapsed.as_secs_f64(),
@@ -1253,7 +1287,7 @@ fn load_json(stats: &WorkerStats, elapsed: Duration) -> Value {
         "may_have_applied": stats.may_have_applied,
         "rollback_kinds": stats.rollback_kinds,
         "undecidable_reads": stats.undecidable,
-        "dropped_acknowledged_states": stats.dropped_acknowledged,
+        "dropped_acknowledged_states": dropped_acknowledged,
     })
 }
 
@@ -1309,6 +1343,7 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
     let mut total_rollbacks = 0_u64;
     let mut total_impossible = 0_u64;
     let mut total_undecidable = 0_u64;
+    let mut total_dropped = 0_u64;
     let mut total_capacity_errors = 0_u64;
     let mut total_capacity_retries = 0_u64;
     let mut total_requests = 0_u64;
@@ -1344,6 +1379,19 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
                 .expect("every dataset key has a model")
                 .resync(state);
         }
+        // A key keeps its model across rounds, so its dropped count is
+        // cumulative. The round reports only the states it dropped itself, so
+        // adding the rounds up does not count a state twice.
+        let dropped_before: u64 = victim
+            .cohort
+            .iter()
+            .map(|key| {
+                models
+                    .get(key)
+                    .expect("every cohort key has a model")
+                    .dropped_acknowledged
+            })
+            .sum();
         let status = observer.replica_status().await?;
         let (pre_progress, affected_ranges) = ranges_for_keys(&status, &topology, &victim.cohort);
         events.record(
@@ -1560,6 +1608,7 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
         }
         models = all_models;
         ledger.flush()?;
+        let dropped_this_round = stats.dropped_acknowledged.saturating_sub(dropped_before);
         let read_recovery_seconds = Progress::value(&progress.first_read_after_kill_ms);
         let write_recovery_seconds = Progress::value(&progress.first_write_after_kill_ms);
         let delete_recovery_seconds = Progress::value(&progress.first_delete_after_kill_ms);
@@ -1646,10 +1695,11 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
         total_rollbacks += stats.rollbacks;
         total_impossible += stats.impossible;
         total_undecidable += stats.undecidable;
+        total_dropped += dropped_this_round;
         total_capacity_errors += stats.capacity_backpressure_errors;
         total_capacity_retries += stats.capacity_backpressure_retries;
         total_requests += stats.requests();
-        let load = load_json(&stats, load_elapsed);
+        let load = load_json(&stats, load_elapsed, dropped_this_round);
         let record = FaultRound {
             round,
             scenario: scenario_name,
@@ -1689,7 +1739,7 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
             undecidable_reads: stats.undecidable,
             undecidable_samples: stats.undecidable_samples.clone(),
             impossible_reads: stats.impossible,
-            dropped_acknowledged_states: stats.dropped_acknowledged,
+            dropped_acknowledged_states: dropped_this_round,
             violations: stats.violations.clone(),
             new_owner_counts,
         };
@@ -1724,6 +1774,7 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
         rollbacks: total_rollbacks,
         impossible: total_impossible,
         undecidable: total_undecidable,
+        dropped: total_dropped,
         capacity_errors: total_capacity_errors,
         capacity_retries: total_capacity_retries,
         requests: total_requests,
@@ -1732,10 +1783,12 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
     events.record(
         "fault_run_complete",
         json!({
-            "rounds": config.fault_rounds,
+            "rounds_requested": config.fault_rounds,
+            "rounds_completed": rounds.len(),
             "rollbacks": total_rollbacks,
             "impossible_reads": total_impossible,
             "undecidable_reads": total_undecidable,
+            "dropped_acknowledged_states": total_dropped,
             "requests": total_requests,
             "seconds": started.elapsed().as_secs_f64(),
             "failures": failures,
@@ -1758,6 +1811,8 @@ struct RunTotals {
     rollbacks: u64,
     impossible: u64,
     undecidable: u64,
+    /// The states the rounds dropped, added up: each round reports its own.
+    dropped: u64,
     capacity_errors: u64,
     capacity_retries: u64,
     requests: u64,
@@ -1779,7 +1834,8 @@ fn record_run(
     failures: &[String],
 ) -> Result<()> {
     observations.insert("fault_scenario".into(), json!(scenario_name));
-    observations.insert("fault_round_count".into(), json!(rounds_requested));
+    observations.insert("fault_rounds_requested".into(), json!(rounds_requested));
+    observations.insert("fault_rounds_completed".into(), json!(rounds.len()));
     observations.insert("fault_rounds".into(), serde_json::to_value(rounds)?);
     observations.insert(
         "fault_acknowledged_window".into(),
@@ -1791,6 +1847,10 @@ fn record_run(
     );
     observations.insert("fault_impossible_reads".into(), json!(totals.impossible));
     observations.insert("fault_undecidable_reads".into(), json!(totals.undecidable));
+    observations.insert(
+        "fault_dropped_acknowledged_states".into(),
+        json!(totals.dropped),
+    );
     observations.insert(
         "fault_capacity_backpressure_errors".into(),
         json!(totals.capacity_errors),
@@ -1983,7 +2043,7 @@ mod tests {
             // figure is a total, so a reader does not mistake it for a
             // rollback the follower loss caused or for this key's count.
             assert!(
-                failures[0].contains("44 states were dropped in total"),
+                failures[0].contains("44 states have been dropped in total"),
                 "{failures:?}"
             );
         }
@@ -2056,6 +2116,7 @@ mod tests {
             rollbacks: 0,
             impossible: 0,
             undecidable: 0,
+            dropped: 0,
             capacity_errors: 0,
             capacity_retries: 0,
             requests: 10,
@@ -2093,6 +2154,10 @@ mod tests {
             json!(["round 1: 3 reads cannot be verified"])
         );
         assert_eq!(observations["fault_acknowledged_window"], json!(WINDOW));
+        // A failed run reports how many rounds it ran and how many it asked
+        // for: `fault_rounds` is shorter than the request when a round fails.
+        assert_eq!(observations["fault_rounds_requested"], json!(2));
+        assert_eq!(observations["fault_rounds_completed"], json!(1));
         // The round the run completed is in the record even though its check
         // failed.
         assert_eq!(observations["fault_rounds"][0]["final_epoch"], json!(2));
@@ -2112,5 +2177,34 @@ mod tests {
         );
         assert!(result.is_ok(), "{:?}", result.err());
         assert_eq!(observations["fault_failures"], json!([]));
+        assert_eq!(observations["fault_rounds_requested"], json!(1));
+        assert_eq!(observations["fault_rounds_completed"], json!(1));
+        assert_eq!(observations["fault_dropped_acknowledged_states"], json!(0));
+    }
+
+    #[test]
+    fn the_window_keeps_its_index_in_step_with_its_order() {
+        // The membership set is what makes acknowledging a new state constant
+        // time, so it must hold exactly the states the window holds.
+        let mut model = KeyModel::new(PossibleState::absent(None), WINDOW);
+        for sequence in 1..=(WINDOW as u64 * 4) {
+            model.on_put(sequence.to_be_bytes().to_vec(), version(sequence));
+            // Acknowledge a state the window already dropped, which inserts it
+            // again, and one it holds, which moves it to the back.
+            if sequence % 3 == 0 {
+                model.on_put((sequence / 2).to_be_bytes().to_vec(), version(sequence / 2));
+            }
+            assert_eq!(
+                model.known.len(),
+                model.acknowledged.len(),
+                "the set and the order disagree after {sequence} writes"
+            );
+            for entry in &model.acknowledged {
+                assert!(
+                    model.known.contains(&entry.fingerprint()),
+                    "the order holds a state the set does not after {sequence} writes"
+                );
+            }
+        }
     }
 }
