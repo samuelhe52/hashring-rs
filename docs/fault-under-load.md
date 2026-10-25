@@ -4,6 +4,8 @@
 
 ## 源码与运行条件
 
+本节配置与基线用于原有的 `OwnerOnly` 运行；独立补测的 `FirstSuccessor` owner 故障使用下文单列的源码和主机条件。
+
 - 代码基线：`60c20a4`（分支 `remainder`）。运行时的代码与该提交一致；工作树里只有本文档的未提交修改和未跟踪的审查文件（`manifest.json` 的 `git_status_porcelain` 记录了实际状态），因此这些仍不是干净源码上的正式基线。
 - 主机：当前开发机，24 逻辑 CPU；`--worker-threads 2`，驱动与每个数据节点共享主机。
 - 编译：debug profile（`cargo run --quiet -- experiment ...`）。绝对吞吐只用于同轮内比较。
@@ -136,6 +138,62 @@
 
 两轮都没有不可解释读和无法判定的读，且第二轮在第一次替换完成后的新拓扑上选择新的 owner，说明多轮扫描和按轮记录可用。每轮的 `dropped_acknowledged_states` 只算该轮（每轮在预读 cohort 当前状态之前快照、轮末取差值，预读引起的淘汰也算该轮），`observations.fault_dropped_acknowledged_states` 是各轮之和，两者都是 0：第二轮 121 个键共约 2.4 万次变更（平均每键约 200 次），默认 4096 条窗口覆盖了最热的键。上一版 256 条窗口的同类运行（负载更长，修复等待也更长）曾累计丢弃 2,267 条；把窗口压到 64 再跑同样的两轮，两轮分别丢弃 14,946 和 17,152 条、合计 32,098 条，逐轮数字因此是可加的。这正是把逐轮数字改成差值、并补运行合计的原因。
 
+### 独立补测：FirstSuccessor 下的 owner 故障（2026-10-25）
+
+目的：检查等待第一跟随副本 ACK 的 `FirstSuccessor`，在 owner 被杀死后是否仍出现上文 `OwnerOnly` 的已确认状态回退。这次杀的是 owner，不是 follower；沿用持续混合负载、替换节点加入和满 RF 修复流程。
+
+- 源码：PR #15 的 `6eabea6f862a85f979562feaad095e4d0657f0ed`，debug 构建，`rustc 1.98.1 (48a229cea 2026-09-01)`，`aarch64-apple-darwin`。启用 `--require-clean-source`，manifest 确认构建与运行均来自同一干净提交，`source_reproducible=true`。
+- 主机：MacBookPro18,3，8 逻辑 CPU、16 GiB 内存，macOS 27.0.1（26A434）。驱动与每个数据节点各 2 个 worker，协调器使用默认 CPU 数。共享桌面主机；运行前一分钟 load average 为 12.71，结束后为 15.29。
+- 开始时间：2026-10-25 22:53:31 +08:00。一次运行、seed 1、4 个初始成员和 1 个替换节点、RF=3、1,000 键、128 B 值、128 个虚拟节点、16 个负载 worker、70:20:10 混合操作、故障前后窗口各 5 s、确认历史窗口 4096。实际 manifest 的 `write_ack_policy=FirstSuccessor`、`fault_scenario=owner`；没有在 kill 前停止负载或额外等待复制排空。
+
+| 项 | 本次结果 |
+|---|---|
+| 受害节点 / epoch / cohort / range | node-1 / 2 / 208 键 / 84 个 range |
+| kill→发布 | 5.046720375 s |
+| kill→首次成功读 / 写 / 删 | 5.154 / 13.851 / 13.860 s |
+| kill→满 RF / 替换开始→满 RF | 22.780661875 / 17.577877209 s |
+| 持续负载 | 98,157 个请求，32.796905291 s，2,992.87 请求/s |
+| 成功 PUT / DELETE / 返回值的 GET / 缺失的 GET | 19,624 / 9,817 / 68,697 / 3 |
+| kill 后成功读 / 写 / 删 | 34,285 / 9,795 / 4,900 |
+| 应用错误 / MayHaveApplied | 16 个 `rpc:Unknown` / 6 个不确定变更 |
+| 内部重试 | 1,220：RPC 478、租约过期 208、暂时不可用 530、Moved 4 |
+| 容量背压错误 / 重试 | 0 / 0 |
+| 已确认状态回退 / 不可解释读 / 无法判定读 / 丢弃历史状态 | **0 / 0 / 0 / 0** |
+| 运行判定 | `success=true`，完成 1/1 轮，`fault_failures=[]` |
+
+运行中的读与修复后的全部 1,000 键校验均未发现回退或历史无法解释的结果。`FirstSuccessor` 的 round 检查会把任何已确认状态回退判为失败，不沿用 `OwnerOnly` 的允许回退规则。6 个 `MayHaveApplied` 变更仍按可能生效/未生效的分支核验，不当作确定成功或确定失败。
+
+另从原始请求账本按每键顺序重放：每个键只有一个 worker，检查了 68,555 次读的值及适用的版本，另有 145 次初始读用于建立该键的起始状态，未发现不匹配。148 个键在 kill 后、任何成功的故障后变更之前被读取；其中一个键最近确认的是删除，读取仍为缺失。kill 前最后 100 ms 内有 289 个成功确认的 PUT/DELETE，因此本次覆盖了故障前仍在持续确认的变更，而非停写后只检查静态数据。该补充重放不替代运行器对初始数据和最终全量状态的校验。
+
+写恢复明显晚于读恢复。发布后的采样中有 69/84 个 range 不可写，原因均为 required follower 尚未 healthy/admitted；负载有 530 次 `temporarily_unavailable` 重试。该观测与同步副本 ACK 的写入门槛一致，但这里没有把全部写停顿归因于某一个内部阶段。kill 后完成的失败请求有 11 个，距 kill 1–2 ms；全轮应用错误合计为 16 个。
+
+这一次结果支持：**在本次单 owner 故障下，FirstSuccessor 没有出现 OwnerOnly 运行中观察到的已确认值丢失、旧值重现或已确认删除丢失。** 它没有给出所有 seed、受害节点和故障时序下的保证，也没有覆盖双节点故障或 `AllReplicas`。此前 `OwnerOnly` 的 3/3/4 个键回退来自另一台 24 逻辑 CPU 主机、另一源码基线；这里没有新增匹配的 `OwnerOnly` 对照，不能从两组的吞吐和恢复时长推导性能差异。
+
+复现命令（debug；输出目录必须为空或不存在）：
+
+```sh
+cargo run --locked --quiet -- experiment \
+  --mode fault --fault-scenario owner --policy first-successor \
+  --nodes 5 --keys 1000 --value-bytes 128 --concurrency 16 \
+  --seed 1 --virtual-nodes 128 --desired-replication-factor 3 \
+  --minimum-admitted-copies 1 --minimum-healthy-followers 0 \
+  --mix 70:20:10 --fault-rounds 1 \
+  --fault-pre-seconds 5 --fault-post-seconds 5 \
+  --fault-acknowledged-window 4096 \
+  --operation-timeout-ms 30000 --migration-timeout-ms 120000 \
+  --worker-threads 2 --require-clean-source \
+  --output results/local-owner-first-successor-20261025-2253/run
+```
+
+原始证据保留在上述本地输出目录：`manifest.json`、`summary.json`、`events.jsonl`、`requests.jsonl`、`coordinator.redb` 和 `process-logs/`；父目录另有 `host-context.json`（完整命令和主机信息）、`completion.json`、`ledger-audit.json` 和 `console.log`。原始数据库和约 59 MB 的账本不纳入 Git。以下 SHA-256 用于核对本次证据：
+
+| 文件 | SHA-256 |
+|---|---|
+| `manifest.json` | `e48a9ea7a1e740cfa0442abc3a697f87c563d1eea2562c4654ae52cdf19f5410` |
+| `summary.json` | `641285798ddb92a4bb73d58d32f5af8b08ead1094fe0cb610118ab46899a90f5` |
+| `events.jsonl` | `d610e2410d39acc7c58d53953b045698da395c743213d2ad80d566ddd4e2050c` |
+| `requests.jsonl` | `fea8003875da5d9572dba22a8c0df840c6efbacaaeeb0941131beff476bdf095` |
+
 ### 回执重试与同键历史
 
 以下测试均通过：
@@ -189,7 +247,7 @@ cargo run -- experiment \
 
 ## 限制
 
-- 这些运行来自 debug 构建，代码基线为 `60c20a4`，不能当作干净源码上的正式性能基线；正式复测应使用 `--require-clean-source`、release 构建和空闲主机。
+- 原有 `OwnerOnly` 运行来自 debug 构建，代码基线为 `60c20a4`，不能当作干净源码上的正式性能基线；独立 `FirstSuccessor` 补测使用干净的 `6eabea6`，但仍是 debug 构建和繁忙桌面主机。正式性能复测应使用 `--require-clean-source`、release 构建和空闲主机。
 - `fault` 模式的容量背压分成两个计数：以容量错误结束的请求数，和客户端因容量而重试的次数；一次跟随副本丢失仍可能触发复制容量背压，本文按 TODO 要求单独记录，不要求故障期间零阻塞。
 - follower 场景中，被杀死节点对其他 range 仍是 owner；这些键不在本场景的判定范围内，按“附带 owner 故障”单独记录并重新同步模型，不作为 follower 丢失的通过/失败条件。
 - 协调器在故障窗口内把所选 range 标为不可写（`owner lease unavailable`）时，owner 仍会接受写入；该状态是协调器视图，与实际是否拒绝写入不是一回事，本文按状态原样记录。
