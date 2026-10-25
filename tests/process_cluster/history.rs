@@ -154,7 +154,7 @@ fn check_key_history(key: u64, entries: &[Entry], phase: &str) {
             _ => None,
         })
         .collect();
-    let reads: Vec<&Read> = entries
+    let mut reads: Vec<&Read> = entries
         .iter()
         .filter_map(|entry| match entry {
             Entry::Read(read) if read.key == key => Some(read),
@@ -205,8 +205,20 @@ fn check_key_history(key: u64, entries: &[Entry], phase: &str) {
         }
     }
 
+    // Completion order is a topological order of read-to-read real time.
+    // Choose the earliest matching prefix at or after every predecessor's
+    // position. This greedy choice leaves all later reads the most room;
+    // overlapping reads may still serialize in either order.
+    reads.sort_by_key(|read| read.completed);
+    let mut serialized_reads: Vec<(&Read, usize)> = Vec::new();
     for read in reads {
-        let matching_prefixes: Vec<usize> = (0..=mutations.len())
+        let minimum_prefix = serialized_reads
+            .iter()
+            .filter(|(earlier, _)| earlier.completed < read.invoked)
+            .map(|(_, prefix)| *prefix)
+            .max()
+            .unwrap_or(0);
+        let matching_prefixes: Vec<usize> = (minimum_prefix..=mutations.len())
             .filter(|prefix| {
                 observation_matches(&state_after(&mutations, *prefix), &read.observation)
                     && mutations[..*prefix]
@@ -219,13 +231,14 @@ fn check_key_history(key: u64, entries: &[Entry], phase: &str) {
             .collect();
         assert!(
             !matching_prefixes.is_empty(),
-            "{phase}: key {key} read by client {} sequence {} ({:?}) at epoch {} has no legal serialization point among {} mutations",
+            "{phase}: key {key} read by client {} sequence {} ({:?}) at epoch {} has no legal serialization point respecting earlier reads among {} mutations",
             read.client,
             read.sequence,
             read.observation,
             read.topology_epoch,
             mutations.len()
         );
+        serialized_reads.push((read, matching_prefixes[0]));
     }
 }
 
@@ -609,4 +622,71 @@ async fn concurrent_same_key_histories_are_linearizable_across_a_membership_hand
     let entries = entries.lock().await.clone();
     write_history("same-key-handoff", &entries);
     check_all(&entries, &keys, "membership handoff");
+}
+
+#[test]
+fn checker_respects_read_to_read_real_time() {
+    let base = Instant::now();
+    let at = |ms| base + Duration::from_millis(ms);
+    let version = |sequence| RecordVersion {
+        topology_epoch: 1,
+        owner_sequence: sequence,
+        owner_node_id: "node-1".into(),
+    };
+    let put = |sequence, value: &[u8], start, end| {
+        Entry::Mutation(Mutation {
+            client: 0,
+            sequence,
+            key: 7,
+            kind: MutationKind::Put(value.to_vec()),
+            version: version(sequence),
+            invoked: at(start),
+            completed: at(end),
+            invoked_unix_ms: 0,
+            completed_unix_ms: 0,
+            topology_epoch: 1,
+        })
+    };
+    let read = |observation, start, end| {
+        Entry::Read(Read {
+            client: 1,
+            sequence: start,
+            key: 7,
+            observation,
+            invoked: at(start),
+            completed: at(end),
+            invoked_unix_ms: 0,
+            completed_unix_ms: 0,
+            topology_epoch: 1,
+        })
+    };
+    let present = |value: &[u8], sequence| ReadObservation::Present {
+        value: value.to_vec(),
+        version: version(sequence),
+    };
+    let history = vec![
+        put(1, b"A", 0, 1),
+        put(2, b"B", 2, 10),
+        read(present(b"B", 2), 3, 4),
+        read(present(b"A", 1), 5, 6),
+    ];
+    assert!(std::panic::catch_unwind(|| check_key_history(7, &history, "regression")).is_err());
+
+    // Overlapping reads may return B then A in completion order, because
+    // their serialization order is allowed to be A then B.
+    let mut overlapping = history[..3].to_vec();
+    overlapping.push(read(present(b"A", 1), 3, 6));
+    check_key_history(7, &overlapping, "overlap");
+
+    // Absence has multiple candidate prefixes: choosing the earliest legal
+    // one must still respect a previous read of B.
+    let mut deleted = history[..3].to_vec();
+    let mut deletion = match put(3, b"", 2, 10) {
+        Entry::Mutation(m) => m,
+        _ => unreachable!(),
+    };
+    deletion.kind = MutationKind::Delete;
+    deleted.push(Entry::Mutation(deletion));
+    deleted.push(read(ReadObservation::Absent, 5, 6));
+    check_key_history(7, &deleted, "delete");
 }
