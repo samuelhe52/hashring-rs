@@ -39,11 +39,28 @@ const LEDGER_FLUSH_INTERVAL: u64 = 64;
 const NEVER: u64 = u64::MAX;
 const MIN_COHORT: usize = 8;
 
+/// How many acknowledged states one key keeps.
+///
+/// The history has to tell a rollback to an acknowledged state apart from a
+/// value the history never held, and it grows with every write the load
+/// makes. The bound keeps the driver's memory proportional to the key space
+/// instead of to the number of writes; the states it drops are counted, and a
+/// read the shortened history can no longer explain is reported as
+/// undecidable instead of impossible.
+const MAX_ACKNOWLEDGED_STATES_PER_KEY: usize = 256;
+
 #[derive(Clone, Default)]
 struct OperationMix {
+    /// The number of slots that carry a GET.
     get: u64,
+    /// The number of slots that carry a PUT.
     put: u64,
+    /// The number of slots that carry a DELETE.
     delete: u64,
+    /// The number of slots the mix divides the operations into.
+    total: u64,
+    /// The step of the walk over the slots.
+    stride: u64,
 }
 
 impl OperationMix {
@@ -60,31 +77,72 @@ impl OperationMix {
             parts.len() == 3,
             "the operation mix must be GET:PUT:DELETE, not {text:?}"
         );
-        ensure!(parts.iter().sum::<u64>() > 0, "the operation mix is empty");
+        let total = parts
+            .iter()
+            .fold(0_u64, |sum, part| sum.saturating_add(*part));
+        ensure!(total > 0, "the operation mix is empty");
         Ok(Self {
             get: parts[0],
             put: parts[1],
             delete: parts[2],
+            total,
+            stride: coprime_stride(total),
         })
     }
 
     fn choose(&self, step: u64, worker: usize) -> Operation {
-        let total = self.get + self.put + self.delete;
-        // A fixed coprime walk spreads the operations over workers without a
-        // random number generator, so a rerun with the same inputs reproduces
-        // the same shape of load.
-        let slot = (step.wrapping_mul(37).wrapping_add(worker as u64 * 11)) % total;
+        // A walk whose step shares no factor with the total reaches every
+        // slot, so every worker offers every operation instead of only the
+        // ones its own step happens to land on.
+        let slot = (step
+            .wrapping_mul(self.stride)
+            .wrapping_add(worker as u64 * 11))
+            % self.total;
         if slot < self.get {
             Operation::Get
-        } else if slot < self.get + self.put {
+        } else if slot < self.get.saturating_add(self.put) {
             Operation::Put
         } else {
             Operation::Delete
         }
     }
+
+    /// Whether the mix offers the operation at all.
+    fn offers(&self, operation: Operation) -> bool {
+        match operation {
+            Operation::Get => self.get > 0,
+            Operation::Put => self.put > 0,
+            Operation::Delete => self.delete > 0,
+        }
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The smallest step at or above 37 that shares no factor with the total.
+///
+/// A fixed step only reaches every slot when it is coprime with the total, so
+/// the step is searched for instead of assumed: a step of 37 leaves a worker
+/// without one of the three operations whenever the total is a multiple of 37.
+fn coprime_stride(total: u64) -> u64 {
+    if total <= 1 {
+        return 1;
+    }
+    let mut stride = 37;
+    while gcd(stride, total) != 1 {
+        stride += 1;
+    }
+    stride
+}
+
+fn gcd(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Operation {
     Get,
     Put,
@@ -219,6 +277,79 @@ impl PossibleState {
     }
 }
 
+/// The digest of a value.
+///
+/// The acknowledged history keeps one digest per state instead of the whole
+/// value, so a long run does not grow the driver's memory with the size of
+/// the data it wrote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ValueDigest([u8; 32]);
+
+impl ValueDigest {
+    fn of(value: &[u8]) -> Self {
+        Self(*blake3::hash(value).as_bytes())
+    }
+}
+
+/// The digest of a record version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VersionDigest([u8; 32]);
+
+impl VersionDigest {
+    fn of(version: &RecordVersion) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&version.topology_epoch.to_be_bytes());
+        hasher.update(&version.owner_sequence.to_be_bytes());
+        hasher.update(version.owner_node_id.as_bytes());
+        Self(*hasher.finalize().as_bytes())
+    }
+}
+
+/// One state the run acknowledged, kept as digests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AcknowledgedState {
+    /// `None` when the key was absent.
+    value: Option<ValueDigest>,
+    /// `None` when the run never saw a version for this state.
+    version: Option<VersionDigest>,
+}
+
+impl AcknowledgedState {
+    fn of(state: &PossibleState) -> Self {
+        Self {
+            value: state.value.as_deref().map(ValueDigest::of),
+            version: state.version.as_ref().map(VersionDigest::of),
+        }
+    }
+
+    /// The state an observation describes.
+    ///
+    /// The digests are taken once per observation: the history holds up to
+    /// [`MAX_ACKNOWLEDGED_STATES_PER_KEY`] states, and hashing the value once
+    /// per state would cost a hash per state per read.
+    fn of_observation(value: Option<&[u8]>, version: Option<&RecordVersion>) -> Self {
+        Self {
+            value: value.map(ValueDigest::of),
+            version: version.map(VersionDigest::of),
+        }
+    }
+
+    /// Whether the observation is this acknowledged state.
+    fn matches(&self, observation: &AcknowledgedState) -> bool {
+        match (&self.value, &observation.value) {
+            (None, None) => true,
+            (Some(expected), Some(observed)) => {
+                expected == observed
+                    && self
+                        .version
+                        .as_ref()
+                        .is_none_or(|expected| Some(expected) == observation.version.as_ref())
+            }
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Observation {
     Matches,
@@ -229,6 +360,9 @@ enum Observation {
         first: bool,
         kind: &'static str,
     },
+    /// The observation is not explainable by the recorded history, and the
+    /// history is too short to say whether it is an allowed rollback.
+    Undecidable,
     /// The observation is not explainable by the recorded history.
     Impossible,
 }
@@ -236,27 +370,45 @@ enum Observation {
 #[derive(Clone, Debug)]
 struct KeyModel {
     possible: Vec<PossibleState>,
-    /// Every state a definite mutation or a pre-read established. A later read
-    /// that matches one of these but not `possible` is a rollback rather than
-    /// an arbitrary value.
-    acknowledged: Vec<PossibleState>,
+    /// Every state a definite mutation or a pre-read established, as digests.
+    /// A later read that matches one of these but not `possible` is a rollback
+    /// rather than an arbitrary value. The list is bounded, and the states it
+    /// dropped are counted.
+    acknowledged: Vec<AcknowledgedState>,
+    /// How many acknowledged states the bound dropped.
+    dropped_acknowledged: u64,
     rolled_back: bool,
 }
 
 impl KeyModel {
     fn new(state: PossibleState) -> Self {
-        Self {
-            possible: vec![state.clone()],
-            acknowledged: vec![state],
+        let mut model = Self {
+            possible: Vec::new(),
+            acknowledged: Vec::new(),
+            dropped_acknowledged: 0,
             rolled_back: false,
-        }
+        };
+        model.resync(state);
+        model
     }
 
     fn resync(&mut self, state: PossibleState) {
         self.possible = vec![state.clone()];
-        if !self.acknowledged.contains(&state) {
-            self.acknowledged.push(state);
+        self.remember(&state);
+    }
+
+    /// Keeps an acknowledged state, and forgets the oldest one when the key's
+    /// history is full.
+    fn remember(&mut self, state: &PossibleState) {
+        let acknowledged = AcknowledgedState::of(state);
+        if self.acknowledged.contains(&acknowledged) {
+            return;
         }
+        if self.acknowledged.len() >= MAX_ACKNOWLEDGED_STATES_PER_KEY {
+            self.acknowledged.remove(0);
+            self.dropped_acknowledged += 1;
+        }
+        self.acknowledged.push(acknowledged);
     }
 
     fn on_put(&mut self, value: Vec<u8>, version: RecordVersion) {
@@ -286,10 +438,11 @@ impl KeyModel {
         {
             return Observation::Matches;
         }
+        let observation = AcknowledgedState::of_observation(value, version);
         if self
             .acknowledged
             .iter()
-            .any(|state| state.matches(value, version))
+            .any(|state| state.matches(&observation))
         {
             let first = !self.rolled_back;
             self.rolled_back = true;
@@ -312,19 +465,38 @@ impl KeyModel {
             self.possible.push(state);
             return Observation::Rollback { first, kind };
         }
+        if self.dropped_acknowledged > 0 {
+            // The history no longer holds every acknowledged state, so this
+            // read cannot be told apart from a rollback to a state that was
+            // dropped. It is undecidable, not impossible.
+            return Observation::Undecidable;
+        }
         Observation::Impossible
     }
 }
 
+/// What the load did after the node was killed.
+///
+/// Every figure in here is counted from the kill, not from the start of the
+/// load: the load runs before the failure too, and a figure that included the
+/// pre-failure window would report the window as the recovery time.
 #[derive(Default)]
 struct Progress {
+    /// The milliseconds from the start of the load to the kill.
     kill_ms: AtomicU64,
+    /// The milliseconds from the kill to the first failure, and to the last.
     first_failure_after_kill_ms: AtomicU64,
     last_failure_after_kill_ms: AtomicU64,
     failures_after_kill: AtomicU64,
+    /// The milliseconds from the kill to the first successful read, write and
+    /// delete.
     first_read_after_kill_ms: AtomicU64,
     first_write_after_kill_ms: AtomicU64,
     first_delete_after_kill_ms: AtomicU64,
+    /// The successes the load completed after the kill, by operation.
+    reads_after_kill: AtomicU64,
+    writes_after_kill: AtomicU64,
+    deletes_after_kill: AtomicU64,
 }
 
 impl Progress {
@@ -337,6 +509,9 @@ impl Progress {
             first_read_after_kill_ms: AtomicU64::new(NEVER),
             first_write_after_kill_ms: AtomicU64::new(NEVER),
             first_delete_after_kill_ms: AtomicU64::new(NEVER),
+            reads_after_kill: AtomicU64::new(0),
+            writes_after_kill: AtomicU64::new(0),
+            deletes_after_kill: AtomicU64::new(0),
         }
     }
 
@@ -345,10 +520,11 @@ impl Progress {
         if kill_ms == NEVER || invoked_ms < kill_ms {
             return;
         }
+        let after_kill = completed_ms.saturating_sub(kill_ms);
         self.first_failure_after_kill_ms
-            .fetch_min(completed_ms, Ordering::Relaxed);
+            .fetch_min(after_kill, Ordering::Relaxed);
         self.last_failure_after_kill_ms
-            .fetch_max(completed_ms, Ordering::Relaxed);
+            .fetch_max(after_kill, Ordering::Relaxed);
         self.failures_after_kill.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -357,12 +533,14 @@ impl Progress {
         if kill_ms == NEVER || invoked_ms < kill_ms {
             return;
         }
-        let field = match operation {
-            Operation::Get => &self.first_read_after_kill_ms,
-            Operation::Put => &self.first_write_after_kill_ms,
-            Operation::Delete => &self.first_delete_after_kill_ms,
+        let after_kill = completed_ms.saturating_sub(kill_ms);
+        let (first, count) = match operation {
+            Operation::Get => (&self.first_read_after_kill_ms, &self.reads_after_kill),
+            Operation::Put => (&self.first_write_after_kill_ms, &self.writes_after_kill),
+            Operation::Delete => (&self.first_delete_after_kill_ms, &self.deletes_after_kill),
         };
-        let _ = field.compare_exchange(NEVER, completed_ms, Ordering::AcqRel, Ordering::Relaxed);
+        let _ = first.compare_exchange(NEVER, after_kill, Ordering::AcqRel, Ordering::Relaxed);
+        count.fetch_add(1, Ordering::Relaxed);
     }
 
     fn value(value: &AtomicU64) -> Option<f64> {
@@ -377,12 +555,20 @@ struct WorkerStats {
     errors: BTreeMap<String, u64>,
     retries: BTreeMap<String, u64>,
     retry_total: u64,
-    capacity_backpressure: u64,
+    /// The requests that ended with a capacity error.
+    capacity_backpressure_errors: u64,
+    /// The retries the client made because of capacity.
+    capacity_backpressure_retries: u64,
     may_have_applied: u64,
     rollbacks: u64,
     rollback_kinds: BTreeMap<String, u64>,
+    /// The reads the shortened history cannot explain.
+    undecidable: u64,
+    undecidable_samples: Vec<String>,
     impossible: u64,
     violations: Vec<String>,
+    /// The acknowledged states the bounded history dropped.
+    dropped_acknowledged: u64,
     models: BTreeMap<u64, KeyModel>,
 }
 
@@ -398,13 +584,21 @@ impl WorkerStats {
             *self.retries.entry(key).or_default() += value;
         }
         self.retry_total += other.retry_total;
-        self.capacity_backpressure += other.capacity_backpressure;
+        self.capacity_backpressure_errors += other.capacity_backpressure_errors;
+        self.capacity_backpressure_retries += other.capacity_backpressure_retries;
         self.may_have_applied += other.may_have_applied;
         self.rollbacks += other.rollbacks;
         for (kind, count) in other.rollback_kinds {
             *self.rollback_kinds.entry(kind).or_default() += count;
         }
+        self.undecidable += other.undecidable;
+        if self.undecidable_samples.len() < 10 {
+            let room = 10 - self.undecidable_samples.len();
+            self.undecidable_samples
+                .extend(other.undecidable_samples.into_iter().take(room));
+        }
         self.impossible += other.impossible;
+        self.dropped_acknowledged += other.dropped_acknowledged;
         if self.violations.len() < 100 {
             let room = 100 - self.violations.len();
             self.violations
@@ -414,6 +608,15 @@ impl WorkerStats {
 
     fn requests(&self) -> u64 {
         self.ops.values().sum::<u64>() + self.errors.values().sum::<u64>()
+    }
+
+    /// Records a read the history cannot explain, with a sample of what it
+    /// saw.
+    fn record_undecidable(&mut self, sample: String) {
+        self.undecidable += 1;
+        if self.undecidable_samples.len() < 10 {
+            self.undecidable_samples.push(sample);
+        }
     }
 }
 
@@ -463,10 +666,6 @@ fn retry_delta(
             (*count > previous).then(|| ((*reason).to_owned(), count - previous))
         })
         .collect()
-}
-
-fn hex(value: &[u8]) -> String {
-    value.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 struct WorkerContext {
@@ -519,7 +718,7 @@ async fn run_worker(context: WorkerContext) -> Result<WorkerStats> {
             worker,
             key,
             operation: operation.name(),
-            value_hex: value.as_deref().map(hex),
+            value_hex: value.as_deref().map(hex::encode),
             invoked_unix_ms,
             completed_unix_ms: 0,
             elapsed_us: 0,
@@ -542,7 +741,7 @@ async fn run_worker(context: WorkerContext) -> Result<WorkerStats> {
                 Ok(output) => {
                     entry.end_epoch = output.topology_epoch;
                     entry.topology_epoch = Some(output.topology_epoch);
-                    entry.value_hex = Some(hex(&output.value));
+                    entry.value_hex = Some(hex::encode(&output.value));
                     entry.version = Some(VersionView::from(&output.version));
                     *stats
                         .ops
@@ -560,6 +759,13 @@ async fn run_worker(context: WorkerContext) -> Result<WorkerStats> {
                                 stats.rollbacks += 1;
                                 *stats.rollback_kinds.entry(kind.to_owned()).or_default() += 1;
                             }
+                        }
+                        Observation::Undecidable => {
+                            stats.record_undecidable(format!(
+                                "GET key {key} returned a value the shortened history cannot \
+                                 explain at epoch {}",
+                                output.topology_epoch
+                            ));
                         }
                         Observation::Impossible => {
                             stats.impossible += 1;
@@ -587,6 +793,12 @@ async fn run_worker(context: WorkerContext) -> Result<WorkerStats> {
                                 stats.rollbacks += 1;
                                 *stats.rollback_kinds.entry(kind.to_owned()).or_default() += 1;
                             }
+                        }
+                        Observation::Undecidable => {
+                            stats.record_undecidable(format!(
+                                "GET key {key} found no record and the shortened history cannot \
+                                 explain it"
+                            ));
                         }
                         Observation::Impossible => {
                             stats.impossible += 1;
@@ -643,7 +855,7 @@ async fn run_worker(context: WorkerContext) -> Result<WorkerStats> {
                             model.on_ambiguous_put(value);
                         }
                         if error_code(&error) == Some(ErrorCode::ResourceExhausted) {
-                            stats.capacity_backpressure += 1;
+                            stats.capacity_backpressure_errors += 1;
                         }
                         progress
                             .record_failure(invoked_ms, started_at.elapsed().as_millis() as u64);
@@ -681,7 +893,7 @@ async fn run_worker(context: WorkerContext) -> Result<WorkerStats> {
                         model.on_ambiguous_delete();
                     }
                     if error_code(&error) == Some(ErrorCode::ResourceExhausted) {
-                        stats.capacity_backpressure += 1;
+                        stats.capacity_backpressure_errors += 1;
                     }
                     progress.record_failure(invoked_ms, started_at.elapsed().as_millis() as u64);
                 }
@@ -697,7 +909,7 @@ async fn run_worker(context: WorkerContext) -> Result<WorkerStats> {
         for (reason, count) in &entry.retry_reasons {
             *stats.retries.entry(reason.clone()).or_default() += *count;
             if reason == "resource_exhausted" {
-                stats.capacity_backpressure += *count;
+                stats.capacity_backpressure_retries += *count;
             }
         }
         stats.retry_total += entry.retries;
@@ -705,10 +917,19 @@ async fn run_worker(context: WorkerContext) -> Result<WorkerStats> {
         let _ = completed;
         step += 1;
     }
+    stats.dropped_acknowledged = models
+        .values()
+        .map(|model| model.dropped_acknowledged)
+        .sum::<u64>();
     stats.models = models;
     Ok(stats)
 }
 
+/// One injected failure and everything the run measured about it.
+///
+/// Every duration is counted from the kill of the victim, so the figures of
+/// two runs can be compared without knowing how long the load ran before the
+/// failure.
 #[derive(Serialize)]
 struct FaultRound {
     round: u32,
@@ -720,13 +941,23 @@ struct FaultRound {
     owner_unchanged: bool,
     pre_failure_replica_progress: Value,
     replica_status_after_failure: Value,
+    /// The seconds from the kill to the failover's publication.
     kill_to_publish_seconds: f64,
+    /// The seconds from the kill to the first successful read.
     read_recovery_seconds: Option<f64>,
+    /// The seconds from the kill to the first successful write.
     write_recovery_seconds: Option<f64>,
+    /// The seconds from the kill to the first successful delete.
     delete_recovery_seconds: Option<f64>,
+    /// The milliseconds from the kill to the first failed request.
     first_failure_after_kill_ms: Option<u64>,
+    /// The milliseconds from the kill to the last failed request.
     last_failure_after_kill_ms: Option<u64>,
     failures_after_kill: u64,
+    /// The reads, writes and deletes the load completed after the kill.
+    reads_after_kill: u64,
+    writes_after_kill: u64,
+    deletes_after_kill: u64,
     replacement_to_full_rf_seconds: f64,
     failure_to_full_rf_seconds: f64,
     final_epoch: u64,
@@ -734,7 +965,13 @@ struct FaultRound {
     collateral_rollbacks: u64,
     load: Value,
     rollbacks: u64,
+    /// The reads the history cannot explain, because the bounded history had
+    /// already dropped a state the read may have rolled back to.
+    undecidable_reads: u64,
+    undecidable_samples: Vec<String>,
     impossible_reads: u64,
+    /// The acknowledged states the bounded history dropped.
+    dropped_acknowledged_states: u64,
     violations: Vec<String>,
     new_owner_counts: BTreeMap<String, u64>,
 }
@@ -856,10 +1093,11 @@ fn cohort_replica_stats(
     status: &ReplicaStatusResponse,
     topology: &TopologySnapshot,
     keys: &[u64],
-) -> (Option<usize>, usize, usize) {
+) -> (Option<usize>, usize, usize, BTreeMap<String, usize>) {
     let mut live_rf = usize::MAX;
     let mut under_replicated = 0;
     let mut not_writable = 0;
+    let mut block_reasons: BTreeMap<String, usize> = BTreeMap::new();
     let mut seen = BTreeMap::new();
     for &key in keys {
         let token = topology.key_token(&key.to_be_bytes());
@@ -881,11 +1119,22 @@ fn cohort_replica_stats(
         live_rf = live_rf.min(range.live_rf as usize);
         under_replicated += usize::from(range.under_replicated);
         not_writable += usize::from(!range.writable);
+        if !range.writable {
+            // The reason a range was not writable is what tells a reader
+            // whether the load could have written to it.
+            let reason = if range.write_block_reason.is_empty() {
+                "unnamed".to_owned()
+            } else {
+                range.write_block_reason.clone()
+            };
+            *block_reasons.entry(reason).or_default() += 1;
+        }
     }
     (
         (live_rf != usize::MAX).then_some(live_rf),
         under_replicated,
         not_writable,
+        block_reasons,
     )
 }
 
@@ -898,9 +1147,12 @@ fn load_json(stats: &WorkerStats, elapsed: Duration) -> Value {
         "errors": stats.errors,
         "retries": stats.retries,
         "retry_total": stats.retry_total,
-        "capacity_backpressure": stats.capacity_backpressure,
+        "capacity_backpressure_errors": stats.capacity_backpressure_errors,
+        "capacity_backpressure_retries": stats.capacity_backpressure_retries,
         "may_have_applied": stats.may_have_applied,
         "rollback_kinds": stats.rollback_kinds,
+        "undecidable_reads": stats.undecidable,
+        "dropped_acknowledged_states": stats.dropped_acknowledged,
     })
 }
 
@@ -951,7 +1203,9 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
     let mut killed = BTreeSet::new();
     let mut total_rollbacks = 0_u64;
     let mut total_impossible = 0_u64;
-    let mut total_capacity = 0_u64;
+    let mut total_undecidable = 0_u64;
+    let mut total_capacity_errors = 0_u64;
+    let mut total_capacity_retries = 0_u64;
     let mut total_requests = 0_u64;
     let started = Instant::now();
 
@@ -1057,19 +1311,23 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
         let mut min_live_rf = usize::MAX;
         let mut max_under_replicated = 0_usize;
         let mut writable_false = 0_usize;
+        let mut block_reasons: BTreeMap<String, usize> = BTreeMap::new();
         let published = loop {
             processes.ensure_running()?;
             let current = observer.refresh_topology().await?;
             if let Ok(Ok(status)) =
                 tokio::time::timeout(Duration::from_secs(2), observer.replica_status()).await
             {
-                let (live_rf, under_replicated, not_writable) =
+                let (live_rf, under_replicated, not_writable, reasons) =
                     cohort_replica_stats(&status, &current, &victim.cohort);
                 if let Some(live_rf) = live_rf {
                     min_live_rf = min_live_rf.min(live_rf);
                 }
                 max_under_replicated = max_under_replicated.max(under_replicated);
                 writable_false = writable_false.max(not_writable);
+                for (reason, count) in reasons {
+                    *block_reasons.entry(reason).or_default() += count;
+                }
             }
             if current.epoch > topology.epoch
                 && !current
@@ -1127,17 +1385,21 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        let (post_failure_min_live_rf, post_failure_under_replicated, post_failure_not_writable) =
-            match observer.replica_status().await {
-                Ok(status) => cohort_replica_stats(&status, &published, &victim.cohort),
-                Err(error) => {
-                    events.record(
-                        "fault_post_failure_status_failed",
-                        json!({ "round": round, "error": error.to_string() }),
-                    )?;
-                    (None, 0, 0)
-                }
-            };
+        let (
+            post_failure_min_live_rf,
+            post_failure_under_replicated,
+            post_failure_not_writable,
+            post_failure_block_reasons,
+        ) = match observer.replica_status().await {
+            Ok(status) => cohort_replica_stats(&status, &published, &victim.cohort),
+            Err(error) => {
+                events.record(
+                    "fault_post_failure_status_failed",
+                    json!({ "round": round, "error": error.to_string() }),
+                )?;
+                (None, 0, 0, BTreeMap::new())
+            }
+        };
 
         // Keep the load running through the replacement and RF repair. The
         // new member is staged first so the coordinator can copy into it.
@@ -1203,6 +1465,9 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
         let failures_after_kill = progress.failures_after_kill.load(Ordering::Acquire);
         let last_failure_after_kill_ms = (failures_after_kill > 0)
             .then(|| progress.last_failure_after_kill_ms.load(Ordering::Acquire));
+        let reads_after_kill = progress.reads_after_kill.load(Ordering::Acquire);
+        let writes_after_kill = progress.writes_after_kill.load(Ordering::Acquire);
+        let deletes_after_kill = progress.deletes_after_kill.load(Ordering::Acquire);
 
         // Verify every key after repair. Keys the follower scenario's victim
         // owned are collateral owner failures; they are recorded separately,
@@ -1249,6 +1514,11 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
                         *stats.rollback_kinds.entry(kind.to_owned()).or_default() += 1;
                     }
                 }
+                Observation::Undecidable => {
+                    stats.record_undecidable(format!(
+                        "final GET key {key} returned a value the shortened history cannot explain"
+                    ));
+                }
                 Observation::Impossible => {
                     stats.impossible += 1;
                     if stats.violations.len() < 100 {
@@ -1270,7 +1540,9 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
         }
         total_rollbacks += stats.rollbacks;
         total_impossible += stats.impossible;
-        total_capacity += stats.capacity_backpressure;
+        total_undecidable += stats.undecidable;
+        total_capacity_errors += stats.capacity_backpressure_errors;
+        total_capacity_retries += stats.capacity_backpressure_retries;
         total_requests += stats.requests();
         let load = load_json(&stats, load_elapsed);
         let record = FaultRound {
@@ -1286,9 +1558,11 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
                 "min_live_rf_during_failure": (min_live_rf != usize::MAX).then_some(min_live_rf),
                 "max_under_replicated_ranges_during_failure": max_under_replicated,
                 "max_not_writable_ranges_during_failure": writable_false,
+                "write_block_reasons_during_failure": block_reasons,
                 "min_live_rf_after_publish": post_failure_min_live_rf,
                 "under_replicated_ranges_after_publish": post_failure_under_replicated,
                 "not_writable_ranges_after_publish": post_failure_not_writable,
+                "write_block_reasons_after_publish": post_failure_block_reasons,
             }),
             kill_to_publish_seconds,
             read_recovery_seconds,
@@ -1297,6 +1571,9 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
             first_failure_after_kill_ms,
             last_failure_after_kill_ms,
             failures_after_kill,
+            reads_after_kill,
+            writes_after_kill,
+            deletes_after_kill,
             replacement_to_full_rf_seconds,
             failure_to_full_rf_seconds,
             final_epoch,
@@ -1304,7 +1581,10 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
             collateral_rollbacks,
             load,
             rollbacks: stats.rollbacks,
+            undecidable_reads: stats.undecidable,
+            undecidable_samples: stats.undecidable_samples.clone(),
             impossible_reads: stats.impossible,
+            dropped_acknowledged_states: stats.dropped_acknowledged,
             violations: stats.violations.clone(),
             new_owner_counts,
         };
@@ -1326,17 +1606,28 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
             stats.requests() > 0,
             "round {round} completed no requests under load"
         );
-        if config.fault_scenario == FaultScenario::Follower {
+        // The load has to keep working after the failure, not only before it:
+        // a run whose writes stopped at the kill would still have completed
+        // requests before it.
+        for (operation, completed) in [
+            (Operation::Get, reads_after_kill),
+            (Operation::Put, writes_after_kill),
+        ] {
             ensure!(
-                stats.ops.get("put_ok").copied().unwrap_or(0) > 0
-                    && stats
-                        .ops
-                        .get("get_ok")
-                        .copied()
-                        .unwrap_or(0)
-                        .saturating_add(stats.ops.get("get_not_found").copied().unwrap_or(0))
-                        > 0,
-                "round {round}: follower loss stopped the load's writes or reads"
+                !mix.offers(operation) || completed > 0,
+                "round {round}: the load completed no {} after the kill",
+                operation.name()
+            );
+        }
+        if config.fault_scenario == FaultScenario::Follower {
+            // The owner of every selected key stayed alive, so a read that does
+            // not match the key's current state is a rollback the scenario does
+            // not allow. A read the shortened history cannot explain is such a
+            // rollback too, so it fails the round as well.
+            ensure!(
+                stats.undecidable == 0,
+                "round {round}: follower loss left {} reads the history cannot explain",
+                stats.undecidable
             );
         }
         ensure!(
@@ -1362,7 +1653,15 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
         json!(total_rollbacks),
     );
     observations.insert("fault_impossible_reads".into(), json!(total_impossible));
-    observations.insert("fault_capacity_backpressure".into(), json!(total_capacity));
+    observations.insert("fault_undecidable_reads".into(), json!(total_undecidable));
+    observations.insert(
+        "fault_capacity_backpressure_errors".into(),
+        json!(total_capacity_errors),
+    );
+    observations.insert(
+        "fault_capacity_backpressure_retries".into(),
+        json!(total_capacity_retries),
+    );
     observations.insert("fault_requests".into(), json!(total_requests));
     observations.insert(
         "fault_total_seconds".into(),
@@ -1374,9 +1673,95 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
             "rounds": config.fault_rounds,
             "rollbacks": total_rollbacks,
             "impossible_reads": total_impossible,
+            "undecidable_reads": total_undecidable,
             "requests": total_requests,
             "seconds": started.elapsed().as_secs_f64(),
         }),
     )?;
     Ok(rounds.last().map_or(0, |round| round.final_epoch))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn version(sequence: u64) -> RecordVersion {
+        RecordVersion {
+            topology_epoch: 1,
+            owner_sequence: sequence,
+            owner_node_id: "node-1".to_owned(),
+        }
+    }
+
+    #[test]
+    fn every_worker_offers_every_operation_of_the_mix() {
+        // A total of 74 shares a factor with the fixed step the mix used
+        // before, which left every worker without one of the three operations.
+        let mix = OperationMix::parse("20:27:27").unwrap();
+        assert_eq!(mix.total, 74);
+        assert_eq!(gcd(mix.stride, mix.total), 1);
+        for worker in 0..3 {
+            let operations: BTreeSet<Operation> = (0..mix.total)
+                .map(|step| mix.choose(step, worker))
+                .collect();
+            assert_eq!(
+                operations.len(),
+                3,
+                "worker {worker} never offers one of the operations"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_mix_keeps_its_share() {
+        let mix = OperationMix::parse("70:20:10").unwrap();
+        let mut counts = BTreeMap::new();
+        for step in 0..mix.total {
+            *counts.entry(mix.choose(step, 0)).or_insert(0_u64) += 1;
+        }
+        assert_eq!(counts[&Operation::Get], 70);
+        assert_eq!(counts[&Operation::Put], 20);
+        assert_eq!(counts[&Operation::Delete], 10);
+    }
+
+    #[test]
+    fn an_empty_mix_is_rejected() {
+        assert!(OperationMix::parse("0:0:0").is_err());
+        assert!(OperationMix::parse("70:20").is_err());
+    }
+
+    #[test]
+    fn the_acknowledged_history_is_bounded_and_reports_what_it_dropped() {
+        let mut model = KeyModel::new(PossibleState::absent(None));
+        let writes = MAX_ACKNOWLEDGED_STATES_PER_KEY as u64 + 1;
+        for sequence in 1..=writes {
+            model.on_put(sequence.to_be_bytes().to_vec(), version(sequence));
+        }
+        assert_eq!(model.acknowledged.len(), MAX_ACKNOWLEDGED_STATES_PER_KEY);
+        // The state the key started with and the first write are the ones the
+        // bound dropped.
+        assert_eq!(model.dropped_acknowledged, 2);
+
+        // The oldest state is gone, so a read of it cannot be told apart from
+        // a value the history never held.
+        assert_eq!(
+            model.observe(Some(&1_u64.to_be_bytes()), Some(&version(1))),
+            Observation::Undecidable
+        );
+        // A state the history still holds is a rollback, not an unknown value.
+        assert!(matches!(
+            model.observe(Some(&2_u64.to_be_bytes()), Some(&version(2))),
+            Observation::Rollback { .. }
+        ));
+    }
+
+    #[test]
+    fn a_read_the_history_never_held_is_impossible() {
+        let mut model = KeyModel::new(PossibleState::absent(None));
+        model.on_put(b"value".to_vec(), version(1));
+        assert_eq!(
+            model.observe(Some(b"other"), Some(&version(9))),
+            Observation::Impossible
+        );
+    }
 }
