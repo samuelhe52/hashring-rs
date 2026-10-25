@@ -198,7 +198,10 @@ Under `OwnerOnly`, a rollback after an owner failure is counted and classified;
 a rollback after a follower failure, or an impossible value in either scenario,
 fails the run. The history of acknowledged states is bounded per key, and a
 read the shortened history can no longer explain is reported as inconclusive
-rather than as an impossible value.
+rather than as an impossible value: such a read is not a verified read, so it
+fails the round in either scenario. The checks of a round are collected, and a
+round that fails ends the run with its own record and the records of the
+rounds before it still in the summary.
 
 See [fault-under-load.md](fault-under-load.md) for the validation experiments.
 
