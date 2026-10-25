@@ -190,9 +190,15 @@ recorded mutations. `summary.json` reports the affected ranges and their
 pre-failure replica progress, publication and first-read/write recovery, the
 minimum observed `live_rf`, replacement and failure to full-RF times, new owner
 distribution, capacity backpressure, `MayHaveApplied` count, and rollbacks.
+Every duration is counted from the kill of the victim, so the figures of two
+runs can be compared without knowing how long the load ran before the
+failure. Capacity backpressure is split into the requests that ended with a
+capacity error and the retries the client made because of capacity.
 Under `OwnerOnly`, a rollback after an owner failure is counted and classified;
 a rollback after a follower failure, or an impossible value in either scenario,
-fails the run.
+fails the run. The history of acknowledged states is bounded per key, and a
+read the shortened history can no longer explain is reported as inconclusive
+rather than as an impossible value.
 
 See [fault-under-load.md](fault-under-load.md) for the validation experiments.
 
