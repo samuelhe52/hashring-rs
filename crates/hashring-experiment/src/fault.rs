@@ -362,6 +362,7 @@ enum Observation {
     Rollback {
         first: bool,
         kind: &'static str,
+        eligible: bool,
     },
     /// The observation is not explainable by the recorded history, and the
     /// history is too short to say whether it is an allowed rollback.
@@ -393,6 +394,9 @@ struct KeyModel {
     /// window cannot be told apart from a value the history never held.
     window: usize,
     rolled_back: bool,
+    /// The newest topology in which a mutation or read established this key.
+    /// A failure of an older owner cannot undo a state established after it.
+    established_epoch: u64,
 }
 
 impl KeyModel {
@@ -404,12 +408,20 @@ impl KeyModel {
             dropped_acknowledged: 0,
             window,
             rolled_back: false,
+            established_epoch: 0,
         };
         model.resync(state);
         model
     }
 
+    fn begin_round(&mut self) {
+        self.rolled_back = false;
+    }
+
     fn resync(&mut self, state: PossibleState) {
+        if let Some(version) = &state.version {
+            self.established_epoch = self.established_epoch.max(version.topology_epoch);
+        }
         self.possible = vec![state.clone()];
         self.remember(&state);
     }
@@ -423,6 +435,9 @@ impl KeyModel {
     fn remember(&mut self, state: &PossibleState) {
         let acknowledged = AcknowledgedState::of(state);
         let fingerprint = acknowledged.fingerprint();
+        if self.acknowledged.back() == Some(&acknowledged) {
+            return;
+        }
         if self.known.contains_key(&fingerprint) {
             // A state the window already holds is acknowledged again, which is
             // rare: find its place in the order and move it to the back.
@@ -477,14 +492,41 @@ impl KeyModel {
     }
 
     fn on_ambiguous_put(&mut self, value: Vec<u8>) {
-        self.possible.push(PossibleState {
+        let state = PossibleState {
             value: Some(value),
             version: None,
-        });
+        };
+        self.remember(&state);
+        self.possible.push(state);
     }
 
     fn on_ambiguous_delete(&mut self) {
-        self.possible.push(PossibleState::absent(None));
+        let state = PossibleState::absent(None);
+        self.remember(&state);
+        self.possible.push(state);
+    }
+
+    fn observe_at(
+        &mut self,
+        value: Option<&[u8]>,
+        version: Option<&RecordVersion>,
+        response_epoch: u64,
+        failure_epoch: u64,
+        failure_injected: bool,
+    ) -> Observation {
+        let eligible = failure_injected && self.established_epoch <= failure_epoch;
+        let observation = self.observe(value, version);
+        // A successful read from the promoted owner establishes its state,
+        // even when the record itself still carries the old owner's version.
+        self.established_epoch = self.established_epoch.max(response_epoch);
+        match observation {
+            Observation::Rollback { first, kind, .. } => Observation::Rollback {
+                first,
+                kind,
+                eligible,
+            },
+            other => other,
+        }
     }
 
     fn observe(&mut self, value: Option<&[u8]>, version: Option<&RecordVersion>) -> Observation {
@@ -493,6 +535,24 @@ impl KeyModel {
             .iter()
             .any(|state| state.matches(value, version))
         {
+            let state = PossibleState {
+                value: value.map(<[u8]>::to_vec),
+                version: version.cloned(),
+            };
+            // Once a GET identifies an ambiguous PUT's version, that concrete
+            // state replaces its wildcard. Keep other historical candidates.
+            let concrete = AcknowledgedState::of(&state);
+            if concrete.value.is_some() && concrete.version.is_some() {
+                if let Some(index) = self
+                    .acknowledged
+                    .iter()
+                    .position(|entry| entry.value == concrete.value && entry.version.is_none())
+                {
+                    let removed = self.acknowledged.remove(index).expect("known index");
+                    self.forget(removed.fingerprint());
+                }
+            }
+            self.resync(state);
             return Observation::Matches;
         }
         let observation = AcknowledgedState::of_observation(value, version);
@@ -509,9 +569,8 @@ impl KeyModel {
                 (Some(_), false) => "older_value_reappeared",
                 (None, _) => "acknowledged_value_lost",
             };
-            // Keep the observed state as possible so one rollback does not
-            // make every later read of the same old state impossible. The
-            // history still remembers the newer acknowledged state.
+            // The read establishes the current state. Newer and uncertain
+            // states remain historical candidates, rather than live branches.
             let state = match value {
                 Some(value) => PossibleState {
                     value: Some(value.to_vec()),
@@ -519,8 +578,12 @@ impl KeyModel {
                 },
                 None => PossibleState::absent(None),
             };
-            self.possible.push(state);
-            return Observation::Rollback { first, kind };
+            self.resync(state);
+            return Observation::Rollback {
+                first,
+                kind,
+                eligible: false,
+            };
         }
         if self.dropped_acknowledged > 0 {
             // The history no longer holds every acknowledged state, so this
@@ -618,6 +681,7 @@ struct WorkerStats {
     capacity_backpressure_retries: u64,
     may_have_applied: u64,
     rollbacks: u64,
+    forbidden_rollbacks: u64,
     rollback_kinds: BTreeMap<String, u64>,
     /// The reads the shortened history cannot explain.
     undecidable: u64,
@@ -646,6 +710,7 @@ impl WorkerStats {
         self.capacity_backpressure_retries += other.capacity_backpressure_retries;
         self.may_have_applied += other.may_have_applied;
         self.rollbacks += other.rollbacks;
+        self.forbidden_rollbacks += other.forbidden_rollbacks;
         for (kind, count) in other.rollback_kinds {
             *self.rollback_kinds.entry(kind).or_default() += count;
         }
@@ -735,6 +800,7 @@ struct WorkerContext {
     value_bytes: usize,
     mix: OperationMix,
     started_at: Instant,
+    failure_epoch: u64,
     stop: Arc<AtomicBool>,
     progress: Arc<Progress>,
     ledger: Arc<RequestLedger>,
@@ -751,6 +817,7 @@ async fn run_worker(context: WorkerContext) -> Result<WorkerStats> {
         value_bytes,
         mix,
         started_at,
+        failure_epoch,
         stop,
         progress,
         ledger,
@@ -810,9 +877,22 @@ async fn run_worker(context: WorkerContext) -> Result<WorkerStats> {
                         invoked_ms,
                         started_at.elapsed().as_millis() as u64,
                     );
-                    match model.observe(Some(&output.value), Some(&output.version)) {
+                    match model.observe_at(
+                        Some(&output.value),
+                        Some(&output.version),
+                        output.topology_epoch,
+                        failure_epoch,
+                        progress.kill_ms.load(Ordering::Acquire) != NEVER,
+                    ) {
                         Observation::Matches => {}
-                        Observation::Rollback { first, kind } => {
+                        Observation::Rollback {
+                            first,
+                            kind,
+                            eligible,
+                        } => {
+                            if !eligible {
+                                stats.forbidden_rollbacks += 1;
+                            }
                             if first {
                                 stats.rollbacks += 1;
                                 *stats.rollback_kinds.entry(kind.to_owned()).or_default() += 1;
@@ -838,15 +918,29 @@ async fn run_worker(context: WorkerContext) -> Result<WorkerStats> {
                 }
                 Err(error) if is_not_found(&error) => {
                     entry.result = "not_found";
+                    entry.end_epoch = client.epoch().await;
                     *stats.ops.entry("get_not_found".to_owned()).or_default() += 1;
                     progress.record_success(
                         operation,
                         invoked_ms,
                         started_at.elapsed().as_millis() as u64,
                     );
-                    match model.observe(None, None) {
+                    match model.observe_at(
+                        None,
+                        None,
+                        entry.end_epoch,
+                        failure_epoch,
+                        progress.kill_ms.load(Ordering::Acquire) != NEVER,
+                    ) {
                         Observation::Matches => {}
-                        Observation::Rollback { first, kind } => {
+                        Observation::Rollback {
+                            first,
+                            kind,
+                            eligible,
+                        } => {
+                            if !eligible {
+                                stats.forbidden_rollbacks += 1;
+                            }
                             if first {
                                 stats.rollbacks += 1;
                                 *stats.rollback_kinds.entry(kind.to_owned()).or_default() += 1;
@@ -1035,13 +1129,17 @@ impl RoundChecks<'_> {
                 self.round
             ));
         }
-        if (self.scenario == FaultScenario::Follower
-            || self.write_ack_policy != WriteAckPolicy::OwnerOnly)
-            && stats.rollbacks > 0
+        let forbidden = if self.scenario == FaultScenario::Follower
+            || self.write_ack_policy != WriteAckPolicy::OwnerOnly
         {
+            stats.rollbacks
+        } else {
+            stats.forbidden_rollbacks
+        };
+        if forbidden > 0 {
             failures.push(format!(
                 "round {} rolled back {} acknowledged changes: {:?}",
-                self.round, stats.rollbacks, stats.rollback_kinds
+                self.round, forbidden, stats.rollback_kinds
             ));
         }
         if stats.undecidable > 0 {
@@ -1303,6 +1401,7 @@ fn load_json(stats: &WorkerStats, elapsed: Duration, dropped_acknowledged: u64) 
         "capacity_backpressure_retries": stats.capacity_backpressure_retries,
         "may_have_applied": stats.may_have_applied,
         "rollback_kinds": stats.rollback_kinds,
+        "forbidden_rollbacks": stats.forbidden_rollbacks,
         "undecidable_reads": stats.undecidable,
         "dropped_acknowledged_states": dropped_acknowledged,
     })
@@ -1367,6 +1466,10 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
     let started = Instant::now();
 
     for round in 1..=config.fault_rounds {
+        // Final verification also observes keys outside the load cohort.
+        for model in models.values_mut() {
+            model.begin_round();
+        }
         let topology = admin_client.refresh_topology().await?;
         let victim = select_victim(config, &topology, round, &killed)?;
         if round == 1 {
@@ -1445,6 +1548,7 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
                 value_bytes: config.value_bytes,
                 mix: mix.clone(),
                 started_at,
+                failure_epoch: topology.epoch,
                 stop: Arc::clone(&stop),
                 progress: Arc::clone(&progress),
                 ledger: Arc::clone(&ledger),
@@ -1668,7 +1772,13 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
                 }
             };
             let model = models.get_mut(&key).expect("every dataset key has a model");
-            let observation = model.observe(value.as_deref(), version.as_ref());
+            let observation = model.observe_at(
+                value.as_deref(),
+                version.as_ref(),
+                workload_client.epoch().await,
+                topology.epoch,
+                true,
+            );
             if collateral.contains(&key) {
                 if matches!(observation, Observation::Rollback { first: true, .. }) {
                     collateral_rollbacks += 1;
@@ -1682,7 +1792,14 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
             }
             match observation {
                 Observation::Matches => {}
-                Observation::Rollback { first, kind } => {
+                Observation::Rollback {
+                    first,
+                    kind,
+                    eligible,
+                } => {
+                    if !eligible {
+                        stats.forbidden_rollbacks += 1;
+                    }
                     if first {
                         stats.rollbacks += 1;
                         *stats.rollback_kinds.entry(kind.to_owned()).or_default() += 1;
@@ -2000,6 +2117,146 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_read_resolves_ambiguous_put_and_preserves_its_exact_history() {
+        let mut model = KeyModel::new(PossibleState::present(b"A".to_vec(), version(1)), 16);
+        model.on_ambiguous_put(b"B".to_vec());
+        assert_eq!(
+            model.observe(Some(b"B"), Some(&version(2))),
+            Observation::Matches
+        );
+        assert!(matches!(
+            model.observe(Some(b"A"), Some(&version(1))),
+            Observation::Rollback { .. }
+        ));
+        model.on_put(b"C".to_vec(), version(3));
+        assert!(matches!(
+            model.observe(Some(b"B"), Some(&version(2))),
+            Observation::Rollback { .. }
+        ));
+        assert_eq!(
+            model.observe(Some(b"B"), Some(&version(99))),
+            Observation::Impossible
+        );
+    }
+
+    #[test]
+    fn uncertain_put_and_delete_survive_a_later_acknowledgement() {
+        for observe_first in [false, true] {
+            let mut put = KeyModel::new(PossibleState::present(b"A".to_vec(), version(1)), 16);
+            put.on_ambiguous_put(b"B".to_vec());
+            if observe_first {
+                assert_eq!(
+                    put.observe(Some(b"B"), Some(&version(2))),
+                    Observation::Matches
+                );
+            }
+            put.on_put(b"C".to_vec(), version(3));
+            assert!(matches!(
+                put.observe(Some(b"B"), Some(&version(2))),
+                Observation::Rollback { .. }
+            ));
+
+            let mut delete = KeyModel::new(PossibleState::present(b"A".to_vec(), version(1)), 16);
+            delete.on_ambiguous_delete();
+            if observe_first {
+                assert_eq!(delete.observe(None, None), Observation::Matches);
+                assert!(matches!(
+                    delete.observe(Some(b"A"), Some(&version(1))),
+                    Observation::Rollback { .. }
+                ));
+            }
+            delete.on_put(b"C".to_vec(), version(3));
+            assert!(matches!(
+                delete.observe(None, None),
+                Observation::Rollback { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn each_round_counts_a_keys_rollback_again() {
+        let mut model = KeyModel::new(PossibleState::present(b"A".to_vec(), version(1)), 16);
+        for sequence in [2, 3] {
+            model.begin_round();
+            model.resync(PossibleState::present(b"A".to_vec(), version(1)));
+            model.on_put(b"B".to_vec(), version(sequence));
+            assert!(matches!(
+                model.observe(Some(b"A"), Some(&version(1))),
+                Observation::Rollback { first: true, .. }
+            ));
+            assert_eq!(
+                model.observe(Some(b"A"), Some(&version(1))),
+                Observation::Matches
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_injected_failure_can_exempt_a_rollback() {
+        let mut model = KeyModel::new(PossibleState::present(b"A".to_vec(), version(1)), 16);
+        model.on_put(b"B".to_vec(), version(2));
+        assert!(matches!(
+            model.observe_at(Some(b"A"), Some(&version(1)), 1, 1, false),
+            Observation::Rollback {
+                eligible: false,
+                ..
+            }
+        ));
+        model.on_put(b"B".to_vec(), version(2));
+        assert!(matches!(
+            model.observe_at(Some(b"A"), Some(&version(1)), 2, 1, true),
+            Observation::Rollback { eligible: true, .. }
+        ));
+        // Even an old-version record observed on the promoted owner fixes
+        // the state: that same failure cannot justify a second regression.
+        model.on_put(
+            b"C".to_vec(),
+            RecordVersion {
+                topology_epoch: 2,
+                ..version(3)
+            },
+        );
+        assert!(matches!(
+            model.observe_at(Some(b"B"), Some(&version(2)), 2, 1, true),
+            Observation::Rollback {
+                eligible: false,
+                first: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_recovered_read_or_delete_closes_the_rollback_exemption() {
+        for delete in [false, true] {
+            let mut model = KeyModel::new(PossibleState::present(b"A".to_vec(), version(1)), 16);
+            if delete {
+                model.on_delete(RecordVersion {
+                    topology_epoch: 2,
+                    ..version(2)
+                });
+            } else {
+                assert_eq!(
+                    model.observe_at(Some(b"A"), Some(&version(1)), 2, 1, true),
+                    Observation::Matches
+                );
+                model.on_ambiguous_put(b"B".to_vec());
+                assert_eq!(
+                    model.observe_at(Some(b"B"), Some(&version(3)), 2, 1, true),
+                    Observation::Matches
+                );
+            }
+            assert!(matches!(
+                model.observe_at(Some(b"A"), Some(&version(1)), 2, 1, true),
+                Observation::Rollback {
+                    eligible: false,
+                    ..
+                }
+            ));
+        }
+    }
+
     fn checks<'a>(mix: &'a OperationMix, scenario: FaultScenario) -> RoundChecks<'a> {
         RoundChecks {
             round: 1,
@@ -2092,6 +2349,20 @@ mod tests {
         let failures = checks(&mix, FaultScenario::Follower).failures(&stats);
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert!(failures[0].contains("rolled back 2"), "{failures:?}");
+    }
+
+    #[test]
+    fn an_owner_round_rejects_regressions_outside_the_failure_boundary() {
+        let mix = OperationMix::parse("70:20:10").unwrap();
+        let mut stats = WorkerStats::default();
+        stats.ops.insert("get_ok".into(), 10);
+        stats.rollbacks = 1;
+        // A forbidden second regression must fail even when the per-key
+        // rollback count was already deduplicated by an earlier valid one.
+        stats.forbidden_rollbacks = 1;
+        let failures = checks(&mix, FaultScenario::Owner).failures(&stats);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].contains("rolled back 1"));
     }
 
     fn a_recorded_round() -> FaultRound {
