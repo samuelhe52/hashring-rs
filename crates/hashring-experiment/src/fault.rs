@@ -9,7 +9,7 @@
 //! then verify every key the run touched.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs::File,
     hash::{DefaultHasher, Hash, Hasher},
     io::{BufWriter, Write},
@@ -340,12 +340,12 @@ impl AcknowledgedState {
         }
     }
 
-    /// A fingerprint for the window's membership set.
+    /// A fingerprint for the window's membership index.
     ///
-    /// The set holds a 64-bit hash rather than a second copy of the state,
-    /// which keeps the window's memory close to the digests themselves. A
-    /// collision makes the window scan for a state it does not hold and then
-    /// treat the state as new, so it only costs the scan the set avoids.
+    /// The index holds a 64-bit hash rather than a second copy of the state,
+    /// which keeps the window's memory close to the digests themselves. Two
+    /// states can share a fingerprint: the index counts it, so a hit that
+    /// finds no matching state is a collision, and the state is new after all.
     fn fingerprint(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
         self.hash(&mut hasher);
@@ -379,12 +379,13 @@ struct KeyModel {
     /// value. The list is bounded by `window`, and the states it dropped are
     /// counted.
     acknowledged: VecDeque<AcknowledgedState>,
-    /// The states `acknowledged` holds, as fingerprints, so acknowledging a
-    /// state the window has never held does not scan the window: only a state
-    /// that is already in it needs its position. A fingerprint is one hash
-    /// instead of a second copy of the state, and a collision only costs the
-    /// scan it avoids.
-    known: HashSet<u64>,
+    /// The states `acknowledged` holds, by fingerprint and count, so
+    /// acknowledging a state the window has never held does not scan the
+    /// window: only a state that is already in it needs its position. A
+    /// fingerprint is one hash instead of a second copy of the state, and two
+    /// states can share one: the count keeps the index right when one of them
+    /// leaves the window.
+    known: HashMap<u64, usize>,
     /// How many acknowledged states the bound dropped.
     dropped_acknowledged: u64,
     /// How many acknowledged states the key keeps. It has to cover the writes
@@ -399,7 +400,7 @@ impl KeyModel {
         let mut model = Self {
             possible: Vec::new(),
             acknowledged: VecDeque::new(),
-            known: HashSet::new(),
+            known: HashMap::new(),
             dropped_acknowledged: 0,
             window,
             rolled_back: false,
@@ -422,33 +423,49 @@ impl KeyModel {
     fn remember(&mut self, state: &PossibleState) {
         let acknowledged = AcknowledgedState::of(state);
         let fingerprint = acknowledged.fingerprint();
-        if self.known.contains(&fingerprint) {
+        if self.known.contains_key(&fingerprint) {
             // A state the window already holds is acknowledged again, which is
-            // rare: find its place in the order and move it to the back. A
-            // fingerprint hit that finds no state is a collision, and the
-            // state is new after all.
+            // rare: find its place in the order and move it to the back.
             if let Some(position) = self
                 .acknowledged
                 .iter()
                 .position(|entry| *entry == acknowledged)
-                && position + 1 != self.acknowledged.len()
             {
-                let entry = self
-                    .acknowledged
-                    .remove(position)
-                    .expect("the position is inside the window");
-                self.acknowledged.push_back(entry);
+                if position + 1 != self.acknowledged.len() {
+                    let entry = self
+                        .acknowledged
+                        .remove(position)
+                        .expect("the position is inside the window");
+                    self.acknowledged.push_back(entry);
+                }
+                return;
             }
-            return;
+            // A fingerprint hit that finds no state is a collision: another
+            // state in the window has the same fingerprint. This state is new,
+            // and the count it adds keeps the other one indexed when it leaves.
         }
         if self.acknowledged.len() >= self.window
             && let Some(evicted) = self.acknowledged.pop_front()
         {
-            self.known.remove(&evicted.fingerprint());
+            self.forget(evicted.fingerprint());
             self.dropped_acknowledged += 1;
         }
-        self.known.insert(fingerprint);
+        *self.known.entry(fingerprint).or_insert(0) += 1;
         self.acknowledged.push_back(acknowledged);
+    }
+
+    /// Drops one state with this fingerprint from the index.
+    fn forget(&mut self, fingerprint: u64) {
+        let remaining = match self.known.get_mut(&fingerprint) {
+            Some(count) => {
+                *count -= 1;
+                *count
+            }
+            None => return,
+        };
+        if remaining == 0 {
+            self.known.remove(&fingerprint);
+        }
     }
 
     fn on_put(&mut self, value: Vec<u8>, version: RecordVersion) {
@@ -1362,6 +1379,22 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
                 }),
             )?;
         }
+        // A key keeps its model across rounds, so its dropped count is
+        // cumulative. The round reports only the states it dropped itself, so
+        // adding the rounds up does not count a state twice. The snapshot is
+        // taken before the pre-failure read: a window too small to hold the
+        // state that read finds drops one there too, and that drop belongs to
+        // this round instead of falling between the rounds.
+        let dropped_before: u64 = victim
+            .cohort
+            .iter()
+            .map(|key| {
+                models
+                    .get(key)
+                    .expect("every cohort key has a model")
+                    .dropped_acknowledged
+            })
+            .sum();
         // The ledger's model must start from the value this run sees now, not
         // from a previous round's expectation. A read also gives the pre-failure
         // version the rollback check can recognize.
@@ -1379,19 +1412,6 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
                 .expect("every dataset key has a model")
                 .resync(state);
         }
-        // A key keeps its model across rounds, so its dropped count is
-        // cumulative. The round reports only the states it dropped itself, so
-        // adding the rounds up does not count a state twice.
-        let dropped_before: u64 = victim
-            .cohort
-            .iter()
-            .map(|key| {
-                models
-                    .get(key)
-                    .expect("every cohort key has a model")
-                    .dropped_acknowledged
-            })
-            .sum();
         let status = observer.replica_status().await?;
         let (pre_progress, affected_ranges) = ranges_for_keys(&status, &topology, &victim.cohort);
         events.record(
@@ -2184,8 +2204,8 @@ mod tests {
 
     #[test]
     fn the_window_keeps_its_index_in_step_with_its_order() {
-        // The membership set is what makes acknowledging a new state constant
-        // time, so it must hold exactly the states the window holds.
+        // The index is what makes acknowledging a new state constant time, so
+        // it must count exactly the states the window holds.
         let mut model = KeyModel::new(PossibleState::absent(None), WINDOW);
         for sequence in 1..=(WINDOW as u64 * 4) {
             model.on_put(sequence.to_be_bytes().to_vec(), version(sequence));
@@ -2195,16 +2215,58 @@ mod tests {
                 model.on_put((sequence / 2).to_be_bytes().to_vec(), version(sequence / 2));
             }
             assert_eq!(
-                model.known.len(),
+                model.known.values().sum::<usize>(),
                 model.acknowledged.len(),
-                "the set and the order disagree after {sequence} writes"
+                "the index and the order disagree after {sequence} writes"
             );
             for entry in &model.acknowledged {
                 assert!(
-                    model.known.contains(&entry.fingerprint()),
-                    "the order holds a state the set does not after {sequence} writes"
+                    model
+                        .known
+                        .get(&entry.fingerprint())
+                        .is_some_and(|count| *count > 0),
+                    "the order holds a state the index does not after {sequence} writes"
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_fingerprint_collision_keeps_the_state_in_the_window() {
+        // Two states can share a fingerprint. A window whose index hits one and
+        // holds the other has to add the new state anyway: dropping it would
+        // take an acknowledged state out of the history, and a later read of it
+        // would look impossible instead of being a rollback.
+        let mut model = KeyModel::new(PossibleState::absent(None), WINDOW);
+        let state = PossibleState::present(b"collided".to_vec(), version(7));
+        let entry = AcknowledgedState::of(&state);
+        // Stand in for another state in the window with the same fingerprint.
+        model.known.insert(entry.fingerprint(), 1);
+
+        model.remember(&state);
+        assert_eq!(model.acknowledged.back(), Some(&entry));
+        assert_eq!(model.known.get(&entry.fingerprint()), Some(&2));
+        // The state is in the history, so the read is a rollback, not a value
+        // the history never held.
+        assert!(
+            matches!(
+                model.observe(state.value.as_deref(), state.version.as_ref()),
+                Observation::Rollback { .. }
+            ),
+            "the collided state did not enter the window"
+        );
+
+        // When it leaves the window the index falls back to the other state's
+        // count instead of losing a fingerprint the window still holds.
+        for sequence in 1..=WINDOW as u64 {
+            model.on_put(sequence.to_be_bytes().to_vec(), version(100 + sequence));
+        }
+        assert!(!model.acknowledged.contains(&entry));
+        assert_eq!(model.known.get(&entry.fingerprint()), Some(&1));
+        // The injected count is the only one that is not a state in the window.
+        assert_eq!(
+            model.known.values().sum::<usize>(),
+            model.acknowledged.len() + 1
+        );
     }
 }
