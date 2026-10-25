@@ -163,6 +163,9 @@ pub struct ExperimentConfig {
     /// How long the `fault` mode keeps running its load after recovery has
     /// reached full RF.
     pub fault_post_seconds: u64,
+    /// How many acknowledged states per key the `fault` mode keeps, so it can
+    /// tell a permitted rollback apart from a value the history never held.
+    pub fault_acknowledged_window: usize,
     /// The membership change a `scaling` run performs.
     pub scaling_scenario: ScalingScenario,
     /// How a `scaling` run offers its load.
@@ -2721,6 +2724,10 @@ fn validate_config(config: &ExperimentConfig) -> Result<()> {
             "fault_pre_seconds and fault_post_seconds must be positive"
         );
         ensure!(
+            config.fault_acknowledged_window > 0,
+            "fault_acknowledged_window must be positive"
+        );
+        ensure!(
             config.key_count >= 32,
             "fault mode needs at least 32 keys to select a failure cohort"
         );
@@ -3065,6 +3072,7 @@ mod tests {
             fault_rounds: 1,
             fault_pre_seconds: 1,
             fault_post_seconds: 1,
+            fault_acknowledged_window: 64,
             scaling_scenario: ScalingScenario::Grow,
             scaling_load_mode: ScalingLoadMode::Closed,
             scaling_open_rate: 0,

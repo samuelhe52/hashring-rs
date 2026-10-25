@@ -57,6 +57,14 @@ pub const DEFAULT_FAULT_ROUNDS: u32 = 1;
 pub const DEFAULT_FAULT_PRE_SECONDS: u64 = 10;
 /// How long a `fault` run keeps its load running after recovery reaches full RF.
 pub const DEFAULT_FAULT_POST_SECONDS: u64 = 10;
+/// How many acknowledged states per key a `fault` run keeps.
+///
+/// The window has to cover the writes a key takes during the load: a rollback
+/// to a state that left the window cannot be told apart from a value the
+/// history never held, and the run then does not count as a pass. The default
+/// covers a default run (a few hundred writes per key) with room to spare; a
+/// longer or faster run needs a larger window.
+pub const DEFAULT_FAULT_ACKNOWLEDGED_WINDOW: usize = 4096;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -99,6 +107,7 @@ pub struct ExperimentFile {
     pub fault_rounds: Option<u32>,
     pub fault_pre_seconds: Option<u64>,
     pub fault_post_seconds: Option<u64>,
+    pub fault_acknowledged_window: Option<usize>,
     pub scaling_scenario: Option<ScalingScenario>,
     pub scaling_load_mode: Option<ScalingLoadMode>,
     pub scaling_open_rate: Option<u64>,
@@ -352,6 +361,10 @@ pub fn resolve(
             .fault_post_seconds
             .or(file.fault_post_seconds)
             .unwrap_or(DEFAULT_FAULT_POST_SECONDS),
+        fault_acknowledged_window: args
+            .fault_acknowledged_window
+            .or(file.fault_acknowledged_window)
+            .unwrap_or(DEFAULT_FAULT_ACKNOWLEDGED_WINDOW),
         scaling_scenario,
         scaling_load_mode: args
             .scaling_load_mode
@@ -521,6 +534,7 @@ mod tests {
         assert_eq!(config.mix, "70:20:10");
         assert_eq!(config.fault_pre_seconds, 10);
         assert_eq!(config.fault_post_seconds, 10);
+        assert_eq!(config.fault_acknowledged_window, 4096);
         assert_eq!(config.pre_publish_delay_ms, 0);
         assert!(matches!(config.write_ack_policy, WriteAckPolicy::OwnerOnly));
     }

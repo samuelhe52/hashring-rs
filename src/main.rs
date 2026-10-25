@@ -599,6 +599,12 @@ struct ExperimentArgs {
     /// RF. [default: 10]
     #[arg(long)]
     fault_post_seconds: Option<u64>,
+    /// How many acknowledged states per key a fault run keeps. A read that
+    /// matches one of them is a permitted rollback; a read the shortened
+    /// history can no longer explain fails the run. It must exceed the writes
+    /// one key takes during the load. [default: 4096]
+    #[arg(long)]
+    fault_acknowledged_window: Option<usize>,
     /// The membership change a scaling run performs: round-trip, grow,
     /// shrink, replace, churn, or control. [default: round-trip]
     #[arg(long, value_enum)]

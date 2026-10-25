@@ -39,16 +39,6 @@ const LEDGER_FLUSH_INTERVAL: u64 = 64;
 const NEVER: u64 = u64::MAX;
 const MIN_COHORT: usize = 8;
 
-/// How many acknowledged states one key keeps.
-///
-/// The history has to tell a rollback to an acknowledged state apart from a
-/// value the history never held, and it grows with every write the load
-/// makes. The bound keeps the driver's memory proportional to the key space
-/// instead of to the number of writes; the states it drops are counted, and a
-/// read the shortened history can no longer explain is reported as
-/// undecidable instead of impossible.
-const MAX_ACKNOWLEDGED_STATES_PER_KEY: usize = 256;
-
 #[derive(Clone, Default)]
 struct OperationMix {
     /// The number of slots that carry a GET.
@@ -325,8 +315,8 @@ impl AcknowledgedState {
     /// The state an observation describes.
     ///
     /// The digests are taken once per observation: the history holds up to
-    /// [`MAX_ACKNOWLEDGED_STATES_PER_KEY`] states, and hashing the value once
-    /// per state would cost a hash per state per read.
+    /// [`KeyModel::window`] states, and hashing the value once per state would
+    /// cost a hash per state per read.
     fn of_observation(value: Option<&[u8]>, version: Option<&RecordVersion>) -> Self {
         Self {
             value: value.map(ValueDigest::of),
@@ -372,20 +362,25 @@ struct KeyModel {
     possible: Vec<PossibleState>,
     /// Every state a definite mutation or a pre-read established, as digests.
     /// A later read that matches one of these but not `possible` is a rollback
-    /// rather than an arbitrary value. The list is bounded, and the states it
-    /// dropped are counted.
+    /// rather than an arbitrary value. The list is bounded by `window`, and the
+    /// states it dropped are counted.
     acknowledged: VecDeque<AcknowledgedState>,
     /// How many acknowledged states the bound dropped.
     dropped_acknowledged: u64,
+    /// How many acknowledged states the key keeps. It has to cover the writes
+    /// the key takes during the load: a rollback to a state that left the
+    /// window cannot be told apart from a value the history never held.
+    window: usize,
     rolled_back: bool,
 }
 
 impl KeyModel {
-    fn new(state: PossibleState) -> Self {
+    fn new(state: PossibleState, window: usize) -> Self {
         let mut model = Self {
             possible: Vec::new(),
             acknowledged: VecDeque::new(),
             dropped_acknowledged: 0,
+            window,
             rolled_back: false,
         };
         model.resync(state);
@@ -419,7 +414,7 @@ impl KeyModel {
             }
             return;
         }
-        if self.acknowledged.len() >= MAX_ACKNOWLEDGED_STATES_PER_KEY {
+        if self.acknowledged.len() >= self.window {
             self.acknowledged.pop_front();
             self.dropped_acknowledged += 1;
         }
@@ -1006,10 +1001,13 @@ impl RoundChecks<'_> {
             // run does not count it as a pass, in either scenario: under
             // `OwnerOnly` a rollback is allowed, but once the history has been
             // shortened it cannot be told apart from an impossible value, and
-            // a follower loss allows no rollback at all.
+            // a follower loss allows no rollback at all. The dropped figure is
+            // the round's total across its keys, not the number of states the
+            // keys of these reads dropped.
             failures.push(format!(
-                "round {}: {} reads cannot be verified, because the acknowledged history of their \
-                 keys was shortened ({} states dropped): {:?}",
+                "round {}: {} reads cannot be verified, because the acknowledged history was \
+                 shortened: {} states were dropped in total across the round's keys, so a read \
+                 cannot be told apart from a rollback to a dropped state: {:?}",
                 self.round,
                 stats.undecidable,
                 stats.dropped_acknowledged,
@@ -1295,10 +1293,13 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
         .map(|key| {
             (
                 key,
-                KeyModel::new(PossibleState {
-                    value: Some(deterministic_value(key, 0, config.value_bytes)),
-                    version: None,
-                }),
+                KeyModel::new(
+                    PossibleState {
+                        value: Some(deterministic_value(key, 0, config.value_bytes)),
+                        version: None,
+                    },
+                    config.fault_acknowledged_window,
+                ),
             )
         })
         .collect();
@@ -1719,28 +1720,15 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
         }
     }
 
-    observations.insert("fault_scenario".into(), json!(scenario_name));
-    observations.insert("fault_round_count".into(), json!(config.fault_rounds));
-    observations.insert("fault_rounds".into(), serde_json::to_value(&rounds)?);
-    observations.insert(
-        "fault_acknowledged_rollbacks".into(),
-        json!(total_rollbacks),
-    );
-    observations.insert("fault_impossible_reads".into(), json!(total_impossible));
-    observations.insert("fault_undecidable_reads".into(), json!(total_undecidable));
-    observations.insert(
-        "fault_capacity_backpressure_errors".into(),
-        json!(total_capacity_errors),
-    );
-    observations.insert(
-        "fault_capacity_backpressure_retries".into(),
-        json!(total_capacity_retries),
-    );
-    observations.insert("fault_requests".into(), json!(total_requests));
-    observations.insert(
-        "fault_total_seconds".into(),
-        json!(started.elapsed().as_secs_f64()),
-    );
+    let totals = RunTotals {
+        rollbacks: total_rollbacks,
+        impossible: total_impossible,
+        undecidable: total_undecidable,
+        capacity_errors: total_capacity_errors,
+        capacity_retries: total_capacity_retries,
+        requests: total_requests,
+        seconds: started.elapsed().as_secs_f64(),
+    };
     events.record(
         "fault_run_complete",
         json!({
@@ -1753,10 +1741,69 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
             "failures": failures,
         }),
     )?;
-    // The rounds are in the observations before the run fails, so a failed run
-    // still says what it saw.
-    ensure!(failures.is_empty(), "{}", failures.join("; "));
+    record_run(
+        observations,
+        scenario_name,
+        config.fault_rounds,
+        config.fault_acknowledged_window,
+        &rounds,
+        &totals,
+        &failures,
+    )?;
     Ok(rounds.last().map_or(0, |round| round.final_epoch))
+}
+
+/// What a whole run measured, across its rounds.
+struct RunTotals {
+    rollbacks: u64,
+    impossible: u64,
+    undecidable: u64,
+    capacity_errors: u64,
+    capacity_retries: u64,
+    requests: u64,
+    seconds: f64,
+}
+
+/// Records what the run measured, and then fails it if a round failed.
+///
+/// The record goes in before the check: a failed run still says what it saw,
+/// because the summary keeps the rounds it completed and the reasons it failed
+/// in `fault_failures` rather than only in the error text.
+fn record_run(
+    observations: &mut BTreeMap<String, Value>,
+    scenario_name: &str,
+    rounds_requested: u32,
+    acknowledged_window: usize,
+    rounds: &[FaultRound],
+    totals: &RunTotals,
+    failures: &[String],
+) -> Result<()> {
+    observations.insert("fault_scenario".into(), json!(scenario_name));
+    observations.insert("fault_round_count".into(), json!(rounds_requested));
+    observations.insert("fault_rounds".into(), serde_json::to_value(rounds)?);
+    observations.insert(
+        "fault_acknowledged_window".into(),
+        json!(acknowledged_window),
+    );
+    observations.insert(
+        "fault_acknowledged_rollbacks".into(),
+        json!(totals.rollbacks),
+    );
+    observations.insert("fault_impossible_reads".into(), json!(totals.impossible));
+    observations.insert("fault_undecidable_reads".into(), json!(totals.undecidable));
+    observations.insert(
+        "fault_capacity_backpressure_errors".into(),
+        json!(totals.capacity_errors),
+    );
+    observations.insert(
+        "fault_capacity_backpressure_retries".into(),
+        json!(totals.capacity_retries),
+    );
+    observations.insert("fault_requests".into(), json!(totals.requests));
+    observations.insert("fault_total_seconds".into(), json!(totals.seconds));
+    observations.insert("fault_failures".into(), json!(failures));
+    ensure!(failures.is_empty(), "{}", failures.join("; "));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1808,14 +1855,17 @@ mod tests {
         assert!(OperationMix::parse("70:20").is_err());
     }
 
+    /// A window small enough to fill in a test.
+    const WINDOW: usize = 4;
+
     #[test]
     fn the_acknowledged_history_is_bounded_and_reports_what_it_dropped() {
-        let mut model = KeyModel::new(PossibleState::absent(None));
-        let writes = MAX_ACKNOWLEDGED_STATES_PER_KEY as u64 + 1;
+        let mut model = KeyModel::new(PossibleState::absent(None), WINDOW);
+        let writes = WINDOW as u64 + 1;
         for sequence in 1..=writes {
             model.on_put(sequence.to_be_bytes().to_vec(), version(sequence));
         }
-        assert_eq!(model.acknowledged.len(), MAX_ACKNOWLEDGED_STATES_PER_KEY);
+        assert_eq!(model.acknowledged.len(), WINDOW);
         // The state the key started with and the first write are the ones the
         // bound dropped.
         assert_eq!(model.dropped_acknowledged, 2);
@@ -1835,8 +1885,8 @@ mod tests {
 
     #[test]
     fn a_state_that_is_acknowledged_again_stays_in_the_window() {
-        let mut model = KeyModel::new(PossibleState::absent(None));
-        for sequence in 1..=MAX_ACKNOWLEDGED_STATES_PER_KEY as u64 + 1 {
+        let mut model = KeyModel::new(PossibleState::absent(None), WINDOW);
+        for sequence in 1..=WINDOW as u64 + 1 {
             model.on_put(sequence.to_be_bytes().to_vec(), version(sequence));
         }
         let oldest = PossibleState::present(1_u64.to_be_bytes().to_vec(), version(1));
@@ -1862,7 +1912,7 @@ mod tests {
 
     #[test]
     fn a_read_the_history_never_held_is_impossible() {
-        let mut model = KeyModel::new(PossibleState::absent(None));
+        let mut model = KeyModel::new(PossibleState::absent(None), WINDOW);
         model.on_put(b"value".to_vec(), version(1));
         assert_eq!(
             model.observe(Some(b"other"), Some(&version(9))),
@@ -1929,9 +1979,13 @@ mod tests {
             let failures = checks(&mix, scenario).failures(&stats);
             assert_eq!(failures.len(), 1, "{scenario:?}: {failures:?}");
             assert!(failures[0].contains("cannot be verified"), "{failures:?}");
-            // The message says that the history was shortened, so a reader
-            // does not mistake it for a rollback the follower loss caused.
-            assert!(failures[0].contains("44 states dropped"), "{failures:?}");
+            // The message says that the history was shortened and that the
+            // figure is a total, so a reader does not mistake it for a
+            // rollback the follower loss caused or for this key's count.
+            assert!(
+                failures[0].contains("44 states were dropped in total"),
+                "{failures:?}"
+            );
         }
     }
 
@@ -1958,5 +2012,105 @@ mod tests {
         let failures = checks(&mix, FaultScenario::Follower).failures(&stats);
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert!(failures[0].contains("rolled back 2"), "{failures:?}");
+    }
+
+    fn a_recorded_round() -> FaultRound {
+        FaultRound {
+            round: 1,
+            scenario: "owner",
+            victim: "node-1".to_owned(),
+            victim_epoch: 1,
+            cohort_keys: 8,
+            affected_ranges: 4,
+            owner_unchanged: true,
+            pre_failure_replica_progress: json!({}),
+            replica_status_after_failure: json!({}),
+            kill_to_publish_seconds: 0.5,
+            read_recovery_seconds: Some(0.5),
+            write_recovery_seconds: Some(0.5),
+            delete_recovery_seconds: Some(0.5),
+            first_failure_after_kill_ms: None,
+            last_failure_after_kill_ms: None,
+            failures_after_kill: 0,
+            reads_after_kill: 10,
+            writes_after_kill: 10,
+            deletes_after_kill: 10,
+            replacement_to_full_rf_seconds: 1.0,
+            failure_to_full_rf_seconds: 1.0,
+            final_epoch: 2,
+            collateral_victim_owned_keys: 0,
+            collateral_rollbacks: 0,
+            load: json!({}),
+            rollbacks: 0,
+            undecidable_reads: 0,
+            undecidable_samples: Vec::new(),
+            impossible_reads: 0,
+            dropped_acknowledged_states: 0,
+            violations: Vec::new(),
+            new_owner_counts: BTreeMap::new(),
+        }
+    }
+
+    fn totals() -> RunTotals {
+        RunTotals {
+            rollbacks: 0,
+            impossible: 0,
+            undecidable: 0,
+            capacity_errors: 0,
+            capacity_retries: 0,
+            requests: 10,
+            seconds: 1.0,
+        }
+    }
+
+    #[test]
+    fn a_failed_run_keeps_its_rounds_and_names_its_failures() {
+        // The run has to fail, but the summary it leaves behind still says
+        // what the rounds measured and why the run failed: a machine reading
+        // `summary.json` does not have to parse the error text.
+        let mut observations = BTreeMap::new();
+        let rounds = [a_recorded_round()];
+        let failures = vec!["round 1: 3 reads cannot be verified".to_owned()];
+        let result = record_run(
+            &mut observations,
+            "owner",
+            2,
+            WINDOW,
+            &rounds,
+            &totals(),
+            &failures,
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "round 1: 3 reads cannot be verified"
+        );
+        assert_eq!(
+            observations["fault_rounds"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            observations["fault_failures"],
+            json!(["round 1: 3 reads cannot be verified"])
+        );
+        assert_eq!(observations["fault_acknowledged_window"], json!(WINDOW));
+        // The round the run completed is in the record even though its check
+        // failed.
+        assert_eq!(observations["fault_rounds"][0]["final_epoch"], json!(2));
+    }
+
+    #[test]
+    fn a_passing_run_records_no_failures() {
+        let mut observations = BTreeMap::new();
+        let result = record_run(
+            &mut observations,
+            "follower",
+            1,
+            WINDOW,
+            &[a_recorded_round()],
+            &totals(),
+            &[],
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert_eq!(observations["fault_failures"], json!([]));
     }
 }
