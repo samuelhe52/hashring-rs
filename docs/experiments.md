@@ -202,10 +202,11 @@ acknowledged again moves to the back of the window), and a read the shortened
 history can no longer explain is reported as inconclusive rather than as an
 impossible value: such a read is not a verified read, so it fails the round in
 either scenario. The window has to cover the writes one key takes during the
-load, and `dropped_acknowledged_states` in each round says whether it did. The
-checks of a round are collected, and a round that fails ends the run with its
-own record and the records of the rounds before it still in the summary,
-together with the reasons in `observations.fault_failures`.
+load: a round's `dropped_acknowledged_states` counts only the states that round
+dropped, and `observations.fault_dropped_acknowledged_states` adds the rounds
+up. The checks of a round are collected, and a round that fails ends the run
+with its own record and the records of the rounds before it still in the
+summary, together with the reasons in `observations.fault_failures`.
 
 See [fault-under-load.md](fault-under-load.md) for the validation experiments.
 
