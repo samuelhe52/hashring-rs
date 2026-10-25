@@ -1515,13 +1515,6 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
                 .expect("every dataset key has a model")
                 .resync(state);
         }
-        let status = observer.replica_status().await?;
-        let (pre_progress, affected_ranges) = ranges_for_keys(&status, &topology, &victim.cohort);
-        events.record(
-            "fault_pre_failure_replica_progress",
-            json!({ "round": round, "ranges": affected_ranges }),
-        )?;
-
         let workers = config.concurrency.min(victim.cohort.len()).max(1);
         let stop = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(Progress::new());
@@ -1567,6 +1560,15 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
         )?;
         tokio::time::sleep(Duration::from_secs(config.fault_pre_seconds)).await;
         processes.ensure_running()?;
+
+        // Sample after the pre-window, with load workers still running: the
+        // cursors must include the mutations whose survival we are testing.
+        let status = observer.replica_status().await?;
+        let (pre_progress, affected_ranges) = ranges_for_keys(&status, &topology, &victim.cohort);
+        events.record(
+            "fault_pre_failure_replica_progress",
+            json!({ "round": round, "ranges": affected_ranges }),
+        )?;
 
         let kill_at = Instant::now();
         let (exit, _) = processes.kill(&victim.node_id)?;
