@@ -24,12 +24,15 @@
 每个请求写入 `requests.jsonl`，字段包括逻辑请求号、worker、键、操作、值（hex）、调用/完成 Unix 毫秒与耗时、调用前后的拓扑 epoch、结果、错误码、`KnownNotApplied/MayHaveApplied`、返回版本、RPC 重试次数和按原因的重试计数。`summary.json` 的 `fault_rounds` 记录：
 
 - 受害者、受害 epoch、选中键数、涉及的 range 数；
-- 故障前所选 range 的 `current_rf`、`live_rf`、`writable`、`under_replicated`、跟随副本的 `stream_head/stream_cursor/last_ack_sequence/lag`；
+- pre-window 结束后、worker 仍在运行时、紧邻 kill 采样的所选 range 的 `current_rf`、`live_rf`、`writable`、`under_replicated`、跟随副本的 `stream_head/stream_cursor/last_ack_sequence/lag`；
 - 从 kill 到发布、到首次成功读/写/删、从替换开始到满 RF、从 kill 到满 RF；
 - kill 之后完成的读、写、删次数，以及 kill 后第一次/最后一次失败的毫秒数（没找到记录的读也算成功的读：这些计数说明读路径仍然工作，不说明数据还在）；
 - 故障期间和发布后的 `live_rf`、under-replicated、not-writable range 数，以及不可写的采样次数与原因（`write_block_reason_samples_*` 计的是“采样 × range”的对数，不是不同 range 的个数）；
 - 请求量、错误、重试、`MayHaveApplied`、回退、无法判定和无法解释的读、被丢弃的已确认状态数；
-- 新 owner 分布和最终校验结果。
+- 新 owner 分布和最终校验结果；
+- `reduced_rf_progress`：follower 被杀死后、原拓扑下成功的 PUT/DELETE 数，以及这一窗口的 ACK/admission 拒绝和容量背压。成功请求必须返回 victim epoch 的版本，拓扑变更或 RF 修复后的成功不能满足这项检查。
+
+每轮完成后立即更新 observations，基础设施错误也会经过统一收尾：已完成的轮不会因下一轮的 RPC、进程或超时错误丢失，`fault_failures` 会标明出错轮次和原因。错误退出时会取消仍在运行的负载 worker。
 
 每一轮的检查在轮结束后统一收集：一轮失败即结束运行，但该轮和之前各轮的记录仍写进 `summary.json` 的 `fault_rounds`，失败原因写进 `observations.fault_failures`（同时出现在 `error` 文本里），失败的运行因此带着它看到的东西，机器读 `summary.json` 不必解析错误文本。运行级字段：`fault_acknowledged_window` 是本次运行使用的确认窗口大小；`fault_rounds_requested` / `fault_rounds_completed` 是请求的轮数和实际完成的轮数（失败时后者更小，`fault_rounds` 的长度与它一致）；`fault_dropped_acknowledged_states` 是各轮丢弃数之和，每轮的 `dropped_acknowledged_states` 只算该轮，逐轮相加不会重复计数。
 
@@ -46,12 +49,15 @@
 每个键维护一个单寄存器模型：
 
 - 成功 PUT/DELETE 把可能状态收窄为唯一值+版本（DELETE 也返回 tombstone 版本，见 `DeleteResponse.version`）；
-- `MayHaveApplied` 的 PUT/DELETE 保留“旧状态”和“新值/缺失”两个分支；
+- `MayHaveApplied` 的 PUT/DELETE 保留“旧状态”和“新值/缺失”两个分支，并把不确定变更保存在有界历史中，后续成功变更不会将它抹掉；
+- 成功 GET 将可能状态收窄到实际观测的值和版本（NotFound 收窄到缺失），保留具体观测作为历史证据；没有新变更时再次读到旧分支会被识别为回退；
 - 故障后的读如果命中唯一状态则正常；如果命中历史中确认过的旧状态，记为一次回退，并按 `older_value_reappeared`、`acknowledged_delete_lost`、`acknowledged_value_lost` 分类；
 - 历史中不可能出现的值记为 `impossible_reads`，运行失败；
-- `OwnerOnly` 的 owner 故障允许回退，回退单独计数；follower 故障不允许回退，因为 owner 一直存活，出现回退即失败。
+- `OwnerOnly` 的 owner 故障只允许该次 kill 能解释的回退：kill 前的回退、恢复后已经确认写入/读取状态又发生的回退不被豁免。`load.forbidden_rollbacks` 单独记录这类读，即使该键本轮已经计过一次回退也会让实验失败；
+- 每轮重置每个键的回退去重标记，跨轮保留历史；同一个键在不同轮的故障中回退会分别计数；
+- follower 故障不允许回退。`OwnerOnly` 场景还要求在缺失 follower 的原拓扑中，对 mix 提供的 PUT/DELETE 分别观察到成功，并且没有 `TemporarilyUnavailable` / `ReplicaNotReady` ACK/admission 拒绝（包括客户端重试隐藏的拒绝）。容量背压单独记录，不能用修复后恢复写入来通过检查。
 
-已确认历史（“这个键曾经确认过哪些状态”）按值和版本的摘要保存。每个键保留多少条由 `--fault-acknowledged-window` 决定（默认 4096 条），超出时丢弃最旧的并计数。明细字段在该轮的 `dropped_acknowledged_states`，运行合计在 `observations.fault_dropped_acknowledged_states`；一个键的模型跨轮保留，所以每轮报的是它自己丢弃的条数（每轮在读取 cohort 当前状态之前快照、轮末取差值，这次预读若淘汰了状态也算在该轮），逐轮相加等于合计。
+历史（包含已确认状态、具体读观测和仍可能应用过的不确定变更）按值和版本的摘要保存；字段名仍使用 acknowledged。每个键保留多少条由 `--fault-acknowledged-window` 决定（默认 4096 条），超出时丢弃最旧的并计数。明细字段在该轮的 `dropped_acknowledged_states`，运行合计在 `observations.fault_dropped_acknowledged_states`；一个键的模型跨轮保留，所以每轮报的是它自己丢弃的条数（每轮在读取 cohort 当前状态之前快照、轮末取差值，这次预读若淘汰了状态也算在该轮），逐轮相加等于合计。
 
 内存上限是 `键数 × 窗口 × 每条约 95 B`：每条状态是值和版本的两个 blake3 摘要（`Option<[u8;32]>`，约 66 B）加计数索引开销。默认 owner 场景 208 个键、窗口 4096 若全部装满约 80 MB，而默认运行每键只装到两三百条，实际约 5 MB。按需调大窗口时要按这个式子估算内存。写路径用集合判重，确认一个新状态是 O(1)；只有重新确认窗口里已有的状态时才线性找位置并移到末尾（这种情形很少）。读路径只在读不匹配当前状态时线性扫描一次窗口。原因与取舍见 [fault-window-dedup.md](optimizations/fault-window-dedup.md)。
 
@@ -94,6 +100,8 @@
 两个测试分别覆盖单一 owner epoch，以及无故障的 3→4 成员交接（交接前和交接后各一轮并发历史，中间等待满 RF）。
 
 ## 结果
+
+以下数值来自本次校验器修正之前的运行，保留为当时的观测记录。它们尚未经过新增的读间实时顺序、故障边界和 reduced-RF 写入检查，不能单独证明这些更严格的不变量；使用修正后的代码复跑时应同时检查新增字段。
 
 以下所有时长都从 kill 起算（`read/write/delete_recovery_seconds`、`first/last_failure_after_kill_ms`），与 `availability` 模式的同名段口径一致；故障前的负载窗口不计入其中。
 

@@ -374,9 +374,9 @@ enum Observation {
 #[derive(Clone, Debug)]
 struct KeyModel {
     possible: Vec<PossibleState>,
-    /// Every state a definite mutation or a pre-read established, as digests,
-    /// in the order each was last acknowledged. A later read that matches one
-    /// of these but not `possible` is a rollback rather than an arbitrary
+    /// Definite and uncertain mutation candidates and concretely observed
+    /// states, as digests, in the order each was last recorded. A later read
+    /// that matches one of these but not `possible` is a rollback rather than an arbitrary
     /// value. The list is bounded by `window`, and the states it dropped are
     /// counted.
     acknowledged: VecDeque<AcknowledgedState>,
@@ -514,7 +514,10 @@ impl KeyModel {
         failure_epoch: u64,
         failure_injected: bool,
     ) -> Observation {
-        let eligible = failure_injected && self.established_epoch <= failure_epoch;
+        let eligible = failure_injected
+            && response_epoch > failure_epoch
+            && self.established_epoch <= failure_epoch
+            && version.is_none_or(|version| version.topology_epoch <= failure_epoch);
         let observation = self.observe(value, version);
         // A successful read from the promoted owner establishes its state,
         // even when the record itself still carries the old owner's version.
@@ -530,10 +533,11 @@ impl KeyModel {
     }
 
     fn observe(&mut self, value: Option<&[u8]>, version: Option<&RecordVersion>) -> Observation {
-        if self
+        if let Some(uncertain) = self
             .possible
             .iter()
-            .any(|state| state.matches(value, version))
+            .find(|state| state.matches(value, version))
+            .map(|state| state.version.is_none())
         {
             let state = PossibleState {
                 value: value.map(<[u8]>::to_vec),
@@ -542,15 +546,16 @@ impl KeyModel {
             // Once a GET identifies an ambiguous PUT's version, that concrete
             // state replaces its wildcard. Keep other historical candidates.
             let concrete = AcknowledgedState::of(&state);
-            if concrete.value.is_some() && concrete.version.is_some() {
-                if let Some(index) = self
+            if uncertain
+                && concrete.value.is_some()
+                && concrete.version.is_some()
+                && let Some(index) = self
                     .acknowledged
                     .iter()
                     .position(|entry| entry.value == concrete.value && entry.version.is_none())
-                {
-                    let removed = self.acknowledged.remove(index).expect("known index");
-                    self.forget(removed.fingerprint());
-                }
+            {
+                let removed = self.acknowledged.remove(index).expect("known index");
+                self.forget(removed.fingerprint());
             }
             self.resync(state);
             return Observation::Matches;
@@ -595,6 +600,19 @@ impl KeyModel {
     }
 }
 
+/// Requests issued after the follower was killed in its original placement.
+/// A successful mutation counts only if its returned version still belongs
+/// to that placement: later success after reconfiguration cannot prove that
+/// the surviving owner was writable with its follower missing.
+#[derive(Clone, Default, Serialize)]
+struct ReducedRfProgress {
+    puts: u64,
+    deletes: u64,
+    admission_rejections: u64,
+    capacity_errors: u64,
+    capacity_retries: u64,
+}
+
 /// What the load did after the node was killed.
 ///
 /// Every figure in here is counted from the kill, not from the start of the
@@ -604,6 +622,8 @@ impl KeyModel {
 struct Progress {
     /// The milliseconds from the start of the load to the kill.
     kill_ms: AtomicU64,
+    published_ms: AtomicU64,
+    reduced_rf: Mutex<ReducedRfProgress>,
     /// The milliseconds from the kill to the first failure, and to the last.
     first_failure_after_kill_ms: AtomicU64,
     last_failure_after_kill_ms: AtomicU64,
@@ -623,6 +643,8 @@ impl Progress {
     fn new() -> Self {
         Self {
             kill_ms: AtomicU64::new(NEVER),
+            published_ms: AtomicU64::new(NEVER),
+            reduced_rf: Mutex::new(ReducedRfProgress::default()),
             first_failure_after_kill_ms: AtomicU64::new(NEVER),
             last_failure_after_kill_ms: AtomicU64::new(0),
             failures_after_kill: AtomicU64::new(0),
@@ -633,6 +655,48 @@ impl Progress {
             writes_after_kill: AtomicU64::new(0),
             deletes_after_kill: AtomicU64::new(0),
         }
+    }
+
+    fn record_reduced_rf(&self, entry: &RequestEntry, invoked_ms: u64, victim_epoch: u64) {
+        let kill = self.kill_ms.load(Ordering::Acquire);
+        let published = self.published_ms.load(Ordering::Acquire);
+        if kill == NEVER
+            || invoked_ms <= kill
+            || invoked_ms >= published
+            || entry.start_epoch != victim_epoch
+            || entry.operation == "get"
+        {
+            return;
+        }
+        let mut reduced = self.reduced_rf.lock().expect("progress lock");
+        if entry.result == "ok"
+            && entry
+                .version
+                .as_ref()
+                .is_some_and(|v| v.topology_epoch == victim_epoch)
+        {
+            match entry.operation {
+                "put" => reduced.puts += 1,
+                "delete" => reduced.deletes += 1,
+                _ => {}
+            }
+        }
+        for reason in ["temporarily_unavailable", "replica_not_ready"] {
+            reduced.admission_rejections += entry.retry_reasons.get(reason).copied().unwrap_or(0);
+        }
+        if matches!(
+            entry.error_code.as_deref(),
+            Some("TemporarilyUnavailable" | "ReplicaNotReady")
+        ) {
+            reduced.admission_rejections += 1;
+        }
+        reduced.capacity_errors +=
+            u64::from(entry.error_code.as_deref() == Some("ResourceExhausted"));
+        reduced.capacity_retries += entry
+            .retry_reasons
+            .get("resource_exhausted")
+            .copied()
+            .unwrap_or(0);
     }
 
     fn record_failure(&self, invoked_ms: u64, completed_ms: u64) {
@@ -1065,6 +1129,7 @@ async fn run_worker(context: WorkerContext) -> Result<WorkerStats> {
             }
         }
         stats.retry_total += entry.retries;
+        progress.record_reduced_rf(&entry, invoked_ms, failure_epoch);
         ledger.record(&entry)?;
         let _ = completed;
         step += 1;
@@ -1090,6 +1155,7 @@ struct RoundChecks<'a> {
     reads_after_kill: u64,
     writes_after_kill: u64,
     owner_unchanged: bool,
+    reduced_rf: &'a ReducedRfProgress,
 }
 
 impl RoundChecks<'_> {
@@ -1120,6 +1186,28 @@ impl RoundChecks<'_> {
                     "round {}: the load completed no {} after the kill",
                     self.round,
                     operation.name()
+                ));
+            }
+        }
+        if self.scenario == FaultScenario::Follower
+            && self.write_ack_policy == WriteAckPolicy::OwnerOnly
+        {
+            for (operation, count) in [
+                (Operation::Put, self.reduced_rf.puts),
+                (Operation::Delete, self.reduced_rf.deletes),
+            ] {
+                if self.mix.offers(operation) && count == 0 {
+                    failures.push(format!(
+                        "round {}: no {} succeeded at reduced RF before failover publication",
+                        self.round,
+                        operation.name()
+                    ));
+                }
+            }
+            if self.reduced_rf.admission_rejections > 0 {
+                failures.push(format!(
+                    "round {}: {} unexpected ACK/admission rejections at reduced RF",
+                    self.round, self.reduced_rf.admission_rejections
                 ));
             }
         }
@@ -1179,6 +1267,7 @@ struct FaultRound {
     affected_ranges: usize,
     owner_unchanged: bool,
     pre_failure_replica_progress: Value,
+    reduced_rf_progress: ReducedRfProgress,
     replica_status_after_failure: Value,
     /// The seconds from the kill to the failover's publication.
     kill_to_publish_seconds: f64,
@@ -1426,33 +1515,6 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
         FaultScenario::Owner => "owner",
         FaultScenario::Follower => "follower",
     };
-    let mix = OperationMix::parse(&config.mix)?;
-    let operation_timeout = Duration::from_millis(config.operation_timeout_ms);
-    let observer =
-        HashringClient::connect(coordinator_endpoint.to_owned(), Duration::from_secs(2)).await?;
-    let ledger = Arc::new(RequestLedger::open(
-        &config.output_dir.join("requests.jsonl"),
-    )?);
-    let next_id = Arc::new(AtomicU64::new(1));
-
-    // A key's expected state starts at the value the initial dataset wrote.
-    // The version is unknown until the first cohort read, so it matches any
-    // version; the value is exact, which is enough to catch an initial value
-    // that changed without a mutation in the ledger.
-    let mut models: BTreeMap<u64, KeyModel> = (0..config.key_count)
-        .map(|key| {
-            (
-                key,
-                KeyModel::new(
-                    PossibleState {
-                        value: Some(deterministic_value(key, 0, config.value_bytes)),
-                        version: None,
-                    },
-                    config.fault_acknowledged_window,
-                ),
-            )
-        })
-        .collect();
     let mut rounds = Vec::new();
     let mut killed = BTreeSet::new();
     let mut failures: Vec<String> = Vec::new();
@@ -1464,449 +1526,520 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
     let mut total_capacity_retries = 0_u64;
     let mut total_requests = 0_u64;
     let started = Instant::now();
+    let mut active_round = 1;
 
-    for round in 1..=config.fault_rounds {
-        // Final verification also observes keys outside the load cohort.
-        for model in models.values_mut() {
-            model.begin_round();
-        }
-        let topology = admin_client.refresh_topology().await?;
-        let victim = select_victim(config, &topology, round, &killed)?;
-        if round == 1 {
+    let execution: Result<()> = async {
+        let mix = OperationMix::parse(&config.mix)?;
+        let operation_timeout = Duration::from_millis(config.operation_timeout_ms);
+        let observer =
+            HashringClient::connect(coordinator_endpoint.to_owned(), Duration::from_secs(2)).await?;
+        let ledger = Arc::new(RequestLedger::open(
+            &config.output_dir.join("requests.jsonl"),
+        )?);
+        let next_id = Arc::new(AtomicU64::new(1));
+
+        // A key's expected state starts at the value the initial dataset wrote.
+        // The version is unknown until the first cohort read, so it matches any
+        // version; the value is exact, which is enough to catch an initial value
+        // that changed without a mutation in the ledger.
+        let mut models: BTreeMap<u64, KeyModel> = (0..config.key_count)
+            .map(|key| {
+                (
+                    key,
+                    KeyModel::new(
+                        PossibleState {
+                            value: Some(deterministic_value(key, 0, config.value_bytes)),
+                            version: None,
+                        },
+                        config.fault_acknowledged_window,
+                    ),
+                )
+            })
+            .collect();
+        for round in 1..=config.fault_rounds {
+            active_round = round;
+            // Final verification also observes keys outside the load cohort.
+            for model in models.values_mut() {
+                model.begin_round();
+            }
             events.record(
-                "fault_cohort_selected",
+                "fault_round_started",
+                json!({ "round": round, "processes": processes.pids() }),
+            )?;
+            let topology = admin_client.refresh_topology().await?;
+            let victim = select_victim(config, &topology, round, &killed)?;
+            if round == 1 {
+                events.record(
+                    "fault_cohort_selected",
+                    json!({
+                        "scenario": scenario_name,
+                        "victim": victim.node_id,
+                        "cohort_keys": victim.cohort.len(),
+                    }),
+                )?;
+            }
+            // A key keeps its model across rounds, so its dropped count is
+            // cumulative. The round reports only the states it dropped itself, so
+            // adding the rounds up does not count a state twice. The snapshot is
+            // taken before the pre-failure read: a window too small to hold the
+            // state that read finds drops one there too, and that drop belongs to
+            // this round instead of falling between the rounds.
+            let dropped_before: u64 = victim
+                .cohort
+                .iter()
+                .map(|key| {
+                    models
+                        .get(key)
+                        .expect("every cohort key has a model")
+                        .dropped_acknowledged
+                })
+                .sum();
+            // The ledger's model must start from the value this run sees now, not
+            // from a previous round's expectation. A read also gives the pre-failure
+            // version the rollback check can recognize.
+            for &key in &victim.cohort {
+                let state = match workload_client.get(key.to_be_bytes().to_vec()).await {
+                    Ok(output) => PossibleState::present(output.value, output.version),
+                    Err(error) if is_not_found(&error) => PossibleState::absent(None),
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("reading cohort key {key} before round {round}"));
+                    }
+                };
+                models
+                    .get_mut(&key)
+                    .expect("every dataset key has a model")
+                    .resync(state);
+            }
+            let workers = config.concurrency.min(victim.cohort.len()).max(1);
+            let stop = Arc::new(AtomicBool::new(false));
+            let progress = Arc::new(Progress::new());
+            let started_at = Instant::now();
+            // Dropping a JoinSet on an error aborts its workers. Detached workers
+            // must not continue issuing requests after the run has failed.
+            let mut handles = tokio::task::JoinSet::new();
+            for worker in 0..workers {
+                let keys: Vec<u64> = victim
+                    .cohort
+                    .iter()
+                    .copied()
+                    .skip(worker)
+                    .step_by(workers)
+                    .collect();
+                let mut worker_models = BTreeMap::new();
+                for key in &keys {
+                    worker_models.insert(*key, models.remove(key).expect("cohort key has a model"));
+                }
+                handles.spawn(run_worker(WorkerContext {
+                    worker,
+                    keys,
+                    models: worker_models,
+                    endpoint: coordinator_endpoint.to_owned(),
+                    operation_timeout,
+                    value_bytes: config.value_bytes,
+                    mix: mix.clone(),
+                    started_at,
+                    failure_epoch: topology.epoch,
+                    stop: Arc::clone(&stop),
+                    progress: Arc::clone(&progress),
+                    ledger: Arc::clone(&ledger),
+                    next_id: Arc::clone(&next_id),
+                }));
+            }
+            events.record(
+                "fault_load_started",
                 json!({
+                    "round": round,
+                    "scenario": scenario_name,
+                    "workers": workers,
+                    "cohort_keys": victim.cohort.len(),
+                    "pre_seconds": config.fault_pre_seconds,
+                }),
+            )?;
+            tokio::time::sleep(Duration::from_secs(config.fault_pre_seconds)).await;
+            processes.ensure_running()?;
+
+            // Sample after the pre-window, with load workers still running: the
+            // cursors must include the mutations whose survival we are testing.
+            let status = observer.replica_status().await?;
+            let (pre_progress, affected_ranges) = ranges_for_keys(&status, &topology, &victim.cohort);
+            events.record(
+                "fault_pre_failure_replica_progress",
+                json!({ "round": round, "ranges": affected_ranges }),
+            )?;
+
+            let kill_at = Instant::now();
+            let (exit, _) = processes.kill(&victim.node_id)?;
+            let kill_elapsed = (kill_at - started_at).as_millis() as u64;
+            progress.kill_ms.store(kill_elapsed, Ordering::Release);
+            events.record(
+                "fault_injected",
+                json!({
+                    "round": round,
                     "scenario": scenario_name,
                     "victim": victim.node_id,
+                    "exit": exit,
+                    "epoch": topology.epoch,
                     "cohort_keys": victim.cohort.len(),
                 }),
             )?;
-        }
-        // A key keeps its model across rounds, so its dropped count is
-        // cumulative. The round reports only the states it dropped itself, so
-        // adding the rounds up does not count a state twice. The snapshot is
-        // taken before the pre-failure read: a window too small to hold the
-        // state that read finds drops one there too, and that drop belongs to
-        // this round instead of falling between the rounds.
-        let dropped_before: u64 = victim
-            .cohort
-            .iter()
-            .map(|key| {
-                models
-                    .get(key)
-                    .expect("every cohort key has a model")
-                    .dropped_acknowledged
-            })
-            .sum();
-        // The ledger's model must start from the value this run sees now, not
-        // from a previous round's expectation. A read also gives the pre-failure
-        // version the rollback check can recognize.
-        for &key in &victim.cohort {
-            let state = match workload_client.get(key.to_be_bytes().to_vec()).await {
-                Ok(output) => PossibleState::present(output.value, output.version),
-                Err(error) if is_not_found(&error) => PossibleState::absent(None),
+
+            let publish_deadline = Instant::now() + Duration::from_secs(60);
+            let mut min_live_rf = usize::MAX;
+            let mut max_under_replicated = 0_usize;
+            let mut writable_false = 0_usize;
+            let mut block_reasons: BTreeMap<String, usize> = BTreeMap::new();
+            let published = loop {
+                processes.ensure_running()?;
+                let current = observer.refresh_topology().await?;
+                if let Ok(Ok(status)) =
+                    tokio::time::timeout(Duration::from_secs(2), observer.replica_status()).await
+                {
+                    let (live_rf, under_replicated, not_writable, reasons) =
+                        cohort_replica_stats(&status, &current, &victim.cohort);
+                    if let Some(live_rf) = live_rf {
+                        min_live_rf = min_live_rf.min(live_rf);
+                    }
+                    max_under_replicated = max_under_replicated.max(under_replicated);
+                    writable_false = writable_false.max(not_writable);
+                    for (reason, count) in reasons {
+                        *block_reasons.entry(reason).or_default() += count;
+                    }
+                }
+                if current.epoch > topology.epoch
+                    && !current
+                        .members
+                        .iter()
+                        .any(|member| member.node_id == victim.node_id)
+                {
+                    break current;
+                }
+                ensure!(
+                    Instant::now() < publish_deadline,
+                    "the coordinator did not publish the failure of {} within 60 seconds",
+                    victim.node_id
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
+            let publish_at = Instant::now();
+            progress.published_ms.store(
+                started_at.elapsed().as_millis() as u64,
+                Ordering::Release,
+            );
+            let kill_to_publish_seconds = (publish_at - kill_at).as_secs_f64();
+            // A follower loss must not move the owner of a selected key. The
+            // replacement that follows is a normal membership change and may move
+            // keys, so this is checked on the post-failure topology, not the final
+            // one.
+            let owner_unchanged = match config.fault_scenario {
+                FaultScenario::Owner => true,
+                FaultScenario::Follower => victim.cohort.iter().all(|key| {
+                    published.owner(&key.to_be_bytes()).is_ok_and(|owner| {
+                        victim
+                            .owner_by_key
+                            .get(key)
+                            .is_some_and(|expected| expected == &owner.node_id)
+                    })
+                }),
+            };
+            events.record(
+                "fault_published",
+                json!({
+                    "round": round,
+                    "epoch": published.epoch,
+                    "seconds": kill_to_publish_seconds,
+                    "members": published.members.iter().map(|member| member.node_id.clone()).collect::<Vec<_>>(),
+                }),
+            )?;
+
+            // The failover publishes before its cleanup finishes; a replacement
+            // cannot be staged until the automatic change is terminal.
+            let change_deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let active = admin_client.topology_change().await?;
+                if active.is_none_or(|active| active.phase.is_terminal()) {
+                    break;
+                }
+                ensure!(
+                    Instant::now() < change_deadline,
+                    "the automatic failover change did not finish within 30 seconds"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let (
+                post_failure_min_live_rf,
+                post_failure_under_replicated,
+                post_failure_not_writable,
+                post_failure_block_reasons,
+            ) = match observer.replica_status().await {
+                Ok(status) => cohort_replica_stats(&status, &published, &victim.cohort),
                 Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("reading cohort key {key} before round {round}"));
+                    events.record(
+                        "fault_post_failure_status_failed",
+                        json!({ "round": round, "error": error.to_string() }),
+                    )?;
+                    (None, 0, 0, BTreeMap::new())
                 }
             };
-            models
-                .get_mut(&key)
-                .expect("every dataset key has a model")
-                .resync(state);
-        }
-        let workers = config.concurrency.min(victim.cohort.len()).max(1);
-        let stop = Arc::new(AtomicBool::new(false));
-        let progress = Arc::new(Progress::new());
-        let started_at = Instant::now();
-        let mut handles = Vec::new();
-        for worker in 0..workers {
-            let keys: Vec<u64> = victim
-                .cohort
-                .iter()
-                .copied()
-                .skip(worker)
-                .step_by(workers)
-                .collect();
-            let mut worker_models = BTreeMap::new();
-            for key in &keys {
-                worker_models.insert(*key, models.remove(key).expect("cohort key has a model"));
-            }
-            handles.push(tokio::spawn(run_worker(WorkerContext {
-                worker,
-                keys,
-                models: worker_models,
-                endpoint: coordinator_endpoint.to_owned(),
-                operation_timeout,
-                value_bytes: config.value_bytes,
-                mix: mix.clone(),
-                started_at,
-                failure_epoch: topology.epoch,
-                stop: Arc::clone(&stop),
-                progress: Arc::clone(&progress),
-                ledger: Arc::clone(&ledger),
-                next_id: Arc::clone(&next_id),
-            })));
-        }
-        events.record(
-            "fault_load_started",
-            json!({
-                "round": round,
-                "scenario": scenario_name,
-                "workers": workers,
-                "cohort_keys": victim.cohort.len(),
-                "pre_seconds": config.fault_pre_seconds,
-            }),
-        )?;
-        tokio::time::sleep(Duration::from_secs(config.fault_pre_seconds)).await;
-        processes.ensure_running()?;
 
-        // Sample after the pre-window, with load workers still running: the
-        // cursors must include the mutations whose survival we are testing.
-        let status = observer.replica_status().await?;
-        let (pre_progress, affected_ranges) = ranges_for_keys(&status, &topology, &victim.cohort);
-        events.record(
-            "fault_pre_failure_replica_progress",
-            json!({ "round": round, "ranges": affected_ranges }),
-        )?;
-
-        let kill_at = Instant::now();
-        let (exit, _) = processes.kill(&victim.node_id)?;
-        let kill_elapsed = (kill_at - started_at).as_millis() as u64;
-        progress.kill_ms.store(kill_elapsed, Ordering::Release);
-        events.record(
-            "fault_injected",
-            json!({
-                "round": round,
-                "scenario": scenario_name,
-                "victim": victim.node_id,
-                "exit": exit,
-                "epoch": topology.epoch,
-                "cohort_keys": victim.cohort.len(),
-            }),
-        )?;
-
-        let publish_deadline = Instant::now() + Duration::from_secs(60);
-        let mut min_live_rf = usize::MAX;
-        let mut max_under_replicated = 0_usize;
-        let mut writable_false = 0_usize;
-        let mut block_reasons: BTreeMap<String, usize> = BTreeMap::new();
-        let published = loop {
-            processes.ensure_running()?;
-            let current = observer.refresh_topology().await?;
-            if let Ok(Ok(status)) =
-                tokio::time::timeout(Duration::from_secs(2), observer.replica_status()).await
-            {
-                let (live_rf, under_replicated, not_writable, reasons) =
-                    cohort_replica_stats(&status, &current, &victim.cohort);
-                if let Some(live_rf) = live_rf {
-                    min_live_rf = min_live_rf.min(live_rf);
-                }
-                max_under_replicated = max_under_replicated.max(under_replicated);
-                writable_false = writable_false.max(not_writable);
-                for (reason, count) in reasons {
-                    *block_reasons.entry(reason).or_default() += count;
-                }
-            }
-            if current.epoch > topology.epoch
-                && !current
-                    .members
-                    .iter()
-                    .any(|member| member.node_id == victim.node_id)
-            {
-                break current;
-            }
-            ensure!(
-                Instant::now() < publish_deadline,
-                "the coordinator did not publish the failure of {} within 60 seconds",
-                victim.node_id
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        };
-        let publish_at = Instant::now();
-        let kill_to_publish_seconds = (publish_at - kill_at).as_secs_f64();
-        // A follower loss must not move the owner of a selected key. The
-        // replacement that follows is a normal membership change and may move
-        // keys, so this is checked on the post-failure topology, not the final
-        // one.
-        let owner_unchanged = match config.fault_scenario {
-            FaultScenario::Owner => true,
-            FaultScenario::Follower => victim.cohort.iter().all(|key| {
-                published.owner(&key.to_be_bytes()).is_ok_and(|owner| {
-                    victim
-                        .owner_by_key
-                        .get(key)
-                        .is_some_and(|expected| expected == &owner.node_id)
-                })
-            }),
-        };
-        events.record(
-            "fault_published",
-            json!({
-                "round": round,
-                "epoch": published.epoch,
-                "seconds": kill_to_publish_seconds,
-                "members": published.members.iter().map(|member| member.node_id.clone()).collect::<Vec<_>>(),
-            }),
-        )?;
-
-        // The failover publishes before its cleanup finishes; a replacement
-        // cannot be staged until the automatic change is terminal.
-        let change_deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let active = admin_client.topology_change().await?;
-            if active.is_none_or(|active| active.phase.is_terminal()) {
-                break;
-            }
-            ensure!(
-                Instant::now() < change_deadline,
-                "the automatic failover change did not finish within 30 seconds"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        let (
-            post_failure_min_live_rf,
-            post_failure_under_replicated,
-            post_failure_not_writable,
-            post_failure_block_reasons,
-        ) = match observer.replica_status().await {
-            Ok(status) => cohort_replica_stats(&status, &published, &victim.cohort),
-            Err(error) => {
-                events.record(
-                    "fault_post_failure_status_failed",
-                    json!({ "round": round, "error": error.to_string() }),
-                )?;
-                (None, 0, 0, BTreeMap::new())
-            }
-        };
-
-        // Keep the load running through the replacement and RF repair. The
-        // new member is staged first so the coordinator can copy into it.
-        let spare = &members[initial_count + round as usize - 1];
-        let spare_port = ports[initial_count + round as usize];
-        let mut target = published.members.clone();
-        target.push(spare.clone());
-        let change = admin_client.begin_topology_change(target).await?;
-        let replacement_started = Instant::now();
-        spawn_node(
-            processes,
-            spare.node_id.clone(),
-            spare_port,
-            coordinator_endpoint,
-        )?;
-        wait_for_listener(spare_port, processes).await?;
-        let completed = admin_client
-            .execute_topology_change(
-                change.change_id,
-                change.base_epoch,
-                change.target_topology.epoch,
+            // Keep the load running through the replacement and RF repair. The
+            // new member is staged first so the coordinator can copy into it.
+            let spare = &members[initial_count + round as usize - 1];
+            let spare_port = ports[initial_count + round as usize];
+            let mut target = published.members.clone();
+            target.push(spare.clone());
+            let change = admin_client.begin_topology_change(target).await?;
+            let replacement_started = Instant::now();
+            spawn_node(
+                processes,
+                spare.node_id.clone(),
+                spare_port,
+                coordinator_endpoint,
+            )?;
+            wait_for_listener(spare_port, processes).await?;
+            let completed = admin_client
+                .execute_topology_change(
+                    change.change_id,
+                    change.base_epoch,
+                    change.target_topology.epoch,
+                )
+                .await?;
+            wait_for_full_rf(
+                admin_client,
+                config.desired_replication_factor,
+                Duration::from_millis(config.migration_timeout_ms),
+                processes,
             )
             .await?;
-        wait_for_full_rf(
-            admin_client,
-            config.desired_replication_factor,
-            Duration::from_millis(config.migration_timeout_ms),
-            processes,
-        )
-        .await?;
-        let replacement_to_full_rf_seconds = replacement_started.elapsed().as_secs_f64();
-        let failure_to_full_rf_seconds = kill_at.elapsed().as_secs_f64();
-        events.record(
-            "fault_full_rf_restored",
-            json!({
-                "round": round,
-                "epoch": completed.target_topology.epoch,
-                "replacement": spare.node_id,
-                "replacement_to_full_rf_seconds": replacement_to_full_rf_seconds,
-                "failure_to_full_rf_seconds": failure_to_full_rf_seconds,
-            }),
-        )?;
+            let replacement_to_full_rf_seconds = replacement_started.elapsed().as_secs_f64();
+            let failure_to_full_rf_seconds = kill_at.elapsed().as_secs_f64();
+            events.record(
+                "fault_full_rf_restored",
+                json!({
+                    "round": round,
+                    "epoch": completed.target_topology.epoch,
+                    "replacement": spare.node_id,
+                    "replacement_to_full_rf_seconds": replacement_to_full_rf_seconds,
+                    "failure_to_full_rf_seconds": failure_to_full_rf_seconds,
+                }),
+            )?;
 
-        tokio::time::sleep(Duration::from_secs(config.fault_post_seconds)).await;
-        stop.store(true, Ordering::Release);
-        let load_elapsed = started_at.elapsed();
-        let mut stats = WorkerStats::default();
-        let mut all_models = std::mem::take(&mut models);
-        for handle in handles {
-            let mut worker = handle.await.context("a fault load worker panicked")??;
-            all_models.append(&mut worker.models);
-            stats.merge(worker);
-        }
-        models = all_models;
-        ledger.flush()?;
-        let dropped_this_round = stats.dropped_acknowledged.saturating_sub(dropped_before);
-        let read_recovery_seconds = Progress::value(&progress.first_read_after_kill_ms);
-        let write_recovery_seconds = Progress::value(&progress.first_write_after_kill_ms);
-        let delete_recovery_seconds = Progress::value(&progress.first_delete_after_kill_ms);
-        let first_failure_after_kill_ms = {
-            let value = progress.first_failure_after_kill_ms.load(Ordering::Acquire);
-            (value != NEVER).then_some(value)
-        };
-        let failures_after_kill = progress.failures_after_kill.load(Ordering::Acquire);
-        let last_failure_after_kill_ms = (failures_after_kill > 0)
-            .then(|| progress.last_failure_after_kill_ms.load(Ordering::Acquire));
-        let reads_after_kill = progress.reads_after_kill.load(Ordering::Acquire);
-        let writes_after_kill = progress.writes_after_kill.load(Ordering::Acquire);
-        let deletes_after_kill = progress.deletes_after_kill.load(Ordering::Acquire);
-
-        // Verify every key after repair. Keys the follower scenario's victim
-        // owned are collateral owner failures; they are recorded separately,
-        // because this scenario's claim is about keys whose owner stayed alive.
-        let collateral: BTreeSet<u64> = match config.fault_scenario {
-            FaultScenario::Follower => (0..config.key_count)
-                .filter(|key| {
-                    topology
-                        .owner(&key.to_be_bytes())
-                        .is_ok_and(|owner| owner.node_id == victim.node_id)
-                })
-                .collect(),
-            FaultScenario::Owner => BTreeSet::new(),
-        };
-        let mut collateral_rollbacks = 0_u64;
-        for key in 0..config.key_count {
-            let result = workload_client.get(key.to_be_bytes().to_vec()).await;
-            let (value, version) = match result {
-                Ok(output) => (Some(output.value), Some(output.version)),
-                Err(error) if is_not_found(&error) => (None, None),
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("verifying key {key} after round {round}"));
-                }
-            };
-            let model = models.get_mut(&key).expect("every dataset key has a model");
-            let observation = model.observe_at(
-                value.as_deref(),
-                version.as_ref(),
-                workload_client.epoch().await,
-                topology.epoch,
-                true,
-            );
-            if collateral.contains(&key) {
-                if matches!(observation, Observation::Rollback { first: true, .. }) {
-                    collateral_rollbacks += 1;
-                }
-                let state = match value {
-                    Some(value) => PossibleState::present(value, version.expect("present value")),
-                    None => PossibleState::absent(None),
-                };
-                model.resync(state);
-                continue;
+            tokio::time::sleep(Duration::from_secs(config.fault_post_seconds)).await;
+            stop.store(true, Ordering::Release);
+            let load_elapsed = started_at.elapsed();
+            let mut stats = WorkerStats::default();
+            let mut all_models = std::mem::take(&mut models);
+            while let Some(handle) = handles.join_next().await {
+                let mut worker = handle.context("a fault load worker panicked")??;
+                all_models.append(&mut worker.models);
+                stats.merge(worker);
             }
-            match observation {
-                Observation::Matches => {}
-                Observation::Rollback {
-                    first,
-                    kind,
-                    eligible,
-                } => {
-                    if !eligible {
-                        stats.forbidden_rollbacks += 1;
+            models = all_models;
+            ledger.flush()?;
+            let dropped_this_round = stats.dropped_acknowledged.saturating_sub(dropped_before);
+            let read_recovery_seconds = Progress::value(&progress.first_read_after_kill_ms);
+            let write_recovery_seconds = Progress::value(&progress.first_write_after_kill_ms);
+            let delete_recovery_seconds = Progress::value(&progress.first_delete_after_kill_ms);
+            let first_failure_after_kill_ms = {
+                let value = progress.first_failure_after_kill_ms.load(Ordering::Acquire);
+                (value != NEVER).then_some(value)
+            };
+            let failures_after_kill = progress.failures_after_kill.load(Ordering::Acquire);
+            let last_failure_after_kill_ms = (failures_after_kill > 0)
+                .then(|| progress.last_failure_after_kill_ms.load(Ordering::Acquire));
+            let reads_after_kill = progress.reads_after_kill.load(Ordering::Acquire);
+            let writes_after_kill = progress.writes_after_kill.load(Ordering::Acquire);
+            let deletes_after_kill = progress.deletes_after_kill.load(Ordering::Acquire);
+            let reduced_rf = progress.reduced_rf.lock().expect("progress lock").clone();
+
+            // Verify every key after repair. Keys the follower scenario's victim
+            // owned are collateral owner failures; they are recorded separately,
+            // because this scenario's claim is about keys whose owner stayed alive.
+            let collateral: BTreeSet<u64> = match config.fault_scenario {
+                FaultScenario::Follower => (0..config.key_count)
+                    .filter(|key| {
+                        topology
+                            .owner(&key.to_be_bytes())
+                            .is_ok_and(|owner| owner.node_id == victim.node_id)
+                    })
+                    .collect(),
+                FaultScenario::Owner => BTreeSet::new(),
+            };
+            let mut collateral_rollbacks = 0_u64;
+            for key in 0..config.key_count {
+                let result = workload_client.get(key.to_be_bytes().to_vec()).await;
+                let (value, version) = match result {
+                    Ok(output) => (Some(output.value), Some(output.version)),
+                    Err(error) if is_not_found(&error) => (None, None),
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("verifying key {key} after round {round}"));
                     }
-                    if first {
-                        stats.rollbacks += 1;
-                        *stats.rollback_kinds.entry(kind.to_owned()).or_default() += 1;
+                };
+                let model = models.get_mut(&key).expect("every dataset key has a model");
+                let observation = model.observe_at(
+                    value.as_deref(),
+                    version.as_ref(),
+                    workload_client.epoch().await,
+                    topology.epoch,
+                    true,
+                );
+                if collateral.contains(&key) {
+                    if matches!(observation, Observation::Rollback { first: true, .. }) {
+                        collateral_rollbacks += 1;
                     }
+                    let state = match value {
+                        Some(value) => PossibleState::present(value, version.expect("present value")),
+                        None => PossibleState::absent(None),
+                    };
+                    model.resync(state);
+                    continue;
                 }
-                Observation::Undecidable => {
-                    stats.record_undecidable(format!(
-                        "final GET key {key} returned a value the shortened history cannot explain"
-                    ));
-                }
-                Observation::Impossible => {
-                    stats.impossible += 1;
-                    if stats.violations.len() < 100 {
-                        stats.violations.push(format!(
-                            "final GET key {key} returned a value the history does not allow"
+                match observation {
+                    Observation::Matches => {}
+                    Observation::Rollback {
+                        first,
+                        kind,
+                        eligible,
+                    } => {
+                        if !eligible {
+                            stats.forbidden_rollbacks += 1;
+                        }
+                        if first {
+                            stats.rollbacks += 1;
+                            *stats.rollback_kinds.entry(kind.to_owned()).or_default() += 1;
+                        }
+                    }
+                    Observation::Undecidable => {
+                        stats.record_undecidable(format!(
+                            "final GET key {key} returned a value the shortened history cannot explain"
                         ));
                     }
+                    Observation::Impossible => {
+                        stats.impossible += 1;
+                        if stats.violations.len() < 100 {
+                            stats.violations.push(format!(
+                                "final GET key {key} returned a value the history does not allow"
+                            ));
+                        }
+                    }
                 }
             }
-        }
 
-        let final_topology = admin_client.refresh_topology().await?;
-        let final_epoch = final_topology.epoch;
-        let mut new_owner_counts = BTreeMap::new();
-        for &key in &victim.cohort {
-            if let Ok(owner) = final_topology.owner(&key.to_be_bytes()) {
-                *new_owner_counts.entry(owner.node_id.clone()).or_default() += 1;
+            let final_topology = admin_client.refresh_topology().await?;
+            let final_epoch = final_topology.epoch;
+            let mut new_owner_counts = BTreeMap::new();
+            for &key in &victim.cohort {
+                if let Ok(owner) = final_topology.owner(&key.to_be_bytes()) {
+                    *new_owner_counts.entry(owner.node_id.clone()).or_default() += 1;
+                }
+            }
+            total_rollbacks += stats.rollbacks;
+            total_impossible += stats.impossible;
+            total_undecidable += stats.undecidable;
+            total_dropped += dropped_this_round;
+            total_capacity_errors += stats.capacity_backpressure_errors;
+            total_capacity_retries += stats.capacity_backpressure_retries;
+            total_requests += stats.requests();
+            let load = load_json(&stats, load_elapsed, dropped_this_round);
+            let record = FaultRound {
+                round,
+                scenario: scenario_name,
+                victim: victim.node_id.clone(),
+                victim_epoch: topology.epoch,
+                cohort_keys: victim.cohort.len(),
+                affected_ranges,
+                owner_unchanged,
+                pre_failure_replica_progress: pre_progress,
+                reduced_rf_progress: reduced_rf.clone(),
+                replica_status_after_failure: json!({
+                    "min_live_rf_during_failure": (min_live_rf != usize::MAX).then_some(min_live_rf),
+                    "max_under_replicated_ranges_during_failure": max_under_replicated,
+                    "max_not_writable_ranges_during_failure": writable_false,
+                    "write_block_reason_samples_during_failure": block_reasons,
+                    "min_live_rf_after_publish": post_failure_min_live_rf,
+                    "under_replicated_ranges_after_publish": post_failure_under_replicated,
+                    "not_writable_ranges_after_publish": post_failure_not_writable,
+                    "write_block_reason_samples_after_publish": post_failure_block_reasons,
+                }),
+                kill_to_publish_seconds,
+                read_recovery_seconds,
+                write_recovery_seconds,
+                delete_recovery_seconds,
+                first_failure_after_kill_ms,
+                last_failure_after_kill_ms,
+                failures_after_kill,
+                reads_after_kill,
+                writes_after_kill,
+                deletes_after_kill,
+                replacement_to_full_rf_seconds,
+                failure_to_full_rf_seconds,
+                final_epoch,
+                collateral_victim_owned_keys: collateral.len() as u64,
+                collateral_rollbacks,
+                load,
+                rollbacks: stats.rollbacks,
+                undecidable_reads: stats.undecidable,
+                undecidable_samples: stats.undecidable_samples.clone(),
+                impossible_reads: stats.impossible,
+                dropped_acknowledged_states: dropped_this_round,
+                violations: stats.violations.clone(),
+                new_owner_counts,
+            };
+            measurements.insert(
+                format!("fault_round_{round}_load"),
+                measurement(stats.requests(), load_elapsed),
+            );
+            rounds.push(record);
+            killed.insert(victim.node_id.clone());
+
+            // The checks of a round. A round that fails ends the run, but its
+            // record and the rounds before it stay in the summary: the evidence of
+            // a failed run is the reason it failed.
+            let round_failures = RoundChecks {
+                round,
+                scenario: config.fault_scenario,
+                write_ack_policy: config.write_ack_policy,
+                mix: &mix,
+                reads_after_kill,
+                writes_after_kill,
+                owner_unchanged,
+                reduced_rf: &reduced_rf,
+            }
+            .failures(&stats);
+            failures.extend(round_failures);
+            save_run(
+                observations,
+                scenario_name,
+                config.fault_rounds,
+                config.fault_acknowledged_window,
+                &rounds,
+                &RunTotals {
+                    rollbacks: total_rollbacks,
+                    impossible: total_impossible,
+                    undecidable: total_undecidable,
+                    dropped: total_dropped,
+                    capacity_errors: total_capacity_errors,
+                    capacity_retries: total_capacity_retries,
+                    requests: total_requests,
+                    seconds: started.elapsed().as_secs_f64(),
+                },
+                &failures,
+            )?;
+            events.record("fault_round_complete", serde_json::to_value(rounds.last())?)?;
+            if !failures.is_empty() {
+                break;
             }
         }
-        total_rollbacks += stats.rollbacks;
-        total_impossible += stats.impossible;
-        total_undecidable += stats.undecidable;
-        total_dropped += dropped_this_round;
-        total_capacity_errors += stats.capacity_backpressure_errors;
-        total_capacity_retries += stats.capacity_backpressure_retries;
-        total_requests += stats.requests();
-        let load = load_json(&stats, load_elapsed, dropped_this_round);
-        let record = FaultRound {
-            round,
-            scenario: scenario_name,
-            victim: victim.node_id.clone(),
-            victim_epoch: topology.epoch,
-            cohort_keys: victim.cohort.len(),
-            affected_ranges,
-            owner_unchanged,
-            pre_failure_replica_progress: pre_progress,
-            replica_status_after_failure: json!({
-                "min_live_rf_during_failure": (min_live_rf != usize::MAX).then_some(min_live_rf),
-                "max_under_replicated_ranges_during_failure": max_under_replicated,
-                "max_not_writable_ranges_during_failure": writable_false,
-                "write_block_reason_samples_during_failure": block_reasons,
-                "min_live_rf_after_publish": post_failure_min_live_rf,
-                "under_replicated_ranges_after_publish": post_failure_under_replicated,
-                "not_writable_ranges_after_publish": post_failure_not_writable,
-                "write_block_reason_samples_after_publish": post_failure_block_reasons,
-            }),
-            kill_to_publish_seconds,
-            read_recovery_seconds,
-            write_recovery_seconds,
-            delete_recovery_seconds,
-            first_failure_after_kill_ms,
-            last_failure_after_kill_ms,
-            failures_after_kill,
-            reads_after_kill,
-            writes_after_kill,
-            deletes_after_kill,
-            replacement_to_full_rf_seconds,
-            failure_to_full_rf_seconds,
-            final_epoch,
-            collateral_victim_owned_keys: collateral.len() as u64,
-            collateral_rollbacks,
-            load,
-            rollbacks: stats.rollbacks,
-            undecidable_reads: stats.undecidable,
-            undecidable_samples: stats.undecidable_samples.clone(),
-            impossible_reads: stats.impossible,
-            dropped_acknowledged_states: dropped_this_round,
-            violations: stats.violations.clone(),
-            new_owner_counts,
-        };
-        events.record("fault_round_complete", serde_json::to_value(&record)?)?;
-        measurements.insert(
-            format!("fault_round_{round}_load"),
-            measurement(stats.requests(), load_elapsed),
-        );
-        rounds.push(record);
-        killed.insert(victim.node_id.clone());
 
-        // The checks of a round. A round that fails ends the run, but its
-        // record and the rounds before it stay in the summary: the evidence of
-        // a failed run is the reason it failed.
-        let round_failures = RoundChecks {
-            round,
-            scenario: config.fault_scenario,
-            write_ack_policy: config.write_ack_policy,
-            mix: &mix,
-            reads_after_kill,
-            writes_after_kill,
-            owner_unchanged,
-        }
-        .failures(&stats);
-        if !round_failures.is_empty() {
-            failures.extend(round_failures);
-            break;
-        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = &execution {
+        failures.push(format!(
+            "round {}: infrastructure error: {error:#}",
+            active_round
+        ));
     }
 
     let totals = RunTotals {
@@ -1919,7 +2052,16 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
         requests: total_requests,
         seconds: started.elapsed().as_secs_f64(),
     };
-    events.record(
+    let recorded = record_run(
+        observations,
+        scenario_name,
+        config.fault_rounds,
+        config.fault_acknowledged_window,
+        &rounds,
+        &totals,
+        &failures,
+    );
+    let final_event = events.record(
         "fault_run_complete",
         json!({
             "rounds_requested": config.fault_rounds,
@@ -1932,16 +2074,22 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
             "seconds": started.elapsed().as_secs_f64(),
             "failures": failures,
         }),
-    )?;
-    record_run(
-        observations,
-        scenario_name,
-        config.fault_rounds,
-        config.fault_acknowledged_window,
-        &rounds,
-        &totals,
-        &failures,
-    )?;
+    );
+    if let Err(error) = &final_event {
+        failures.push(format!("finalizing fault run: {error:#}"));
+        save_run(
+            observations,
+            scenario_name,
+            config.fault_rounds,
+            config.fault_acknowledged_window,
+            &rounds,
+            &totals,
+            &failures,
+        )?;
+    }
+    execution?;
+    recorded?;
+    final_event?;
     Ok(rounds.last().map_or(0, |round| round.final_epoch))
 }
 
@@ -1964,6 +2112,28 @@ struct RunTotals {
 /// because the summary keeps the rounds it completed and the reasons it failed
 /// in `fault_failures` rather than only in the error text.
 fn record_run(
+    observations: &mut BTreeMap<String, Value>,
+    scenario_name: &str,
+    rounds_requested: u32,
+    acknowledged_window: usize,
+    rounds: &[FaultRound],
+    totals: &RunTotals,
+    failures: &[String],
+) -> Result<()> {
+    save_run(
+        observations,
+        scenario_name,
+        rounds_requested,
+        acknowledged_window,
+        rounds,
+        totals,
+        failures,
+    )?;
+    ensure!(failures.is_empty(), "{}", failures.join("; "));
+    Ok(())
+}
+
+fn save_run(
     observations: &mut BTreeMap<String, Value>,
     scenario_name: &str,
     rounds_requested: u32,
@@ -2001,7 +2171,6 @@ fn record_run(
     observations.insert("fault_requests".into(), json!(totals.requests));
     observations.insert("fault_total_seconds".into(), json!(totals.seconds));
     observations.insert("fault_failures".into(), json!(failures));
-    ensure!(failures.is_empty(), "{}", failures.join("; "));
     Ok(())
 }
 
@@ -2210,6 +2379,17 @@ mod tests {
             model.observe_at(Some(b"A"), Some(&version(1)), 2, 1, true),
             Observation::Rollback { eligible: true, .. }
         ));
+        // An old-owner response that was already in flight at the kill
+        // cannot attribute a regression to promotion of a follower.
+        let mut in_flight = KeyModel::new(PossibleState::present(b"A".to_vec(), version(1)), 16);
+        in_flight.on_put(b"B".to_vec(), version(2));
+        assert!(matches!(
+            in_flight.observe_at(Some(b"A"), Some(&version(1)), 1, 1, true),
+            Observation::Rollback {
+                eligible: false,
+                ..
+            }
+        ));
         // Even an old-version record observed on the promoted owner fixes
         // the state: that same failure cannot justify a second regression.
         model.on_put(
@@ -2268,6 +2448,13 @@ mod tests {
             reads_after_kill: 10,
             writes_after_kill: 10,
             owner_unchanged: true,
+            reduced_rf: &ReducedRfProgress {
+                puts: 10,
+                deletes: 10,
+                admission_rejections: 0,
+                capacity_errors: 0,
+                capacity_retries: 0,
+            },
         }
     }
 
@@ -2367,6 +2554,89 @@ mod tests {
         assert!(failures[0].contains("rolled back 1"));
     }
 
+    #[test]
+    fn post_repair_success_cannot_prove_reduced_rf_writability() {
+        let mix = OperationMix::parse("70:20:10").unwrap();
+        let mut stats = WorkerStats::default();
+        stats.ops.insert("put_ok".into(), 10);
+        let missing = ReducedRfProgress::default();
+        let mut round = checks(&mix, FaultScenario::Follower);
+        round.reduced_rf = &missing;
+        let failures = round.failures(&stats);
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert!(
+            failures
+                .iter()
+                .all(|failure| failure.contains("at reduced RF"))
+        );
+        let backpressure = ReducedRfProgress {
+            puts: 1,
+            deletes: 1,
+            capacity_errors: 5,
+            capacity_retries: 9,
+            ..Default::default()
+        };
+        round.reduced_rf = &backpressure;
+        assert!(round.failures(&stats).is_empty());
+        let rejected = ReducedRfProgress {
+            admission_rejections: 1,
+            ..backpressure
+        };
+        round.reduced_rf = &rejected;
+        assert_eq!(round.failures(&stats).len(), 1);
+    }
+
+    #[test]
+    fn reduced_rf_progress_excludes_pre_kill_and_reconfigured_success() {
+        let progress = Progress::new();
+        progress.kill_ms.store(10, Ordering::Release);
+        progress.published_ms.store(30, Ordering::Release);
+        let mut entry = RequestEntry {
+            id: 1,
+            worker: 0,
+            key: 7,
+            operation: "put",
+            value_hex: None,
+            invoked_unix_ms: 0,
+            completed_unix_ms: 0,
+            elapsed_us: 0,
+            start_epoch: 1,
+            end_epoch: 1,
+            result: "ok",
+            error: None,
+            error_code: None,
+            outcome: None,
+            version: Some(VersionView::from(&version(1))),
+            topology_epoch: Some(1),
+            retries: 0,
+            retry_reasons: BTreeMap::new(),
+        };
+        progress.record_reduced_rf(&entry, 9, 1);
+        progress.record_reduced_rf(&entry, 10, 1);
+        progress.record_reduced_rf(&entry, 31, 1);
+        assert_eq!(progress.reduced_rf.lock().unwrap().puts, 0);
+        progress.record_reduced_rf(&entry, 11, 1);
+        assert_eq!(progress.reduced_rf.lock().unwrap().puts, 1);
+        entry.version.as_mut().unwrap().topology_epoch = 2;
+        progress.record_reduced_rf(&entry, 12, 1);
+        assert_eq!(progress.reduced_rf.lock().unwrap().puts, 1);
+        entry.result = "error";
+        entry.error_code = Some("ResourceExhausted".into());
+        entry.retry_reasons.insert("resource_exhausted".into(), 2);
+        progress.record_reduced_rf(&entry, 13, 1);
+        {
+            let reduced = progress.reduced_rf.lock().unwrap();
+            assert_eq!(reduced.capacity_errors, 1);
+            assert_eq!(reduced.capacity_retries, 2);
+            assert_eq!(reduced.admission_rejections, 0);
+        }
+        entry.error_code = Some("TemporarilyUnavailable".into());
+        entry.retry_reasons.clear();
+        entry.retry_reasons.insert("replica_not_ready".into(), 2);
+        progress.record_reduced_rf(&entry, 14, 1);
+        assert_eq!(progress.reduced_rf.lock().unwrap().admission_rejections, 3);
+    }
+
     fn a_recorded_round() -> FaultRound {
         FaultRound {
             round: 1,
@@ -2377,6 +2647,7 @@ mod tests {
             affected_ranges: 4,
             owner_unchanged: true,
             pre_failure_replica_progress: json!({}),
+            reduced_rf_progress: ReducedRfProgress::default(),
             replica_status_after_failure: json!({}),
             kill_to_publish_seconds: 0.5,
             read_recovery_seconds: Some(0.5),

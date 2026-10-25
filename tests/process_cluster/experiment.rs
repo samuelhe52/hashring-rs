@@ -695,3 +695,186 @@ async fn scaling_round_trip_defers_s1_verification_and_records_the_stop_window()
     assert!(events.contains("scaling_cohorts_verified"));
     assert!(events.contains("removed_node_exited"));
 }
+
+#[tokio::test]
+#[ignore = "timed fault experiment with injected infrastructure failure; run with --ignored"]
+async fn fault_experiment_keeps_completed_rounds_after_coordinator_failure() {
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let output_directory = directory.path().join("fault");
+    let stderr_path = directory.path().join("stderr.log");
+    let mut experiment = Process(
+        Command::new(env!("CARGO_BIN_EXE_hashring-rs"))
+            .args([
+                "experiment",
+                "--mode",
+                "fault",
+                "--fault-scenario",
+                "owner",
+                "--fault-rounds",
+                "2",
+                "--nodes",
+                "6",
+                "--keys",
+                "128",
+                "--concurrency",
+                "4",
+                "--virtual-nodes",
+                "8",
+                "--value-bytes",
+                "32",
+                "--fault-pre-seconds",
+                "1",
+                "--fault-post-seconds",
+                "1",
+                "--operation-timeout-ms",
+                "2000",
+                "--migration-timeout-ms",
+                "30000",
+                "--worker-threads",
+                "2",
+                "--coordinator-worker-threads",
+                "2",
+                "--output",
+                output_directory.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&stderr_path).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let events = loop {
+        let text =
+            std::fs::read_to_string(output_directory.join("events.jsonl")).unwrap_or_default();
+        let events: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        if let Some(started) = events
+            .iter()
+            .find(|event| event["event"] == "fault_round_started" && event["fields"]["round"] == 2)
+        {
+            let pid = started["fields"]["processes"]["coordinator"]
+                .as_u64()
+                .unwrap();
+            assert!(
+                Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            break events;
+        }
+        assert!(
+            !experiment.has_exited(),
+            "experiment exited early: {}",
+            std::fs::read_to_string(&stderr_path).unwrap()
+        );
+        assert!(Instant::now() < deadline, "round 2 never started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    loop {
+        if let Some(status) = experiment.0.try_wait().unwrap() {
+            assert!(!status.success());
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "experiment did not exit after coordinator failure"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output_directory.join("summary.json")).unwrap())
+            .unwrap();
+    let observations = &summary["observations"];
+    assert_eq!(summary["success"], false);
+    assert_eq!(observations["fault_rounds_requested"], 2);
+    assert_eq!(observations["fault_rounds_completed"], 1);
+    assert_eq!(observations["fault_rounds"].as_array().unwrap().len(), 1);
+    assert!(
+        observations["fault_failures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|failure| failure
+                .as_str()
+                .unwrap()
+                .contains("round 2: infrastructure error"))
+    );
+    assert!(summary["measurements"]["fault_round_1_load"].is_object());
+    let completed = events
+        .iter()
+        .find(|event| event["event"] == "fault_round_complete")
+        .unwrap();
+    assert_eq!(observations["fault_rounds"][0], completed["fields"]);
+
+    // The pre-failure status must follow the active pre-window, not precede it.
+    let event_time = |name| {
+        events.iter().find(|event| event["event"] == name).unwrap()["unix_ms"]
+            .as_u64()
+            .unwrap()
+    };
+    assert!(
+        event_time("fault_pre_failure_replica_progress") >= event_time("fault_load_started") + 1000
+    );
+    assert!(event_time("fault_pre_failure_replica_progress") <= event_time("fault_injected"));
+}
+
+#[tokio::test]
+#[ignore = "timed follower fault experiment; run with --ignored"]
+async fn fault_experiment_proves_follower_loss_writability_before_reconfiguration() {
+    let _guard = process_test_lock().lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let output_directory = directory.path().join("fault");
+    let output = Command::new(env!("CARGO_BIN_EXE_hashring-rs"))
+        .args([
+            "experiment",
+            "--mode",
+            "fault",
+            "--fault-scenario",
+            "follower",
+            "--nodes",
+            "5",
+            "--keys",
+            "128",
+            "--concurrency",
+            "4",
+            "--virtual-nodes",
+            "8",
+            "--value-bytes",
+            "32",
+            "--fault-pre-seconds",
+            "1",
+            "--fault-post-seconds",
+            "1",
+            "--operation-timeout-ms",
+            "2000",
+            "--migration-timeout-ms",
+            "30000",
+            "--worker-threads",
+            "2",
+            "--coordinator-worker-threads",
+            "2",
+            "--output",
+            output_directory.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output_directory.join("summary.json")).unwrap())
+            .unwrap();
+    let round = &summary["observations"]["fault_rounds"][0];
+    assert!(round["reduced_rf_progress"]["puts"].as_u64().unwrap() > 0);
+    assert!(round["reduced_rf_progress"]["deletes"].as_u64().unwrap() > 0);
+    assert_eq!(round["reduced_rf_progress"]["admission_rejections"], 0);
+    assert_eq!(round["owner_unchanged"], true);
+    assert_eq!(round["rollbacks"], 0);
+}
