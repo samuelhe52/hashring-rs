@@ -46,6 +46,15 @@ policy: first-successor
 # round: `nodes` is the initial members plus those spares.
 availability_rounds: 1
 
+# The `fault` mode only. It keeps a mixed load running while one node fails.
+# `nodes` is four initial members plus one spare per round.
+# fault_scenario: owner          # owner or follower
+# fault_rounds: 1                # consecutive failures, one spare each
+# fault_pre_seconds: 10          # load before the kill
+# fault_post_seconds: 10         # load after recovery reaches full RF
+# fault_acknowledged_window: 4096  # acknowledged states kept per key; must cover one key's writes
+# mix: "70:20:10"                # GET:PUT:DELETE share of the fault load
+
 # The `scaling` mode only.
 # scaling_scenario: round-trip   # round-trip, grow, shrink, replace, churn, or control
 # scaling_load_mode: closed      # closed or open

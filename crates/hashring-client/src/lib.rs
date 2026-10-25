@@ -16,7 +16,9 @@ use tonic::Code;
 use tonic::transport::{Channel, Endpoint};
 
 use hashring_core::{
-    limits::{DEFAULT_MAX_KEY_BYTES, MAX_DATA_MESSAGE_BYTES, MAX_VALUE_BYTES},
+    limits::{
+        DEFAULT_MAX_KEY_BYTES, MAX_DATA_MESSAGE_BYTES, MAX_MUTATION_ID_BYTES, MAX_VALUE_BYTES,
+    },
     migration::TopologyChange,
     proto::{
         self, BeginTopologyChangeRequest, DeleteRequest, ErrorCode, ExecuteTopologyChangeRequest,
@@ -107,6 +109,9 @@ impl From<Expiry> for Option<u64> {
 #[derive(Clone, Debug)]
 pub struct DeleteOutput {
     pub topology_epoch: u64,
+    /// The tombstone's version. It orders this delete against the writes and
+    /// reads a caller observed.
+    pub version: RecordVersion,
 }
 
 /// A conditional write rejected on a retry whose earlier attempt's outcome
@@ -678,6 +683,37 @@ impl HashringClient {
         self.put_with_expiry(key, value, Expiry::Keep).await
     }
 
+    /// Stores `value` under a caller-chosen mutation ID.
+    ///
+    /// Every internal retry of this call reuses the ID, and a later call with
+    /// the same ID and payload is answered from the owner's receipt instead of
+    /// being applied again. That is what lets a caller retry a request whose
+    /// response it never saw.
+    ///
+    /// The ID must not be empty and must not exceed
+    /// [`MAX_MUTATION_ID_BYTES`] bytes; a call that breaks either rule fails
+    /// without contacting a node. The ID must also stay unique to this
+    /// operation for at least the cluster's receipt retention period: a later
+    /// call that reuses the ID with a different payload is rejected with
+    /// `MutationIdConflict`, and a call that reuses it with the same payload
+    /// is answered from the receipt instead of being applied again.
+    pub async fn put_with_mutation_id(
+        &self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        mutation_id: impl Into<String>,
+    ) -> Result<PutOutput, ClientError> {
+        let mutation_id = mutation_id.into();
+        validate_mutation_id(&mutation_id)?;
+        match self
+            .put_record(key, value, Expiry::Keep, false, None, mutation_id)
+            .await?
+        {
+            PutResult::Applied(output) => Ok(output),
+            PutResult::KeyMissing | PutResult::ConditionFailed => Err(ClientError::MissingVersion),
+        }
+    }
+
     /// Stores `value` and sets the record's deadline.
     ///
     /// The deadline is absolute and is fixed when this is called, so every
@@ -690,7 +726,10 @@ impl HashringClient {
         value: Vec<u8>,
         expiry: Expiry,
     ) -> Result<PutOutput, ClientError> {
-        match self.put_record(key, value, expiry, false, None).await? {
+        match self
+            .put_record(key, value, expiry, false, None, new_request_id())
+            .await?
+        {
             PutResult::Applied(output) => Ok(output),
             // Only a conditional or expiry-only write is answered this way.
             PutResult::KeyMissing | PutResult::ConditionFailed => Err(ClientError::MissingVersion),
@@ -712,7 +751,14 @@ impl HashringClient {
         precondition: Precondition,
     ) -> Result<Option<PutOutput>, ClientError> {
         match self
-            .put_record(key, value, expiry, false, Some(precondition))
+            .put_record(
+                key,
+                value,
+                expiry,
+                false,
+                Some(precondition),
+                new_request_id(),
+            )
             .await?
         {
             PutResult::Applied(output) => Ok(Some(output)),
@@ -755,7 +801,14 @@ impl HashringClient {
     ) -> Result<Option<PutOutput>, ClientError> {
         let expiry = expires_at_unix_millis.map_or(Expiry::Clear, Expiry::At);
         match self
-            .put_record(key, Vec::new(), expiry, true, precondition)
+            .put_record(
+                key,
+                Vec::new(),
+                expiry,
+                true,
+                precondition,
+                new_request_id(),
+            )
             .await?
         {
             PutResult::Applied(output) => Ok(Some(output)),
@@ -770,6 +823,7 @@ impl HashringClient {
         expiry: Expiry,
         preserve_value: bool,
         precondition: Option<Precondition>,
+        request_id: String,
     ) -> Result<PutResult, ClientError> {
         let _operation_timer = hashring_core::rpc_profile::CLIENT_PUT_OPERATION.start();
         validate_key_size(&key)?;
@@ -781,7 +835,6 @@ impl HashringClient {
             )));
         }
         let deadline = self.mutation_deadline();
-        let request_id = new_request_id();
         let mut attempt = 0_u32;
         let mut unknown_write_outcome = false;
 
@@ -895,7 +948,23 @@ impl HashringClient {
     }
 
     pub async fn delete(&self, key: Vec<u8>) -> Result<DeleteOutput, ClientError> {
-        self.delete_record(key, None)
+        self.delete_record(key, None, new_request_id())
+            .await?
+            .ok_or(ClientError::MissingVersion)
+    }
+
+    /// Deletes the key under a caller-chosen mutation ID. Every internal retry
+    /// reuses the ID, and a later call with the same ID is answered from the
+    /// owner's receipt. See [`HashringClient::put_with_mutation_id`] for the
+    /// rules the ID has to follow.
+    pub async fn delete_with_mutation_id(
+        &self,
+        key: Vec<u8>,
+        mutation_id: impl Into<String>,
+    ) -> Result<DeleteOutput, ClientError> {
+        let mutation_id = mutation_id.into();
+        validate_mutation_id(&mutation_id)?;
+        self.delete_record(key, None, mutation_id)
             .await?
             .ok_or(ClientError::MissingVersion)
     }
@@ -908,17 +977,18 @@ impl HashringClient {
         key: Vec<u8>,
         precondition: Precondition,
     ) -> Result<Option<DeleteOutput>, ClientError> {
-        self.delete_record(key, Some(precondition)).await
+        self.delete_record(key, Some(precondition), new_request_id())
+            .await
     }
 
     async fn delete_record(
         &self,
         key: Vec<u8>,
         precondition: Option<Precondition>,
+        request_id: String,
     ) -> Result<Option<DeleteOutput>, ClientError> {
         validate_key_size(&key)?;
         let deadline = self.mutation_deadline();
-        let request_id = new_request_id();
         let mut attempt = 0_u32;
         let mut unknown_write_outcome = false;
 
@@ -1017,6 +1087,7 @@ impl HashringClient {
             }
             return Ok(Some(DeleteOutput {
                 topology_epoch: response.current_epoch,
+                version: response.version.ok_or(ClientError::MissingVersion)?,
             }));
         }
     }
@@ -1582,6 +1653,26 @@ fn validate_key_size(key: &[u8]) -> Result<(), ClientError> {
         return Err(size_failure(format!(
             "key exceeds {DEFAULT_MAX_KEY_BYTES} bytes"
         )));
+    }
+    Ok(())
+}
+
+/// Rejects a mutation ID a node would refuse anyway.
+///
+/// The check is here so a caller learns about a bad ID without a round trip,
+/// and so the error names the rule instead of the transport.
+fn validate_mutation_id(mutation_id: &str) -> Result<(), ClientError> {
+    if mutation_id.is_empty() || mutation_id.len() > MAX_MUTATION_ID_BYTES {
+        return Err(OperationFailure {
+            code: ErrorCode::InvalidArgument,
+            message: format!(
+                "mutation id must contain 1 to {MAX_MUTATION_ID_BYTES} bytes, not {}",
+                mutation_id.len()
+            ),
+            retryable: false,
+            outcome: MutationOutcome::KnownNotApplied,
+        }
+        .into());
     }
     Ok(())
 }
@@ -2181,5 +2272,53 @@ mod tests {
         ));
         assert_eq!(attempt, 1);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_mutation_id_a_node_would_refuse_is_rejected_without_a_round_trip() {
+        // The client's owner is unreachable, so an ID that reached a node
+        // would fail with a transport error instead of the rule it broke.
+        let client = unreachable_client(Duration::from_millis(100));
+
+        for mutation_id in ["", &"x".repeat(MAX_MUTATION_ID_BYTES + 1)] {
+            let error = client
+                .put_with_mutation_id(b"key".to_vec(), b"value".to_vec(), mutation_id)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    ClientError::Operation(OperationFailure {
+                        code: ErrorCode::InvalidArgument,
+                        outcome: MutationOutcome::KnownNotApplied,
+                        ..
+                    })
+                ),
+                "the client accepted the mutation id {mutation_id:?}: {error}"
+            );
+
+            let error = client
+                .delete_with_mutation_id(b"key".to_vec(), mutation_id)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    ClientError::Operation(OperationFailure {
+                        code: ErrorCode::InvalidArgument,
+                        ..
+                    })
+                ),
+                "the client accepted the mutation id {mutation_id:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mutation_id_at_the_limit_is_accepted() {
+        assert!(validate_mutation_id(&"x".repeat(MAX_MUTATION_ID_BYTES)).is_ok());
+        assert!(validate_mutation_id("x").is_ok());
+        assert!(validate_mutation_id("").is_err());
+        assert!(validate_mutation_id(&"x".repeat(MAX_MUTATION_ID_BYTES + 1)).is_err());
     }
 }

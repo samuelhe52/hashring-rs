@@ -301,6 +301,13 @@ target/release/hashring-rs experiment --mode latency --target-rates 5000,10000,2
 # every cohort after each change.
 target/release/hashring-rs experiment --mode scaling \
   --output results/scaling
+
+# Keep a mixed load running while a follower or an owner fails, and verify the
+# request ledger and every key after the replacement reaches full RF.
+target/release/hashring-rs experiment --mode fault --fault-scenario follower \
+  --nodes 5 --output results/fault-follower
+target/release/hashring-rs experiment --mode fault --fault-scenario owner \
+  --nodes 5 --output results/fault-owner
 ```
 
 Experiment settings can also come from a YAML file whose keys are the flag

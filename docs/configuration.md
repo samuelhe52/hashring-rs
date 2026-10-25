@@ -113,15 +113,15 @@ replaced during the run.
 | Flag | YAML key | Default | Scope | Notes |
 | --- | --- | --- | --- | --- |
 | `--config` | — | none | process | |
-| `--mode` | `mode` | `correctness` | experiment | `correctness`, `performance`, `availability`, `latency` or `scaling`. |
+| `--mode` | `mode` | `correctness` | experiment | `correctness`, `performance`, `availability`, `latency`, `scaling` or `fault`. |
 | `--output` | `output` | required | experiment | New or empty directory. |
-| `--nodes` | `nodes` | 3 + rounds for availability, 10 otherwise | experiment | Peak node count. The `availability` mode starts with the node count minus one node per round, and uses the rest as the replacements it joins after every failure. |
-| `--keys` | `keys` | 20,000 / 1,000,000 / 1,000 / 100,000 by mode | experiment | The `latency` mode reads it as the key count of the run, which is its `--preload-keys`. At most 100,000,000, so the products the runner makes from the key space stay in range. |
+| `--nodes` | `nodes` | 3 + rounds for availability, 4 + rounds for fault, 10 otherwise | experiment | Peak node count. The `availability` and `fault` modes start with the node count minus one node per round, and use the rest as the replacements they join after every failure. |
+| `--keys` | `keys` | 20,000 / 1,000,000 / 1,000 / 100,000 / 1,000 by mode | experiment | The `latency` mode reads it as the key count of the run, which is its `--preload-keys`. At most 100,000,000, so the products the runner makes from the key space stay in range. |
 | `--value-bytes` | `value_bytes` | 128 | experiment | |
-| `--concurrency` | `concurrency` | 64 | experiment | The `latency` mode uses it for the preload and the check, not for the load. The `scaling` mode uses it for its read tasks and verification. |
+| `--concurrency` | `concurrency` | 64 | experiment | The `latency` mode uses it for the preload and the check, not for the load. The `scaling` mode uses it for its read tasks and verification. The `fault` mode uses it for its load workers. |
 | `--operation-timeout-ms` | `operation_timeout_ms` | 30000 | experiment | At most `--receipt-retention-ms`, since mutations stop retrying there. |
 | `--migration-timeout-ms` | `migration_timeout_ms` | 600000 | experiment | |
-| `--pre-publish-delay-ms` | `pre_publish_delay_ms` | 250; 0 for scaling | experiment | Observation window before each publication. It runs after writes are paused, so a scaling run defaults it to 0. |
+| `--pre-publish-delay-ms` | `pre_publish_delay_ms` | 250; 0 for scaling and fault | experiment | Observation window before each publication. It runs after writes are paused, so a scaling or fault run defaults it to 0. |
 | `--require-clean-source` | `require_clean_source` | off | experiment | Refuse a run whose source is not one clean commit. |
 | `--verbose` | `verbose` | off | experiment | |
 | `--policy` | `policy` | `first-successor` for availability, `owner-only` otherwise | experiment | ACK policy. |
@@ -129,10 +129,15 @@ replaced during the run.
 | `--target-rates` | `target_rates` | none | experiment | `latency` mode only: the target rates in operations per second, one stage each. A list in YAML. |
 | `--warmup-seconds` | `warmup_seconds` | 10 | experiment | `latency` mode: the seconds at the start of every stage that are not counted. `scaling` mode: the read/write warmup before the first change. |
 | `--duration-seconds` | `duration_seconds` | 60 | experiment | `latency` mode only: the seconds of every stage that are counted. |
-| `--mix` | `mix` | `90:9:1` | experiment | `latency` mode only: the `GET:PUT:DELETE` share of the requests. |
+| `--mix` | `mix` | `90:9:1`; `70:20:10` for fault | experiment | `latency` and `fault` modes: the `GET:PUT:DELETE` share of the requests. |
 | `--key-distribution` | `key_distribution` | `zipf:0.99` | experiment | `latency` and `scaling` modes: `uniform`, `zipf:<theta>`, or `hotspot:<key share>:<traffic share>`. |
 | `--max-in-flight` | `max_in_flight` | 4096 | experiment | `latency` mode only: how many requests may be in flight at once. A request over the limit is dropped and counted as late. |
 | `--availability-rounds` | `availability_rounds` | 1 | experiment | `availability` mode only: how many consecutive owner failures the run injects. Every round kills the current owner of the probe key and then joins a replacement, so the run needs one spare node per round. |
+| `--fault-scenario` | `fault_scenario` | `owner` | experiment | `fault` mode only: `owner` kills the owner of the selected keys; `follower` kills a node that is only a follower for them. |
+| `--fault-rounds` | `fault_rounds` | 1 | experiment | `fault` mode only: how many consecutive node failures the run injects. Every round joins a replacement, so the run needs one spare node per round. |
+| `--fault-pre-seconds` | `fault_pre_seconds` | 10 | experiment | `fault` mode only: how long the load runs before the node is killed. |
+| `--fault-post-seconds` | `fault_post_seconds` | 10 | experiment | `fault` mode only: how long the load keeps running after recovery reaches full RF. |
+| `--fault-acknowledged-window` | `fault_acknowledged_window` | 4096 | experiment | `fault` mode only: how many acknowledged states per key the run keeps, so it can tell a permitted rollback apart from a value the history never held. It must cover the writes one key takes during the load; a smaller window makes a rollback outside it inconclusive, and such a read fails the run. |
 | `--scaling-scenario` | `scaling_scenario` | `round-trip` | experiment | `scaling` mode only: `round-trip` (grow one, then shrink), `grow`, `shrink`, `replace` (swap one member for a spare), `churn` (grow by three, then shrink), or `control` (no membership change). |
 | `--scaling-load-mode` | `scaling_load_mode` | `closed` | experiment | `scaling` mode only: `closed` for a fixed number of workers, `open` for requests offered at `--scaling-open-rate`. |
 | `--scaling-open-rate` | `scaling_open_rate` | 0 | experiment | `scaling` mode only: total operations per second in open mode. Reads are 80%; writes are 12% rewrite, 5% fresh write, and 3% delete. The pools are sized from this rate. The delete share is 3%, so the rate has to be at least 34 for every cohort to get an operation, and at most 1,000,000. |
