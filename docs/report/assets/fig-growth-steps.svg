@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 330" width="1000" height="330" role="img" aria-label="9 到 10 扩容各步骤的耗时">
+<line x1="240.0" y1="32.0" x2="240.0" y2="304.0" stroke="#e3dfd7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="240.0" y="324.0" font-size="11.5" font-weight="500" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >0</text>
+<line x1="396.8" y1="32.0" x2="396.8" y2="304.0" stroke="#e3dfd7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="396.8" y="324.0" font-size="11.5" font-weight="500" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >500</text>
+<line x1="553.6" y1="32.0" x2="553.6" y2="304.0" stroke="#e3dfd7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="553.6" y="324.0" font-size="11.5" font-weight="500" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >1000</text>
+<line x1="710.5" y1="32.0" x2="710.5" y2="304.0" stroke="#e3dfd7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="710.5" y="324.0" font-size="11.5" font-weight="500" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >1500</text>
+<line x1="867.3" y1="32.0" x2="867.3" y2="304.0" stroke="#e3dfd7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="867.3" y="324.0" font-size="11.5" font-weight="500" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >2000</text>
+<text x="930.0" y="346.0" font-size="12" font-weight="500" fill="#5d6874" text-anchor="end" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >毫秒</text>
+<text x="225.0" y="60.0" font-size="13" font-weight="500" fill="#1b2430" text-anchor="end" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >快照复制</text>
+<rect x="240.0" y="44.0" width="320.2" height="21.0" rx="3" fill="#1f6f8b" opacity=".9"/>
+<text x="569.2" y="60.0" font-size="12" font-weight="600" fill="#5d6874" text-anchor="start" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >1021 ms</text>
+<text x="225.0" y="98.0" font-size="13" font-weight="500" fill="#1b2430" text-anchor="end" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >变更日志回放</text>
+<rect x="240.0" y="82.0" width="672.4" height="21.0" rx="3" fill="#1f6f8b" opacity=".9"/>
+<text x="921.4" y="98.0" font-size="12" font-weight="600" fill="#5d6874" text-anchor="start" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >2144 ms</text>
+<text x="225.0" y="136.0" font-size="13" font-weight="500" fill="#1b2430" text-anchor="end" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >停写</text>
+<rect x="240.0" y="120.0" width="3.5" height="21.0" rx="3" fill="#1f6f8b" opacity=".9"/>
+<text x="252.4" y="136.0" font-size="12" font-weight="600" fill="#5d6874" text-anchor="start" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >11 ms</text>
+<text x="225.0" y="174.0" font-size="13" font-weight="500" fill="#1b2430" text-anchor="end" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >校验</text>
+<rect x="240.0" y="158.0" width="321.8" height="21.0" rx="3" fill="#1f6f8b" opacity=".9"/>
+<text x="570.8" y="174.0" font-size="12" font-weight="600" fill="#5d6874" text-anchor="start" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >1026 ms</text>
+<text x="225.0" y="212.0" font-size="13" font-weight="500" fill="#1b2430" text-anchor="end" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >发布</text>
+<rect x="240.0" y="196.0" width="5.0" height="21.0" rx="3" fill="#1f6f8b" opacity=".9"/>
+<text x="254.0" y="212.0" font-size="12" font-weight="600" fill="#5d6874" text-anchor="start" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >16 ms</text>
+<text x="225.0" y="250.0" font-size="13" font-weight="500" fill="#1b2430" text-anchor="end" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >激活</text>
+<rect x="240.0" y="234.0" width="209.2" height="21.0" rx="3" fill="#1f6f8b" opacity=".9"/>
+<text x="458.2" y="250.0" font-size="12" font-weight="600" fill="#5d6874" text-anchor="start" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >667 ms</text>
+<text x="225.0" y="288.0" font-size="13" font-weight="500" fill="#1b2430" text-anchor="end" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >客户端观测的停写窗口</text>
+<rect x="240.0" y="272.0" width="344.4" height="21.0" rx="3" fill="#c0532b" opacity=".9"/>
+<text x="593.4" y="288.0" font-size="12" font-weight="600" fill="#5d6874" text-anchor="start" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >1098 ms</text>
+</svg>
