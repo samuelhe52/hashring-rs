@@ -8,8 +8,9 @@ linestretch: 1.2
 numbersections: false
 toc: false
 colorlinks: true
-linkcolor: blue
-urlcolor: blue
+linkcolor: linkblue
+urlcolor: linkblue
+citecolor: linkblue
 mainfont: "Source Han Serif SC"
 CJKmainfont: "Source Han Serif SC"
 CJKmonofont: "Source Han Serif SC"

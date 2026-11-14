@@ -1,4 +1,4 @@
-INPUT ?= preliminary-report.md
+INPUT ?= final-report.md
 OUTPUT ?= build/$(basename $(notdir $(INPUT))).pdf
 
 .PHONY: pdf figures

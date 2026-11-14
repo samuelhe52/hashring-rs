@@ -1,9 +1,8 @@
 # Reports
 
+[final-report.md](final-report.md) is the final report.
 [preliminary-report.md](preliminary-report.md) is the preliminary technical report.
-[related-work.md](related-work.md) and
-[implementation-and-verification.md](implementation-and-verification.md) contain
-supporting material.
+[related-work.md](related-work.md) contains supporting material.
 
 [preliminary-slides.html](preliminary-slides.html) is the self-contained
 defense deck (Chinese, about 6–7 minutes). Open it in a browser: arrow keys
@@ -18,7 +17,8 @@ From this directory:
 make pdf
 ```
 
-The PDF is written to `build/preliminary-report.pdf`. The build directory also
+The PDF is written to `build/final-report.pdf`. Build the preliminary report with
+`make pdf INPUT=preliminary-report.md`. The build directory also
 contains generated LaTeX, rasterized figures, and compilation logs, all ignored
 by Git. The Desktop PDF used during layout review is not a build dependency.
 
@@ -58,10 +58,31 @@ Use `{.page-break}` on a heading when it should begin a new page.
 Use standalone Markdown images with their complete caption as the alt text:
 
 ```md
-![图 3-1　系统总体架构](assets/architecture.svg){width=86%}
+![图 3-1　系统总体架构](assets/architecture.svg){#fig-architecture width=86%}
 ```
 
-The same caption serves the Markdown view and PDF. The rendering filter keeps
+Give a table its numbered caption on a `Table:` line just above it; the PDF
+prints the caption text as written, without an automatic label:
+
+```md
+Table: 表 3-2　三种写入确认策略 {#tbl-ack-policies}
+```
+
+The same caption serves the Markdown view and PDF.
+
+Give every figure and table an identifier (`#fig-…`, `#tbl-…`) and refer to it
+with a link whose text is the caption label, up to the first full-width space:
+
+```md
+各策略的差异见[表 3-2](#tbl-ack-policies)，整体结构如[图 3-1](#fig-architecture)所示。
+```
+
+In the PDF these are clickable internal links. The build stops with an error if
+a link's text differs from the caption label (for example after renumbering) or
+if it points to an identifier that does not exist, so a stale reference cannot
+slip through. Section references work the same way through heading identifiers
+(`### 4.2 …  {#sec-token-index}` and `[4.2 节](#sec-token-index)`); their text is
+not checked. The rendering filter keeps
 the image and caption together. Figure numbering and explanations belong in the
 report, while typography belongs in the shared rendering files.
 

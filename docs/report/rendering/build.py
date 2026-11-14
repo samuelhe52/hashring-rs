@@ -130,19 +130,26 @@ def main():
     prepare(document)
     ast = work / "report.json"
     ast.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
-    tex = work / "report.tex"
-    run(["pandoc", str(ast), "--from", "json", "--to", "latex", "--standalone", "--citeproc",
-         "--lua-filter", str(rendering / "layout.lua"),
-         "--include-in-header", str(rendering / "header.tex"), "--output", str(tex)],
-        cwd=source.parent)
-    for pass_number in (1, 2):
-        with (work / f"xelatex-{pass_number}.log").open("w") as log:
-            try:
-                run(["xelatex", "-interaction=nonstopmode", "-halt-on-error", tex.name],
-                    cwd=work, stdout=log, stderr=subprocess.STDOUT)
-            except subprocess.CalledProcessError:
-                raise RuntimeError(f"XeLaTeX failed; inspect {log.name}") from None
-    shutil.copyfile(work / "report.pdf", output)
+    # Compile in a private directory: an editor that auto-builds .tex files it
+    # sees change (e.g. LaTeX Workshop) would otherwise race on report.aux.
+    with tempfile.TemporaryDirectory(prefix="report-tex-") as latex_dir:
+        latex_dir = Path(latex_dir)
+        tex = latex_dir / "report.tex"
+        run(["pandoc", str(ast), "--from", "json", "--to", "latex", "--standalone", "--citeproc",
+             "--wrap=none", "--lua-filter", str(rendering / "layout.lua"),
+             "--include-in-header", str(rendering / "header.tex"), "--output", str(tex)],
+            cwd=source.parent)
+        for pass_number in (1, 2):
+            log = latex_dir / f"xelatex-{pass_number}.log"
+            with log.open("w") as handle:
+                status = subprocess.run(
+                    ["xelatex", "-interaction=nonstopmode", "-halt-on-error", tex.name],
+                    cwd=latex_dir, stdout=handle, stderr=subprocess.STDOUT).returncode
+            if status != 0:
+                shutil.copyfile(tex, work / tex.name)
+                shutil.copyfile(log, work / log.name)
+                raise RuntimeError(f"XeLaTeX failed; inspect {work / log.name}")
+        shutil.copyfile(latex_dir / "report.pdf", output)
     print(output)
 
 
