@@ -337,6 +337,22 @@ Table: 表 5-4　复制批量等待的对照（6 节点、30 万键、$\mathrm{R
 
 ## 六、测试 {#sec-ch-testing}
 
+### 6.1 测试方法与环境 {#sec-test-method}
+
+### 6.2 功能正确性 {#sec-test-correctness}
+
+### 6.3 在线扩缩容 {#sec-test-scaling}
+
+### 6.4 故障转移与数据保留 {#sec-test-failover}
+
+### 6.5 负载均衡 {#sec-test-balance}
+
+### 6.6 性能与延迟 {#sec-test-performance}
+
+### 6.7 Redis 网关兼容性 {#sec-test-gateway}
+
+### 6.8 测试的局限 {#sec-test-limits}
+
 ## 七、总结
 
 本项目实现了多进程分布式内存缓存 hashring-rs：数据按一致性哈希分布在多个节点上，支持在线扩缩容、多副本和故障自动转移，现有 Redis 应用可通过网关直接接入。
