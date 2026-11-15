@@ -1,0 +1,451 @@
+- generic [ref=f66e3]:
+  - banner [ref=f66e4]:
+    - link "Hashring 实验结果首页" [ref=f66e5] [cursor=pointer]:
+      - /url: /
+      - generic [ref=f66e12]: hashring-rs
+    - generic [ref=f66e13]: 实验工作台
+    - generic [ref=f66e14]:
+      - generic [ref=f66e15]: 本地结果
+      - link "学习文档" [ref=f66e17] [cursor=pointer]:
+        - /url: /api/guide
+        - text: 学习文档 ↗
+  - main [ref=f66e18]:
+    - generic [ref=f66e19]:
+      - generic [ref=f66e20]:
+        - heading "实验结果" [level=1] [ref=f66e21]
+        - paragraph [ref=f66e22]: 查看配置，读懂每一次运行。
+      - button "刷新结果" [ref=f66e52] [cursor=pointer]
+    - generic [ref=f66e26]:
+      - complementary "实验运行列表" [ref=f66e27]:
+        - generic [ref=f66e28]:
+          - heading "全部运行" [level=2] [ref=f66e29]
+          - generic [ref=f66e30]: "2"
+        - searchbox "搜索运行名称" [ref=f66e35]
+        - generic [ref=f66e36]:
+          - combobox "筛选实验模式" [ref=f66e37] [cursor=pointer]:
+            - option "全部模式" [selected]
+            - option "latency"
+          - combobox "筛选运行状态" [ref=f66e38] [cursor=pointer]:
+            - option "全部状态" [selected]
+            - option "成功"
+            - option "失败"
+            - option "未完成"
+        - generic [ref=f66e39]:
+          - generic [ref=f66e40]: 2 次运行
+          - combobox "运行排序" [ref=f66e41] [cursor=pointer]:
+            - option "最新优先" [selected]
+            - option "最早优先"
+            - option "名称排序"
+        - list [ref=f66e53]:
+          - listitem [ref=f66e54]:
+            - button "latency 成功 my-latency 2026/10/28 01:33:57 3 节点 RF 3 27.56 s OwnerOnly 2,000 键" [pressed] [ref=f66e55] [cursor=pointer]:
+              - generic [ref=f66e56]:
+                - generic [ref=f66e57]: latency
+                - generic [ref=f66e58]: 成功
+              - strong [ref=f66e60]: my-latency
+              - generic [ref=f66e61]: 2026/10/28 01:33:57
+              - generic [ref=f66e62]:
+                - generic [ref=f66e63]: 3 节点
+                - generic [ref=f66e64]: RF 3
+                - generic [ref=f66e65]: 27.56 s
+              - generic [ref=f66e66]:
+                - text: OwnerOnly
+                - generic [ref=f66e67]: 2,000 键
+          - listitem [ref=f66e68]:
+            - button "latency 成功 dashboard-smoke 2026/10/28 01:07:30 3 节点 RF 3 27.51 s OwnerOnly 2,000 键" [ref=f66e69] [cursor=pointer]:
+              - generic [ref=f66e70]:
+                - generic [ref=f66e71]: latency
+                - generic [ref=f66e72]: 成功
+              - strong [ref=f66e74]: dashboard-smoke
+              - generic [ref=f66e75]: 2026/10/28 01:07:30
+              - generic [ref=f66e76]:
+                - generic [ref=f66e77]: 3 节点
+                - generic [ref=f66e78]: RF 3
+                - generic [ref=f66e79]: 27.51 s
+              - generic [ref=f66e80]:
+                - text: OwnerOnly
+                - generic [ref=f66e81]: 2,000 键
+        - paragraph [ref=f66e43]: 开始时间均为北京时间。
+      - region "运行详情" [ref=f66e44]:
+        - generic [ref=f66e82]:
+          - generic [ref=f66e83]:
+            - generic [ref=f66e84]:
+              - generic [ref=f66e85]: latency
+              - generic [ref=f66e86]: 成功
+            - heading "my-latency" [level=2] [ref=f66e88]
+            - paragraph [ref=f66e89]: my-latency-20261028-013354
+          - generic [ref=f66e90]:
+            - generic [ref=f66e91]: 2026/10/28 01:33:57
+            - generic [ref=f66e92]: 总耗时 27.56 s
+        - generic [ref=f66e93]:
+          - generic [ref=f66e94]:
+            - term [ref=f66e95]: 节点
+            - definition [ref=f66e96]: "3"
+          - generic [ref=f66e97]:
+            - term [ref=f66e98]: 期望 RF
+            - definition [ref=f66e99]: "3"
+          - generic [ref=f66e100]:
+            - term [ref=f66e101]: ACK 策略
+            - definition [ref=f66e102]: OwnerOnly
+          - generic [ref=f66e103]:
+            - term [ref=f66e104]: 键数
+            - definition [ref=f66e105]: 2,000
+          - generic [ref=f66e106]:
+            - term [ref=f66e107]: 值大小
+            - definition [ref=f66e108]: 128 B
+        - generic [ref=f66e109]:
+          - generic [aria-hidden] [ref=f66e110]: "!"
+          - paragraph [ref=f66e111]:
+            - strong [ref=f66e112]: 源码可复现性未满足
+            - generic [ref=f66e113]: 保留本次结果；正式引用前请核对构建与运行源码。
+        - navigation "详情视图" [ref=f66e114]:
+          - button "结果概览" [pressed] [ref=f66e115] [cursor=pointer]
+          - button "实验配置" [ref=f66e116] [cursor=pointer]
+          - button "原始文件" [ref=f66e117] [cursor=pointer]
+          - button "进程日志" [ref=f66e118] [cursor=pointer]
+        - generic [ref=f66e119]:
+          - generic [ref=f66e120]:
+            - generic [ref=f66e121]:
+              - heading "阶段表现" [level=3] [ref=f66e122]
+              - paragraph [ref=f66e123]: 正式计时结果，不含预热。
+            - generic [ref=f66e124]:
+              - text: 当前阶段
+              - combobox "当前阶段" [ref=f66e125] [cursor=pointer]:
+                - option "rate_0 · 500 ops/s"
+                - option "rate_1 · 1,000 ops/s" [selected]
+          - generic [ref=f66e126]:
+            - generic [ref=f66e127]:
+              - generic [ref=f66e128]: 实际成功速率
+              - strong [ref=f66e129]: 1,000ops/s
+              - generic [ref=f66e130]: 目标 1,000 ops/s
+            - generic [ref=f66e131]:
+              - generic [ref=f66e132]: GET p99
+              - strong [ref=f66e133]: 660µs
+              - generic [ref=f66e134]: 9,019 个样本
+            - generic [ref=f66e135]:
+              - generic [ref=f66e136]: PUT p99
+              - strong [ref=f66e137]: 755µs
+              - generic [ref=f66e138]: 874 个样本
+            - generic [ref=f66e139]:
+              - generic [ref=f66e140]: DELETE p99
+              - strong [ref=f66e141]: 613µs
+              - generic [ref=f66e142]: 107 个样本
+          - generic [ref=f66e143]:
+            - generic [ref=f66e144]:
+              - generic [ref=f66e145]:
+                - heading "延迟随负载的变化" [level=3] [ref=f66e146]
+                - paragraph [ref=f66e147]: 横轴为各阶段实际成功速率。
+              - generic "曲线操作类型" [ref=f66e148]:
+                - button "GET" [active] [pressed] [ref=f66e149] [cursor=pointer]
+                - button "PUT" [ref=f66e150] [cursor=pointer]
+                - button "DELETE" [ref=f66e151] [cursor=pointer]
+            - img "GET 阶段 p50 和 p99 延迟与实际速率曲线" [ref=f66e510]:
+              - img [ref=f66e154]:
+                - generic [ref=f66e156]:
+                  - generic [ref=f66e511]: µs
+                  - generic [ref=f66e512]: 实际速率（ops/s）
+                  - generic [ref=f66e513]: "0"
+                  - generic [ref=f66e514]: "100"
+                  - generic [ref=f66e515]: "200"
+                  - generic [ref=f66e516]: "300"
+                  - generic [ref=f66e517]: "400"
+                  - generic [ref=f66e518]: "500"
+                  - generic [ref=f66e519]: "600"
+                  - generic [ref=f66e520]: "700"
+                  - generic [ref=f66e521]: "800"
+                  - generic [ref=f66e522]: "0"
+                  - generic [ref=f66e523]: "200"
+                  - generic [ref=f66e524]: "400"
+                  - generic [ref=f66e525]: "600"
+                  - generic [ref=f66e526]: "800"
+                  - generic [ref=f66e527]: 1,000
+                  - generic [ref=f66e536]: GET p50
+                  - generic [ref=f66e539]: GET p99
+            - table [ref=f66e190]:
+              - caption [ref=f66e191]: 各阶段速率、计数和所选操作延迟
+              - rowgroup [ref=f66e192]:
+                - row [ref=f66e193]:
+                  - columnheader "阶段" [ref=f66e194]
+                  - columnheader "目标 / 实际 ops/s" [ref=f66e195]
+                  - columnheader "GET p50 / p99 µs" [ref=f66e196]
+                  - columnheader "issued / late" [ref=f66e197]
+                  - columnheader "重试" [ref=f66e198]
+                  - columnheader "错误" [ref=f66e199]
+                  - columnheader "发送端" [ref=f66e200]
+              - rowgroup [ref=f66e201]:
+                - row [ref=f66e202]:
+                  - rowheader [ref=f66e203]:
+                    - button "rate_0" [ref=f66e204] [cursor=pointer]
+                  - cell "500 / 500" [ref=f66e205]
+                  - cell "401 / 732" [ref=f66e206]
+                  - cell "5,000 / 0" [ref=f66e207]
+                  - cell "0" [ref=f66e208]
+                  - cell "全为 0" [ref=f66e209]
+                  - cell "正常" [ref=f66e210]
+                - row [ref=f66e211]:
+                  - rowheader [ref=f66e212]:
+                    - button "rate_1" [pressed] [ref=f66e213] [cursor=pointer]
+                  - cell "1,000 / 1,000" [ref=f66e214]
+                  - cell "321 / 660" [ref=f66e215]
+                  - cell "10,000 / 0" [ref=f66e216]
+                  - cell "0" [ref=f66e217]
+                  - cell "全为 0" [ref=f66e218]
+                  - cell "正常" [ref=f66e219]
+          - generic [ref=f66e220]:
+            - generic [ref=f66e221]:
+              - generic [ref=f66e222]:
+                - generic [ref=f66e223]:
+                  - heading "延迟分布" [level=3] [ref=f66e224]
+                  - paragraph [ref=f66e225]: rate_1 · 客户端端到端延迟
+                - generic [ref=f66e226]: µs
+              - img "这是一个图表，它由3个图表系列组成。第0个系列是一个表示DELETE的柱状图，其数据是——p50的数据是0，388，p95的数据是1，575，p99的数据是2，613，max的数据是3，795；第1个系列是一个表示GET的柱状图，其数据是——p50的数据是0，321，p95的数据是1，555，p99的数据是2，660，max的数据是3，1336；第2个系列是一个表示PUT的柱状图，其数据是——p50的数据是0，381，p95的数据是1，583，p99的数据是2，755，max的数据是3，2203。" [ref=f66e227]:
+                - img [ref=f66e229]:
+                  - generic [ref=f66e231]:
+                    - generic [ref=f66e232]: µs
+                    - generic [ref=f66e233]: "0"
+                    - generic [ref=f66e234]: "500"
+                    - generic [ref=f66e235]: 1,000
+                    - generic [ref=f66e236]: 1,500
+                    - generic [ref=f66e237]: 2,000
+                    - generic [ref=f66e238]: 2,500
+                    - generic [ref=f66e239]: p50
+                    - generic [ref=f66e240]: p95
+                    - generic [ref=f66e241]: p99
+                    - generic [ref=f66e242]: max
+                    - generic [ref=f66e257]: DELETE
+                    - generic [ref=f66e260]: GET
+                    - generic [ref=f66e263]: PUT
+            - generic [ref=f66e265]:
+              - generic [ref=f66e266]:
+                - generic [ref=f66e267]:
+                  - heading "节点负载" [level=3] [ref=f66e268]
+                  - paragraph [ref=f66e269]: rate_1 · Owner 键数
+                - combobox "节点负载指标" [ref=f66e270] [cursor=pointer]:
+                  - option "Owner 键数" [selected]
+                  - option "处理操作数"
+                  - option "CPU（单核 %）"
+              - img "这是一个图表，图表类型是柱状图。其数据是——node-1的数据是635，0，node-2的数据是534，1，node-3的数据是831，2。" [ref=f66e271]:
+                - img [ref=f66e273]:
+                  - generic [ref=f66e275]:
+                    - generic [ref=f66e276]: node-1
+                    - generic [ref=f66e277]: node-2
+                    - generic [ref=f66e278]: node-3
+                    - generic [ref=f66e279]: "0"
+                    - generic [ref=f66e280]: "200"
+                    - generic [ref=f66e281]: "400"
+                    - generic [ref=f66e282]: "600"
+                    - generic [ref=f66e283]: "800"
+                    - generic [ref=f66e284]: 1,000
+                    - generic [ref=f66e291]: "635"
+                    - generic [ref=f66e292]: "534"
+                    - generic [ref=f66e293]: "831"
+          - generic [ref=f66e294]:
+            - generic [ref=f66e295]:
+              - generic [ref=f66e296]:
+                - heading "逐项核对" [level=3] [ref=f66e297]
+                - paragraph [ref=f66e298]: 延迟单位 µs；max 为直方图桶上界。
+              - generic [ref=f66e299]: rate_1
+            - table [ref=f66e301]:
+              - caption [ref=f66e302]: 当前阶段延迟、成功操作数与样本数
+              - rowgroup [ref=f66e303]:
+                - row [ref=f66e304]:
+                  - columnheader "操作" [ref=f66e305]
+                  - columnheader "p50" [ref=f66e306]
+                  - columnheader "p95" [ref=f66e307]
+                  - columnheader "p99" [ref=f66e308]
+                  - columnheader "p999" [ref=f66e309]
+                  - columnheader "max" [ref=f66e310]
+                  - columnheader "max_observed" [ref=f66e311]
+                  - columnheader "超量程" [ref=f66e312]
+                  - columnheader "样本数" [ref=f66e313]
+                  - columnheader "成功操作数" [ref=f66e314]
+              - rowgroup [ref=f66e315]:
+                - row [ref=f66e316]:
+                  - rowheader "DELETE" [ref=f66e317]
+                  - cell "388" [ref=f66e318]
+                  - cell "575" [ref=f66e319]
+                  - cell "613" [ref=f66e320]
+                  - cell "795" [ref=f66e321]
+                  - cell "795" [ref=f66e322]
+                  - cell "795" [ref=f66e323]
+                  - cell "0" [ref=f66e324]
+                  - cell "107" [ref=f66e325]
+                  - cell "107" [ref=f66e326]
+                - row [ref=f66e327]:
+                  - rowheader "GET" [ref=f66e328]
+                  - cell "321" [ref=f66e329]
+                  - cell "555" [ref=f66e330]
+                  - cell "660" [ref=f66e331]
+                  - cell "861" [ref=f66e332]
+                  - cell "1,336" [ref=f66e333]
+                  - cell "1,336" [ref=f66e334]
+                  - cell "0" [ref=f66e335]
+                  - cell "9,019" [ref=f66e336]
+                  - cell "9,019" [ref=f66e337]
+                - row [ref=f66e338]:
+                  - rowheader "PUT" [ref=f66e339]
+                  - cell "381" [ref=f66e340]
+                  - cell "583" [ref=f66e341]
+                  - cell "755" [ref=f66e342]
+                  - cell "2,203" [ref=f66e343]
+                  - cell "2,203" [ref=f66e344]
+                  - cell "2,203" [ref=f66e345]
+                  - cell "0" [ref=f66e346]
+                  - cell "874" [ref=f66e347]
+                  - cell "874" [ref=f66e348]
+            - table [ref=f66e350]:
+              - caption [ref=f66e351]: 当前阶段每个节点的负载
+              - rowgroup [ref=f66e352]:
+                - row [ref=f66e353]:
+                  - columnheader "节点" [ref=f66e354]
+                  - columnheader "Owner 键数" [ref=f66e355]
+                  - columnheader "处理操作数" [ref=f66e356]
+                  - columnheader "CPU（单核 %）" [ref=f66e357]
+              - rowgroup [ref=f66e358]:
+                - row [ref=f66e359]:
+                  - rowheader "node-1" [ref=f66e360]
+                  - cell "635" [ref=f66e361]
+                  - cell "3,177" [ref=f66e362]
+                  - cell "7.3" [ref=f66e363]
+                - row [ref=f66e364]:
+                  - rowheader "node-2" [ref=f66e365]
+                  - cell "534" [ref=f66e366]
+                  - cell "2,739" [ref=f66e367]
+                  - cell "6.6" [ref=f66e368]
+                - row [ref=f66e369]:
+                  - rowheader "node-3" [ref=f66e370]
+                  - cell "831" [ref=f66e371]
+                  - cell "4,084" [ref=f66e372]
+                  - cell "8.8" [ref=f66e373]
+            - generic [ref=f66e374]:
+              - generic [ref=f66e375]:
+                - term [ref=f66e376]: 键数 max/mean
+                - definition [ref=f66e377]: "1.2465"
+              - generic [ref=f66e378]:
+                - term [ref=f66e379]: 键数 CV
+                - definition [ref=f66e380]: "0.1849"
+              - generic [ref=f66e381]:
+                - term [ref=f66e382]: 操作数 max/mean
+                - definition [ref=f66e383]: "1.2252"
+              - generic [ref=f66e384]:
+                - term [ref=f66e385]: 操作数 CV
+                - definition [ref=f66e386]: "0.168"
+            - paragraph [ref=f66e387]: “—”表示未提供。Owner 键数不重复计入 follower 副本。样本包含返回的失败请求；成功操作数单独列出。
+          - generic [ref=f66e388]:
+            - generic [ref=f66e390]:
+              - heading "批量步骤吞吐" [level=3] [ref=f66e391]
+              - paragraph [ref=f66e392]: 预加载、校验等步骤，与固定速率负载分别记录。
+            - table [ref=f66e394]:
+              - caption [ref=f66e395]: 批量操作吞吐
+              - rowgroup [ref=f66e396]:
+                - row [ref=f66e397]:
+                  - columnheader "步骤" [ref=f66e398]
+                  - columnheader "操作数" [ref=f66e399]
+                  - columnheader "耗时 s" [ref=f66e400]
+                  - columnheader "吞吐 ops/s" [ref=f66e401]
+              - rowgroup [ref=f66e402]:
+                - row [ref=f66e403]:
+                  - rowheader "初始读校验" [ref=f66e404]
+                  - cell "2,000" [ref=f66e405]
+                  - cell "0.0608" [ref=f66e406]
+                  - cell "32,909.86" [ref=f66e407]
+                - row [ref=f66e408]:
+                  - rowheader "初始写入" [ref=f66e409]
+                  - cell "2,000" [ref=f66e410]
+                  - cell "0.0705" [ref=f66e411]
+                  - cell "28,366.14" [ref=f66e412]
+          - generic [ref=f66e413]:
+            - generic [ref=f66e415]:
+              - heading "空闲基线" [level=3] [ref=f66e416]
+              - paragraph [ref=f66e417]: 负载结束后的空闲集群采样，不代表负载下延迟。单位 µs。
+            - table [ref=f66e419]:
+              - caption [ref=f66e420]: 空闲基线延迟
+              - rowgroup [ref=f66e421]:
+                - row [ref=f66e422]:
+                  - columnheader "路径" [ref=f66e423]
+                  - columnheader "p50" [ref=f66e424]
+                  - columnheader "p95" [ref=f66e425]
+                  - columnheader "p99" [ref=f66e426]
+                  - columnheader "max" [ref=f66e427]
+                  - columnheader "样本数" [ref=f66e428]
+              - rowgroup [ref=f66e429]:
+                - row [ref=f66e430]:
+                  - rowheader "客户端 PUT" [ref=f66e431]
+                  - cell "362" [ref=f66e432]
+                  - cell "559" [ref=f66e433]
+                  - cell "631" [ref=f66e434]
+                  - cell "665" [ref=f66e435]
+                  - cell "128" [ref=f66e436]
+                - row [ref=f66e437]:
+                  - rowheader "直连 owner RPC PUT" [ref=f66e438]
+                  - cell "377" [ref=f66e439]
+                  - cell "577" [ref=f66e440]
+                  - cell "629" [ref=f66e441]
+                  - cell "667" [ref=f66e442]
+                  - cell "128" [ref=f66e443]
+          - generic [ref=f66e444]:
+            - generic [ref=f66e446]:
+              - heading "初始写入后的节点压力" [level=3] [ref=f66e447]
+              - paragraph [ref=f66e448]: 去重回执占用与复制状态。
+            - table [ref=f66e450]:
+              - caption [ref=f66e451]: 初始写入后的节点压力
+              - rowgroup [ref=f66e452]:
+                - row [ref=f66e453]:
+                  - columnheader "节点" [ref=f66e454]
+                  - columnheader "去重占用 B" [ref=f66e455]
+                  - columnheader "去重容量 B" [ref=f66e456]
+                  - columnheader "owner 拒绝" [ref=f66e457]
+                  - columnheader "follower 拒绝" [ref=f66e458]
+                  - columnheader "复制 RPC 重试" [ref=f66e459]
+                  - columnheader "队列峰值" [ref=f66e460]
+              - rowgroup [ref=f66e461]:
+                - row [ref=f66e462]:
+                  - rowheader "node-1" [ref=f66e463]
+                  - cell "668,000" [ref=f66e464]
+                  - cell "134,217,728" [ref=f66e465]
+                  - cell "0" [ref=f66e466]
+                  - cell "0" [ref=f66e467]
+                  - cell "0" [ref=f66e468]
+                  - cell "18" [ref=f66e469]
+                - row [ref=f66e470]:
+                  - rowheader "node-2" [ref=f66e471]
+                  - cell "668,000" [ref=f66e472]
+                  - cell "134,217,728" [ref=f66e473]
+                  - cell "0" [ref=f66e474]
+                  - cell "0" [ref=f66e475]
+                  - cell "0" [ref=f66e476]
+                  - cell "13" [ref=f66e477]
+                - row [ref=f66e478]:
+                  - rowheader "node-3" [ref=f66e479]
+                  - cell "668,000" [ref=f66e480]
+                  - cell "134,217,728" [ref=f66e481]
+                  - cell "0" [ref=f66e482]
+                  - cell "0" [ref=f66e483]
+                  - cell "0" [ref=f66e484]
+                  - cell "21" [ref=f66e485]
+          - generic [ref=f66e486]:
+            - generic [ref=f66e488]:
+              - heading "其他观测" [level=3] [ref=f66e489]
+              - paragraph [ref=f66e490]: 实验程序记录的结果；完整结构见原始文件。
+            - generic [ref=f66e491]:
+              - generic [ref=f66e492]:
+                - term [ref=f66e493]: 初始完整 RF（s）
+                - definition [ref=f66e494]: "0.7702"
+              - generic [ref=f66e495]:
+                - term [ref=f66e496]: 删除池键数
+                - definition [ref=f66e497]: "180"
+              - generic [ref=f66e498]:
+                - term [ref=f66e499]: 负载键分布
+                - definition [ref=f66e500]: uniform
+              - generic [ref=f66e501]:
+                - term [ref=f66e502]: 负载键空间
+                - definition [ref=f66e503]: 2,000
+              - generic [ref=f66e504]:
+                - term [ref=f66e505]: 负载操作配比
+                - definition [ref=f66e506]: 90:9:1
+              - generic [ref=f66e507]:
+                - term [ref=f66e508]: 负载后核验键数
+                - definition [ref=f66e509]: 2,000
+    - generic [ref=f66e49]:
+      - generic [ref=f66e50]: hashring-rs · 一致性哈希实验
+      - generic [ref=f66e51]: 让每个读数，都有出处。

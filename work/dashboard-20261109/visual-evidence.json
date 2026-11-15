@@ -1,0 +1,25 @@
+{
+  "contract": "本地 hashring-rs 实验工作台。浅暖纸面、陶橙与青色数据对照。首屏可读当前运行和工具入口，桌面案例与回放左侧图固定、右侧能浏览。数据来自记录，导出保留图题、单位、来源。",
+  "targetViewports": ["1440x900", "390x844"],
+  "accessibility": {
+    "status": "pass",
+    "evidence": "Chrome 用 Esc 和外部点击关闭窗口，焦点回到入口。目录跳转聚焦目标区块。系统减少动效时比例条直接呈现。正文灰字在纸面约 4.80:1，目录选中文字约 4.94:1。"
+  },
+  "responsive": {
+    "status": "pass",
+    "evidence": "桌面右侧可向下滚动 150px 以上，左侧绘图区域留在原处。390px 窄屏概览和案例窗无页面级横向溢出。720px 工作区检查通过。"
+  },
+  "contentStates": {
+    "loading": { "status": "pass", "evidence": "暂缓列表响应时显示正在读取运行结果。" },
+    "empty": { "status": "pass", "evidence": "空列表提供 results 放置路径与刷新动作。" },
+    "error": { "status": "pass", "evidence": "列表返回 503 时明确显示读取失败，恢复请求后可重试。" },
+    "partial": { "status": "pass", "evidence": "真实停止运行显示结果尚不完整，保留 manifest 和事件。" },
+    "success": { "status": "pass", "evidence": "生产页面显示原有真实读数，表单启动后按实时事件更新，成功切换到新结果。" },
+    "permission": { "status": "not-applicable", "reason": "实验工作台只在本地回环地址提供，组长规格无登录或授权界面。同源写入边界已单独用 HTTP 测试覆盖。" }
+  },
+  "renderedEvidence": [
+    { "viewport": "1440x900", "artifact": "case-desktop.png", "observation": "阶段对比、可下载图表、右栏读数、事件与目录同屏。" },
+    { "viewport": "1440x900", "artifact": "live-desktop.png", "observation": "生产页面发起的真实小规模实验正在显示窗口速率与已收到事件。" },
+    { "viewport": "390x844", "artifact": "mobile.png", "observation": "窄屏概览纵向排布，顶部目录入口与结果操作分开。" }
+  ]
+}

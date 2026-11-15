@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="520" viewBox="0 0 1100 520"><rect width="100%" height="100%" fill="#fbfaf7"/><text x="24" y="35" fill="#282720" font-size="22" font-family="system-ui, Microsoft YaHei, sans-serif">GET p99 阶段对比（µs）</text><svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1100" height="416" version="1.1" baseProfile="full" viewBox="0 0 1100 416" y="54">
+<rect width="1100" height="416" x="0" y="0" fill="none"/>
+<path d="M85.5 15L85.5 361" fill="none" pointer-events="visible" stroke="#e5e0d7" stroke-dasharray="4,2" class="zr2-cls-3"/>
+<path d="M202.5 15L202.5 361" fill="none" pointer-events="visible" stroke="#e5e0d7" stroke-dasharray="4,2" class="zr2-cls-3"/>
+<path d="M318.5 15L318.5 361" fill="none" pointer-events="visible" stroke="#e5e0d7" stroke-dasharray="4,2" class="zr2-cls-3"/>
+<path d="M435.5 15L435.5 361" fill="none" pointer-events="visible" stroke="#e5e0d7" stroke-dasharray="4,2" class="zr2-cls-3"/>
+<path d="M552.5 15L552.5 361" fill="none" pointer-events="visible" stroke="#e5e0d7" stroke-dasharray="4,2" class="zr2-cls-3"/>
+<path d="M668.5 15L668.5 361" fill="none" pointer-events="visible" stroke="#e5e0d7" stroke-dasharray="4,2" class="zr2-cls-3"/>
+<path d="M785.5 15L785.5 361" fill="none" pointer-events="visible" stroke="#e5e0d7" stroke-dasharray="4,2" class="zr2-cls-3"/>
+<path d="M902.5 15L902.5 361" fill="none" pointer-events="visible" stroke="#e5e0d7" stroke-dasharray="4,2" class="zr2-cls-3"/>
+<path d="M1019.5 15L1019.5 361" fill="none" pointer-events="visible" stroke="#e5e0d7" stroke-dasharray="4,2" class="zr2-cls-3"/>
+<text dominant-baseline="central" text-anchor="start" style="font-size:13px;font-family:system-ui, Microsoft YaHei, sans-serif;" transform="translate(1027.8003 361)" fill="#736f65">µs</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:12px;font-family:system-ui, Microsoft YaHei, sans-serif;" xml:space="preserve" transform="translate(77.1172 101.5)" fill="#54555a">500 ops/s</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:12px;font-family:system-ui, Microsoft YaHei, sans-serif;" xml:space="preserve" transform="translate(77.1172 274.5)" fill="#54555a">1,000 ops/s</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:12px;font-family:system-ui, Microsoft YaHei, sans-serif;" y="6" transform="translate(85.1172 369)" fill="#54555a">0</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:12px;font-family:system-ui, Microsoft YaHei, sans-serif;" y="6" transform="translate(201.8276 369)" fill="#54555a">100</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:12px;font-family:system-ui, Microsoft YaHei, sans-serif;" y="6" transform="translate(318.538 369)" fill="#54555a">200</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:12px;font-family:system-ui, Microsoft YaHei, sans-serif;" y="6" transform="translate(435.2484 369)" fill="#54555a">300</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:12px;font-family:system-ui, Microsoft YaHei, sans-serif;" y="6" transform="translate(551.9587 369)" fill="#54555a">400</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:12px;font-family:system-ui, Microsoft YaHei, sans-serif;" y="6" transform="translate(668.6691 369)" fill="#54555a">500</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:12px;font-family:system-ui, Microsoft YaHei, sans-serif;" y="6" transform="translate(785.3795 369)" fill="#54555a">600</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:12px;font-family:system-ui, Microsoft YaHei, sans-serif;" y="6" transform="translate(902.0899 369)" fill="#54555a">700</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:12px;font-family:system-ui, Microsoft YaHei, sans-serif;" y="6" transform="translate(1018.8003 369)" fill="#54555a">800</text>
+<path d="M85.1 89.5l933.7 0l0 24l-933.7 0Z" fill="#f3f1ec" class="zr2-cls-3"/>
+<path d="M85.1 262.5l933.7 0l0 24l-933.7 0Z" fill="#f3f1ec" class="zr2-cls-3"/>
+<path d="M85.1 89.5L935.4 89.5A4 4 0 0 1 939.4 93.5L939.4 109.5A4 4 0 0 1 935.4 113.5L85.1 113.5L85.1 89.5Z" fill="#b4532a" ecmeta_series_index="0" ecmeta_data_index="0" ecmeta_ssr_type="chart" class="zr2-cls-4"/>
+<path d="M85.1 262.5L851.4 262.5A4 4 0 0 1 855.4 266.5L855.4 282.5A4 4 0 0 1 851.4 286.5L85.1 286.5L85.1 262.5Z" fill="#2d7774" ecmeta_series_index="0" ecmeta_data_index="1" ecmeta_ssr_type="chart" class="zr2-cls-5"/>
+<text dominant-baseline="central" text-anchor="start" style="font-size:13px;font-family:system-ui, Microsoft YaHei, sans-serif;" transform="translate(944.4372 101.5)" fill="#333" stroke="rgb(255,255,255)" stroke-width="2" paint-order="stroke" stroke-miterlimit="2">732</text>
+<text dominant-baseline="central" text-anchor="start" style="font-size:13px;font-family:system-ui, Microsoft YaHei, sans-serif;" transform="translate(860.4057 274.5)" fill="#333" stroke="rgb(255,255,255)" stroke-width="2" paint-order="stroke" stroke-miterlimit="2">660</text>
+<style><![CDATA[
+.zr2-cls-3:hover {
+pointer-events:none;
+}
+.zr2-cls-4:hover {
+cursor:pointer;
+fill:rgba(198,91,46,1);
+}
+.zr2-cls-5:hover {
+cursor:pointer;
+fill:rgba(49,130,127,1);
+}
+
+]]>
+
+</style>
+</svg><text x="24" y="502" fill="#736f65" font-size="13" font-family="system-ui, Microsoft YaHei, sans-serif">hashring-rs / my-latency-20261028-013354 / 目标速率分组</text></svg>

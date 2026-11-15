@@ -1,0 +1,28 @@
+- generic [ref=f1e3]:
+  - banner [ref=f1e4]:
+    - link "Hashring 实验结果首页" [ref=f1e5] [cursor=pointer]:
+      - /url: /
+      - generic [ref=f1e12]: hashring-rs
+    - generic [ref=f1e13]: 实验工作台
+    - generic [ref=f1e14]:
+      - generic [ref=f1e15]: 本地结果
+      - link "汇报攻略 ↗" [ref=f1e17] [cursor=pointer]:
+        - /url: /api/reporting
+      - link "学习文档 ↗" [ref=f1e18] [cursor=pointer]:
+        - /url: /api/guide
+  - main [ref=f1e19]:
+    - generic [ref=f1e20]:
+      - generic [ref=f1e21]:
+        - paragraph [ref=f1e22]: CONSISTENT HASHING / RESULTS
+        - heading "hashring-rs 实验工作台" [level=1] [ref=f1e23]
+      - generic [ref=f1e24]:
+        - button "切换运行 0" [ref=f1e25] [cursor=pointer]:
+          - text: 切换运行
+          - generic [ref=f1e26]: "0"
+        - button "刷新结果" [disabled] [ref=f1e27]
+    - region "运行概览" [ref=f1e30]:
+      - status [ref=f1e31]:
+        - heading "正在读取运行结果" [level=2] [ref=f1e33]
+    - generic [ref=f1e34]:
+      - generic [ref=f1e35]: hashring-rs · 一致性哈希实验
+      - generic [ref=f1e36]: 读数来自原始记录 · 缺失项显示 —

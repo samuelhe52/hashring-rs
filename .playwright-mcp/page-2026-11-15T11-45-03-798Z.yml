@@ -1,0 +1,198 @@
+- application [ref=e14]:
+  - generic [ref=e17]:
+    - link "跳到主要内容" [ref=e18] [cursor=pointer]
+    - generic [ref=e22]:
+      - button "应用启动器" [ref=e24]:
+        - generic [aria-hidden] [ref=e26]: 
+      - generic [ref=e28]:
+        - button "所有文件夹" [ref=e558]:
+          - generic [aria-hidden] [ref=e561]: 
+        - search [ref=e33]:
+          - generic [ref=e34]:
+            - status
+            - button "退出搜索" [ref=e562] [cursor=pointer]:
+              - generic [aria-hidden] [ref=e566]: 
+            - combobox "搜索电子邮件、会议、文件等。" [ref=e42]: assignment
+            - button "搜索筛选器，所有文件夹，已应用其他 0 个筛选器" [ref=e568] [cursor=pointer]:
+              - generic [aria-hidden] [ref=e572]: 
+          - button "搜索" [ref=e573] [cursor=pointer]:
+            - generic [aria-hidden] [ref=e577]: 
+        - generic [ref=e44]:
+          - button "积分商城" [ref=e46]:
+            - generic [ref=e47]: "1175"
+          - button "购买 Microsoft 365" [ref=e54]:
+            - generic [aria-hidden] [ref=e57]: 
+          - button "通知" [ref=e59]:
+            - generic [aria-hidden] [ref=e62]: 
+          - button "访问其他功能" [ref=e63]:
+            - generic [aria-hidden] [ref=e65]: 
+      - button "陈 阳" [ref=e68]:
+        - img [aria-hidden] [ref=e69]:
+          - generic [aria-hidden] [ref=e71]: 
+    - generic [ref=e74]:
+      - generic [ref=e78]:
+        - navigation "left-rail-appbar" [ref=e80]:
+          - generic "邮件" [ref=e82]:
+            - button "邮件" [pressed] [ref=e83]:
+              - generic [ref=e84]:
+                - generic:
+                  - generic:
+                    - img "邮件"
+          - generic "日历" [ref=e86]:
+            - button "日历" [ref=e87]:
+              - generic [ref=e88]:
+                - generic:
+                  - generic:
+                    - img "日历"
+          - generic "人员" [ref=e90]:
+            - button "人员" [ref=e91]:
+              - generic [ref=e92]:
+                - generic:
+                  - generic:
+                    - img "人员"
+          - generic "To Do" [ref=e94]:
+            - button "To Do" [ref=e95]:
+              - generic [ref=e96]:
+                - generic:
+                  - generic:
+                    - img "To Do"
+          - generic "Word" [ref=e98]:
+            - button "Word" [ref=e99]:
+              - generic [ref=e100]:
+                - generic:
+                  - generic:
+                    - img "Word"
+          - generic "Excel" [ref=e102]:
+            - button "Excel" [ref=e103]:
+              - generic [ref=e104]:
+                - generic:
+                  - generic:
+                    - img "Excel"
+          - generic "PowerPoint" [ref=e106]:
+            - button "PowerPoint" [ref=e107]:
+              - generic [ref=e108]:
+                - generic:
+                  - generic:
+                    - img "PowerPoint"
+          - status [ref=e109]
+        - button [ref=e112]:
+          - generic [ref=e113]:
+            - generic:
+              - generic:
+                - generic [aria-hidden]: 
+      - generic [ref=e117]:
+        - region "功能区" [ref=e118]:
+          - generic [ref=e120]:
+            - generic [ref=e121]:
+              - button "隐藏导航窗格" [ref=e123]:
+                - generic [aria-hidden] [ref=e125]: 
+              - button "文件" [ref=e126]
+              - toolbar [ref=e132]:
+                - tablist "功能区选项卡" [ref=e134]:
+                  - tab "主页" [ref=e136] [cursor=pointer]
+                  - tab "查看" [ref=e138] [cursor=pointer]
+                  - tab "帮助" [ref=e140] [cursor=pointer]
+                  - tab "搜索" [selected] [ref=e580] [cursor=pointer]
+              - menuitem "做希冀平台作业, 2026 年 11 月 15 日 星期日，22:30 到 22:45, Free" [ref=e145] [cursor=pointer]:
+                - generic [ref=e148]:
+                  - generic [aria-hidden] [ref=e151]: 
+                  - generic [ref=e152]:
+                    - generic [ref=e153]: 做希冀平台作业
+                    - generic [ref=e154]: 22:30
+            - toolbar [ref=e159]:
+              - tabpanel "搜索" [ref=e619]:
+                - generic [ref=e168]:
+                  - group "精简条件" [ref=e623]:
+                    - generic [ref=e624]:
+                      - generic [ref=e626]:
+                        - generic [ref=e628]:
+                          - button "带有附件" [ref=e629]:
+                            - generic [ref=e630]: 
+                          - button "未读" [ref=e634]:
+                            - generic [ref=e635]: 
+                          - button "提及我" [ref=e639]:
+                            - generic [ref=e640]: 
+                        - generic [ref=e645]:
+                          - button "已标记" [ref=e646]:
+                            - generic [ref=e647]: 
+                          - button "高重要性" [ref=e651]:
+                            - generic [ref=e652]: 
+                          - button "收件人是我" [ref=e656]:
+                            - generic [ref=e657]: 
+                      - generic [ref=e661]: 精简条件
+                  - group "搜索工具" [ref=e668]:
+                    - generic [ref=e669]:
+                      - generic [ref=e673]:
+                        - button "突出显示" [pressed] [ref=e674]:
+                          - generic [ref=e675]:  
+                          - generic [ref=e679]: 在搜索结果中突出显示匹配的搜索词
+                        - button "关闭搜索" [ref=e680]:
+                          - generic [ref=e681]: 
+                      - generic [ref=e686]: 搜索工具
+                - button "切换布局" [ref=e347]:
+                  - generic [aria-hidden] [ref=e351]: 
+        - generic [ref=e356]:
+          - generic [ref=e362]:
+            - region "导航窗格" [ref=e363]:
+              - generic [ref=e368]:
+                - tree [ref=e369]:
+                  - heading "导航窗格" [level=2] [ref=e370]
+                  - group [ref=e372]:
+                    - treeitem "收藏夹" [expanded] [level=1] [ref=e373] [cursor=pointer]:
+                      - button [aria-hidden] [ref=e374]:
+                        - generic [aria-hidden] [ref=e376]: 
+                    - generic [ref=e379]:
+                      - treeitem "收件箱" [level=2] [ref=e381] [cursor=pointer]:
+                        - generic [aria-hidden] [ref=e384]: 
+                      - treeitem "已发送邮件" [level=2] [ref=e387] [cursor=pointer]:
+                        - generic [aria-hidden] [ref=e390]: 
+                      - treeitem "草稿" [level=2] [ref=e393] [cursor=pointer]:
+                        - generic [aria-hidden] [ref=e396]: 
+                  - group [ref=e400]:
+                    - treeitem "outlook_BE6DE213BDB04E51@outlook.com" [expanded] [level=1] [ref=e402] [cursor=pointer]:
+                      - button [aria-hidden] [ref=e403]:
+                        - generic [aria-hidden] [ref=e405]: 
+                    - group "outlook_BE6DE213BDB04E51@outlook.com" [ref=e409]:
+                      - treeitem "收件箱" [level=2] [ref=e585] [cursor=pointer]:
+                        - generic [aria-hidden] [ref=e586]: 
+                      - treeitem "垃圾邮件" [level=2] [ref=e418] [cursor=pointer]:
+                        - generic [aria-hidden] [ref=e421]: 
+                      - treeitem "草稿" [level=2] [ref=e424] [cursor=pointer]:
+                        - generic [aria-hidden] [ref=e427]: 
+                      - treeitem "已发送邮件" [level=2] [ref=e430] [cursor=pointer]:
+                        - generic [aria-hidden] [ref=e433]: 
+                      - treeitem "已删除邮件" [level=2] [ref=e436] [cursor=pointer]:
+                        - generic [aria-hidden] [ref=e439]: 
+                      - treeitem "存档" [level=2] [ref=e442] [cursor=pointer]:
+                        - generic [aria-hidden] [ref=e445]: 
+                      - treeitem "对话历史记录" [level=2] [ref=e448] [cursor=pointer]:
+                        - generic [aria-hidden] [ref=e451]: 
+                      - treeitem "注释" [level=2] [ref=e454] [cursor=pointer]:
+                        - generic [aria-hidden] [ref=e457]: 
+                    - treeitem "转到组. 组 - 0 封未读" [level=1] [ref=e461] [cursor=pointer]:
+                      - generic [aria-hidden] [ref=e464]: 
+                      - generic [ref=e465]: 转到组
+                - status
+            - generic [ref=e591]:
+              - complementary "邮件列表" [ref=e594]:
+                - generic [ref=e597]:
+                  - heading "结果" [level=2] [ref=e599]
+                  - generic [ref=e691]:
+                    - button "拇指向上反馈" [ref=e692]:
+                      - generic [aria-hidden] [ref=e694]: 
+                    - button "拇指向下反馈" [ref=e695]:
+                      - generic [aria-hidden] [ref=e697]: 
+                - generic [ref=e603]:
+                  - generic [ref=e604]: 未找到任何内容。
+                  - generic [ref=e708]: 请尝试使用其他关键字。
+                - alert [ref=e605]
+              - main "阅读窗格" [ref=e608]:
+                - alert [ref=e614]
+            - generic [ref=e544]:
+              - iframe [ref=e707]:
+                - iframe [ref=f19e1]
+              - generic [ref=e549] [cursor=pointer]:
+                - generic [ref=e550]: 广告
+                - img "设置广告首选项" [ref=e552]
+          - generic:
+            - status

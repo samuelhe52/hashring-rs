@@ -1,0 +1,15 @@
+- generic [ref=e1]:
+  - banner:
+    - heading "hashring-rs 实验工作台" [level=1] [ref=e2]
+    - generic:
+      - button "切换运行 0" [ref=e10] [cursor=pointer]:
+        - text: 切换运行
+        - generic [ref=e11]: "0"
+      - button "刷新结果" [disabled] [ref=e12]
+      - button "运行实验" [ref=e15] [cursor=pointer]
+  - main:
+    - region "运行概览":
+      - status [ref=e16]:
+        - heading "正在读取运行结果" [level=2] [ref=e18]
+    - generic: 数据来自本地实验记录。缺失项以 — 表示。
+  - button "打开完整目录" [ref=e20] [cursor=pointer]

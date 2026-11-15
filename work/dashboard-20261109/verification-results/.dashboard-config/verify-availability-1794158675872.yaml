@@ -1,0 +1,7 @@
+mode: availability
+nodes: 4
+keys: 300
+virtual_nodes: 32
+concurrency: 8
+worker_threads: 2
+coordinator_worker_threads: 2

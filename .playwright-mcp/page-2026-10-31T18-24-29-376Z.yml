@@ -1,0 +1,119 @@
+- generic [ref=f52e3]:
+  - banner [ref=f52e4]:
+    - heading [level=1] [ref=f52e5]:
+      - text: Consistent
+      - emphasis [ref=f52e6]: Hashing
+    - paragraph [ref=f52e7]: What breaks when a server joins or dies, and what a hash ring does about it — measured, not asserted.
+    - generic [ref=f52e8]: 500 keys · 32-bit ring · runs in your browser
+    - link "source & 60 tests →" [ref=f52e9] [cursor=pointer]:
+      - /url: https://github.com/NeelVinay/consistent-hashing-visualizer
+  - main [ref=f52e10]:
+    - navigation "The argument" [ref=f52e11]:
+      - button "1 Naive modulo A fifth server joins 81.4% of keys moved" [pressed] [ref=f52e13] [cursor=pointer]:
+        - generic [ref=f52e14]: "1"
+        - generic [ref=f52e15]:
+          - generic [ref=f52e16]: Naive modulo
+          - generic [ref=f52e17]: A fifth server joins
+          - generic [ref=f52e18]: 81.4% of keys moved
+      - button "2 The hash ring A fifth server joins 23.8% of keys moved" [ref=f52e19] [cursor=pointer]:
+        - generic [ref=f52e20]: "2"
+        - generic [ref=f52e21]:
+          - generic [ref=f52e22]: The hash ring
+          - generic [ref=f52e23]: A fifth server joins
+          - generic [ref=f52e24]: 23.8% of keys moved
+      - button "3 One point per server A server fails 100% onto the busiest server" [ref=f52e25] [cursor=pointer]:
+        - generic [ref=f52e26]: "3"
+        - generic [ref=f52e27]:
+          - generic [ref=f52e28]: One point per server
+          - generic [ref=f52e29]: A server fails
+          - generic [ref=f52e30]: 100% onto the busiest server
+      - button "4 150 points per server A server fails 55% onto the busiest server" [ref=f52e31] [cursor=pointer]:
+        - generic [ref=f52e32]: "4"
+        - generic [ref=f52e33]:
+          - generic [ref=f52e34]: 150 points per server
+          - generic [ref=f52e35]: A server fails
+          - generic [ref=f52e36]: 55% onto the busiest server
+      - button "5 Three copies of each key A server fails 0 keys lost" [ref=f52e37] [cursor=pointer]:
+        - generic [ref=f52e38]: "5"
+        - generic [ref=f52e39]:
+          - generic [ref=f52e40]: Three copies of each key
+          - generic [ref=f52e41]: A server fails
+          - generic [ref=f52e42]: 0 keys lost
+    - generic [ref=f52e43]:
+      - generic [ref=f52e44]:
+        - strong [ref=f52e45]: Naive modulo
+        - generic [ref=f52e46]: hash(key) % N
+      - generic [ref=f52e47]:
+        - generic [ref=f52e48]:
+          - generic [ref=f52e49]: Before · 4 servers
+          - img "4 servers before the change" [ref=f52e51]:
+            - generic [ref=f52e553]:
+              - generic [ref=f52e554]: "4"
+              - generic [ref=f52e555]: SERVERS
+        - generic [ref=f52e556]:
+          - generic [ref=f52e557]: After · 5 servers · moved keys ringed
+          - img "5 servers after the change" [ref=f52e559]:
+            - generic [ref=f52e1061]:
+              - generic [ref=f52e1062]: 81.4%
+              - generic [ref=f52e1063]: KEYS MOVED
+      - paragraph [ref=f52e1064]: Each key goes to hash(key) % N. The server count is inside the formula, so changing it changes every answer. Every key is recomputed from scratch — including the ones on servers that never changed.
+    - complementary [ref=f52e1065]:
+      - generic [ref=f52e1066]:
+        - generic [ref=f52e1067]: A fifth server joins
+        - generic [ref=f52e1068]: 81.4%
+        - generic [ref=f52e1069]: of keys moved
+      - generic [ref=f52e1070]:
+        - generic [ref=f52e1071]: Measured
+        - generic [ref=f52e1072]:
+          - generic [ref=f52e1073]:
+            - generic [ref=f52e1074]: Keys that moved
+            - generic [ref=f52e1075]: 407 / 500
+          - generic [ref=f52e1076]:
+            - generic [ref=f52e1077]: Largest single share
+            - generic [ref=f52e1078]: 27%
+          - generic [ref=f52e1079]:
+            - generic [ref=f52e1080]: Load imbalance
+            - generic [ref=f52e1081]: 1.56× → 1.42×
+      - generic [ref=f52e1082]:
+        - generic [ref=f52e1083]: Load per server
+        - generic [ref=f52e1084]:
+          - generic [ref=f52e1086]:
+            - generic [ref=f52e1087]: server-1
+            - generic [ref=f52e1089]: "104"
+          - generic [ref=f52e1094]:
+            - generic [ref=f52e1095]: server-2
+            - generic [ref=f52e1097]: "94"
+          - generic [ref=f52e1102]:
+            - generic [ref=f52e1103]: server-3
+            - generic [ref=f52e1105]: "112"
+          - generic [ref=f52e1110]:
+            - generic [ref=f52e1111]: server-4
+            - generic [ref=f52e1113]: "79"
+          - generic [ref=f52e1118]:
+            - generic [ref=f52e1119]: server-5
+            - generic [ref=f52e1121]: "111"
+          - generic [ref=f52e1124]: dashed = before · keys held
+      - paragraph [ref=f52e1125]:
+        - text: A key only stays put when
+        - generic [ref=f52e1126]: hash % 4
+        - text: and
+        - generic [ref=f52e1127]: hash % 5
+        - text: agree — one value in 5. So
+        - generic [ref=f52e1128]: 81%
+        - text: moving is arithmetic, not luck, and every one is a cache miss hitting the database at once.
+  - contentinfo [ref=f52e1129]:
+    - generic [ref=f52e1130]:
+      - generic [ref=f52e1131]: Hash
+      - paragraph [ref=f52e1132]:
+        - text: FNV-1a plus a MurmurHash3 finalizer. Uniform spread is the only requirement — a hash value
+        - emphasis [ref=f52e1133]: is
+        - text: a ring position.
+    - generic [ref=f52e1134]:
+      - generic [ref=f52e1135]: A bug worth naming
+      - paragraph [ref=f52e1136]: Plain FNV-1a scored χ² 108 where uniform is ~9, clustering the very strings that place virtual nodes. The finalizer brought it to 3.8.
+    - generic [ref=f52e1137]:
+      - generic [ref=f52e1138]: Tested
+      - paragraph [ref=f52e1139]: "60 unit tests asserting mechanisms, not totals: moved keys are exactly the newcomer’s, positions wrap, replicas are distinct machines."
+    - generic [ref=f52e1140]:
+      - generic [ref=f52e1141]: Scope
+      - paragraph [ref=f52e1142]: The placement algorithm is real. The cluster around it is simulated — no network, no stored data, no failure detection.
