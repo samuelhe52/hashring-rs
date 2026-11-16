@@ -285,8 +285,8 @@ Table: 表 5-1　实验主机 {#tbl-hosts}
 
 | 主机 | CPU | 系统 |
 | --- | --- | --- |
-| 桌面主机 | AMD Ryzen 9 7845HX，24 逻辑 CPU | Linux |
-| 笔记本 | Apple M1 Pro，8 逻辑 CPU，16 GiB 内存 | macOS |
+| 笔记本（MECHREVO） | AMD Ryzen 9 7845HX，24 逻辑 CPU | Linux |
+| 笔记本（Apple） | Apple M1 Pro，8 逻辑 CPU，16 GiB 内存 | macOS |
 
 ### 5.2 迁移区间索引
 
@@ -354,7 +354,7 @@ Table: 表 6-1　本章各节的实验来源 {#tbl-test-sources}
 | 6.6 | `latency`、`correctness` | `docs/latency-acceptance.md`、`docs/optimizations/write-path-saturation.md` |
 | 6.7 | 与 Redis Cluster 的对照 | `docs/redis-cluster-comparison.md` |
 
-除另有说明外，实验均在桌面主机上完成，主机配置见[表 5-1](#tbl-hosts)：协调器、全部数据节点与负载生成器运行在同一台主机，进程之间经回环网络通信，负载生成器与集群共享 CPU。主要实验重复三次取中位数。
+除另有说明外，实验均在 Linux 笔记本上完成，主机配置见[表 5-1](#tbl-hosts)：协调器、全部数据节点与负载生成器运行在同一台主机，进程之间经回环网络通信，负载生成器与集群共享 CPU。主要实验重复三次取中位数。
 
 ### 6.2 功能正确性 {#sec-test-correctness}
 
