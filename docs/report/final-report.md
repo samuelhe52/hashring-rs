@@ -285,8 +285,8 @@ Table: 表 5-1　实验主机 {#tbl-hosts}
 
 | 主机 | CPU | 系统 |
 | --- | --- | --- |
-| 笔记本（MECHREVO） | AMD Ryzen 9 7845HX，24 逻辑 CPU | Linux |
-| 笔记本（Apple） | Apple M1 Pro，8 逻辑 CPU，16 GiB 内存 | macOS |
+| 笔记本（MECHREVO） | AMD Ryzen 9 7845HX，12 物理核心（24 逻辑 CPU），30 GiB 内存 | Linux |
+| 笔记本（Apple） | Apple M1 Pro，8 物理核心（8 逻辑 CPU），16 GiB 内存 | macOS |
 
 ### 5.2 迁移区间索引
 
