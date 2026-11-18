@@ -473,7 +473,7 @@ Table: 表 6-7　连续三次故障后剩余节点的均衡度（10 万键，RF=
 
 **运行中的分布。** 在开环实验的最高速率下，均匀负载的各节点持有键数与服务的请求数都接近均值，单节点 CPU 不到四成；换成 Zipf 0.99 的热点负载后，持有键数的分布不变，请求数却明显向少数节点集中，单节点 CPU 升到近五成。键的分布与键的访问热度彼此独立。
 
-**与 Cassandra 的对照。** Cassandra 同样按 token 切分键空间，4.0 起推荐每节点 16 个 vnode，并用副本感知的分配算法放置 token，使各节点与各副本的持有量接近；官方给出的经验值是 8 个 vnode 时负载差异约 10%（[Cassandra: vnodes](https://cassandra.apache.org/doc/4.0/cassandra/getting_started/production.html#tokens)）。本系统的默认 $V=128$ 与这一思路相同，都是把节点份额切成多段，CV 按 $1/\sqrt{V}$ 收敛，$V=128$ 时约 8.8%，与 Cassandra 在小 vnode 数下的差异量级相当。区别在于 Cassandra 的 token 由分配算法选定，可以照顾副本位置；本系统的 token 来自哈希，份额完全随机。把峰值偏差压到 2% 左右需要每节点数千个 token，协调器内存与变更耗时随之上升（[8.1 节](#sec-balance)）。
+**与 Cassandra 的对照。** Cassandra 同样按 token 切分键空间，4.0 起推荐每节点 16 个 vnode，官方给出的经验值是 8 个 vnode 时负载差异约 10%（[Cassandra: vnodes](https://cassandra.apache.org/doc/4.0/cassandra/getting_started/production.html#tokens)）。本系统的默认 $V=128$ 与这一思路相同，都是把节点份额切成多段，CV 按 $1/\sqrt{V}$ 收敛，$V=128$ 时约 8.8%，与 Cassandra 在小 vnode 数下的差异量级相当。把峰值偏差压到 2% 左右需要每节点数千个 token，协调器内存与变更耗时随之上升（[8.1 节](#sec-balance)）。
 
 ### 6.6 性能与延迟 {#sec-test-performance}
 
