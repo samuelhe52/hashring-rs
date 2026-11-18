@@ -9,6 +9,7 @@ import { createExperiments } from './experiments.mjs'
 const dashboard = fileURLToPath(new URL('..', import.meta.url))
 const repo = path.resolve(dashboard, '..')
 const demoPrefix = '@demo/'
+const localPrefix = '@local/'
 const evidenceFiles = new Map([
   ['acceptance-metrics.md', 'docs/acceptance-metrics.md'],
   ['scaling-under-load.md', 'docs/scaling-under-load.md'],
@@ -19,6 +20,11 @@ const evidenceFiles = new Map([
 
 function demoRecord(run) {
   return { ...run, id: demoPrefix + run.id, source: 'demo' }
+}
+
+function localRecord(run) {
+  if (!run.id.startsWith(demoPrefix) && !run.id.startsWith(localPrefix)) return run
+  return { ...run, id: localPrefix + run.id }
 }
 
 function send(res, status, body, type = 'application/json; charset=utf-8') {
@@ -92,7 +98,7 @@ export async function createDashboardServer({
         if (url.pathname === '/api/runs') {
           const includeDemo = url.searchParams.get('include') === 'demo'
           const [runs, samples] = await Promise.all([store.listRuns(), includeDemo ? demo.listRuns() : []])
-          return send(res, 200, { runs: [...runs, ...samples.map(demoRecord)] })
+          return send(res, 200, { runs: [...runs.map(localRecord), ...samples.map(demoRecord)] })
         }
         if (url.pathname.startsWith('/api/evidence/')) {
           const file = evidenceFiles.get(url.pathname.slice('/api/evidence/'.length))
@@ -107,6 +113,7 @@ export async function createDashboardServer({
         const isDemo = id.startsWith(demoPrefix)
         const source = isDemo ? demo : store
         if (isDemo) id = id.slice(demoPrefix.length)
+        else if (id.startsWith(localPrefix)) id = id.slice(localPrefix.length)
         if (route[2] === 'events') return send(res, 200, await source.events(id))
         if (route[2] === 'owned-keys') {
           const line = Number(url.searchParams.get('line'))
@@ -131,7 +138,7 @@ export async function createDashboardServer({
           return send(res, 200, content, process ? 'text/plain; charset=utf-8' : 'application/json; charset=utf-8')
         }
         const run = await source.readRun(id)
-        return send(res, 200, isDemo ? demoRecord(run) : run)
+        return send(res, 200, isDemo ? demoRecord(run) : localRecord(run))
       }
       if (vite) return vite.middlewares(req, res)
       const file = url.pathname.startsWith('/assets/')

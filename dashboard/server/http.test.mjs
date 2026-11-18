@@ -93,17 +93,29 @@ test('运行列表可包含内置样例，报告接口仅公开指定文件', as
   const f = await fixture(t)
   const name = 'verify-availability-1794158675872'
   await f.writeRun(name, manifest, partial)
+  const reserved = ['@demo/' + name, '@local/@demo/' + name]
+  for (const id of reserved) await f.writeRun(id, manifest, partial)
   const app = await createDashboardServer({ resultsRoot: f.root })
   await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve))
   t.after(() => app.close())
   const base = 'http://127.0.0.1:' + app.server.address().port
   const list = async suffix => (await (await fetch(base + '/api/runs' + suffix)).json()).runs
-  assert.deepEqual((await list('')).map(run => run.id), [name])
-  const demo = (await list('?include=demo')).find(run => run.source === 'demo' && run.name === name)
+  const localIds = [name, ...reserved.map(id => '@local/' + id)]
+  assert.deepEqual(new Set((await list('')).map(run => run.id)), new Set(localIds))
+  const allRuns = await list('?include=demo')
+  assert.equal(new Set(allRuns.map(run => run.id)).size, allRuns.length)
+  const demo = allRuns.find(run => run.source === 'demo' && run.name === name)
   assert.ok(demo)
   const demoRoute = base + '/api/runs/' + encodeURIComponent(demo.id)
   assert.equal((await (await fetch(demoRoute)).json()).summary.success, true)
   assert.equal((await (await fetch(base + '/api/runs/' + name)).json()).status, 'failed')
+  for (const id of localIds) {
+    const response = await fetch(base + '/api/runs/' + encodeURIComponent(id))
+    assert.equal(response.status, 200)
+    const run = await response.json()
+    assert.equal(run.id, id)
+    assert.equal(run.status, 'failed')
+  }
   const log = await (await fetch(demoRoute + '/events')).json()
   assert.ok(log.events.some(event => event.event === 'failover_read_recovered'))
   const source = await fetch(base + '/api/evidence/latency-medians.tsv')
