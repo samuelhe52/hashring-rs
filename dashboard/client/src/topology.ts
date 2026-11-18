@@ -13,17 +13,20 @@ export function tokenValue(value: unknown): bigint {
   return token
 }
 
-export function assignmentAt(model: RingModel, token: bigint): Assignment {
+function assignmentIndex(model: RingModel, token: bigint): number {
   let low = 0
   let high = model.assignments.length
   while (low < high) { const mid = (low + high) >>> 1; if (model.assignments[mid]!.token < token) low = mid + 1; else high = mid }
-  return model.assignments[low % model.assignments.length]!
+  return low % model.assignments.length
+}
+
+export function assignmentAt(model: RingModel, token: bigint): Assignment {
+  return model.assignments[assignmentIndex(model, token)]!
 }
 
 // 与 topology.rs 一致：从第一个 >= token 的位置顺时针收集不同物理节点。
 export function placementAt(model: RingModel, token: bigint): string[] {
-  const owner = assignmentAt(model, token)
-  const index = model.assignments.indexOf(owner)
+  const index = assignmentIndex(model, token)
   const target = Math.min(model.rf, model.members.length)
   const nodes = new Set<string>()
   for (let offset = 0; offset < model.assignments.length && nodes.size < target; offset++) nodes.add(model.assignments[(index + offset) % model.assignments.length]!.node)
