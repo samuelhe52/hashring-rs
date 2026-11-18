@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="520" viewBox="0 0 1100 520"><rect width="100%" height="100%" fill="#fbfaf7"/><text x="24" y="35" fill="#282720" font-size="22" font-family="system-ui, Microsoft YaHei, sans-serif">PUT 阶段 p50 和 p99 延迟与实际速率曲线</text><svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1100" height="416" version="1.1" baseProfile="full" viewBox="0 0 1100 416" y="54">
+<rect width="1100" height="416" x="0" y="0" fill="none"/>
+<path d="M57 368.5L1062 368.5" fill="none" pointer-events="visible" stroke="#e5e0d7" stroke-dasharray="4,2" class="zr5-cls-0"/>
+<path d="M57 287.5L1062 287.5" fill="none" pointer-events="visible" stroke="#e5e0d7" stroke-dasharray="4,2" class="zr5-cls-0"/>
+<path d="M57 207.5L1062 207.5" fill="none" pointer-events="visible" stroke="#e5e0d7" stroke-dasharray="4,2" class="zr5-cls-0"/>
+<path d="M57 126.5L1062 126.5" fill="none" pointer-events="visible" stroke="#e5e0d7" stroke-dasharray="4,2" class="zr5-cls-0"/>
+<path d="M57 46.5L1062 46.5" fill="none" pointer-events="visible" stroke="#e5e0d7" stroke-dasharray="4,2" class="zr5-cls-0"/>
+<path d="M57.5 46L57.5 368" fill="none" pointer-events="visible" stroke="#e5e0d7" stroke-dasharray="4,2" class="zr5-cls-0"/>
+<path d="M308.5 46L308.5 368" fill="none" pointer-events="visible" stroke="#e5e0d7" stroke-dasharray="4,2" class="zr5-cls-0"/>
+<path d="M559.5 46L559.5 368" fill="none" pointer-events="visible" stroke="#e5e0d7" stroke-dasharray="4,2" class="zr5-cls-0"/>
+<path d="M811.5 46L811.5 368" fill="none" pointer-events="visible" stroke="#e5e0d7" stroke-dasharray="4,2" class="zr5-cls-0"/>
+<path d="M1062.5 46L1062.5 368" fill="none" pointer-events="visible" stroke="#e5e0d7" stroke-dasharray="4,2" class="zr5-cls-0"/>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:13px;font-family:system-ui, Microsoft YaHei, sans-serif;" y="-6.5" transform="translate(57 32)" fill="#736f65">延迟（µs）</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:13px;font-family:system-ui, Microsoft YaHei, sans-serif;" y="6.5" transform="translate(559.5 393)" fill="#736f65">实际成功速率（ops/s）</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:system-ui, Microsoft YaHei, sans-serif;" transform="translate(49 368)" fill="#736f65">0</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:system-ui, Microsoft YaHei, sans-serif;" transform="translate(49 287.5)" fill="#736f65">200</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:system-ui, Microsoft YaHei, sans-serif;" transform="translate(49 207)" fill="#736f65">400</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:system-ui, Microsoft YaHei, sans-serif;" transform="translate(49 126.5)" fill="#736f65">600</text>
+<text dominant-baseline="central" text-anchor="end" style="font-size:11px;font-family:system-ui, Microsoft YaHei, sans-serif;" transform="translate(49 46)" fill="#736f65">800</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:system-ui, Microsoft YaHei, sans-serif;" y="5.5" transform="translate(57 376)" fill="#736f65">0</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:system-ui, Microsoft YaHei, sans-serif;" y="5.5" transform="translate(308.25 376)" fill="#736f65">300</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:system-ui, Microsoft YaHei, sans-serif;" y="5.5" transform="translate(559.5 376)" fill="#736f65">600</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:system-ui, Microsoft YaHei, sans-serif;" y="5.5" transform="translate(810.75 376)" fill="#736f65">900</text>
+<text dominant-baseline="central" text-anchor="middle" style="font-size:11px;font-family:system-ui, Microsoft YaHei, sans-serif;" y="5.5" transform="translate(1062 376)" fill="#736f65">1,200</text>
+<g clip-path="url(#zr5-c0)">
+<path d="M475.8 183.7L894.5 214.6" fill="none" pointer-events="visible" stroke="#2d7774" stroke-width="2.3" stroke-dasharray="9.2,4.6" stroke-linejoin="bevel" class="zr5-cls-2"/>
+</g>
+<g clip-path="url(#zr5-c1)">
+<path d="M475.8 56.9L894.5 64.1" fill="none" pointer-events="visible" stroke="#b4532a" stroke-width="2.3" stroke-linejoin="bevel" class="zr5-cls-2"/>
+</g>
+<path d="M1 0A1 1 0 1 1 1 -0.1A1 1 0 0 1 1 0" transform="matrix(4,0,0,4,475.75,183.655)" fill="#2d7774" ecmeta_series_index="0" ecmeta_data_index="0" ecmeta_ssr_type="chart" class="zr5-cls-3"/>
+<path d="M1 0A1 1 0 1 1 1 -0.1A1 1 0 0 1 1 0" transform="matrix(4,0,0,4,894.5,214.6475)" fill="#2d7774" ecmeta_series_index="0" ecmeta_data_index="1" ecmeta_ssr_type="chart" class="zr5-cls-3"/>
+<path d="M0 -1L1 0L0 1L-1 0Z" transform="matrix(4,0,0,4,475.75,56.8675)" fill="#b4532a" ecmeta_series_index="1" ecmeta_data_index="0" ecmeta_ssr_type="chart" class="zr5-cls-4"/>
+<path d="M0 -1L1 0L0 1L-1 0Z" transform="matrix(4,0,0,4,894.5,64.1125)" fill="#b4532a" ecmeta_series_index="1" ecmeta_data_index="1" ecmeta_ssr_type="chart" class="zr5-cls-4"/>
+<path d="M-5 -5l150.9 0l0 21l-150.9 0Z" transform="translate(935.1406 11)" fill="rgb(0,0,0)" fill-opacity="0" stroke="#b7b9be" stroke-width="0" class="zr5-cls-0"/>
+<path d="M0 4L16 4" transform="translate(936.1406 12.5)" fill="#000" stroke="#2d7774" stroke-width="2" stroke-dasharray="8,4" stroke-linecap="butt" stroke-miterlimit="10" class="zr5-cls-0"/>
+<path d="M11.2 4A3.2 3.2 0 1 1 11.2 3.7A3.2 3.2 0 0 1 11.2 4" transform="translate(936.1406 12.5)" fill="#2d7774" class="zr5-cls-0"/>
+<text dominant-baseline="central" text-anchor="start" style="font-size:11px;font-family:system-ui, Microsoft YaHei, sans-serif;" xml:space="preserve" x="21" y="4" transform="translate(936.1406 12.5)" fill="#736f65">PUT p50</text>
+<path d="M-1 -1.5l66.4 0l0 11l-66.4 0Z" transform="translate(936.1406 12.5)" fill="none" pointer-events="visible" ecmeta_series_index="0" ecmeta_data_index="0" ecmeta_ssr_type="legend" class="zr5-cls-5"/>
+<path d="M0 4L16 4" transform="translate(1010.5703 12.5)" fill="#000" stroke="#b4532a" stroke-width="2" stroke-linecap="butt" stroke-miterlimit="10" class="zr5-cls-0"/>
+<path d="M8 0.8L11.2 4L8 7.2L4.8 4Z" transform="translate(1010.5703 12.5)" fill="#b4532a" class="zr5-cls-0"/>
+<text dominant-baseline="central" text-anchor="start" style="font-size:11px;font-family:system-ui, Microsoft YaHei, sans-serif;" xml:space="preserve" x="21" y="4" transform="translate(1010.5703 12.5)" fill="#736f65">PUT p99</text>
+<path d="M-1 -1.5l66.4 0l0 11l-66.4 0Z" transform="translate(1010.5703 12.5)" fill="none" pointer-events="visible" ecmeta_series_index="1" ecmeta_data_index="1" ecmeta_ssr_type="legend" class="zr5-cls-5"/>
+<defs>
+<clipPath id="zr5-c0">
+<path d="M55 44.9l1009 0l0 324.3l-1009 0Z" fill="#000" class="zr5-cls-1"/>
+</clipPath>
+<clipPath id="zr5-c1">
+<path d="M55 44.9l1009 0l0 324.3l-1009 0Z" fill="#000" class="zr5-cls-1"/>
+</clipPath>
+</defs>
+<style><![CDATA[
+.zr5-cls-0:hover {
+pointer-events:none;
+}
+.zr5-cls-1:hover {
+cursor:pointer;
+fill:rgba(0,0,0,1);
+}
+.zr5-cls-2:hover {
+cursor:pointer;
+}
+.zr5-cls-3:hover {
+cursor:pointer;
+fill:rgba(49,130,127,1);
+}
+.zr5-cls-4:hover {
+cursor:pointer;
+fill:rgba(198,91,46,1);
+}
+.zr5-cls-5:hover {
+cursor:pointer;
+fill:rgba(0,0,0,0);
+}
+
+]]>
+
+</style>
+</svg><text x="24" y="502" fill="#736f65" font-size="13" font-family="system-ui, Microsoft YaHei, sans-serif">hashring-rs / my-latency-20261028-013354</text></svg>

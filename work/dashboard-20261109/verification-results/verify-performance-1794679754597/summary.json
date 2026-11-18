@@ -1,0 +1,82 @@
+{
+  "success": true,
+  "error": null,
+  "elapsed_seconds": 3.269879946,
+  "final_epoch": 1,
+  "measurements": {
+    "initial_get_verify": {
+      "operations": 500,
+      "seconds": 0.013985775,
+      "operations_per_second": 35750.610888563555
+    },
+    "initial_put": {
+      "operations": 500,
+      "seconds": 0.018441975,
+      "operations_per_second": 27112.063648280622
+    }
+  },
+  "observations": {
+    "idle_client_put_latency_us": {
+      "max": 672,
+      "p50": 343,
+      "p95": 521,
+      "p99": 625,
+      "samples": 128
+    },
+    "idle_owner_rpc_put_latency_us": {
+      "max": 636,
+      "p50": 366,
+      "p95": 533,
+      "p99": 583,
+      "samples": 128
+    },
+    "initial_full_rf_seconds": 0.769777777,
+    "node_pressure_after_initial_put": {
+      "node-1": {
+        "ack_completion_write_timing": null,
+        "ack_write_timing": null,
+        "dedup_bytes": 167000,
+        "dedup_capacity_bytes": 134217728,
+        "dedup_peak_bytes": 167000,
+        "follower_dedup_rejections": 0,
+        "follower_write_timing": null,
+        "owner_dedup_rejections": 0,
+        "owner_write_timing": null,
+        "receipt_cleanup_timing": null,
+        "replication_reservation_rejections": 0,
+        "replication_rpc_retries": 0,
+        "replication_stream_peak_pending": 8
+      },
+      "node-2": {
+        "ack_completion_write_timing": null,
+        "ack_write_timing": null,
+        "dedup_bytes": 167000,
+        "dedup_capacity_bytes": 134217728,
+        "dedup_peak_bytes": 167000,
+        "follower_dedup_rejections": 0,
+        "follower_write_timing": null,
+        "owner_dedup_rejections": 0,
+        "owner_write_timing": null,
+        "receipt_cleanup_timing": null,
+        "replication_reservation_rejections": 0,
+        "replication_rpc_retries": 0,
+        "replication_stream_peak_pending": 9
+      },
+      "node-3": {
+        "ack_completion_write_timing": null,
+        "ack_write_timing": null,
+        "dedup_bytes": 167000,
+        "dedup_capacity_bytes": 134217728,
+        "dedup_peak_bytes": 167000,
+        "follower_dedup_rejections": 0,
+        "follower_write_timing": null,
+        "owner_dedup_rejections": 0,
+        "owner_write_timing": null,
+        "receipt_cleanup_timing": null,
+        "replication_reservation_rejections": 0,
+        "replication_rpc_retries": 0,
+        "replication_stream_peak_pending": 9
+      }
+    }
+  }
+}

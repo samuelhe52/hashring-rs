@@ -1742,6 +1742,7 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
                     })
                 }),
             };
+            crate::write_topology_snapshot(events, &published)?;
             events.record(
                 "fault_published",
                 json!({
@@ -1813,6 +1814,7 @@ pub(crate) async fn run(context: RunContext<'_>) -> Result<u64> {
             .await?;
             let replacement_to_full_rf_seconds = replacement_started.elapsed().as_secs_f64();
             let failure_to_full_rf_seconds = kill_at.elapsed().as_secs_f64();
+            crate::write_topology_snapshot(events, &completed.target_topology)?;
             events.record(
                 "fault_full_rf_restored",
                 json!({

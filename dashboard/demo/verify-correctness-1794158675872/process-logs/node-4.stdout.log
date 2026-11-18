@@ -1,0 +1,2 @@
+[2m2026-11-08T17:25:32.884855Z[0m [32m INFO[0m [2mhashring_rs[0m[2m:[0m data node ready [3mnode_id[0m[2m=[0mnode-4 [3mprocess_instance_id[0m[2m=[0m"d01e6b6a-152e-404c-9622-7eda99a76687" [3mlisten[0m[2m=[0m127.0.0.1:40153
+[2m2026-11-08T17:25:37.580232Z[0m [32m INFO[0m [2mhashring_rs[0m[2m:[0m data node received remote shutdown

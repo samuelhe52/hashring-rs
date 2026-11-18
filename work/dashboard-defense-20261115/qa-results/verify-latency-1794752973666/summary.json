@@ -1,0 +1,245 @@
+{
+  "success": true,
+  "error": null,
+  "elapsed_seconds": 49.611848207,
+  "final_epoch": 1,
+  "measurements": {
+    "rate_0": {
+      "target_rate": 500,
+      "achieved_rate": 500.0,
+      "seconds": 20.0,
+      "sender_saturated": false,
+      "issued": 10000,
+      "late": 0,
+      "ops": {
+        "delete": 117,
+        "get": 8950,
+        "put": 933
+      },
+      "errors": {
+        "deadline": 0,
+        "not_found": 0,
+        "operation": 0,
+        "protocol": 0,
+        "rpc": 0,
+        "topology": 0
+      },
+      "retries": 0,
+      "latency_us": {
+        "delete": {
+          "p50": 476,
+          "p95": 665,
+          "p99": 739,
+          "p999": 775,
+          "max": 775,
+          "max_observed": 775,
+          "over_range": 0,
+          "samples": 117
+        },
+        "get": {
+          "p50": 386,
+          "p95": 594,
+          "p99": 682,
+          "p999": 896,
+          "max": 1787,
+          "max_observed": 1787,
+          "over_range": 0,
+          "samples": 8950
+        },
+        "put": {
+          "p50": 464,
+          "p95": 677,
+          "p99": 736,
+          "p999": 830,
+          "max": 830,
+          "max_observed": 830,
+          "over_range": 0,
+          "samples": 933
+        }
+      },
+      "load_balance": {
+        "per_node": {
+          "node-1": {
+            "owned_keys": 6560,
+            "ops_handled": 3327,
+            "cpu_percent": 4.7
+          },
+          "node-2": {
+            "owned_keys": 5424,
+            "ops_handled": 2656,
+            "cpu_percent": 4.15
+          },
+          "node-3": {
+            "owned_keys": 8016,
+            "ops_handled": 4017,
+            "cpu_percent": 5.449999999999999
+          }
+        },
+        "owned_keys_max_over_mean": 1.2024,
+        "owned_keys_cv": 0.15912963268982933,
+        "ops_handled_max_over_mean": 1.2050999999999998,
+        "ops_handled_cv": 0.16669319122267712
+      }
+    },
+    "rate_1": {
+      "target_rate": 1000,
+      "achieved_rate": 1000.0,
+      "seconds": 20.0,
+      "sender_saturated": false,
+      "issued": 20000,
+      "late": 0,
+      "ops": {
+        "delete": 222,
+        "get": 17989,
+        "put": 1789
+      },
+      "errors": {
+        "deadline": 0,
+        "not_found": 0,
+        "operation": 0,
+        "protocol": 0,
+        "rpc": 0,
+        "topology": 0
+      },
+      "retries": 0,
+      "latency_us": {
+        "delete": {
+          "p50": 423,
+          "p95": 621,
+          "p99": 667,
+          "p999": 849,
+          "max": 849,
+          "max_observed": 849,
+          "over_range": 0,
+          "samples": 222
+        },
+        "get": {
+          "p50": 348,
+          "p95": 553,
+          "p99": 625,
+          "p999": 727,
+          "max": 1560,
+          "max_observed": 1560,
+          "over_range": 0,
+          "samples": 17989
+        },
+        "put": {
+          "p50": 413,
+          "p95": 617,
+          "p99": 700,
+          "p999": 766,
+          "max": 776,
+          "max_observed": 776,
+          "over_range": 0,
+          "samples": 1789
+        }
+      },
+      "load_balance": {
+        "per_node": {
+          "node-1": {
+            "owned_keys": 6560,
+            "ops_handled": 6664,
+            "cpu_percent": 8.4
+          },
+          "node-2": {
+            "owned_keys": 5424,
+            "ops_handled": 5325,
+            "cpu_percent": 7.250000000000001
+          },
+          "node-3": {
+            "owned_keys": 8016,
+            "ops_handled": 8011,
+            "cpu_percent": 9.750000000000004
+          }
+        },
+        "owned_keys_max_over_mean": 1.2024,
+        "owned_keys_cv": 0.15912963268982933,
+        "ops_handled_max_over_mean": 1.2016499999999999,
+        "ops_handled_cv": 0.16448347941358732
+      }
+    }
+  },
+  "observations": {
+    "idle_client_put_latency_us": {
+      "max": 780,
+      "p50": 401,
+      "p95": 622,
+      "p99": 716,
+      "samples": 128
+    },
+    "idle_owner_rpc_put_latency_us": {
+      "max": 696,
+      "p50": 385,
+      "p95": 597,
+      "p99": 671,
+      "samples": 128
+    },
+    "initial_full_rf_seconds": 0.77463724,
+    "initial_get_verify": {
+      "operations": 20000,
+      "operations_per_second": 33348.3414209064,
+      "seconds": 0.599729976
+    },
+    "initial_put": {
+      "operations": 20000,
+      "operations_per_second": 29402.86930017072,
+      "seconds": 0.680205724
+    },
+    "latency_delete_pool_keys": 1000,
+    "latency_key_distribution": "uniform",
+    "latency_key_space": 20000,
+    "latency_mix": "90:9:1",
+    "latency_saturated_windows": {
+      "rate_0": 0,
+      "rate_1": 0
+    },
+    "latency_verified_keys": 20000,
+    "node_pressure_after_initial_put": {
+      "node-1": {
+        "ack_completion_write_timing": null,
+        "ack_write_timing": null,
+        "dedup_bytes": 6680000,
+        "dedup_capacity_bytes": 134217728,
+        "dedup_peak_bytes": 6680000,
+        "follower_dedup_rejections": 0,
+        "follower_write_timing": null,
+        "owner_dedup_rejections": 0,
+        "owner_write_timing": null,
+        "receipt_cleanup_timing": null,
+        "replication_reservation_rejections": 0,
+        "replication_rpc_retries": 0,
+        "replication_stream_peak_pending": 16
+      },
+      "node-2": {
+        "ack_completion_write_timing": null,
+        "ack_write_timing": null,
+        "dedup_bytes": 6680000,
+        "dedup_capacity_bytes": 134217728,
+        "dedup_peak_bytes": 6680000,
+        "follower_dedup_rejections": 0,
+        "follower_write_timing": null,
+        "owner_dedup_rejections": 0,
+        "owner_write_timing": null,
+        "receipt_cleanup_timing": null,
+        "replication_reservation_rejections": 0,
+        "replication_rpc_retries": 0,
+        "replication_stream_peak_pending": 14
+      },
+      "node-3": {
+        "ack_completion_write_timing": null,
+        "ack_write_timing": null,
+        "dedup_bytes": 6680000,
+        "dedup_capacity_bytes": 134217728,
+        "dedup_peak_bytes": 6680000,
+        "follower_dedup_rejections": 0,
+        "follower_write_timing": null,
+        "owner_dedup_rejections": 0,
+        "owner_write_timing": null,
+        "receipt_cleanup_timing": null,
+        "replication_reservation_rejections": 0,
+        "replication_rpc_retries": 0,
+        "replication_stream_peak_pending": 19
+      }
+    }
+  }
+}

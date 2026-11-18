@@ -1,0 +1,21 @@
+- generic [ref=f53e1]:
+  - main [ref=f53e2]:
+    - generic [ref=f53e3]:
+      - heading "bencher.dev" [level=1] [ref=f53e5]
+      - heading "正在进行安全验证" [level=2] [ref=f53e6]
+      - paragraph [ref=f53e7]: 本网站使用安全服务防护恶意自动程序。在验证您不是自动程序期间，将显示此页面。
+  - contentinfo [ref=f53e12]:
+    - generic [ref=f53e14]:
+      - generic [ref=f53e16]:
+        - text: "Ray ID:"
+        - code [ref=f53e17]: a534b2f93c942606
+      - generic [ref=f53e18]:
+        - generic [ref=f53e19]:
+          - text: 由
+          - link "Cloudflare，在新标签页中打开" [ref=f53e20] [cursor=pointer]:
+            - /url: https://www.cloudflare.com?utm_source=challenge&utm_campaign=m
+            - text: Cloudflare
+          - text: 提供的性能和安全服务
+        - link "隐私，在新标签页中打开" [ref=f53e22] [cursor=pointer]:
+          - /url: https://www.cloudflare.com/zh-cn/privacypolicy/
+          - text: 隐私

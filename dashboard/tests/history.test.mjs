@@ -1,0 +1,57 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { nodeOperationSample, replayBounds, visibleCount, sampledSeries, scalingIssueRate, warmupIntervals, windowLatency } from '../client/src/history.ts'
+
+const e = (line, unix_ms, fields = {}, event = 'metrics_sampled') => ({ line, unix_ms, fields, event, raw: '{}' })
+test('回放不读未来，同毫秒按行前进，起点优先实验启动', () => {
+  const events = [e(1, 1000, {}, 'experiment_started'), e(2, 2000), e(3, 2000), e(4, 4000)]
+  assert.deepEqual(replayBounds(events, 500), { start: 1000, end: 4000, origin: 1000 })
+  assert.equal(visibleCount(events, 1999), 1)
+  assert.equal(visibleCount(events, 2000, 2), 2)
+  assert.equal(visibleCount(events, 2000), 3)
+  assert.equal(visibleCount(events, 9999), 4)
+  assert.deepEqual(replayBounds([], 500), { start: 500, end: 500, origin: 500 })
+})
+test('缺窗口和阶段切换断线，保留零值，不插值或平均 p99', () => {
+  const events = [e(1, 1000, { stage: 'a', window_ms: 1000, value: 0 }), e(2, 5000, { stage: 'a', window_ms: 1000, value: 732 }), e(3, 6000, { stage: 'b', window_ms: 1000, value: 660 })]
+  assert.deepEqual(sampledSeries(events, 0, e => e.fields.value), [[1, 0], [3, null], [5, 732], [5.5, null], [6, 660]])
+  assert.equal(windowLatency(e(1, 1000, { latency_us: { get: { p99: 0 } } }), 'get', 'p99'), 0)
+  const emptyHistogram = e(1, 1000, { latency_us: { get: { samples: 0, p99: 0 } } })
+  assert.equal(windowLatency(emptyHistogram, 'get', 'p99'), null)
+  assert.equal(windowLatency(emptyHistogram, 'get', 'samples'), 0)
+  assert.equal(windowLatency(e(1, 1000), 'get', 'p99'), null)
+  assert.deepEqual(sampledSeries([e(1, 1000, { value: 1 }), e(2, 2000, { value: 2 })], 0, e => e.fields.value), [[1, 1], [1.5, null], [2, 2]])
+})
+test('预热按记录的窗口区间着色，缺窗口宽度不猜；可隐藏预热', () => {
+  const events = [e(1, 1000, { warmup: true, window_ms: 1000 }), e(2, 2000, { warmup: true, window_ms: 1000 }), e(3, 3000, { warmup: true }), e(4, 4000, { warmup: false, value: 4 })]
+  assert.deepEqual(warmupIntervals(events, 0), [[0, 2]])
+  assert.deepEqual(sampledSeries(events, 0, e => e.fields.value ?? null, true), [[4, 4]])
+})
+
+test('扩容窗口的多阶段样本按记录中的阶段读取分位数', () => {
+  const sample = e(1, 1000, { phase: 'post', metrics: {
+    'published|get': { latency_us: { p99: 920 } },
+    'post|get': { latency_us: { p99: 440 } },
+    'published|put_new': { latency_us: { p99: 680 } },
+  } })
+  assert.equal(windowLatency(sample, 'get', 'p99'), 440)
+  assert.equal(windowLatency(sample, 'published|get', 'p99'), 920)
+  assert.equal(windowLatency(sample, 'put_new', 'p99'), null)
+})
+
+test('扩缩容速率需要记录窗口宽度，保留不足一秒的尾窗', () => {
+  assert.equal(scalingIssueRate(e(1, 1000, { mode: 'scaling', issued: 50, achieved_rate: 50 })), null)
+  assert.equal(scalingIssueRate(e(2, 1100, { mode: 'scaling', issued: 50, achieved_rate: 500, window_ms: 100 })), 500)
+})
+
+test('节点负载优先使用窗口操作速率，旧记录按正式阶段时长换算', () => {
+  const stage = { seconds: 10, load_balance: { per_node: { 'node-1': { ops_handled: 55 }, 'node-2': { ops_handled: null } } } }
+  const legacy = e(1, 1000, { node_cpu_percent: { 'node-1': 122.5 } })
+  assert.deepEqual(nodeOperationSample(legacy, stage), { values: new Map([['node-1', 5.5]]), average: true })
+  assert.equal(nodeOperationSample(legacy, { ...stage, seconds: 0 }), null)
+  assert.equal(nodeOperationSample(e(2, 2000, { warmup: true }), stage), null)
+  assert.deepEqual(nodeOperationSample(e(3, 3000, { warmup: true, node_ops_per_second: { 'node-1': 0, 'node-2': 122.5, 'node-3': null } }), stage), {
+    values: new Map([['node-1', 0], ['node-2', 122.5]]), average: false,
+  })
+  assert.equal(nodeOperationSample(e(4, 4000, { node_ops_per_second: {} }), stage), null)
+})

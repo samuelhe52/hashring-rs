@@ -1,0 +1,307 @@
+{
+  "success": true,
+  "error": null,
+  "elapsed_seconds": 39.075020361,
+  "final_epoch": 1,
+  "measurements": {
+    "rate_0": {
+      "target_rate": 20000,
+      "achieved_rate": 20000.0,
+      "seconds": 10.0,
+      "sender_saturated": false,
+      "issued": 200000,
+      "late": 0,
+      "ops": {
+        "delete": 2087,
+        "get": 180127,
+        "put": 17786
+      },
+      "errors": {
+        "deadline": 0,
+        "not_found": 0,
+        "operation": 0,
+        "protocol": 0,
+        "rpc": 0,
+        "topology": 0
+      },
+      "retries": 0,
+      "latency_us": {
+        "delete": {
+          "p50": 281,
+          "p95": 1173,
+          "p99": 2949,
+          "p999": 4495,
+          "max": 70655,
+          "max_observed": 70624,
+          "over_range": 0,
+          "samples": 2087
+        },
+        "get": {
+          "p50": 243,
+          "p95": 1114,
+          "p99": 2793,
+          "p999": 3881,
+          "max": 71359,
+          "max_observed": 71331,
+          "over_range": 0,
+          "samples": 180127
+        },
+        "put": {
+          "p50": 286,
+          "p95": 1200,
+          "p99": 2893,
+          "p999": 4411,
+          "max": 70911,
+          "max_observed": 70865,
+          "over_range": 0,
+          "samples": 17786
+        }
+      },
+      "load_balance": {
+        "per_node": {
+          "node-1": {
+            "owned_keys": 10184,
+            "ops_handled": 20106,
+            "cpu_percent": 29.500000000000004
+          },
+          "node-10": {
+            "owned_keys": 10286,
+            "ops_handled": 20413,
+            "cpu_percent": 29.799999999999994
+          },
+          "node-2": {
+            "owned_keys": 9706,
+            "ops_handled": 19655,
+            "cpu_percent": 29.299999999999997
+          },
+          "node-3": {
+            "owned_keys": 10783,
+            "ops_handled": 21700,
+            "cpu_percent": 31.199999999999996
+          },
+          "node-4": {
+            "owned_keys": 10678,
+            "ops_handled": 21021,
+            "cpu_percent": 30.9
+          },
+          "node-5": {
+            "owned_keys": 10328,
+            "ops_handled": 20869,
+            "cpu_percent": 30.300000000000004
+          },
+          "node-6": {
+            "owned_keys": 10510,
+            "ops_handled": 21088,
+            "cpu_percent": 30.700000000000006
+          },
+          "node-7": {
+            "owned_keys": 9334,
+            "ops_handled": 18491,
+            "cpu_percent": 27.599999999999998
+          },
+          "node-8": {
+            "owned_keys": 9337,
+            "ops_handled": 18903,
+            "cpu_percent": 28.900000000000002
+          },
+          "node-9": {
+            "owned_keys": 8854,
+            "ops_handled": 17754,
+            "cpu_percent": 26.700000000000003
+          }
+        },
+        "owned_keys_max_over_mean": 1.0783,
+        "owned_keys_cv": 0.06195955132180994,
+        "ops_handled_max_over_mean": 1.085,
+        "ops_handled_cv": 0.06061596736834281
+      }
+    }
+  },
+  "observations": {
+    "idle_client_put_latency_us": {
+      "max": 616,
+      "p50": 338,
+      "p95": 524,
+      "p99": 587,
+      "samples": 128
+    },
+    "idle_owner_rpc_put_latency_us": {
+      "max": 877,
+      "p50": 339,
+      "p95": 574,
+      "p99": 613,
+      "samples": 128
+    },
+    "initial_full_rf_seconds": 7.978036162,
+    "initial_get_verify": {
+      "operations": 100000,
+      "operations_per_second": 49213.087431815125,
+      "seconds": 2.031979809
+    },
+    "initial_put": {
+      "operations": 100000,
+      "operations_per_second": 44078.56191734657,
+      "seconds": 2.268676555
+    },
+    "latency_delete_pool_keys": 5000,
+    "latency_key_distribution": "uniform",
+    "latency_key_space": 100000,
+    "latency_mix": "90:9:1",
+    "latency_saturated_windows": {
+      "rate_0": 0
+    },
+    "latency_verified_keys": 100000,
+    "node_pressure_after_initial_put": {
+      "node-1": {
+        "ack_completion_write_timing": null,
+        "ack_write_timing": null,
+        "dedup_bytes": 9666513,
+        "dedup_capacity_bytes": 134217728,
+        "dedup_peak_bytes": 9666513,
+        "follower_dedup_rejections": 0,
+        "follower_write_timing": null,
+        "owner_dedup_rejections": 0,
+        "owner_write_timing": null,
+        "receipt_cleanup_timing": null,
+        "replication_reservation_rejections": 0,
+        "replication_rpc_retries": 0,
+        "replication_stream_peak_pending": 24
+      },
+      "node-10": {
+        "ack_completion_write_timing": null,
+        "ack_write_timing": null,
+        "dedup_bytes": 10367292,
+        "dedup_capacity_bytes": 134217728,
+        "dedup_peak_bytes": 10367292,
+        "follower_dedup_rejections": 0,
+        "follower_write_timing": null,
+        "owner_dedup_rejections": 0,
+        "owner_write_timing": null,
+        "receipt_cleanup_timing": null,
+        "replication_reservation_rejections": 0,
+        "replication_rpc_retries": 0,
+        "replication_stream_peak_pending": 20
+      },
+      "node-2": {
+        "ack_completion_write_timing": null,
+        "ack_write_timing": null,
+        "dedup_bytes": 9920933,
+        "dedup_capacity_bytes": 134217728,
+        "dedup_peak_bytes": 9920933,
+        "follower_dedup_rejections": 0,
+        "follower_write_timing": null,
+        "owner_dedup_rejections": 0,
+        "owner_write_timing": null,
+        "receipt_cleanup_timing": null,
+        "replication_reservation_rejections": 0,
+        "replication_rpc_retries": 0,
+        "replication_stream_peak_pending": 19
+      },
+      "node-3": {
+        "ack_completion_write_timing": null,
+        "ack_write_timing": null,
+        "dedup_bytes": 10212021,
+        "dedup_capacity_bytes": 134217728,
+        "dedup_peak_bytes": 10212021,
+        "follower_dedup_rejections": 0,
+        "follower_write_timing": null,
+        "owner_dedup_rejections": 0,
+        "owner_write_timing": null,
+        "receipt_cleanup_timing": null,
+        "replication_reservation_rejections": 0,
+        "replication_rpc_retries": 0,
+        "replication_stream_peak_pending": 17
+      },
+      "node-4": {
+        "ack_completion_write_timing": null,
+        "ack_write_timing": null,
+        "dedup_bytes": 10694399,
+        "dedup_capacity_bytes": 134217728,
+        "dedup_peak_bytes": 10694399,
+        "follower_dedup_rejections": 0,
+        "follower_write_timing": null,
+        "owner_dedup_rejections": 0,
+        "owner_write_timing": null,
+        "receipt_cleanup_timing": null,
+        "replication_reservation_rejections": 0,
+        "replication_rpc_retries": 0,
+        "replication_stream_peak_pending": 25
+      },
+      "node-5": {
+        "ack_completion_write_timing": null,
+        "ack_write_timing": null,
+        "dedup_bytes": 9544280,
+        "dedup_capacity_bytes": 134217728,
+        "dedup_peak_bytes": 9544280,
+        "follower_dedup_rejections": 0,
+        "follower_write_timing": null,
+        "owner_dedup_rejections": 0,
+        "owner_write_timing": null,
+        "receipt_cleanup_timing": null,
+        "replication_reservation_rejections": 0,
+        "replication_rpc_retries": 0,
+        "replication_stream_peak_pending": 23
+      },
+      "node-6": {
+        "ack_completion_write_timing": null,
+        "ack_write_timing": null,
+        "dedup_bytes": 10414578,
+        "dedup_capacity_bytes": 134217728,
+        "dedup_peak_bytes": 10414578,
+        "follower_dedup_rejections": 0,
+        "follower_write_timing": null,
+        "owner_dedup_rejections": 0,
+        "owner_write_timing": null,
+        "receipt_cleanup_timing": null,
+        "replication_reservation_rejections": 0,
+        "replication_rpc_retries": 0,
+        "replication_stream_peak_pending": 20
+      },
+      "node-7": {
+        "ack_completion_write_timing": null,
+        "ack_write_timing": null,
+        "dedup_bytes": 9548144,
+        "dedup_capacity_bytes": 134217728,
+        "dedup_peak_bytes": 9548144,
+        "follower_dedup_rejections": 0,
+        "follower_write_timing": null,
+        "owner_dedup_rejections": 0,
+        "owner_write_timing": null,
+        "receipt_cleanup_timing": null,
+        "replication_reservation_rejections": 0,
+        "replication_rpc_retries": 0,
+        "replication_stream_peak_pending": 17
+      },
+      "node-8": {
+        "ack_completion_write_timing": null,
+        "ack_write_timing": null,
+        "dedup_bytes": 10345421,
+        "dedup_capacity_bytes": 134217728,
+        "dedup_peak_bytes": 10345421,
+        "follower_dedup_rejections": 0,
+        "follower_write_timing": null,
+        "owner_dedup_rejections": 0,
+        "owner_write_timing": null,
+        "receipt_cleanup_timing": null,
+        "replication_reservation_rejections": 0,
+        "replication_rpc_retries": 0,
+        "replication_stream_peak_pending": 26
+      },
+      "node-9": {
+        "ack_completion_write_timing": null,
+        "ack_write_timing": null,
+        "dedup_bytes": 9517277,
+        "dedup_capacity_bytes": 134217728,
+        "dedup_peak_bytes": 9517277,
+        "follower_dedup_rejections": 0,
+        "follower_write_timing": null,
+        "owner_dedup_rejections": 0,
+        "owner_write_timing": null,
+        "receipt_cleanup_timing": null,
+        "replication_reservation_rejections": 0,
+        "replication_rpc_retries": 0,
+        "replication_stream_peak_pending": 27
+      }
+    }
+  }
+}

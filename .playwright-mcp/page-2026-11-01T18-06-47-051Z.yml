@@ -1,0 +1,33 @@
+- generic [active] [ref=f6e1]:
+  - generic [ref=f6e2]:
+    - generic [ref=f6e3]:
+      - paragraph [ref=f6e4]: 01 · 一致性哈希
+      - heading "一致性哈希：增减节点时，只移动一小段数据" [level=2] [ref=f6e5]
+      - generic [ref=f6e6]:
+        - img "一致性哈希环" [ref=f6e7]:
+          - generic [ref=f6e9]: "0"
+          - generic [ref=f6e10]: 2⁶⁴−1
+          - generic [ref=f6e12]: 顺时针
+          - generic [ref=f6e39]: 哈希空间
+          - generic [ref=f6e40]: 0 … 264 − 1
+          - generic [ref=f6e41]: 26 个键
+        - generic [ref=f6e42]:
+          - generic [ref=f6e48]:
+            - heading "① 把哈希值排成一个环" [level=3] [ref=f6e49]
+            - paragraph [ref=f6e50]: 哈希函数把任意键映射成 0 到 2⁶⁴−1 之间的一个整数。把这个范围首尾相接，就得到一个环，每个键落在环上一个固定的位置。
+          - generic [ref=f6e51]:
+            - button "上一步" [disabled] [ref=f6e52]
+            - button "下一步" [ref=f6e53] [cursor=pointer]
+          - generic [ref=f6e54]:
+            - heading "对比：取模分片，节点 = hash(key) mod 3" [level=4] [ref=f6e55]
+            - generic [ref=f6e83]:
+              - generic [ref=f6e84]:
+                - text: 取模：需要迁移
+                - generic [ref=f6e85]: —
+              - generic [ref=f6e86]:
+                - text: 一致性哈希：需要迁移
+                - generic [ref=f6e87]: —
+      - generic [ref=f6e88]: HASHRING-RS
+      - generic [ref=f6e89]: 02 / 10
+    - text: → → →
+  - generic [ref=f6e91]: ← → 翻页 / 逐步播放 · N 讲稿 · F 全屏

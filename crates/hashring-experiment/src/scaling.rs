@@ -279,6 +279,7 @@ struct Bucket {
 }
 
 struct MetricState {
+    window_started: Instant,
     window: BTreeMap<String, Bucket>,
     total: BTreeMap<String, Bucket>,
     window_errors: BTreeMap<String, u64>,
@@ -325,6 +326,7 @@ impl Metrics {
             write_ok_after_busy: AtomicU64::new(0),
             max_in_flight,
             state: Mutex::new(MetricState {
+                window_started: Instant::now(),
                 window: BTreeMap::new(),
                 total: BTreeMap::new(),
                 window_errors: BTreeMap::new(),
@@ -432,6 +434,9 @@ impl Metrics {
 
     fn sample(&self, events: &EventLog) -> Result<()> {
         let mut state = self.state.lock().expect("the metrics lock is not poisoned");
+        let sampled_at = super::unix_ms();
+        let now = Instant::now();
+        let elapsed = now.duration_since(std::mem::replace(&mut state.window_started, now));
         let window = std::mem::take(&mut state.window);
         let errors = std::mem::take(&mut state.window_errors);
         let issued = self.issued.swap(0, Ordering::AcqRel);
@@ -463,7 +468,7 @@ impl Metrics {
         let violations = state.violations.clone();
         let violation_examples = state.violation_examples.clone();
         drop(state);
-        events.record(
+        events.record_at(
             "metrics_sampled",
             json!({
                 "mode": "scaling",
@@ -471,13 +476,15 @@ impl Metrics {
                 "phase": self.phase().name(),
                 "issued": issued,
                 "late": late,
-                "achieved_rate": issued as f64,
+                "window_ms": elapsed.as_secs_f64() * 1000.0,
+                "achieved_rate": (elapsed > Duration::ZERO).then(|| issued as f64 / elapsed.as_secs_f64()),
                 "in_flight": in_flight,
                 "metrics": seconds,
                 "errors": errors,
                 "violations": violations,
                 "violation_examples": violation_examples,
             }),
+            sampled_at,
         )
     }
 
@@ -1486,7 +1493,12 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                 if let Ok(Some(current)) = observer.topology_change().await {
                     let phase = phase_of(current.phase);
                     if phase != last_phase {
-                        if matches!(phase, Phase::Published | Phase::Complete) {
+                        if matches!(
+                            current.phase,
+                            MigrationPhase::Published
+                                | MigrationPhase::CleaningUp
+                                | MigrationPhase::Complete
+                        ) {
                             if published_ms.is_none() {
                                 published_ms = Some(started.elapsed().as_secs_f64() * 1_000.0);
                                 published_ms_source = Some(if phase == Phase::Published {
@@ -1494,6 +1506,7 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                                 } else {
                                     "completion_fallback"
                                 });
+                                super::write_topology_snapshot(events, &current.target_topology)?;
                             }
                             // Re-read the keys written before the switch right
                             // away. A stale read after publication heals
@@ -1553,9 +1566,12 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
             // published phase. Start the probe here rather than silently
             // dropping the read-after-publish coverage; the earliest time we
             // can name is completion, and the source says so.
+            if published_ms.is_none() {
+                published_ms = complete_ms;
+                published_ms_source = Some("completion_fallback");
+                super::write_topology_snapshot(events, &completed.target_topology)?;
+            }
             if after_publish_probe.is_none() {
-                published_ms.get_or_insert(complete_ms.expect("just recorded"));
-                published_ms_source.get_or_insert("completion_fallback");
                 after_publish_probe = spawn_after_publish_probe_task(
                     config,
                     workload_client,

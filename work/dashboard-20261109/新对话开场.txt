@@ -1,0 +1,3 @@
+我是 cyable，GitHub cyablex，负责 hashring-rs Dashboard。
+请继续在 D:/数据结构课程/实验7/项目/hashring-rs 的原仓库工作。先读 work/dashboard-20261109/交接.md、dashboard/PROGRESS.md 和 AGENTS.md，了解 11 月 9 日版和已有验收。当前的实现和本地结果在这台机器。备份只用于查看或恢复。
+先按我在新对话里说的范围行动。提交、推送、PR 或关机需要我在当时明确授权。正式网页上保留实验工具和结果，个人学习与汇报资料放在工作区。

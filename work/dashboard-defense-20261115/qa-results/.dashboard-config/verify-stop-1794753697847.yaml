@@ -1,0 +1,6 @@
+mode: latency
+nodes: 3
+keys: 2000
+target_rates: [500]
+warmup_seconds: 1
+duration_seconds: 20

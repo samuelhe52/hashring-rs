@@ -1,0 +1,171 @@
+{
+  "success": true,
+  "error": null,
+  "elapsed_seconds": 12.349247137,
+  "final_epoch": 4,
+  "measurements": {
+    "initial_get_verify": {
+      "operations": 300,
+      "seconds": 0.01841645,
+      "operations_per_second": 16289.784404703403
+    },
+    "initial_put": {
+      "operations": 300,
+      "seconds": 0.036742392,
+      "operations_per_second": 8164.95561856724
+    },
+    "restore_full_rf": {
+      "operations": 1,
+      "seconds": 1.046460188,
+      "operations_per_second": 0.9556025269448665
+    },
+    "restore_full_rf_round_1": {
+      "operations": 1,
+      "seconds": 1.046459196,
+      "operations_per_second": 0.9556034328165052
+    }
+  },
+  "observations": {
+    "acknowledged_key_survival": {
+      "lost": 0,
+      "policy": "FirstSuccessor",
+      "preserved": 128,
+      "sampled": 128,
+      "tail_key": 291,
+      "tail_survived": true
+    },
+    "availability_acknowledged_lost_total": 0,
+    "availability_max_read_recovery_seconds": 5.194912558,
+    "availability_observed_unavailable_max_streak_ms": 4922,
+    "availability_round_count": 1,
+    "availability_rounds": [
+      {
+        "acknowledged_key_survival": {
+          "lost": 0,
+          "policy": "FirstSuccessor",
+          "preserved": 128,
+          "sampled": 128,
+          "tail_key": 291,
+          "tail_survived": true
+        },
+        "balance": {
+          "cv": 0.13441230102437302,
+          "max_over_mean_minus_one": 0.18999999999999995,
+          "max_over_min": 1.3222222222222222,
+          "nodes": 3,
+          "range_over_mean": 0.29
+        },
+        "failure_to_full_rf_seconds": 10.302531152,
+        "kill_to_publish_seconds": 5.126208543,
+        "live_members": [
+          "node-2",
+          "node-3",
+          "node-4"
+        ],
+        "observed_unavailable_max_streak_ms": 4922,
+        "owned_keys": {
+          "node-2": 91,
+          "node-3": 90,
+          "node-4": 119
+        },
+        "previous_tail_survived": null,
+        "read_recovery_seconds": 5.194912558,
+        "replacement_to_full_rf_seconds": 1.046456291,
+        "round": 1,
+        "survivor_balance": {
+          "cv": 0.0055248618784530384,
+          "max_over_mean_minus_one": 0.005524861878453136,
+          "max_over_min": 1.011111111111111,
+          "nodes": 2,
+          "range_over_mean": 0.011049723756906077
+        },
+        "survivor_owned_keys": {
+          "node-2": 91,
+          "node-3": 90
+        },
+        "survivors": [
+          "node-2",
+          "node-3"
+        ],
+        "tail_ack_to_kill_ms": 0,
+        "tail_bytes": 1048576,
+        "tail_key": 291,
+        "tail_put_seconds": 0.024715535,
+        "unavailable_probe_count": 17,
+        "victim": "node-1",
+        "victim_epoch": 2,
+        "write_recovery_seconds": 3.971091951
+      }
+    ],
+    "availability_total_seconds": 10.437904461,
+    "availability_unavailable_probe_count": 17,
+    "failover_seconds": 5.126208543,
+    "failure_to_full_rf_seconds": 10.302531152,
+    "idle_client_put_latency_us": {
+      "max": 1244,
+      "p50": 785,
+      "p95": 1084,
+      "p99": 1186,
+      "samples": 128
+    },
+    "idle_owner_rpc_put_latency_us": {
+      "max": 1680,
+      "p50": 873,
+      "p95": 1172,
+      "p99": 1222,
+      "samples": 128
+    },
+    "initial_full_rf_seconds": 0.262692438,
+    "node_pressure_after_initial_put": {
+      "node-1": {
+        "ack_completion_write_timing": null,
+        "ack_write_timing": null,
+        "dedup_bytes": 100200,
+        "dedup_capacity_bytes": 134217728,
+        "dedup_peak_bytes": 100316,
+        "follower_dedup_rejections": 0,
+        "follower_write_timing": null,
+        "owner_dedup_rejections": 0,
+        "owner_write_timing": null,
+        "receipt_cleanup_timing": null,
+        "replication_reservation_rejections": 0,
+        "replication_rpc_retries": 0,
+        "replication_stream_peak_pending": 4
+      },
+      "node-2": {
+        "ack_completion_write_timing": null,
+        "ack_write_timing": null,
+        "dedup_bytes": 100200,
+        "dedup_capacity_bytes": 134217728,
+        "dedup_peak_bytes": 100200,
+        "follower_dedup_rejections": 0,
+        "follower_write_timing": null,
+        "owner_dedup_rejections": 0,
+        "owner_write_timing": null,
+        "receipt_cleanup_timing": null,
+        "replication_reservation_rejections": 0,
+        "replication_rpc_retries": 0,
+        "replication_stream_peak_pending": 3
+      },
+      "node-3": {
+        "ack_completion_write_timing": null,
+        "ack_write_timing": null,
+        "dedup_bytes": 100200,
+        "dedup_capacity_bytes": 134217728,
+        "dedup_peak_bytes": 100200,
+        "follower_dedup_rejections": 0,
+        "follower_write_timing": null,
+        "owner_dedup_rejections": 0,
+        "owner_write_timing": null,
+        "receipt_cleanup_timing": null,
+        "replication_reservation_rejections": 0,
+        "replication_rpc_retries": 0,
+        "replication_stream_peak_pending": 3
+      }
+    },
+    "observed_unavailable_max_streak_ms": 4922,
+    "read_recovery_seconds": 5.194912558,
+    "replacement_to_full_rf_seconds": 1.046456291,
+    "unavailable_probe_count": 17
+  }
+}

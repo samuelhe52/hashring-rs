@@ -1,0 +1,545 @@
+{
+  "success": true,
+  "error": null,
+  "elapsed_seconds": 16.830492977,
+  "final_epoch": 2,
+  "measurements": {
+    "grow_transition": {
+      "operations": 11111,
+      "seconds": 0.470815371,
+      "operations_per_second": 23599.484393214512
+    },
+    "initial_get_verify": {
+      "operations": 20000,
+      "seconds": 0.98480242,
+      "operations_per_second": 20308.64221475004
+    },
+    "initial_put": {
+      "operations": 20000,
+      "seconds": 1.144098849,
+      "operations_per_second": 17481.00701043534
+    }
+  },
+  "observations": {
+    "grow_transition": {
+      "base_epoch": 1,
+      "change_seconds": 0.470815371,
+      "complete_ms": 470.815341,
+      "control": false,
+      "delete_pool": 210,
+      "direct_merge": false,
+      "full_rf_seconds": 5.085531333,
+      "migration": {
+        "keys": 20000,
+        "keys_moved": 5272,
+        "ranges": 32,
+        "rate": 0.2636,
+        "snapshot_records": 5280
+      },
+      "new_pool": 360,
+      "post_seconds": 4,
+      "published_ms": 321.20622,
+      "published_ms_source": "observed",
+      "retries_by_reason": {
+        "connect": 0,
+        "lease_expired": 11,
+        "moved": 0,
+        "outcome_unknown": 0,
+        "range_busy": 7,
+        "replica_not_ready": 0,
+        "resource_exhausted": 0,
+        "rpc": 0,
+        "temporarily_unavailable": 0,
+        "topology_refresh": 0,
+        "unavailable": 0
+      },
+      "rewrite_pool": 900,
+      "stop_window": {
+        "busy_before_first_ok": 7,
+        "first_range_busy_ms": 193.930381,
+        "first_write_ok_ms": 353.86706000000004,
+        "last_range_busy_ms": 309.847948,
+        "observed_ms": 159.93667900000003,
+        "poll_ms": 5
+      },
+      "target_epoch": 2,
+      "touched_strata": [
+        "new_target",
+        "replicas_changed",
+        "unchanged"
+      ],
+      "verification": "passed",
+      "work_steps_ms": {
+        "activation_ms": 15,
+        "catch_up_ms": 0,
+        "changelog_replay_ms": 319,
+        "merge_proof_ms": 0,
+        "pause_writes_ms": 5,
+        "publish_ms": 0,
+        "snapshot_copy_ms": 802,
+        "verify_ms": 142
+      }
+    },
+    "idle_client_put_latency_us": {
+      "max": 791,
+      "p50": 356,
+      "p95": 640,
+      "p99": 726,
+      "samples": 128
+    },
+    "idle_owner_rpc_put_latency_us": {
+      "max": 655,
+      "p50": 357,
+      "p95": 600,
+      "p99": 616,
+      "samples": 128
+    },
+    "initial_full_rf_seconds": 0.25807923,
+    "node_pressure_after_initial_put": {
+      "node-1": {
+        "ack_completion_write_timing": null,
+        "ack_write_timing": null,
+        "dedup_bytes": 6680000,
+        "dedup_capacity_bytes": 134217728,
+        "dedup_peak_bytes": 6680000,
+        "follower_dedup_rejections": 0,
+        "follower_write_timing": null,
+        "owner_dedup_rejections": 0,
+        "owner_write_timing": null,
+        "receipt_cleanup_timing": null,
+        "replication_reservation_rejections": 0,
+        "replication_rpc_retries": 0,
+        "replication_stream_peak_pending": 15
+      },
+      "node-2": {
+        "ack_completion_write_timing": null,
+        "ack_write_timing": null,
+        "dedup_bytes": 6680000,
+        "dedup_capacity_bytes": 134217728,
+        "dedup_peak_bytes": 6680000,
+        "follower_dedup_rejections": 0,
+        "follower_write_timing": null,
+        "owner_dedup_rejections": 0,
+        "owner_write_timing": null,
+        "receipt_cleanup_timing": null,
+        "replication_reservation_rejections": 0,
+        "replication_rpc_retries": 0,
+        "replication_stream_peak_pending": 12
+      },
+      "node-3": {
+        "ack_completion_write_timing": null,
+        "ack_write_timing": null,
+        "dedup_bytes": 6680000,
+        "dedup_capacity_bytes": 134217728,
+        "dedup_peak_bytes": 6680000,
+        "follower_dedup_rejections": 0,
+        "follower_write_timing": null,
+        "owner_dedup_rejections": 0,
+        "owner_write_timing": null,
+        "receipt_cleanup_timing": null,
+        "replication_reservation_rejections": 0,
+        "replication_rpc_retries": 0,
+        "replication_stream_peak_pending": 11
+      }
+    },
+    "scaling_after_publish_probes": {
+      "keys_read": [
+        2
+      ],
+      "probes": 1
+    },
+    "scaling_metrics": {
+      "errors": {},
+      "in_flight": 0,
+      "issued": 312335,
+      "late": 0,
+      "load_mode": "closed",
+      "metrics": {
+        "copying_snapshot|delete": {
+          "latency_us": {
+            "max": 720,
+            "max_observed": 720,
+            "over_range": 0,
+            "p50": 361,
+            "p95": 720,
+            "p99": 720,
+            "p999": 720,
+            "samples": 2
+          },
+          "operations": 2
+        },
+        "copying_snapshot|get": {
+          "latency_us": {
+            "max": 1188,
+            "max_observed": 1188,
+            "over_range": 0,
+            "p50": 357,
+            "p95": 615,
+            "p99": 787,
+            "p999": 1136,
+            "samples": 3436
+          },
+          "operations": 3436
+        },
+        "copying_snapshot|probe_read_after_write": {
+          "latency_us": {
+            "max": 749,
+            "max_observed": 749,
+            "over_range": 0,
+            "p50": 524,
+            "p95": 749,
+            "p99": 749,
+            "p999": 749,
+            "samples": 8
+          },
+          "operations": 8
+        },
+        "copying_snapshot|put_new": {
+          "latency_us": {
+            "max": 244,
+            "max_observed": 244,
+            "over_range": 0,
+            "p50": 236,
+            "p95": 244,
+            "p99": 244,
+            "p999": 244,
+            "samples": 2
+          },
+          "operations": 2
+        },
+        "copying_snapshot|put_rewrite": {
+          "latency_us": {
+            "max": 577,
+            "max_observed": 577,
+            "over_range": 0,
+            "p50": 492,
+            "p95": 577,
+            "p99": 577,
+            "p999": 577,
+            "samples": 4
+          },
+          "operations": 4
+        },
+        "pausing_writes|get": {
+          "latency_us": {
+            "max": 913,
+            "max_observed": 913,
+            "over_range": 0,
+            "p50": 301,
+            "p95": 526,
+            "p99": 701,
+            "p999": 913,
+            "samples": 710
+          },
+          "operations": 710
+        },
+        "pausing_writes|probe_read_after_write": {
+          "latency_us": {
+            "max": 341,
+            "max_observed": 341,
+            "over_range": 0,
+            "p50": 341,
+            "p95": 341,
+            "p99": 341,
+            "p999": 341,
+            "samples": 1
+          },
+          "operations": 1
+        },
+        "pausing_writes|put_new": {
+          "latency_us": {
+            "max": 272,
+            "max_observed": 272,
+            "over_range": 0,
+            "p50": 272,
+            "p95": 272,
+            "p99": 272,
+            "p999": 272,
+            "samples": 1
+          },
+          "operations": 1
+        },
+        "pausing_writes|put_rewrite": {
+          "latency_us": {
+            "max": 207487,
+            "max_observed": 207415,
+            "over_range": 0,
+            "p50": 207487,
+            "p95": 207487,
+            "p99": 207487,
+            "p999": 207487,
+            "samples": 1
+          },
+          "operations": 1
+        },
+        "post|delete": {
+          "latency_us": {
+            "max": 69567,
+            "max_observed": 69547,
+            "over_range": 0,
+            "p50": 372,
+            "p95": 805,
+            "p99": 69567,
+            "p999": 69567,
+            "samples": 64
+          },
+          "operations": 64
+        },
+        "post|get": {
+          "latency_us": {
+            "max": 19439,
+            "max_observed": 19425,
+            "over_range": 0,
+            "p50": 275,
+            "p95": 534,
+            "p99": 700,
+            "p999": 1302,
+            "samples": 244846
+          },
+          "operations": 244846
+        },
+        "post|probe_read_after_write": {
+          "latency_us": {
+            "max": 1209,
+            "max_observed": 1209,
+            "over_range": 0,
+            "p50": 300,
+            "p95": 607,
+            "p99": 797,
+            "p999": 1209,
+            "samples": 435
+          },
+          "operations": 435
+        },
+        "post|put_new": {
+          "latency_us": {
+            "max": 56607,
+            "max_observed": 56582,
+            "over_range": 0,
+            "p50": 346,
+            "p95": 678,
+            "p99": 10687,
+            "p999": 56607,
+            "samples": 108
+          },
+          "operations": 108
+        },
+        "post|put_rewrite": {
+          "latency_us": {
+            "max": 64895,
+            "max_observed": 64867,
+            "over_range": 0,
+            "p50": 348,
+            "p95": 667,
+            "p99": 10631,
+            "p999": 64895,
+            "samples": 263
+          },
+          "operations": 263
+        },
+        "pre|delete": {
+          "latency_us": {
+            "max": 810,
+            "max_observed": 810,
+            "over_range": 0,
+            "p50": 347,
+            "p95": 810,
+            "p99": 810,
+            "p999": 810,
+            "samples": 13
+          },
+          "operations": 13
+        },
+        "pre|get": {
+          "latency_us": {
+            "max": 1334,
+            "max_observed": 1334,
+            "over_range": 0,
+            "p50": 274,
+            "p95": 534,
+            "p99": 682,
+            "p999": 855,
+            "samples": 56077
+          },
+          "operations": 56077
+        },
+        "pre|probe_read_after_write": {
+          "latency_us": {
+            "max": 829,
+            "max_observed": 829,
+            "over_range": 0,
+            "p50": 308,
+            "p95": 500,
+            "p99": 829,
+            "p999": 829,
+            "samples": 95
+          },
+          "operations": 95
+        },
+        "pre|put_new": {
+          "latency_us": {
+            "max": 682,
+            "max_observed": 682,
+            "over_range": 0,
+            "p50": 327,
+            "p95": 621,
+            "p99": 682,
+            "p999": 682,
+            "samples": 23
+          },
+          "operations": 23
+        },
+        "pre|put_rewrite": {
+          "latency_us": {
+            "max": 782,
+            "max_observed": 782,
+            "over_range": 0,
+            "p50": 325,
+            "p95": 596,
+            "p99": 782,
+            "p999": 782,
+            "samples": 59
+          },
+          "operations": 59
+        },
+        "published|get": {
+          "latency_us": {
+            "max": 1156,
+            "max_observed": 1156,
+            "over_range": 0,
+            "p50": 278,
+            "p95": 504,
+            "p99": 630,
+            "p999": 848,
+            "samples": 3497
+          },
+          "operations": 3497
+        },
+        "published|probe_read_after_publish": {
+          "latency_us": {
+            "max": 468,
+            "max_observed": 468,
+            "over_range": 0,
+            "p50": 360,
+            "p95": 468,
+            "p99": 468,
+            "p999": 468,
+            "samples": 2
+          },
+          "operations": 2
+        },
+        "published|probe_read_after_write": {
+          "latency_us": {
+            "max": 494,
+            "max_observed": 494,
+            "over_range": 0,
+            "p50": 259,
+            "p95": 494,
+            "p99": 494,
+            "p999": 494,
+            "samples": 6
+          },
+          "operations": 6
+        },
+        "published|put_new": {
+          "latency_us": {
+            "max": 534,
+            "max_observed": 534,
+            "over_range": 0,
+            "p50": 435,
+            "p95": 534,
+            "p99": 534,
+            "p999": 534,
+            "samples": 2
+          },
+          "operations": 2
+        },
+        "published|put_rewrite": {
+          "latency_us": {
+            "max": 511,
+            "max_observed": 511,
+            "over_range": 0,
+            "p50": 418,
+            "p95": 511,
+            "p99": 511,
+            "p999": 511,
+            "samples": 2
+          },
+          "operations": 2
+        },
+        "verifying|delete": {
+          "latency_us": {
+            "max": 53343,
+            "max_observed": 53338,
+            "over_range": 0,
+            "p50": 53343,
+            "p95": 53343,
+            "p99": 53343,
+            "p999": 53343,
+            "samples": 1
+          },
+          "operations": 1
+        },
+        "verifying|get": {
+          "latency_us": {
+            "max": 32191,
+            "max_observed": 32181,
+            "over_range": 0,
+            "p50": 282,
+            "p95": 549,
+            "p99": 717,
+            "p999": 16079,
+            "samples": 3223
+          },
+          "operations": 3223
+        },
+        "verifying|probe_read_after_write": {
+          "latency_us": {
+            "max": 628,
+            "max_observed": 628,
+            "over_range": 0,
+            "p50": 628,
+            "p95": 628,
+            "p99": 628,
+            "p999": 628,
+            "samples": 1
+          },
+          "operations": 1
+        },
+        "verifying|put_new": {
+          "latency_us": {
+            "max": 536,
+            "max_observed": 536,
+            "over_range": 0,
+            "p50": 536,
+            "p95": 536,
+            "p99": 536,
+            "p999": 536,
+            "samples": 1
+          },
+          "operations": 1
+        }
+      },
+      "phase": "post",
+      "violation_examples": [],
+      "violations": {}
+    },
+    "scaling_pool_plan": {
+      "cohort_write_rates": {
+        "delete": 7,
+        "rewrite": 30,
+        "total": 49,
+        "write_new": 12
+      },
+      "load_mode": "closed",
+      "open_rate": 0,
+      "pool_seconds": 30,
+      "read_distribution": "zipf:0.99",
+      "read_keys": 12000,
+      "transitions": [
+        "grow"
+      ],
+      "write_rate": 50
+    }
+  }
+}

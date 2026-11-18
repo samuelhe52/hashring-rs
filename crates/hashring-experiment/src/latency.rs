@@ -15,12 +15,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use hashring_client::{ClientError, HashringClient};
-use hashring_core::proto::ErrorCode;
+use hashring_core::{proto::ErrorCode, topology::Member};
 use hdrhistogram::Histogram;
 use rand::Rng;
 use serde_json::json;
 
-use crate::{EventLog, LatencyStageMeasurement, LatencySummary, deterministic_value};
+use crate::{
+    EventLog, LatencyStageMeasurement, LatencySummary, deterministic_value,
+    node_load::NodeOperationSampler, process_cpu_seconds,
+};
 
 /// The operations the load issues.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,6 +226,7 @@ impl KeyDistribution {
 pub struct LatencyHistogram {
     inner: Histogram<u64>,
     highest_micros: u64,
+    sum_micros: u128,
     /// The samples that were longer than the histogram's range.
     over_range: u64,
     /// The longest sample, whether or not it was in the range.
@@ -237,12 +241,14 @@ impl LatencyHistogram {
         Ok(Self {
             inner,
             highest_micros,
+            sum_micros: 0,
             over_range: 0,
             max_observed: 0,
         })
     }
 
     pub fn record(&mut self, micros: u64) {
+        self.sum_micros += u128::from(micros);
         self.max_observed = self.max_observed.max(micros);
         if micros > self.highest_micros {
             self.over_range += 1;
@@ -255,12 +261,14 @@ impl LatencyHistogram {
 
     pub fn merge(&mut self, other: &Self) {
         let _ = self.inner.add(&other.inner);
+        self.sum_micros += other.sum_micros;
         self.over_range += other.over_range;
         self.max_observed = self.max_observed.max(other.max_observed);
     }
 
     pub fn reset(&mut self) {
         self.inner.reset();
+        self.sum_micros = 0;
         self.over_range = 0;
         self.max_observed = 0;
     }
@@ -270,6 +278,7 @@ impl LatencyHistogram {
             return LatencySummary::default();
         }
         LatencySummary {
+            mean: Some(self.sum_micros as f64 / self.inner.len() as f64),
             p50: self.inner.value_at_quantile(0.50),
             p95: self.inner.value_at_quantile(0.95),
             p99: self.inner.value_at_quantile(0.99),
@@ -467,15 +476,24 @@ pub struct LoadRunner {
     client: HashringClient,
     plan: Arc<LoadPlan>,
     metrics: Arc<Metrics>,
+    node_pids: Arc<BTreeMap<String, u32>>,
+    node_operations: NodeOperationSampler,
 }
 
 impl LoadRunner {
-    pub fn new(client: HashringClient, plan: LoadPlan) -> Result<Self> {
+    pub fn new(
+        client: HashringClient,
+        plan: LoadPlan,
+        node_pids: BTreeMap<String, u32>,
+        members: &[Member],
+    ) -> Result<Self> {
         let metrics = Arc::new(Metrics::new(plan.highest_latency_micros)?);
         Ok(Self {
             client,
             plan: Arc::new(plan),
             metrics,
+            node_pids: Arc::new(node_pids),
+            node_operations: NodeOperationSampler::new(members)?,
         })
     }
 
@@ -520,6 +538,8 @@ impl LoadRunner {
         seconds: u64,
         warmup: bool,
     ) -> Result<(LatencyStageMeasurement, u64)> {
+        let mut node_operations = self.node_operations.clone();
+        node_operations.sample(&self.client.topology().await).await;
         let start = Instant::now();
         let end = start + Duration::from_secs(seconds);
         // The sender of the previous phase has stopped; this one starts fresh.
@@ -537,6 +557,8 @@ impl LoadRunner {
                 start,
                 end,
                 retries_before,
+                node_pids: Arc::clone(&self.node_pids),
+                node_operations,
             },
         ));
         let (issued, late, saturated_windows) = self.drive(stage, start, end).await?;
@@ -828,6 +850,8 @@ struct SampleWindow {
     start: Instant,
     end: Instant,
     retries_before: u64,
+    node_pids: Arc<BTreeMap<String, u32>>,
+    node_operations: NodeOperationSampler,
 }
 
 /// Write one event per second, including warmup.
@@ -843,13 +867,23 @@ async fn sample_windows(
         start,
         end,
         retries_before,
+        node_pids,
+        mut node_operations,
     } = window;
+    let node_cpu_totals = || -> BTreeMap<_, _> {
+        node_pids
+            .iter()
+            .filter_map(|(id, pid)| process_cpu_seconds(*pid).map(|seconds| (id.as_str(), seconds)))
+            .collect()
+    };
+    let mut cpu_before = node_cpu_totals();
+    let mut cpu_at = Instant::now();
     let mut window_start = start;
     let mut retries_seen = retries_before;
     while window_start < end {
         let window_end = window_start + Duration::from_secs(1);
         tokio::time::sleep_until(window_end.into()).await;
-        let (issued, late, completed, errors, latency_us) = {
+        let (issued, late, completed, errors, latency_us, sampled_at) = {
             let mut state = metrics
                 .state
                 .lock()
@@ -858,7 +892,14 @@ async fn sample_windows(
             state.fold();
             let issued = metrics.issued.swap(0, Ordering::AcqRel);
             let late = metrics.late.swap(0, Ordering::AcqRel);
-            (issued, late, completed, errors, latency_us)
+            (
+                issued,
+                late,
+                completed,
+                errors,
+                latency_us,
+                crate::unix_ms(),
+            )
         };
         // Dropped requests count as scheduled; only unscheduled requests are behind.
         let length = window_end.min(end).saturating_duration_since(window_start);
@@ -868,7 +909,22 @@ async fn sample_windows(
         let retries_now = client.retry_count();
         let retries = retries_now.saturating_sub(retries_seen);
         retries_seen = retries_now;
-        let epoch = client.epoch().await;
+        let topology = client.topology().await;
+        let epoch = topology.epoch;
+        let cpu_after = node_cpu_totals();
+        let now = Instant::now();
+        let elapsed = now.duration_since(cpu_at).as_secs_f64();
+        let node_cpu_percent: BTreeMap<_, _> = cpu_after
+            .iter()
+            .filter_map(|(id, total)| {
+                let previous = cpu_before.get(id)?;
+                (elapsed > 0.0 && total >= previous)
+                    .then_some((*id, (total - previous) / elapsed * 100.0))
+            })
+            .collect();
+        cpu_before = cpu_after;
+        cpu_at = now;
+        let node_ops_per_second = node_operations.sample(&topology).await;
         let fields = json!({
             "stage": stage.name,
             "warmup": warmup,
@@ -883,8 +939,13 @@ async fn sample_windows(
             "retries": retries,
             "epoch": epoch,
             "latency_us": latency_us,
+            "node_ops_per_second": node_ops_per_second,
+            "node_cpu_percent": node_cpu_percent,
         });
-        if events.record("metrics_sampled", fields).is_err() {
+        if events
+            .record_at("metrics_sampled", fields, sampled_at)
+            .is_err()
+        {
             return;
         }
         window_start = window_end;
@@ -1002,6 +1063,7 @@ mod tests {
         }
         let summary = histogram.summary();
         assert_eq!(summary.samples, 10_000);
+        assert_eq!(summary.mean, Some(5_000.5));
         // A histogram reports the upper bound of the bucket a value falls in,
         // so its maximum is a little above the largest value recorded.
         assert!(summary.max >= 10_000 && summary.max <= 10_010);
@@ -1047,6 +1109,9 @@ mod tests {
         assert_eq!(summary.samples, 4);
         assert_eq!(summary.max_observed, 9_000);
         assert_eq!(summary.over_range, 3);
+        assert_eq!(summary.mean, Some(4_002.5));
+        histogram.reset();
+        assert_eq!(histogram.summary().mean, None);
     }
 
     #[test]

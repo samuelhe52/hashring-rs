@@ -1,0 +1,7 @@
+mode: correctness
+nodes: 4
+keys: 2000
+virtual_nodes: 32
+concurrency: 8
+worker_threads: 2
+coordinator_worker_threads: 2

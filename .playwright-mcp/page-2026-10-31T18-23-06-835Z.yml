@@ -1,0 +1,113 @@
+- generic [ref=f2e1]:
+  - generic [ref=f2e2]:
+    - generic [ref=f2e5]:
+      - generic [ref=f2e6]:
+        - generic [ref=f2e8]:
+          - link [ref=f2e9] [cursor=pointer]:
+            - /url: /search
+          - button "Collapse/expand navigation" [ref=f2e19] [cursor=pointer]
+        - generic [ref=f2e26]:
+          - generic [ref=f2e27]:
+            - link "Search" [ref=f2e28] [cursor=pointer]:
+              - /url: /search
+            - link "Saved searches" [ref=f2e34] [cursor=pointer]:
+              - /url: /search/list
+              - button [ref=f2e42]
+            - paragraph [ref=f2e47]:
+              - text: No favorites. Star on
+              - link "Saved searches" [ref=f2e48] [cursor=pointer]:
+                - /url: /search/list
+              - text: .
+            - link "Chart explorer" [ref=f2e49] [cursor=pointer]:
+              - /url: /chart
+            - link "Client sessions" [ref=f2e60] [cursor=pointer]:
+              - /url: /sessions
+            - link "Service map Beta" [ref=f2e66] [cursor=pointer]:
+              - /url: /service-map
+              - generic [ref=f2e67]: Service map
+              - generic [ref=f2e75]: Beta
+            - link "Dashboards" [ref=f2e79] [cursor=pointer]:
+              - /url: /dashboards/list
+              - button [ref=f2e88]
+            - paragraph [ref=f2e93]:
+              - text: No favorites. Star on
+              - link "Dashboards" [ref=f2e94] [cursor=pointer]:
+                - /url: /dashboards/list
+              - text: .
+            - button "New updates available Help" [ref=f2e95] [cursor=pointer]:
+              - generic [ref=f2e96]:
+                - img "New updates available" [ref=f2e98]
+                - generic [ref=f2e102]: Help
+          - generic [ref=f2e104]:
+            - text: Ready to deploy on ClickHouse Cloud?
+            - link "Get started for free" [ref=f2e106] [cursor=pointer]:
+              - /url: https://clickhouse.com/docs/use-cases/observability/clickstack/getting-started#deploy-with-clickhouse-cloud
+        - generic [ref=f2e109]:
+          - link [ref=f2e110] [cursor=pointer]:
+            - /url: /careers
+            - paragraph [ref=f2e111]: Join us & build the future of high scale observability →
+          - generic [ref=f2e113] [cursor=pointer]:
+            - generic [ref=f2e114]: U
+            - generic [ref=f2e116]:
+              - paragraph [ref=f2e117]: Local mode
+              - paragraph
+      - generic [ref=f2e121]:
+        - generic [ref=f2e122]:
+          - generic [ref=f2e123]:
+            - generic [ref=f2e124]:
+              - combobox "Data Source" [ref=f2e131] [cursor=pointer]
+              - button "Source actions" [ref=f2e132] [cursor=pointer]
+            - generic [ref=f2e140]:
+              - generic [ref=f2e141]: SELECT
+              - textbox [ref=f2e147]:
+                - generic [ref=f2e148]:
+                  - generic "placeholder SELECT Columns": SELECT Columns
+            - generic [ref=f2e151]:
+              - generic [ref=f2e152]: ORDER BY
+              - textbox [ref=f2e158]
+            - button "Save" [ref=f2e160] [cursor=pointer]
+          - generic [ref=f2e163]:
+            - generic [ref=f2e164]:
+              - generic [ref=f2e166]:
+                - combobox "Query language" [ref=f2e169] [cursor=pointer]: Lucene
+                - button "Open syntax reference" [ref=f2e170] [cursor=pointer]
+              - textbox "Search your events w/ Lucene ex. column:foo" [ref=f2e179]
+            - generic [ref=f2e180]:
+              - textbox "Time Range" [ref=f2e186]: Live Tail
+              - combobox [ref=f2e190] [cursor=pointer]: 10s
+              - button "Run" [ref=f2e191] [cursor=pointer]
+        - generic [ref=f2e199]:
+          - heading "No data to display" [level=3] [ref=f2e205]
+          - paragraph [ref=f2e206]: Select a source and click the play button to query data.
+    - region "Notifications (F8)":
+      - list
+  - dialog [ref=f2e208]:
+    - banner [ref=f2e209]:
+      - heading "Welcome to ClickStack" [level=2] [ref=f2e210]
+    - generic [ref=f2e211]:
+      - paragraph [ref=f2e212]: Lets set up your connection to ClickHouse
+      - generic [ref=f2e214]:
+        - generic [ref=f2e215]:
+          - paragraph [ref=f2e216]: Connection Name
+          - textbox "My Clickhouse Server" [ref=f2e218]: Default
+        - generic [ref=f2e219]:
+          - generic [ref=f2e220]:
+            - paragraph [ref=f2e221]: Host
+            - img [ref=f2e222] [cursor=pointer]
+          - textbox "http://localhost:8123" [ref=f2e227]
+        - generic [ref=f2e228]:
+          - paragraph [ref=f2e229]: Username
+          - 'textbox "Username (default: default)" [ref=f2e231]': default
+        - generic [ref=f2e232]:
+          - paragraph [ref=f2e233]: Password
+          - generic [ref=f2e236]:
+            - 'textbox "Password (default: blank)" [ref=f2e238]'
+            - button "Toggle password visibility" [ref=f2e240] [cursor=pointer]
+        - generic [ref=f2e246]: Advanced Settings
+        - generic [ref=f2e252]:
+          - button "Test Connection" [ref=f2e253] [cursor=pointer]
+          - button "Create Connection" [ref=f2e257] [cursor=pointer]
+      - separator [ref=f2e260]:
+        - generic [ref=f2e261]: OR
+      - button "Connect to Demo Server" [ref=f2e262] [cursor=pointer]
+  - alert [ref=f2e265]

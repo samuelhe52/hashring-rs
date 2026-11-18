@@ -1,0 +1,126 @@
+- generic [ref=f72e3]:
+  - banner [ref=f72e4]:
+    - link "Hashring 实验结果首页" [ref=f72e5] [cursor=pointer]:
+      - /url: /
+      - generic [ref=f72e12]: hashring-rs
+    - generic [ref=f72e13]: 实验工作台
+    - generic [ref=f72e14]:
+      - generic [ref=f72e15]: 本地结果
+      - link "学习文档" [ref=f72e17] [cursor=pointer]:
+        - /url: /api/guide
+        - text: 学习文档 ↗
+  - main [ref=f72e18]:
+    - generic [ref=f72e19]:
+      - generic [ref=f72e20]:
+        - heading "实验结果" [level=1] [ref=f72e21]
+        - paragraph [ref=f72e22]: 查看配置，读懂每一次运行。
+      - button "刷新结果" [ref=f72e23] [cursor=pointer]
+    - generic [ref=f72e26]:
+      - complementary "实验运行列表" [ref=f72e27]:
+        - generic [ref=f72e28]:
+          - heading "全部运行" [level=2] [ref=f72e29]
+          - generic [ref=f72e30]: "2"
+        - searchbox "搜索运行名称" [ref=f72e35]
+        - generic [ref=f72e36]:
+          - combobox "筛选实验模式" [ref=f72e37] [cursor=pointer]:
+            - option "全部模式" [selected]
+            - option "latency"
+          - combobox "筛选运行状态" [ref=f72e38] [cursor=pointer]:
+            - option "全部状态" [selected]
+            - option "成功"
+            - option "失败"
+            - option "未完成"
+        - generic [ref=f72e39]:
+          - generic [ref=f72e40]: 2 次运行
+          - combobox "运行排序" [ref=f72e41] [cursor=pointer]:
+            - option "最新优先" [selected]
+            - option "最早优先"
+            - option "名称排序"
+        - list [ref=f72e42]:
+          - listitem [ref=f72e43]:
+            - button "latency 成功 my-latency 2026/10/28 01:33:57 3 节点 RF 3 27.56 s OwnerOnly 2,000 键" [pressed] [ref=f72e44] [cursor=pointer]:
+              - generic [ref=f72e45]:
+                - generic [ref=f72e46]: latency
+                - generic [ref=f72e47]: 成功
+              - strong [ref=f72e49]: my-latency
+              - generic [ref=f72e50]: 2026/10/28 01:33:57
+              - generic [ref=f72e51]:
+                - generic [ref=f72e52]: 3 节点
+                - generic [ref=f72e53]: RF 3
+                - generic [ref=f72e54]: 27.56 s
+              - generic [ref=f72e55]:
+                - text: OwnerOnly
+                - generic [ref=f72e56]: 2,000 键
+          - listitem [ref=f72e57]:
+            - button "latency 成功 dashboard-smoke 2026/10/28 01:07:30 3 节点 RF 3 27.51 s OwnerOnly 2,000 键" [ref=f72e58] [cursor=pointer]:
+              - generic [ref=f72e59]:
+                - generic [ref=f72e60]: latency
+                - generic [ref=f72e61]: 成功
+              - strong [ref=f72e63]: dashboard-smoke
+              - generic [ref=f72e64]: 2026/10/28 01:07:30
+              - generic [ref=f72e65]:
+                - generic [ref=f72e66]: 3 节点
+                - generic [ref=f72e67]: RF 3
+                - generic [ref=f72e68]: 27.51 s
+              - generic [ref=f72e69]:
+                - text: OwnerOnly
+                - generic [ref=f72e70]: 2,000 键
+        - paragraph [ref=f72e71]: 开始时间均为北京时间。
+      - region "运行详情" [ref=f72e72]:
+        - generic [ref=f72e73]:
+          - generic [ref=f72e74]:
+            - generic [ref=f72e75]:
+              - generic [ref=f72e76]: latency
+              - generic [ref=f72e77]: 成功
+            - heading "my-latency" [level=2] [ref=f72e79]
+            - paragraph [ref=f72e80]: my-latency-20261028-013354
+          - generic [ref=f72e81]:
+            - generic [ref=f72e82]: 2026/10/28 01:33:57
+            - generic [ref=f72e83]: 总耗时 27.56 s
+        - generic [ref=f72e84]:
+          - generic [ref=f72e85]:
+            - term [ref=f72e86]: 节点
+            - definition [ref=f72e87]: "3"
+          - generic [ref=f72e88]:
+            - term [ref=f72e89]: 期望 RF
+            - definition [ref=f72e90]: "3"
+          - generic [ref=f72e91]:
+            - term [ref=f72e92]: ACK 策略
+            - definition [ref=f72e93]: OwnerOnly
+          - generic [ref=f72e94]:
+            - term [ref=f72e95]: 键数
+            - definition [ref=f72e96]: 2,000
+          - generic [ref=f72e97]:
+            - term [ref=f72e98]: 值大小
+            - definition [ref=f72e99]: 128 B
+        - generic [ref=f72e100]:
+          - generic [aria-hidden] [ref=f72e101]: "!"
+          - paragraph [ref=f72e102]:
+            - strong [ref=f72e103]: 源码可复现性未满足
+            - text: 保留本次结果；正式引用前请核对构建与运行源码。
+        - navigation "详情视图" [ref=f72e104]:
+          - button "结果概览" [ref=f72e105] [cursor=pointer]
+          - button "实验配置" [ref=f72e106] [cursor=pointer]
+          - button "原始文件" [pressed] [ref=f72e107] [cursor=pointer]
+          - button "进程日志" [ref=f72e108] [cursor=pointer]
+        - generic [ref=f72e109]:
+          - generic [ref=f72e110]:
+            - generic [ref=f72e111]:
+              - heading "原始结果文件" [level=3] [ref=f72e112]
+              - paragraph [ref=f72e113]: 保留文件原文，可对照页面读数。
+            - link "下载原文" [active] [ref=f72e114] [cursor=pointer]:
+              - /url: /api/runs/my-latency-20261028-013354/raw?file=summary.json
+          - generic [ref=f72e115]:
+            - generic [ref=f72e116]:
+              - text: 文件
+              - combobox "选择文件" [ref=f72e117] [cursor=pointer]:
+                - option "summary.json" [selected]
+                - option "manifest.json"
+                - option "events.jsonl"
+            - generic [ref=f72e118]:
+              - text: 搜索行
+              - searchbox "搜索行" [ref=f72e119]
+          - generic "summary.json原文" [ref=f72e120]: "{ \"success\": true, \"error\": null, \"elapsed_seconds\": 27.555309429, \"final_epoch\": 1, \"measurements\": { \"rate_0\": { \"target_rate\": 500, \"achieved_rate\": 500.0, \"seconds\": 10.0, \"sender_saturated\": false, \"issued\": 5000, \"late\": 0, \"ops\": { \"delete\": 49, \"get\": 4527, \"put\": 424 }, \"errors\": { \"deadline\": 0, \"not_found\": 0, \"operation\": 0, \"protocol\": 0, \"rpc\": 0, \"topology\": 0 }, \"retries\": 0, \"latency_us\": { \"delete\": { \"p50\": 531, \"p95\": 704, \"p99\": 759, \"p999\": 759, \"max\": 759, \"max_observed\": 759, \"over_range\": 0, \"samples\": 49 }, \"get\": { \"p50\": 401, \"p95\": 599, \"p99\": 732, \"p999\": 940, \"max\": 1368, \"max_observed\": 1368, \"over_range\": 0, \"samples\": 4527 }, \"put\": { \"p50\": 458, \"p95\": 684, \"p99\": 773, \"p999\": 929, \"max\": 929, \"max_observed\": 929, \"over_range\": 0, \"samples\": 424 } }, \"load_balance\": { \"per_node\": { \"node-1\": { \"owned_keys\": 635, \"ops_handled\": 1573, \"cpu_percent\": 4.2 }, \"node-2\": { \"owned_keys\": 534, \"ops_handled\": 1321, \"cpu_percent\": 3.6999999999999997 }, \"node-3\": { \"owned_keys\": 831, \"ops_handled\": 2106, \"cpu_percent\": 5.099999999999999 } }, \"owned_keys_max_over_mean\": 1.2465000000000002, \"owned_keys_cv\": 0.18494999324141648, \"ops_handled_max_over_mean\": 1.2635999999999998, \"ops_handled_cv\": 0.19634846574394207 } }, \"rate_1\": { \"target_rate\": 1000, \"achieved_rate\": 1000.0, \"seconds\": 10.0, \"sender_saturated\": false, \"issued\": 10000, \"late\": 0, \"ops\": { \"delete\": 107, \"get\": 9019, \"put\": 874 }, \"errors\": { \"deadline\": 0, \"not_found\": 0, \"operation\": 0, \"protocol\": 0, \"rpc\": 0, \"topology\": 0 }, \"retries\": 0, \"latency_us\": { \"delete\": { \"p50\": 388, \"p95\": 575, \"p99\": 613, \"p999\": 795, \"max\": 795, \"max_observed\": 795, \"over_range\": 0, \"samples\": 107 }, \"get\": { \"p50\": 321, \"p95\": 555, \"p99\": 660, \"p999\": 861, \"max\": 1336, \"max_observed\": 1336, \"over_range\": 0, \"samples\": 9019 }, \"put\": { \"p50\": 381, \"p95\": 583, \"p99\": 755, \"p999\": 2203, \"max\": 2203, \"max_observed\": 2203, \"over_range\": 0, \"samples\": 874 } }, \"load_balance\": { \"per_node\": { \"node-1\": { \"owned_keys\": 635, \"ops_handled\": 3177, \"cpu_percent\": 7.3 }, \"node-2\": { \"owned_keys\": 534, \"ops_handled\": 2739, \"cpu_percent\": 6.599999999999999 }, \"node-3\": { \"owned_keys\": 831, \"ops_handled\": 4084, \"cpu_percent\": 8.799999999999999 } }, \"owned_keys_max_over_mean\": 1.2465000000000002, \"owned_keys_cv\": 0.18494999324141648, \"ops_handled_max_over_mean\": 1.2251999999999998, \"ops_handled_cv\": 0.1680332705150977 } } }, \"observations\": { \"idle_client_put_latency_us\": { \"max\": 665, \"p50\": 362, \"p95\": 559, \"p99\": 631, \"samples\": 128 }, \"idle_owner_rpc_put_latency_us\": { \"max\": 667, \"p50\": 377, \"p95\": 577, \"p99\": 629, \"samples\": 128 }, \"initial_full_rf_seconds\": 0.770168397, \"initial_get_verify\": { \"operations\": 2000, \"operations_per_second\": 32909.859138891814, \"seconds\": 0.060772062 }, \"initial_put\": { \"operations\": 2000, \"operations_per_second\": 28366.139175143024, \"seconds\": 0.070506599 }, \"latency_delete_pool_keys\": 180, \"latency_key_distribution\": \"uniform\", \"latency_key_space\": 2000, \"latency_mix\": \"90:9:1\", \"latency_saturated_windows\": { \"rate_0\": 0, \"rate_1\": 0 }, \"latency_verified_keys\": 2000, \"node_pressure_after_initial_put\": { \"node-1\": { \"ack_completion_write_timing\": null, \"ack_write_timing\": null, \"dedup_bytes\": 668000, \"dedup_capacity_bytes\": 134217728, \"dedup_peak_bytes\": 668000, \"follower_dedup_rejections\": 0, \"follower_write_timing\": null, \"owner_dedup_rejections\": 0, \"owner_write_timing\": null, \"receipt_cleanup_timing\": null, \"replication_reservation_rejections\": 0, \"replication_rpc_retries\": 0, \"replication_stream_peak_pending\": 18 }, \"node-2\": { \"ack_completion_write_timing\": null, \"ack_write_timing\": null, \"dedup_bytes\": 668000, \"dedup_capacity_bytes\": 134217728, \"dedup_peak_bytes\": 668000, \"follower_dedup_rejections\": 0, \"follower_write_timing\": null, \"owner_dedup_rejections\": 0, \"owner_write_timing\": null, \"receipt_cleanup_timing\": null, \"replication_reservation_rejections\": 0, \"replication_rpc_retries\": 0, \"replication_stream_peak_pending\": 13 }, \"node-3\": { \"ack_completion_write_timing\": null, \"ack_write_timing\": null, \"dedup_bytes\": 668000, \"dedup_capacity_bytes\": 134217728, \"dedup_peak_bytes\": 668000, \"follower_dedup_rejections\": 0, \"follower_write_timing\": null, \"owner_dedup_rejections\": 0, \"owner_write_timing\": null, \"receipt_cleanup_timing\": null, \"replication_reservation_rejections\": 0, \"replication_rpc_retries\": 0, \"replication_stream_peak_pending\": 21 } } } }"
+    - generic [ref=f72e121]:
+      - generic [ref=f72e122]: hashring-rs · 一致性哈希实验
+      - generic [ref=f72e123]: 让每个读数，都有出处。

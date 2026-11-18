@@ -1,0 +1,46 @@
+- generic [ref=f1e3]:
+  - banner [ref=f1e4]:
+    - link "Hashring 实验结果首页" [ref=f1e5] [cursor=pointer]:
+      - /url: /
+      - generic [ref=f1e12]: hashring-rs
+    - generic [ref=f1e13]: 实验工作台
+    - generic [ref=f1e14]:
+      - generic [ref=f1e15]: 本地结果
+      - link "学习文档" [ref=f1e17] [cursor=pointer]:
+        - /url: /api/guide
+        - text: 学习文档 ↗
+  - main [ref=f1e18]:
+    - generic [ref=f1e19]:
+      - generic [ref=f1e20]:
+        - heading "实验结果" [level=1] [ref=f1e21]
+        - paragraph [ref=f1e22]: 查看配置，读懂每一次运行。
+      - button "正在读取" [disabled] [ref=f1e23]
+    - generic [ref=f1e26]:
+      - complementary "实验运行列表" [ref=f1e27]:
+        - generic [ref=f1e28]:
+          - heading "全部运行" [level=2] [ref=f1e29]
+          - generic [ref=f1e30]: "0"
+        - searchbox "搜索运行名称" [ref=f1e35]
+        - generic [ref=f1e36]:
+          - combobox "筛选实验模式" [ref=f1e37] [cursor=pointer]:
+            - option "全部模式" [selected]
+          - combobox "筛选运行状态" [ref=f1e38] [cursor=pointer]:
+            - option "全部状态" [selected]
+            - option "成功"
+            - option "失败"
+            - option "未完成"
+        - generic [ref=f1e39]:
+          - generic [ref=f1e40]: 0 次运行
+          - combobox "运行排序" [ref=f1e41] [cursor=pointer]:
+            - option "最新优先" [selected]
+            - option "最早优先"
+            - option "名称排序"
+        - status [ref=f1e42]: 正在查找运行结果……
+        - paragraph [ref=f1e43]: 开始时间均为北京时间。
+      - region "运行详情" [ref=f1e44]:
+        - generic [ref=f1e45]:
+          - heading "从一次运行开始" [level=2] [ref=f1e47]
+          - paragraph [ref=f1e48]: 选择左侧实验，查看它的配置与结果。
+    - generic [ref=f1e49]:
+      - generic [ref=f1e50]: hashring-rs · 一致性哈希实验
+      - generic [ref=f1e51]: 让每个读数，都有出处。
