@@ -1758,6 +1758,9 @@ pub(crate) async fn run(context: crate::RunContext<'_>) -> Result<u64> {
                 "verification": verification_status,
             }),
         );
+        if let Some(change) = &completed {
+            super::write_topology_snapshot(events, &change.target_topology)?;
+        }
         events.record(
             "scaling_transition_complete",
             json!({

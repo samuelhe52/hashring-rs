@@ -1,28 +1,28 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 import CaseRing from './CaseRing.vue'
 import CaseWindowMetrics from './CaseWindowMetrics.vue'
 import ReplayEventList from './ReplayEventList.vue'
 import RunFacts from './RunFacts.vue'
 import RunReadings from './RunReadings.vue'
 import { number, object, request } from '../data'
-import { casePlayback, headline, latestPublishedEpoch, scenes, seconds, stageDetails, type Scene } from '../caseReplay'
+import { casePlayback, changeDirection, headline, latestPublishedEpoch, scenes, seconds, stageDetails, type Scene } from '../caseReplay'
 import { eventName, eventSummary, relativeEventTime } from '../events'
 import { replayBounds, visibleCount } from '../history.ts'
-import { decodeTopology, type RingModel } from '../topology.ts'
-import type { EventLog, RunDetail, RunEvent } from '../types'
+import { decodeTopology, topologyWithoutMember, type RingModel } from '../topology.ts'
+import type { EventLog, ReplayStart, RunDetail, RunEvent } from '../types'
 import { useReplayClock } from '../useReplayClock'
 
 const props = defineProps<{ run: RunDetail; scene: Scene; modalOpen: boolean }>()
 const emit = defineEmits<{ inspect: [event: RunEvent]; topology: [line?: number] }>()
-const log = ref<EventLog>({ events: [], issues: [], missing: false })
+const log = shallowRef<EventLog>({ events: [], issues: [], missing: false })
 const loading = ref(true)
 const eventError = ref('')
 const timeline = ref<HTMLElement | null>(null)
 let controller: AbortController | undefined
 const visual = ref<'ring' | 'metrics' | 'mechanism'>('ring')
 const evidence = ref<'stage' | 'feed'>('stage')
-const mechanismOverride = ref<'before' | 'after' | null>(null)
+const mechanismOverride = ref<'before' | 'after' | 'removed' | null>(null)
 
 const replay = computed(() => casePlayback(props.scene, log.value.events))
 const stages = computed(() => replay.value.stages.map(stage => ({ ...stage, ...stageDetails(stage, replay.value, props.run.summary) })))
@@ -59,30 +59,61 @@ const snapshotEvents = computed(() => snapshots.value.map(({ event }) => event))
 const snapshotIndex = computed(() => visibleCount(snapshotEvents.value, cursor.value, boundaryLine.value ?? Infinity) - 1)
 const snapshot = computed(() => snapshots.value[snapshotIndex.value])
 const earlierRing = computed<RingModel | null>(() => {
-  const initial = snapshots.value.slice(0, Math.max(0, snapshotIndex.value)).find(({ event }) => event === replay.value.initialSnapshot)
-  if (!snapshot.value || !initial || initial.model.epoch === snapshot.value.model.epoch) return null
-  return initial.model
+  const epoch = snapshot.value?.model.epoch
+  return snapshots.value.slice(0, Math.max(0, snapshotIndex.value)).reverse()
+    .find(({ model }) => model.epoch !== epoch)?.model ?? null
 })
 const publishedEpoch = computed(() => latestPublishedEpoch(seen.value))
-const missingTargetRing = computed(() => props.scene === 'expansion' &&
-  reachedStages.value.some(stage => stage.kind === 'migrated' || stage.kind === 'verified') &&
-  !reachedStages.value.some(stage => stage.kind === 'snapshot'))
-const ringStatus = computed(() => {
-  const displayed = snapshot.value?.model.epoch
-  if (publishedEpoch.value && publishedEpoch.value !== displayed) {
-    return '已发布 epoch ' + publishedEpoch.value + (displayed ? ' · 环图为记录中的 epoch ' + displayed : ' · 完整快照未记录')
-  }
-  if (missingTargetRing.value) return '扩容后的完整快照未记录'
-  return snapshot.value ? 'events.jsonl 第 ' + snapshot.value.event.line + ' 行' : '当前游标无完整快照'
-})
 const victim = computed(() => {
   const anchor = replay.value.anchor
   return props.scene === 'fault' && anchor && seen.value.includes(anchor)
     ? String(anchor.fields.node_id ?? anchor.fields.victim ?? '') : undefined
 })
-const mechanism = computed(() => mechanismOverride.value ?? (
-  reachedStages.value.some(stage => ['publish', 'migrated', 'verified', 'snapshot'].includes(stage.kind)) ? 'after' : 'before'
-))
+const faultBase = computed(() => snapshots.value.find(({ event }) => event === replay.value.initialSnapshot)?.model ?? null)
+const failurePublished = computed(() => props.scene === 'fault' ? reachedStages.value.find(stage => stage.kind === 'publish')?.event : undefined)
+const inferredFailover = computed(() => {
+  const base = faultBase.value
+  const publication = failurePublished.value
+  if (!base || !publication || !victim.value || snapshot.value?.model.epoch !== base.epoch || publication.fields.epoch == null) return null
+  const model = topologyWithoutMember(base, victim.value, String(publication.fields.epoch))
+  const members = publication.fields.members
+  if (Array.isArray(members) && (members.length !== model?.members.length || members.some(id => !model?.members.some(member => member.id === id)))) return null
+  return model
+})
+const displayedRing = computed(() => inferredFailover.value ?? snapshot.value?.model ?? null)
+const displayedPrevious = computed(() => inferredFailover.value ? faultBase.value : earlierRing.value)
+const displayedVictim = computed(() => failurePublished.value && displayedRing.value?.members.some(member => member.id === victim.value) ? undefined : victim.value)
+const awaitingHandoff = computed(() => displayedRing.value?.members.some(member => member.id === displayedVictim.value))
+const useIllustration = computed(() => {
+  if (props.scene !== 'expansion') return false
+  const steps = replay.value.stages
+  const starts = steps.filter(stage => ['grow', 'shrink', 'replace'].includes(stage.kind))
+  return starts.some((stage, index) => {
+    if (stage.kind === 'replace') return false
+    const end = starts[index + 1]?.event.line ?? Infinity
+    const later = steps.filter(candidate => candidate.event.line > stage.event.line && candidate.event.line < end)
+    return later.some(candidate => candidate.kind === 'migrated') && !later.some(candidate => candidate.kind === 'snapshot')
+  })
+})
+const mechanism = computed(() => {
+  const last = reachedStages.value.filter(stage => ['publish', 'migrated', 'verified', 'snapshot'].includes(stage.kind)).at(-1)
+  if (!last) return changeDirection(replay.value.label) === 'shrink' ? 'after' : 'before'
+  return changeDirection(last.change) === 'shrink' ? 'removed' : 'after'
+})
+const shownMechanism = computed(() => visual.value === 'mechanism' ? mechanismOverride.value ?? mechanism.value
+  : useIllustration.value ? mechanism.value : undefined)
+const ringStatus = computed(() => {
+  if (shownMechanism.value) return '机制示意 · 阶段取自事件记录'
+  if (inferredFailover.value) {
+    const epoch = inferredFailover.value.epoch
+    return '接管推导 · epoch ' + epoch + (publishedEpoch.value !== epoch ? ' · 已发布 epoch ' + publishedEpoch.value : '')
+  }
+  const displayed = snapshot.value?.model.epoch
+  if (publishedEpoch.value && publishedEpoch.value !== displayed) {
+    return '已发布 epoch ' + publishedEpoch.value + (displayed ? ' · 环图为记录中的 epoch ' + displayed : ' · 完整快照未记录')
+  }
+  return snapshot.value ? 'events.jsonl 第 ' + snapshot.value.event.line + ' 行' : '当前游标无完整快照'
+})
 const hasMetrics = computed(() => replay.value.records.some(event => event.event === 'metrics_sampled'))
 const marks = computed(() => reachedStages.value.map(stage => stage.event))
 function jump(event: RunEvent) { seek(event.unix_ms, event.line) }
@@ -110,6 +141,12 @@ async function loadEvents() {
   }
 }
 watch(() => props.modalOpen, open => { if (open) pause() })
+defineExpose({
+  replayStart(): ReplayStart | undefined {
+    if (loading.value || eventError.value) return undefined
+    return { log: log.value, time: cursor.value, line: boundaryLine.value }
+  },
+})
 watch(activeStage, async () => {
   mechanismOverride.value = null
   await nextTick()
@@ -130,37 +167,38 @@ onBeforeUnmount(() => controller?.abort())
   </div>
   <section v-else class="dashboard-content" aria-label="阶段回放">
     <RunFacts :config="config" :nodes="initialNodes" />
-    <RunReadings :items="readings" label="本场最终读数" />
+    <RunReadings :items="readings" :label="scene === 'expansion' ? '首个成员变更读数' : '本轮故障读数'" />
     <div v-if="eventError" class="notice error" role="alert"><p>事件读取失败。{{ eventError }}</p><button class="table-link" @click="loadEvents">重新读取</button></div>
     <div v-else-if="log.issues.length" class="notice warning">{{ log.issues.length }} 行事件无法解析，可在原文中核对。</div>
     <div class="case-layout">
       <section class="dashboard-card case-figure" aria-label="随游标变化的实验图">
         <header class="dashboard-card-heading">
-          <h2>{{ visual === 'metrics' ? '变更窗口' : '一致性哈希环' }}</h2>
+          <h2>{{ visual === 'metrics' ? '变更窗口' : shownMechanism ? '哈希环 · 机制示意' : '一致性哈希环' }}</h2>
           <nav v-if="scene === 'expansion' || hasMetrics" class="dashboard-card-tabs" aria-label="图表视图">
-            <button :aria-pressed="visual === 'ring'" @click="visual = 'ring'">记录的环</button>
+            <button :aria-pressed="visual === 'ring'" @click="visual = 'ring'">阶段动画</button>
             <button v-if="scene === 'expansion'" :aria-pressed="visual === 'mechanism'" @click="visual = 'mechanism'">机制示意</button>
             <button v-if="hasMetrics" :aria-pressed="visual === 'metrics'" @click="visual = 'metrics'">指标</button>
           </nav>
-          <span v-else-if="snapshot" class="case-snapshot-tag">实测快照</span>
+          <span v-else-if="snapshot" class="case-snapshot-tag">{{ awaitingHandoff ? '等待接管' : inferredFailover ? '接管推导' : '实测快照' }}</span>
         </header>
         <div class="case-figure-body">
           <CaseWindowMetrics v-if="visual === 'metrics'" :seen="seen" :records="replay.records" :marks="marks"
             :start="bounds.start" :end="bounds.end" :origin="sourceOrigin" :cursor="cursor"
-            :axis-label="scene === 'fault' ? '自故障起算（s）' : '自扩容开始（s）'" />
-          <CaseRing v-else :model="snapshot?.model ?? null" :previous="earlierRing" :victim="victim" :mechanism="visual === 'mechanism' ? mechanism : undefined" />
+            :axis-label="scene === 'fault' ? '自故障起算（s）' : '自成员变更开始（s）'" />
+          <CaseRing v-else :model="displayedRing" :previous="displayedPrevious" :victim="displayedVictim" :mechanism="shownMechanism" :derived="!!inferredFailover" />
         </div>
         <footer class="dashboard-card-footer">
           <template v-if="visual === 'mechanism'">
             <span>K 的哈希位置固定</span>
             <div class="dashboard-card-tabs" aria-label="机制示意阶段">
-              <button :aria-pressed="mechanism === 'before'" @click="mechanismOverride = 'before'">加入前</button>
-              <button :aria-pressed="mechanism === 'after'" @click="mechanismOverride = 'after'">加入后</button>
+              <button :aria-pressed="shownMechanism === 'before'" @click="mechanismOverride = 'before'">加入前</button>
+              <button :aria-pressed="shownMechanism === 'after'" @click="mechanismOverride = 'after'">加入后</button>
+              <button :aria-pressed="shownMechanism === 'removed'" @click="mechanismOverride = 'removed'">移除后</button>
             </div>
           </template>
           <span v-else-if="visual === 'metrics'">{{ config.mode === 'scaling' ? '窗口 p99 取采样时所在阶段，缺失处断开。' : '竖线标注变更事件，缺失窗口断开。' }}</span>
           <template v-else>
-            <span :class="{ 'snapshot-stale': missingTargetRing || (publishedEpoch && publishedEpoch !== snapshot?.model.epoch) }">{{ ringStatus }}</span>
+            <span :class="{ 'snapshot-stale': shownMechanism || (publishedEpoch && publishedEpoch !== snapshot?.model.epoch) }">{{ ringStatus }}</span>
             <button v-if="topologyRecords.length" class="table-link" aria-haspopup="dialog" @click="emit('topology', snapshot?.event.line)">快照详情 ↗</button>
           </template>
         </footer>
@@ -176,7 +214,7 @@ onBeforeUnmount(() => controller?.abort())
         </header>
         <div v-if="evidence === 'stage'" class="case-evidence-body">
           <article v-if="activeStage" :key="activeStage.event.line" class="case-stage-reading" :data-tone="activeStage.tone">
-            <div class="case-stage-time"><i aria-hidden="true"></i><time>{{ activeStage.elapsed < 0 ? '−' : '+' }}{{ seconds(Math.abs(activeStage.elapsed)) }} s</time><span>{{ scene === 'fault' ? '自故障起算' : '相对扩容开始' }}</span></div>
+            <div class="case-stage-time"><i aria-hidden="true"></i><time>{{ activeStage.elapsed < 0 ? '−' : '+' }}{{ seconds(Math.abs(activeStage.elapsed)) }} s</time><span>{{ scene === 'fault' ? '自故障起算' : '相对成员变更开始' }}</span></div>
             <h2>{{ activeStage.title }}</h2>
             <p>{{ activeStage.note }}</p>
             <dl v-if="activeStage.facts.length" class="case-stage-facts">

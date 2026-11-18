@@ -9,6 +9,7 @@ import { parseEventLog, parseRecordedJson } from './events.mjs'
 const execute = promisify(execFile)
 const modes = ['correctness', 'performance', 'availability', 'latency', 'scaling', 'fault']
 const policies = ['owner-only', 'first-successor', 'all-replicas']
+const scalingReserves = { 'round-trip': 1, replace: 1, churn: 3 }
 const terminal = new Set(['succeeded', 'failed', 'stopped'])
 const emptyLog = () => ({ events: [], issues: [], missing: false })
 const quote = value => "'" + String(value).replaceAll("'", "'\"'\"'") + "'"
@@ -46,14 +47,26 @@ export function experimentPlan(input, { resultsRoot, repoRoot, binary }) {
     const nodes = positive(input.nodes, '节点数', 2)
     const keys = positive(input.keys, '键数')
     const rf = positive(input.rf, 'RF')
+    const availabilityRounds = mode === 'availability' ? positive(input.availabilityRounds ?? 1, '连续故障轮数') : '1'
+    const scalingScenario = input.scalingScenario ?? 'round-trip'
+    if (mode === 'scaling' && (typeof scalingScenario !== 'string' || !Object.hasOwn(scalingReserves, scalingScenario))) {
+      throw problem(400, '扩缩容场景无效')
+    }
     const minimumNodes = { availability: 4, fault: 5 }[mode] ?? 2
-    const reserves = ['correctness', 'availability', 'scaling', 'fault'].includes(mode) ? 1 : 0
+    const reserves = { correctness: 1, availability: Number(availabilityRounds), scaling: scalingReserves[scalingScenario], fault: 1 }[mode] ?? 0
     if (input.nodes < minimumNodes || input.nodes - reserves < input.rf) throw problem(400, '起始节点数不足以满足当前模式与 RF')
     if (['availability', 'fault'].includes(mode) && (input.rf !== 3 || policy === 'all-replicas')) throw problem(400, '故障模式要求 RF 为 3，ACK 请选择 OwnerOnly 或 FirstSuccessor')
     args.push('--mode', mode, '--nodes', nodes, '--keys', keys, '--desired-replication-factor', rf,
       '--concurrency', positive(input.concurrency, '并发度'), '--value-bytes', positive(input.valueBytes, '值大小'),
       '--seed', u64(input.seed, '哈希种子'), '--virtual-nodes', positive(input.virtualNodes, '每节点虚拟位置'),
       '--policy', policy)
+    if (input.workerThreads !== undefined && input.workerThreads !== '') {
+      args.push('--worker-threads', positive(input.workerThreads, '工作线程数'))
+    }
+    if (mode === 'availability') args.push('--availability-rounds', availabilityRounds)
+    if (mode === 'scaling' && input.scalingScenario !== undefined) {
+      args.push('--scaling-scenario', scalingScenario, '--pre-publish-delay-ms', '0')
+    }
     if (mode === 'latency') {
       const rates = String(input.rates ?? '').trim().split(/[\s,，]+/).filter(Boolean)
       if (!rates.length) throw problem(400, '至少填写一个目标速率')
@@ -63,6 +76,10 @@ export function experimentPlan(input, { resultsRoot, repoRoot, binary }) {
         '--warmup-seconds', positive(input.warmup, '预热时长', 0), '--duration-seconds', positive(input.duration, '正式时长'),
         '--mix', input.mix, '--key-distribution', input.distribution,
         '--max-in-flight', positive(input.maxInFlight, '在途请求上限'))
+      if (input.dedupMiB !== undefined) {
+        const budgetMiB = Number(positive(input.dedupMiB, '每节点回执预算'))
+        args.push('--max-dedup-bytes', positive(budgetMiB * 1024 * 1024, '每节点回执预算（字节）'))
+      }
     }
   }
   const command = [binary, ...args].map(quote).join(' ')

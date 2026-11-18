@@ -9,7 +9,7 @@ export type EventCategory = keyof typeof categories
 const names: Record<string, string> = {
   experiment_started: '实验启动', cluster_ready: '集群就绪', experiment_finished: '实验结束',
   initial_put_complete: '初始写入完成', initial_get_verify_complete: '初始读校验完成', verification_complete: '最终核验完成',
-  metrics_sampled: '指标采样', node_pressure_sampled: '节点压力采样',
+  metrics_sampled: '指标采样', node_load_sampled: '节点请求采样', node_pressure_sampled: '节点压力采样',
   client_put_latency_sampled: '客户端空闲延迟采样', owner_rpc_put_latency_sampled: 'Owner RPC 空闲延迟采样',
   topology_published: '拓扑快照已记录', ack_policy_activated: 'ACK 策略已生效',
   migration_started: '迁移开始', migration_execution_finished: '迁移执行结束', migration_complete: '迁移完成',

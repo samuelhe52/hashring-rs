@@ -20,7 +20,7 @@ use hashring_core::{
 };
 use hashring_experiment::{
     ExperimentConfig, ExperimentMode, FaultScenario, ScalingLoadMode, ScalingScenario,
-    run_experiment,
+    run_experiment, snapshot_owned_keys,
 };
 use hashring_node::DataNodeService;
 use serde::Deserialize;
@@ -56,6 +56,11 @@ enum Command {
     Delete(DeleteArgs),
     /// Print the canonical topology as JSON.
     Topology(ClientArgs),
+    #[command(hide = true)]
+    ExperimentOwnedKeys {
+        #[arg(long)]
+        keys: u64,
+    },
     /// Persist a pending target topology and its moving-range plan.
     BeginChange(ChangeArgs),
     /// Stage a committed-topology ACK policy transition.
@@ -730,6 +735,16 @@ async fn run(command: Command) -> Result<()> {
         Command::Get(args) => run_get(args).await,
         Command::Delete(args) => run_delete(args).await,
         Command::Topology(args) => run_topology(args).await,
+        Command::ExperimentOwnedKeys { keys } => {
+            #[derive(Deserialize)]
+            struct RecordedTopology {
+                fields: TopologySnapshot,
+            }
+            let record: RecordedTopology = serde_json::from_reader(std::io::stdin().lock())?;
+            let counts = snapshot_owned_keys(&record.fields, keys)?;
+            println!("{}", serde_json::to_string(&counts)?);
+            Ok(())
+        }
         Command::BeginChange(args) => run_begin_change(args).await,
         Command::BeginPolicyChange(args) => run_begin_policy_change(args).await,
         Command::BeginConfigChange(args) => run_begin_config_change(args).await,

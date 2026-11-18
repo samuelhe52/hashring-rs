@@ -13,6 +13,7 @@ export interface RunListItem {
 }
 
 export interface Latency {
+  mean?: number | null
   p50?: number | null
   p95?: number | null
   p99?: number | null
@@ -91,6 +92,12 @@ export interface EventLog {
   events: RunEvent[]
   issues: { line: number; message: string; raw: string }[]
   missing: boolean
+}
+
+export interface ReplayStart {
+  log: EventLog
+  time: number
+  line: number | null
 }
 
 export interface ExperimentSession {

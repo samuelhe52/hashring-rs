@@ -48,6 +48,17 @@ export function decodeTopology(value: unknown): { model: RingModel | null; error
   } catch (error) { return { model: null, error: error instanceof Error ? error.message : String(error) } }
 }
 
+export function topologyWithoutMember(model: RingModel, id: string, epoch: string): RingModel | null {
+  if (!model.members.some(member => member.id === id)) return null
+  return decodeTopology({
+    epoch,
+    desired_replication_factor: model.rf,
+    members: model.members.filter(member => member.id !== id).map(member => ({ node_id: member.id, endpoint: member.endpoint })),
+    assignments: model.assignments.filter(assignment => assignment.node !== id)
+      .map(assignment => ({ token: assignment.token.toString(), node_id: assignment.node })),
+  }).model
+}
+
 export function topologySegments(current: RingModel, previous: RingModel | null) {
   const ends = [...new Set([...current.assignments, ...(previous?.assignments ?? [])].map(item => item.token))].sort((a, b) => a < b ? -1 : a > b ? 1 : 0)
   return ends.map((end, index) => {
@@ -70,6 +81,17 @@ export function spaceStats(model: RingModel) {
 // 只在绘图时转为角度；归属、区间与比较始终使用 BigInt。
 export function ringAngle(token: bigint): number { return Number(token * 1_000_000_000_000n / HASH_SPACE) / 1_000_000_000_000 * 360 }
 export function ringPoint(angle: number, radius: number, center = 180): [number, number] { const radians = angle * Math.PI / 180; return [center + radius * Math.sin(radians), center - radius * Math.cos(radians)] }
+export function ringArc(start: bigint, length: bigint, radius: number): string {
+  const angle = ringAngle(start)
+  const span = ringAngle(length)
+  const [x1, y1] = ringPoint(angle, radius)
+  const [x2, y2] = ringPoint(angle + span, radius)
+  if (length === HASH_SPACE) {
+    const [midX, midY] = ringPoint(angle + 180, radius)
+    return `M${x1} ${y1}A${radius} ${radius} 0 0 1 ${midX} ${midY}A${radius} ${radius} 0 0 1 ${x1} ${y1}`
+  }
+  return `M${x1} ${y1}A${radius} ${radius} 0 ${span > 180 ? 1 : 0} 1 ${x2} ${y2}`
+}
 export function ringBand(start: bigint, length: bigint, inner = 124, outer = 149, center = 180): string {
   if (length === HASH_SPACE) return `M${center} ${center - outer}a${outer} ${outer} 0 1 1 0 ${outer * 2}a${outer} ${outer} 0 1 1 0 ${-outer * 2}M${center} ${center - inner}a${inner} ${inner} 0 1 0 0 ${inner * 2}a${inner} ${inner} 0 1 0 0 ${-inner * 2}Z`
   const angle = ringAngle(start)

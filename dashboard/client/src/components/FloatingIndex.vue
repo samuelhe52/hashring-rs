@@ -8,12 +8,10 @@ const emit = defineEmits<{ navigate: [entry: DirectoryEntry, keyboard: boolean] 
 const root = ref<HTMLElement | null>(null)
 const menu = ref<HTMLDialogElement | null>(null)
 const toggle = ref<HTMLButtonElement | null>(null)
-const railTree = ref<InstanceType<typeof DirectoryTree> | null>(null)
 const dialogTree = ref<InstanceType<typeof DirectoryTree> | null>(null)
 const open = ref(false)
 const closing = ref(false)
 const instant = ref(false)
-const progress = ref(0)
 const scrolledEntry = ref('')
 const menuId = useId()
 const headingId = useId()
@@ -22,7 +20,6 @@ const activeParent = computed(() => parents.value.find(item => item.id === props
 const expanded = ref(activeParent.value?.children ? activeParent.value.id : '')
 const current = computed(() => scrolledEntry.value || props.active)
 let scroller: HTMLElement | null = null
-let resizeObserver: ResizeObserver | undefined
 let closeTimer: ReturnType<typeof setTimeout> | undefined
 let frame = 0
 let outsidePress = false
@@ -31,12 +28,8 @@ let locked: { element: HTMLElement; overflow: string } | null = null
 function schedule() { if (!frame) frame = requestAnimationFrame(update) }
 function update() {
   frame = 0
-  const area = scroller ?? document.scrollingElement
-  if (!area) return
-  const distance = area.scrollHeight - area.clientHeight
-  progress.value = distance > 0 ? Math.max(0, Math.min(1, area.scrollTop / distance)) : 1
-  if (area.scrollTop < 2) { scrolledEntry.value = ''; return }
-  const top = scroller?.getBoundingClientRect().top ?? 0
+  if (!scroller || scroller.scrollTop < 2) { scrolledEntry.value = ''; return }
+  const top = scroller.getBoundingClientRect().top
   const reached = activeParent.value?.children?.filter(entry => {
     const section = entry.anchor ? document.getElementById(entry.anchor) : null
     return section && section.getBoundingClientRect().top <= top + 85
@@ -75,7 +68,6 @@ async function openMenu(event: MouseEvent) {
   menu.value.showModal()
   await nextTick()
   const nav = menu.value.querySelector<HTMLElement>('.index-dialog-nav')
-  dialogTree.value?.centerActive()
   if (event.detail === 0) dialogTree.value?.focusActive()
   else nav?.focus({ preventScroll: true })
 }
@@ -106,7 +98,6 @@ function keepFocus(event: KeyboardEvent) {
 
 function resize() {
   if (menu.value?.open && toggle.value && !toggle.value.checkVisibility()) closeMenu()
-  schedule()
 }
 
 watch(() => props.active, () => {
@@ -116,18 +107,12 @@ watch(() => props.active, () => {
 
 onMounted(() => {
   scroller = root.value?.closest('dialog.detail-window')?.querySelector<HTMLElement>('.window-body') ?? null
-  const target = scroller ?? window
-  target.addEventListener('scroll', schedule, { passive: true })
+  scroller?.addEventListener('scroll', schedule, { passive: true })
   window.addEventListener('resize', resize)
-  const content = scroller ?? document.querySelector('.dashboard-main')
-  if (content) { resizeObserver = new ResizeObserver(schedule); resizeObserver.observe(content) }
-  schedule()
 })
 onBeforeUnmount(() => {
-  const target = scroller ?? window
-  target.removeEventListener('scroll', schedule)
+  scroller?.removeEventListener('scroll', schedule)
   window.removeEventListener('resize', resize)
-  resizeObserver?.disconnect()
   cancelAnimationFrame(frame)
   clearTimeout(closeTimer)
   menu.value?.close()
@@ -137,24 +122,21 @@ onBeforeUnmount(() => {
 
 <template>
   <div ref="root" class="floating-index">
-    <aside class="index-rail" aria-label="Dashboard 目录" @wheel="railTree?.relayWheel($event)">
-      <div class="index-rail-heading"><span>目录</span></div>
+    <aside class="index-rail" aria-label="Dashboard 目录">
+      <div class="index-rail-heading">目录</div>
       <nav class="index-rail-nav" aria-label="完整目录">
-        <DirectoryTree ref="railTree" :groups="groups" :active="current" :expanded="expanded" :has-run="hasRun" @expand="expanded = $event" @choose="choose" />
+        <DirectoryTree :groups="groups" :active="current" :expanded="expanded" :has-run="hasRun" @expand="expanded = $event" @choose="choose" />
       </nav>
-      <p class="index-wheel-hint"><span class="index-mouse-hint">滚动浏览</span><span class="index-touch-hint">上下滑动</span><span>点击打开</span></p>
     </aside>
 
     <button ref="toggle" type="button" class="index-toggle" title="打开完整目录" aria-label="打开完整目录" aria-haspopup="dialog" :aria-expanded="open" :aria-controls="menuId" @click="openMenu">
-      <svg class="index-progress" viewBox="0 0 48 48" aria-hidden="true"><circle class="index-progress-track" cx="24" cy="24" r="22" /><circle class="index-progress-value" cx="24" cy="24" r="22" pathLength="1" stroke-dasharray="1" :stroke-dashoffset="1 - progress" /></svg>
       <svg class="index-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="M7 5h9M7 10h9M7 15h6M3.5 5h.1M3.5 10h.1M3.5 15h.1" /></svg>
     </button>
 
     <dialog :id="menuId" ref="menu" class="index-dialog" :class="{ closing, instant }" :aria-labelledby="headingId" @cancel.stop.prevent="closeMenu(undefined, true)"
-      @wheel="dialogTree?.relayWheel($event)" @keydown="keepFocus" @pointerdown="rememberPress" @click="outsidePress && outside($event) && closeMenu()">
+      @keydown="keepFocus" @pointerdown="rememberPress" @click="outsidePress && outside($event) && closeMenu()">
       <header class="index-dialog-heading"><h2 :id="headingId">目录</h2><button class="index-close" aria-label="关闭目录" @click="closeMenu(undefined, $event.detail === 0)"><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5 5 10 10m0-10L5 15" /></svg></button></header>
       <nav class="index-dialog-nav" aria-label="完整目录" tabindex="-1"><DirectoryTree ref="dialogTree" :groups="groups" :active="current" :expanded="expanded" :has-run="hasRun" @expand="expanded = $event" @choose="choose" /></nav>
-      <p class="index-wheel-hint"><span class="index-mouse-hint">滚动浏览</span><span class="index-touch-hint">上下滑动</span><span>点击打开</span></p>
     </dialog>
   </div>
 </template>

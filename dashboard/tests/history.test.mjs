@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { replayBounds, visibleCount, sampledSeries, warmupIntervals, windowLatency } from '../client/src/history.ts'
+import { nodeOperationSample, replayBounds, visibleCount, sampledSeries, warmupIntervals, windowLatency } from '../client/src/history.ts'
 
 const e = (line, unix_ms, fields = {}, event = 'metrics_sampled') => ({ line, unix_ms, fields, event, raw: '{}' })
 test('回放不读未来，同毫秒按行前进，起点优先实验启动', () => {
@@ -34,4 +34,16 @@ test('扩容窗口的多阶段样本按记录中的阶段读取分位数', () =>
   assert.equal(windowLatency(sample, 'get', 'p99'), 440)
   assert.equal(windowLatency(sample, 'published|get', 'p99'), 920)
   assert.equal(windowLatency(sample, 'put_new', 'p99'), null)
+})
+
+test('节点负载优先使用窗口操作速率，旧记录按正式阶段时长换算', () => {
+  const stage = { seconds: 10, load_balance: { per_node: { 'node-1': { ops_handled: 55 }, 'node-2': { ops_handled: null } } } }
+  const legacy = e(1, 1000, { node_cpu_percent: { 'node-1': 122.5 } })
+  assert.deepEqual(nodeOperationSample(legacy, stage), { values: new Map([['node-1', 5.5]]), average: true })
+  assert.equal(nodeOperationSample(legacy, { ...stage, seconds: 0 }), null)
+  assert.equal(nodeOperationSample(e(2, 2000, { warmup: true }), stage), null)
+  assert.deepEqual(nodeOperationSample(e(3, 3000, { warmup: true, node_ops_per_second: { 'node-1': 0, 'node-2': 122.5, 'node-3': null } }), stage), {
+    values: new Map([['node-1', 0], ['node-2', 122.5]]), average: false,
+  })
+  assert.equal(nodeOperationSample(e(4, 4000, { node_ops_per_second: {} }), stage), null)
 })

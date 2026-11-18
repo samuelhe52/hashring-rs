@@ -5,24 +5,31 @@ import { decodeTopology, tokenValue } from './topology.ts'
 import type { JsonObject, RunEvent, Summary } from './types'
 
 export const scenes = {
-  expansion: { title: '在线扩容', sample: 'verify-correctness-1794158675872' },
+  expansion: { title: '在线扩缩容', sample: 'verify-correctness-1794158675872' },
   fault: { title: '主节点故障', sample: 'verify-availability-1794158675872' },
 } as const
 export type Scene = keyof typeof scenes
 
 export function sceneFor(config?: JsonObject): Scene | undefined {
   if (config?.mode === 'correctness' ||
-      (config?.mode === 'scaling' && ['grow', 'round-trip', 'churn'].includes(String(config.scaling_scenario)))) return 'expansion'
+      (config?.mode === 'scaling' && ['grow', 'shrink', 'round-trip', 'churn', 'replace'].includes(String(config.scaling_scenario)))) return 'expansion'
   if (config?.mode === 'availability' || (config?.mode === 'fault' && config.fault_scenario === 'owner')) return 'fault'
 }
 
 export const seconds = (value: unknown) => number(value)?.toFixed(2) ?? '未记录'
 const isInjection = (event: RunEvent) => event.event === 'owner_killed' || event.event === 'fault_injected'
 const isTransition = (event: RunEvent) => event.event === 'migration_started' || event.event === 'scaling_transition_started'
+export function changeDirection(label: unknown) {
+  if (label === 'scale_in' || label === 'shrink') return 'shrink'
+  return label === 'replace' ? 'replace' : 'grow'
+}
 
 const milestones = {
   before: { label: '变更前', title: '扩容前的拓扑', note: '顺时针遇到的第一个虚拟位置决定主节点。', tone: 'neutral' },
+  healthy: { label: '故障前', title: '故障前的节点归属', note: '环上颜色标出各区间当前的主节点。', tone: 'neutral' },
   grow: { label: '开始扩容', title: '启动在线扩容', note: '协调器开始变更成员。旧环继续提供数据归属，直到新拓扑发布。', tone: 'change' },
+  shrink: { label: '开始缩容', title: '启动在线缩容', note: '旧主节点继续服务。新拓扑发布后，离开节点的区间并入顺时针的接管节点。', tone: 'change' },
+  replace: { label: '开始替换', title: '启动节点替换', note: '新成员准备接管区间。当前归属在新拓扑发布前继续生效。', tone: 'change' },
   copy: { label: '复制期间', title: '复制期间仍有写入', note: '实验在快照复制期间记录了完成的改写和删除。', tone: 'change' },
   replay: { label: '增量追平', title: '回放变更日志', note: '迁移过程中发生的写入通过变更日志追平。', tone: 'change' },
   gate: { label: '限制写入', title: '对迁移区间设置写入栅栏', note: '协调器短暂限制这些区间的写入，准备校验并切换归属。', tone: 'change' },
@@ -37,12 +44,12 @@ const milestones = {
   round: { label: '本轮核验', title: '负载下的恢复结果', note: '本轮汇总记录了请求恢复与已确认状态的校验结果。', tone: 'ok' },
 } as const
 type Milestone = keyof typeof milestones
-export interface CaseStage { event: RunEvent; kind: Milestone }
+export interface CaseStage { event: RunEvent; kind: Milestone; change?: unknown }
 
 function expansionPhase(event: RunEvent): Milestone | undefined {
   switch (event.event) {
     case 'migration_started':
-    case 'scaling_transition_started': return 'grow'
+    case 'scaling_transition_started': return changeDirection(event.fields.label)
     case 'migration_mutation_overlap_observed': return 'copy'
     case 'migration_complete':
     case 'scaling_transition_complete': return 'migrated'
@@ -76,33 +83,39 @@ export function casePlayback(scene: Scene, events: RunEvent[]) {
   const expansion = scene === 'expansion'
   const isStart = expansion ? isTransition : isInjection
   const start = events.findIndex(event => isStart(event) && (expansion
-    ? ['scale_out', 'grow'].includes(String(event.fields.label)) && event.fields.control !== true
+    ? event.fields.control !== true
     : event.fields.scenario !== 'follower'))
   const stages: CaseStage[] = []
   const anchor = events[start]
   const label = anchor?.fields.label
   const round = anchor?.fields.round
-  const targetEpoch = epochText(anchor?.fields.target_epoch)
   const initialRecords = start < 0 ? [] : events.slice(0, start)
   const initialSnapshot = initialRecords.filter(event => event.event === 'topology_published').reverse()
     .find(event => decodeTopology(event.fields).model)
 
   if (anchor) {
-    const next = events.findIndex((event, index) => index > start && isStart(event))
+    const next = expansion ? -1 : events.findIndex((event, index) => index > start && isInjection(event))
     const scope = events.slice(start, next < 0 ? undefined : next)
     if (expansion) {
       const before = initialRecords.filter(event => event.event === 'initial_get_verify_complete').at(-1) ?? initialSnapshot
-      if (before) stages.push({ event: before, kind: 'before' })
+      if (before) stages.push({ event: before, kind: 'before', change: label })
+    } else if (initialSnapshot) {
+      stages.push({ event: initialSnapshot, kind: 'healthy' })
     }
+    let change: RunEvent | undefined
+    let recordedEpoch = epochText(initialSnapshot?.fields.epoch)
     for (const event of scope) {
-      const related = expansion ? event.fields.label === label : event.fields.round === round
+      if (expansion && isTransition(event)) change = event.fields.control !== true ? event : undefined
+      const related = expansion ? change && event.fields.label === change.fields.label : event.fields.round === round
       const kind = related ? (expansion ? expansionPhase(event) : faultPhase(event)) : undefined
-      if (kind) stages.push({ event, kind })
-      else if (expansion && event.event === 'topology_published') {
+      if (kind) stages.push({ event, kind, change: change?.fields.label })
+      else if (change && event.event === 'topology_published') {
         const snapshot = decodeTopology(event.fields).model
-        const before = initialSnapshot?.fields.members
-        if (snapshot && (targetEpoch ? snapshot.epoch === targetEpoch
-          : Array.isArray(before) && snapshot.members.length > before.length)) stages.push({ event, kind: 'snapshot' })
+        const targetEpoch = epochText(change.fields.target_epoch)
+        if (snapshot && snapshot.epoch !== recordedEpoch && (!targetEpoch || snapshot.epoch === targetEpoch)) {
+          recordedEpoch = snapshot.epoch
+          stages.push({ event, kind: 'snapshot', change: change.fields.label })
+        }
       }
     }
   }
@@ -181,13 +194,13 @@ export function headline(scene: Scene, replay: CasePlayback, summary?: Summary |
   const transition = object(object(summary?.observations)[String(replay.label) + '_transition'])
   const migration = object(transition.migration)
   const moved = number(migration.keys_moved) ?? number(replay.anchor?.fields.keys_moved)
-  const checked = { label: '受检键', value: number(verification?.keys) === null ? '未记录' : fmt(verification?.keys), unit: '键', note: '扩容后的读回校验', tone: 'ok' }
+  const checked = { label: '受检键', value: number(verification?.keys) === null ? '未记录' : fmt(verification?.keys), unit: '键', note: '变更后的读回校验', tone: 'ok' }
   if (moved !== null) {
     const total = number(migration.keys)
     return [
       { label: '换主键数', value: fmt(moved), unit: '键', note: total !== null && total > 0 ? '共 ' + fmt(total) + ' 键 · ' + fmt(moved / total * 100, 2) + '%' : '扩容前后逐键比较', tone: 'change' },
       checked,
-      { label: '校验不符', value: number(verification?.violations) === null ? '未记录' : fmt(verification?.violations), unit: '项', note: '扩容键组核验', tone: 'ok' },
+      { label: '校验不符', value: number(verification?.violations) === null ? '未记录' : fmt(verification?.violations), unit: '项', note: '变更键组核验', tone: 'ok' },
     ]
   }
   return [
@@ -201,19 +214,26 @@ export function stageDetails(stage: CaseStage, replay: CasePlayback, summary?: S
   const { kind, event } = stage
   const f = event.fields
   const copyObserved = kind === 'copy' && event.event === 'migration_mutation_overlap_observed'
+  const direction = changeDirection(stage.change)
+  const changeName = { grow: '扩容', shrink: '缩容', replace: '替换' }[direction]
+  const base = milestones[kind]
+  const label = kind === 'migrated' ? changeName + '完成' : kind === 'verified' ? changeName + '校验' : base.label
   const labels = kind === 'copy' && !copyObserved
     ? { ...milestones.copy, title: '复制快照', note: '实验观测到迁移进入快照复制阶段。' }
-    : milestones[kind]
+    : { ...base, label, title: base.title.replace('扩容', changeName) }
   let facts: [string, unknown, string?, RunEvent?][] = []
   switch (kind) {
+    case 'healthy':
     case 'before': facts = [['初始读校验', f.keys, '键'], ['起始 epoch', replay.initialSnapshot?.fields.epoch]]; break
-    case 'grow': facts = [['起始 epoch', f.base_epoch ?? replay.initialSnapshot?.fields.epoch], ['目标 epoch', f.target_epoch], ['换主键数', f.keys_moved, '键']]; break
+    case 'shrink':
+    case 'replace':
+    case 'grow': facts = [['起始 epoch', f.base_epoch ?? (event === replay.anchor ? replay.initialSnapshot?.fields.epoch : undefined)], ['目标 epoch', f.target_epoch], ['换主键数', f.keys_moved, '键']]; break
     case 'copy': facts = [['观测阶段', f.observed_phase ?? f.phase], ['复制期间完成的变更', f.completed_mutations_while_active, '次']]; break
     case 'replay':
     case 'gate':
     case 'verify': facts = [['目标 epoch', f.epoch]]; break
     case 'migrated': {
-      const migration = object(object(object(summary?.observations)[String(replay.label) + '_transition']).migration)
+      const migration = object(object(object(summary?.observations)[String(stage.change) + '_transition']).migration)
       const reasons = Object.values(object(f.retries_by_reason)).map(number)
       const retries = reasons.length && reasons.every(count => count !== null)
         ? reasons.reduce<number>((sum, count) => sum + (count ?? 0), 0) : null
@@ -221,7 +241,7 @@ export function stageDetails(stage: CaseStage, replay: CasePlayback, summary?: S
         ['快照搬运', migration.snapshot_records, '条'], ['变更期间重试', retries, '次'], ['目标 epoch', f.target_epoch]]
       break
     }
-    case 'verified': facts = [['受检', f.keys, '键'], ['改写检查', f.rewritten_moving_keys, '键'], ['删除检查', f.deleted_moving_keys, '键'], ['不符', f.violations, '项']]; break
+    case 'verified': facts = [['受检', f.keys, '键'], ['改写检查', f.rewritten_moving_keys, '键'], ['恢复检查', f.restored_moving_keys, '键'], ['删除检查', f.deleted_moving_keys, '键'], ['不符', f.violations, '项']]; break
     case 'snapshot':
     case 'publish': facts = [['已发布 epoch', f.epoch]]; break
     case 'killed': facts = [['故障节点', f.node_id ?? f.victim], ['退出信号', f.exit]]; break

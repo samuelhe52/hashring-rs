@@ -1,4 +1,5 @@
 import http from 'node:http'
+import { execFile } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -23,6 +24,19 @@ function demoRecord(run) {
 function send(res, status, body, type = 'application/json; charset=utf-8') {
   res.writeHead(status, { 'Content-Type': type, 'X-Content-Type-Options': 'nosniff' })
   res.end(type.startsWith('application/json') ? JSON.stringify(body) : body)
+}
+
+function snapshotOwnedKeys(binary, keyCount, raw) {
+  return new Promise((resolve, reject) => {
+    const child = execFile(binary, ['experiment-owned-keys', '--keys', String(keyCount)], { timeout: 30_000 }, (error, stdout) => {
+      if (error) return reject(Object.assign(new Error('无法按此快照计算主节点键数'), { status: 422 }))
+      try { resolve(JSON.parse(stdout)) }
+      catch (failure) { reject(failure) }
+    })
+    // The exit callback handles launch and parsing failures, including early exits.
+    child.stdin.on('error', () => {})
+    child.stdin.end(raw)
+  })
 }
 
 async function readCommand(req) {
@@ -50,9 +64,10 @@ export async function createDashboardServer({
   dev = false,
 } = {}) {
   const root = path.resolve(resultsRoot)
+  const executable = path.resolve(repo, binary)
   const store = createStore(root)
   const demo = createStore(path.join(dashboard, 'demo'))
-  const experiments = createExperiments({ resultsRoot: root, repoRoot: repo, binary: path.resolve(repo, binary) })
+  const experiments = createExperiments({ resultsRoot: root, repoRoot: repo, binary: executable })
   const vite = dev ? await (await import('vite')).createServer({
     configFile: path.join(dashboard, 'vite.config.ts'),
     server: { middlewareMode: true }, appType: 'spa',
@@ -84,7 +99,7 @@ export async function createDashboardServer({
           if (!file) return send(res, 404, { error: '证据文件不存在' })
           return send(res, 200, await readFile(path.join(repo, file), 'utf8'), 'text/plain; charset=utf-8')
         }
-        const route = /^\/api\/runs\/([^/]+)(?:\/(raw|logs|events))?$/.exec(url.pathname)
+        const route = /^\/api\/runs\/([^/]+)(?:\/(raw|logs|events|owned-keys))?$/.exec(url.pathname)
         if (!route) return send(res, 404, { error: '接口不存在' })
         let id
         try { id = decodeURIComponent(route[1]) }
@@ -93,6 +108,16 @@ export async function createDashboardServer({
         const source = isDemo ? demo : store
         if (isDemo) id = id.slice(demoPrefix.length)
         if (route[2] === 'events') return send(res, 200, await source.events(id))
+        if (route[2] === 'owned-keys') {
+          const line = Number(url.searchParams.get('line'))
+          if (!Number.isSafeInteger(line) || line < 1) return send(res, 400, { error: '缺少拓扑快照行号' })
+          const [run, log] = await Promise.all([source.readRun(id), source.events(id)])
+          const snapshot = log.events.find(event => event.line === line && event.event === 'topology_published')
+          if (!snapshot) return send(res, 404, { error: '未找到这份拓扑快照' })
+          const keys = run.manifest?.config?.key_count
+          if (!Number.isSafeInteger(keys) || keys < 1) return send(res, 422, { error: '本次运行未记录初始键数' })
+          return send(res, 200, await snapshotOwnedKeys(executable, keys, snapshot.raw))
+        }
         if (route[2] === 'raw') {
           const filename = url.searchParams.get('file')
           const content = await source.rawFile(id, filename)

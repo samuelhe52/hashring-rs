@@ -20,6 +20,42 @@ test('发现嵌套运行，按时间排列；保留失败的部分指标和真�
   assert.equal('runtime_source' in run.manifest, false)
 })
 
+test('轻量元数据可读取运行并保留完整清单下载', async t => {
+  const f = await fixture(t)
+  const directory = await f.writeRun('indexed', undefined, { success: true, elapsed_seconds: 12 })
+  const { runtime_source, ...metadata } = manifest
+  await writeFile(path.join(directory, 'run-metadata.json'), JSON.stringify(metadata))
+  const store = createStore(f.root)
+  const [listed] = await store.listRuns()
+  assert.equal(listed.status, 'success')
+  assert.equal(listed.started_unix_ms, manifest.started_unix_ms)
+  assert.equal(listed.elapsed_seconds, 12)
+  assert.deepEqual(listed.config, manifest.config)
+  assert.deepEqual((await store.readRun('indexed')).manifest.config, manifest.config)
+
+  const raw = JSON.stringify({ ...metadata, runtime_source })
+  await writeFile(path.join(directory, 'manifest.json'), raw)
+  assert.equal(await store.rawFile('indexed', 'manifest.json'), raw)
+  await writeFile(path.join(directory, 'run-metadata.json'), '{')
+  assert.deepEqual((await store.readRun('indexed')).manifest.config, manifest.config)
+})
+
+test('刷新时重新读取发生变化的完整清单与运行状态', async t => {
+  const f = await fixture(t)
+  const directory = await f.writeRun('changing', manifest)
+  const store = createStore(f.root)
+  const [initial] = await store.listRuns()
+  assert.equal(initial.status, 'incomplete')
+  assert.equal(initial.config.key_count, manifest.config.key_count)
+
+  const config = { ...manifest.config, key_count: 50_000 }
+  await writeFile(path.join(directory, 'manifest.json'), JSON.stringify({ ...manifest, config }))
+  await writeFile(path.join(directory, 'summary.json'), JSON.stringify({ success: true }))
+  const [updated] = await store.listRuns()
+  assert.equal(updated.status, 'success')
+  assert.deepEqual(updated.config, config)
+})
+
 test('结构化模式记录的 u64 不舍入，零值与 null 保留', async t => {
   const f = await fixture(t)
   const dir = await f.writeRun('wide', manifest)

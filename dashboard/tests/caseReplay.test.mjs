@@ -2,8 +2,9 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { parseEventLog } from '../server/events.mjs'
-import { casePlayback, headline, latestPublishedEpoch, stageDetails } from '../client/src/caseReplay.ts'
+import { casePlayback, headline, latestPublishedEpoch, sceneFor, stageDetails } from '../client/src/caseReplay.ts'
 import { visibleCount } from '../client/src/history.ts'
+import { decodeTopology, placementAt, topologyWithoutMember } from '../client/src/topology.ts'
 
 async function sample(id) {
   const base = new URL('../demo/' + id + '/', import.meta.url)
@@ -14,25 +15,35 @@ async function sample(id) {
 test('故障回放区分发布、读恢复和完整副本，阶段只引用到达的 epoch', async () => {
   const { events, summary } = await sample('verify-availability-1794158675872')
   const replay = casePlayback('fault', events)
-  assert.deepEqual(replay.stages.map(stage => stage.kind), ['killed', 'publish', 'read', 'restored'])
-  assert.deepEqual(replay.stages.map(stage => stageDetails(stage, replay, summary).elapsed.toFixed(2)), ['0.00', '5.13', '5.19', '10.30'])
+  assert.deepEqual(replay.stages.map(stage => stage.kind), ['healthy', 'killed', 'publish', 'read', 'restored'])
+  assert.deepEqual(replay.stages.slice(1).map(stage => stageDetails(stage, replay, summary).elapsed.toFixed(2)), ['0.00', '5.13', '5.19', '10.30'])
   assert.deepEqual(headline('fault', replay, summary).map(reading => reading.value), ['5.19', '10.30', '128 / 128'])
-  const publish = replay.stages[1].event
+  const publish = replay.stages[2].event
   const seen = events.slice(0, visibleCount(events, publish.unix_ms, publish.line))
   assert.equal(latestPublishedEpoch(seen), '3')
   assert.equal(seen.filter(event => event.event === 'topology_published').at(-1).fields.epoch, 2)
+  const base = decodeTopology(replay.initialSnapshot.fields).model
+  const victim = replay.anchor.fields.node_id
+  const handoff = topologyWithoutMember(base, victim, String(publish.fields.epoch))
+  assert.equal(handoff.epoch, '3')
+  assert.deepEqual(handoff.assignments, base.assignments.filter(assignment => assignment.node !== victim))
+  for (const range of base.ranges) {
+    const expected = range.owner === victim ? range.replicas[1] : range.owner
+    assert.equal(placementAt(handoff, range.end)[0], expected)
+  }
   const details = stageDetails(replay.stages.at(-1), replay, summary)
   assert.equal(details.facts.find(fact => fact.label === '写探针自身耗时').source.event, 'write_after_failover')
 })
 
-test('扩容回放只采用 scale_out 校验，完整记录包含缩容后的快照', async () => {
+test('同一条时间线展示扩容和缩容，保留扩容的核验读数', async () => {
   const { events, summary } = await sample('verify-correctness-1794158675872')
   const replay = casePlayback('expansion', events)
-  assert.deepEqual(replay.stages.map(stage => stage.kind), ['before', 'grow', 'copy', 'migrated', 'verified'])
+  assert.deepEqual(replay.stages.map(stage => stage.kind), ['before', 'grow', 'copy', 'migrated', 'verified', 'shrink', 'migrated', 'verified', 'snapshot'])
   assert.deepEqual(headline('expansion', replay, summary).map(reading => reading.value), ['2,000', '172', '171'])
-  assert.equal(latestPublishedEpoch(replay.records), '1')
-  assert.equal(latestPublishedEpoch(events), '3')
-  assert.equal(replay.records.some(event => event.fields.label === 'scale_in'), false)
+  assert.equal(latestPublishedEpoch(replay.records), '3')
+  assert.equal(replay.stages.at(-1).change, 'scale_in')
+  assert.equal(stageDetails(replay.stages.at(-2), replay, summary).title, '读回核对缩容结果')
+  assert.equal(sceneFor({ mode: 'scaling', scaling_scenario: 'shrink' }), 'expansion')
 })
 
 test('同毫秒的扩容快照按原行到达，零违规保留，未记录的读数保持缺失', () => {

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import RunReplay from './RunReplay.vue'
-import type { EventLog, ExperimentFeed, ExperimentSession, JsonObject } from '../types'
+import type { EventLog, ExperimentFeed, ExperimentSession, JsonObject, RunDetail } from '../types'
 import { formatNumber as fmt, formatTime, object, request, text } from '../data'
 import { downloadBlob } from '../download'
 
@@ -9,12 +9,38 @@ const emit = defineEmits<{ result: [id: string] }>()
 const modes = [
   ['latency', '延迟负载'], ['correctness', '正确性与迁移'], ['performance', '性能'],
   ['availability', '可用性'], ['scaling', '扩缩容'], ['fault', '故障负载'],
-]
+] as const
+type Mode = (typeof modes)[number][0]
+
+const baseSettings = { nodes: 8, keys: 100_000, rf: 3, concurrency: 64, valueBytes: 128, seed: '1', virtualNodes: 128,
+  policy: 'owner-only', workerThreads: 2 as number | '' }
+const capacityLoad = { rates: '40000,60000,80000,90000,100000', warmup: 3, duration: 10,
+  mix: '80:15:5', distribution: 'zipf:0.99', maxInFlight: 4096, dedupMiB: 256 }
+const latencyPresets = {
+  capacity: capacityLoad,
+  query: { ...capacityLoad, rates: '2000,5000,10000', mix: '100:0:0' },
+  balance: { ...capacityLoad, virtualNodes: 200, rates: '20000', mix: '90:9:1',
+    distribution: 'uniform', maxInFlight: 1024, dedupMiB: 128 },
+}
+const scalingScenarios = [
+  { value: 'round-trip', label: '扩容再缩容' },
+  { value: 'replace', label: '节点替换' },
+  { value: 'churn', label: '连续扩缩容' },
+] as const
+const modePresets = {
+  correctness: {},
+  performance: {},
+  availability: { availabilityRounds: 3, virtualNodes: 1024, policy: 'first-successor' },
+  scaling: { scalingScenario: 'round-trip' },
+  fault: { keys: 1_000, concurrency: 16, policy: 'first-successor' },
+}
 const phases = { starting: '正在启动', running: '实验运行中', stopping: '正在停止', succeeded: '实验成功', failed: '实验失败', stopped: '已停止' }
 const emptyLog = (): EventLog => ({ events: [], issues: [], missing: false })
 const feed = ref<ExperimentFeed>({ session: null, log: emptyLog(), stderr: '', streamError: '' })
 const session = computed(() => feed.value.session)
 const active = computed(() => session.value !== null && session.value.endedAt === null)
+const completedRun = ref<RunDetail>()
+const completedId = computed(() => !active.value && session.value?.hasResult ? session.value.id : '')
 const editing = ref(false)
 const connected = ref(false)
 const connectionError = ref('')
@@ -24,9 +50,8 @@ const now = ref(Date.now())
 const kind = ref<'form' | 'yaml'>('form')
 const yaml = ref('')
 const form = reactive({
-  mode: 'latency', nodes: 3, keys: 2000, rf: 3, concurrency: 16, valueBytes: 128,
-  seed: '1', virtualNodes: 128, policy: 'owner-only', rates: '500,1000', warmup: 2,
-  duration: 10, mix: '90:9:1', distribution: 'uniform', maxInFlight: 4096,
+  mode: 'latency' as Mode, ...baseSettings, ...latencyPresets.capacity,
+  availabilityRounds: 3, scalingScenario: 'round-trip',
 })
 const name = ref(freshName())
 const prepared = ref<{ id: string; command: string; script: string } | null>(null)
@@ -49,10 +74,13 @@ function freshName() {
   return 'dashboard-' + new Date().toISOString().replace(/[T:.Z-]/g, '')
 }
 
-function applyPreset(mode: string) {
-  form.nodes = mode === 'fault' ? 5 : ['scaling', 'availability', 'correctness'].includes(mode) ? 4 : 3
-  form.rf = 3
-  form.policy = ['availability', 'fault'].includes(mode) ? 'first-successor' : 'owner-only'
+function applyLatencyPreset(preset: keyof typeof latencyPresets) {
+  Object.assign(form, baseSettings, latencyPresets[preset])
+}
+
+function applyPreset(mode: Mode) {
+  if (mode === 'latency') applyLatencyPreset('capacity')
+  else Object.assign(form, baseSettings, modePresets[mode])
 }
 
 async function upload(event: Event) {
@@ -184,6 +212,16 @@ function editNew() {
 }
 
 watch(input, () => { prepared.value = null; copied.value = false })
+watch(completedId, async (id, _, onCleanup) => {
+  completedRun.value = undefined
+  if (!id) return
+  const controller = new AbortController()
+  onCleanup(() => controller.abort())
+  try {
+    const result = await request<RunDetail>('/api/runs/' + encodeURIComponent(id), controller.signal)
+    if (!controller.signal.aborted) completedRun.value = result
+  } catch { /* The event stream can still be replayed if the summary is unavailable. */ }
+})
 watch([pollTopology, active, () => session.value?.id], ([enabled, running]) => {
   endTopologyPolling()
   observed.value = null
@@ -213,7 +251,7 @@ onBeforeUnmount(() => { source?.close(); clearInterval(clock); endTopologyPollin
       <p v-if="session.message" class="footnote">{{ session.message }}</p>
       <p v-if="feed.streamError" class="notice warning">{{ feed.streamError }}</p>
       <p v-if="active" class="footnote">关掉窗口后实验会继续运行。重新打开可查看或停止。</p>
-      <RunReplay :key="session.id" :live="feed">
+      <RunReplay :key="session.id" :live="feed" :run="completedRun">
         <template #source>
           <details class="data-disclosure"><summary>运行命令与 stderr</summary><pre class="source-view command-view" tabindex="0">{{ session.command }}</pre><pre class="source-view live-stderr" tabindex="0" aria-label="实验 stderr">{{ feed.stderr || '暂无 stderr 输出' }}</pre></details>
           <div v-if="active" class="replica-panel">
@@ -235,16 +273,31 @@ onBeforeUnmount(() => { source?.close(); clearInterval(clock); endTopologyPollin
         <div class="segmented" aria-label="实验配置方式"><button type="button" :aria-pressed="kind === 'form'" @click="kind = 'form'">表单配置</button><button type="button" :aria-pressed="kind === 'yaml'" @click="kind = 'yaml'">YAML 配置</button></div>
         <label class="form-field">结果目录名<input v-model.trim="name" required maxlength="80" pattern="[A-Za-z0-9][A-Za-z0-9_\-]{0,79}" /></label>
         <template v-if="kind === 'form'">
+          <div v-if="form.mode === 'latency'" class="command-actions" role="group" aria-label="延迟负载预设">
+            <button type="button" class="button secondary" @click="applyLatencyPreset('capacity')">容量阶梯</button>
+            <button type="button" class="button secondary" @click="applyLatencyPreset('query')">查询延迟</button>
+            <button type="button" class="button secondary" @click="applyLatencyPreset('balance')">虚拟节点均衡</button>
+          </div>
           <div class="form-grid">
             <label class="form-field">模式<select v-model="form.mode" @change="applyPreset(form.mode)"><option v-for="[mode, label] in modes" :key="mode" :value="mode">{{ label }}</option></select></label>
-            <label class="form-field">峰值节点数<input v-model.number="form.nodes" type="number" min="2" required /></label>
-            <label class="form-field">键数<input v-model.number="form.keys" type="number" min="1" required /></label>
+            <label class="form-field">{{ form.mode === 'availability' || form.mode === 'fault' ? '节点总数（含替换）' : '峰值节点数' }}<input v-model.number="form.nodes" type="number" min="2" required /></label>
+            <label class="form-field">集群总键数<input v-model.number="form.keys" type="number" min="1" required /></label>
             <label class="form-field">并发度<input v-model.number="form.concurrency" type="number" min="1" required /></label>
+            <label class="form-field">工作线程数
+              <input v-model.number="form.workerThreads" type="number" min="1" step="1" placeholder="留空自动"
+                title="压测客户端和每个数据节点各使用此数量。" aria-description="压测客户端和每个数据节点各使用此数量。留空时自动分配。" />
+            </label>
             <label class="form-field">值大小（B）<input v-model.number="form.valueBytes" type="number" min="1" required /></label>
             <label class="form-field">副本数 RF<input v-model.number="form.rf" type="number" min="1" required /></label>
             <label class="form-field">ACK 策略<select v-model="form.policy"><option value="owner-only">OwnerOnly</option><option value="first-successor">FirstSuccessor</option><option value="all-replicas">AllReplicas</option></select></label>
             <label class="form-field">哈希种子<input v-model.trim="form.seed" inputmode="numeric" pattern="[0-9]{1,20}" required /></label>
             <label class="form-field">虚拟位置 / 节点<input v-model.number="form.virtualNodes" type="number" min="1" required /></label>
+            <label v-if="form.mode === 'availability'" class="form-field">连续故障轮数<input v-model.number="form.availabilityRounds" type="number" min="1" required /></label>
+            <label v-if="form.mode === 'scaling'" class="form-field">扩缩容场景
+              <select v-model="form.scalingScenario" aria-label="扩缩容场景" @change="form.nodes = baseSettings.nodes">
+                <option v-for="scenario in scalingScenarios" :key="scenario.value" :value="scenario.value">{{ scenario.label }}</option>
+              </select>
+            </label>
           </div>
           <fieldset v-if="form.mode === 'latency'" class="latency-fields">
             <legend>负载阶段</legend>
@@ -255,6 +308,7 @@ onBeforeUnmount(() => { source?.close(); clearInterval(clock); endTopologyPollin
               <label class="form-field">GET:PUT:DELETE<input v-model.trim="form.mix" required /></label>
               <label class="form-field">键分布<input v-model.trim="form.distribution" required /></label>
               <label class="form-field">在途请求上限<input v-model.number="form.maxInFlight" type="number" min="1" required /></label>
+              <label class="form-field">每节点回执预算（MiB）<input v-model.number="form.dedupMiB" type="number" min="1" required /></label>
             </div>
           </fieldset>
         </template>

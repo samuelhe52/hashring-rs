@@ -17,17 +17,33 @@ export interface DirectoryGroup {
 }
 
 export const directory: DirectoryGroup[] = [
-  { label: '实验', items: [
+  { label: '运行', items: [
     { id: 'overview', label: '运行概览', panel: null },
     { id: 'runs', label: '选择运行', panel: 'runs' },
     { id: 'experiment', label: '运行实验与实时监测', panel: 'experiment' },
+    { id: 'replay', label: '历史回放', panel: 'replay', children: [
+      { id: 'replay-metrics', label: '指标曲线', panel: 'replay', view: 'metrics', anchor: 'playback-metrics' },
+      { id: 'replay-topology', label: '哈希环与节点负载', panel: 'replay', view: 'metrics', anchor: 'playback-topology' },
+      { id: 'replay-readings', label: '游标读数', panel: 'replay', anchor: 'playback-current' },
+      { id: 'replay-events', label: '事件进程', panel: 'replay', anchor: 'playback-events' },
+      { id: 'replay-source', label: '事件字段与来源', panel: 'replay', anchor: 'playback-source' },
+    ] },
+    { id: 'config', label: '实验配置', panel: 'config', children: [
+      { id: 'config-parameters', label: '实际参数', panel: 'config', view: 'parameters' },
+      { id: 'config-build', label: '构建与环境', panel: 'config', view: 'build' },
+    ] },
   ] },
   { label: '分析', items: [
-    { id: 'case', label: '负载档位对比', panel: 'case', children: [
-      { id: 'case-stages', label: '档位对比与导出', panel: 'case', view: 'stages' },
-      { id: 'case-story', label: '档位数据与采样时刻', panel: 'case', anchor: 'playback-case' },
+    { id: 'latency', label: '延迟与速率', panel: 'latency', children: [
+      { id: 'latency-curve', label: '负载曲线', panel: 'latency', view: 'curve' },
+      { id: 'latency-distribution', label: '延迟分布与图表导出', panel: 'latency', view: 'distribution' },
+      { id: 'latency-numbers', label: '数值明细与错误', panel: 'latency', view: 'numbers' },
     ] },
-    { id: 'compare', label: '运行对比', panel: 'compare', children: [
+    { id: 'topology', label: '哈希环与拓扑', panel: 'topology', children: [
+      { id: 'topology-range', label: '区间、归属与副本', panel: 'topology', view: 'range' },
+      { id: 'topology-nodes', label: '虚拟节点与空间分布', panel: 'topology', view: 'nodes' },
+    ] },
+    { id: 'compare', label: '跨运行对比', panel: 'compare', children: [
       { id: 'compare-bar', label: '阶段指标与差值', panel: 'compare', view: 'latency', plot: 'bar' },
       { id: 'compare-group', label: '分组分位数', panel: 'compare', view: 'latency', plot: 'group' },
       { id: 'compare-curve', label: '负载曲线叠加', panel: 'compare', view: 'latency', plot: 'curve' },
@@ -35,23 +51,9 @@ export const directory: DirectoryGroup[] = [
       { id: 'compare-other', label: '其他指标', panel: 'compare', view: 'other' },
       { id: 'compare-config', label: '配置差异', panel: 'compare', view: 'config' },
     ] },
-    { id: 'replay', label: '历史回放', panel: 'replay', children: [
-      { id: 'replay-metrics', label: '指标曲线与播放控制', panel: 'replay', view: 'metrics' },
-      { id: 'replay-topology', label: '哈希环动画', panel: 'replay', view: 'topology' },
-      { id: 'replay-readings', label: '游标读数', panel: 'replay', anchor: 'playback-current' },
-      { id: 'replay-events', label: '事件进程', panel: 'replay', anchor: 'playback-events' },
-      { id: 'replay-source', label: '事件字段与来源', panel: 'replay', anchor: 'playback-source' },
-    ] },
-    { id: 'topology', label: '哈希环与拓扑', panel: 'topology', children: [
-      { id: 'topology-range', label: '区间、归属与副本', panel: 'topology', view: 'range' },
-      { id: 'topology-nodes', label: '虚拟节点与空间分布', panel: 'topology', view: 'nodes' },
-    ] },
-  ] },
-  { label: '指标与观测', items: [
-    { id: 'latency', label: '延迟与速率', panel: 'latency', children: [
-      { id: 'latency-curve', label: '负载曲线', panel: 'latency', view: 'curve' },
-      { id: 'latency-distribution', label: '延迟分布与图表导出', panel: 'latency', view: 'distribution' },
-      { id: 'latency-numbers', label: '数值明细与错误', panel: 'latency', view: 'numbers' },
+    { id: 'case', label: '负载档位对比', panel: 'case', children: [
+      { id: 'case-stages', label: '档位对比与导出', panel: 'case', view: 'stages' },
+      { id: 'case-story', label: '档位数据与采样时刻', panel: 'case', anchor: 'playback-case' },
     ] },
     { id: 'nodes', label: '节点负载', panel: 'nodes', children: [
       { id: 'nodes-keys', label: '键数分布', panel: 'nodes', view: 'owned_keys' },
@@ -68,10 +70,6 @@ export const directory: DirectoryGroup[] = [
   ] },
   { label: '记录与报告', items: [
     { id: 'events', label: '事件时间线', panel: 'events' },
-    { id: 'config', label: '实验配置', panel: 'config', children: [
-      { id: 'config-parameters', label: '实际参数', panel: 'config', view: 'parameters' },
-      { id: 'config-build', label: '构建与环境', panel: 'config', view: 'build' },
-    ] },
     { id: 'files', label: '文件与日志', panel: 'files', children: [
       { id: 'files-raw', label: '原始结果', panel: 'files', view: 'raw' },
       { id: 'files-logs', label: '进程日志', panel: 'files', view: 'logs' },

@@ -1,4 +1,4 @@
-import type { RunEvent } from './types'
+import type { Measurement, RunEvent } from './types'
 import { number, object } from './data.ts'
 
 export function replayBounds(events: RunEvent[], manifestStart?: number) {
@@ -65,4 +65,19 @@ export function windowSuccessRate(event: RunEvent): number | null {
   const ops = Object.values(object(event.fields.ops))
   if (window === null || window <= 0 || !ops.length || ops.some(value => number(value) === null)) return null
   return ops.reduce<number>((total, value) => total + Number(value), 0) * 1000 / window
+}
+
+export function nodeOperationSample(event: RunEvent, stage?: Measurement) {
+  const average = !Object.hasOwn(event.fields, 'node_ops_per_second')
+  const seconds = number(stage?.seconds) ?? 0
+  if (average && (event.fields.warmup === true || seconds <= 0)) return null
+  const source = average
+    ? Object.entries(stage?.load_balance?.per_node ?? {}).map(([id, node]) => [id, node?.ops_handled] as const)
+    : Object.entries(object(event.fields.node_ops_per_second))
+  const values = new Map<string, number>()
+  for (const [id, raw] of source) {
+    const value = number(raw)
+    if (value !== null && value >= 0) values.set(id, average ? value / seconds : value)
+  }
+  return values.size ? { values, average } : null
 }

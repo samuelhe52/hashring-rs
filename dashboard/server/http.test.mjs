@@ -3,7 +3,34 @@ import assert from 'node:assert/strict'
 import { readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { createDashboardServer } from './index.mjs'
+import { experimentPlan } from './experiments.mjs'
 import { fixture, manifest, partial } from './test-fixture.mjs'
+
+test('实验表单传递负载规模、工作线程、回执预算和成员变更参数', () => {
+  const options = { resultsRoot: 'results', repoRoot: '.', binary: 'hashring-rs' }
+  const form = { kind: 'form', name: 'preset', nodes: 10, keys: 100_000, rf: 3, concurrency: 64,
+    valueBytes: 128, seed: '1', virtualNodes: 128, policy: 'owner-only' }
+  const flags = (input) => {
+    const { args } = experimentPlan({ ...form, ...input }, options)
+    const parameters = {}
+    for (let index = 3; index < args.length; index += 2) parameters[args[index]] = args[index + 1]
+    return parameters
+  }
+  const latency = flags({ mode: 'latency', keys: 1_000_000, rates: '2000,5000,10000', warmup: 3, duration: 10, workerThreads: 10,
+    mix: '100:0:0', distribution: 'zipf:0.99', maxInFlight: 4096, dedupMiB: 256 })
+  assert.equal(latency['--preload-keys'], '1000000')
+  assert.equal(latency['--target-rates'], '2000,5000,10000')
+  assert.equal(latency['--mix'], '100:0:0')
+  assert.equal(latency['--worker-threads'], '10')
+  assert.equal(latency['--max-dedup-bytes'], '268435456')
+  assert.equal(flags({ mode: 'performance', workerThreads: '' })['--worker-threads'], undefined)
+  assert.throws(() => flags({ mode: 'performance', workerThreads: 0 }), /工作线程数/)
+  assert.equal(flags({ mode: 'availability', nodes: 9, availabilityRounds: 3 })['--availability-rounds'], '3')
+  assert.throws(() => flags({ mode: 'availability', nodes: 5, availabilityRounds: 3 }), /起始节点数不足/)
+  const scaling = flags({ mode: 'scaling', nodes: 9, scalingScenario: 'churn' })
+  assert.equal(scaling['--scaling-scenario'], 'churn')
+  assert.equal(scaling['--pre-publish-delay-ms'], '0')
+})
 
 test('HTTP 可读取嵌套运行与原文，拒绝写入，失败请求不会破坏后续读取', async t => {
   const f = await fixture(t)

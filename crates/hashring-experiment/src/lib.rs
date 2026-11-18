@@ -27,6 +27,7 @@ use tonic::transport::Channel;
 
 mod fault;
 mod latency;
+mod node_load;
 mod scaling;
 
 /// The cluster a mode runs against and the outputs it fills in.
@@ -280,9 +281,11 @@ pub struct ThroughputMeasurement {
     pub operations_per_second: f64,
 }
 
-/// The percentiles of one operation's latency, in microseconds.
+/// The statistics of one operation's latency, in microseconds.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct LatencySummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mean: Option<f64>,
     pub p50: u64,
     pub p95: u64,
     pub p99: u64,
@@ -347,13 +350,19 @@ pub struct LatencyStageMeasurement {
 
 #[derive(Serialize)]
 struct ExperimentManifest<'a> {
-    schema_version: u32,
-    started_unix_ms: u128,
+    #[serde(flatten)]
+    metadata: RunMetadata<'a>,
     executable_path: String,
     executable_blake3: String,
+    runtime_source: RuntimeSource,
+}
+
+#[derive(Serialize)]
+struct RunMetadata<'a> {
+    schema_version: u32,
+    started_unix_ms: u128,
     config: &'a ExperimentConfig,
     build: BuildIdentity,
-    runtime_source: RuntimeSource,
     source_reproducible: bool,
     system: Option<String>,
 }
@@ -578,19 +587,23 @@ pub async fn run_experiment(
         runtime_tree_hash.as_deref(),
     );
     let manifest = ExperimentManifest {
-        schema_version: 9,
-        started_unix_ms: unix_ms(),
+        metadata: RunMetadata {
+            schema_version: 9,
+            started_unix_ms: unix_ms(),
+            config: &config,
+            build: BuildIdentity {
+                git_commit: env!("HASHRING_BUILD_GIT_COMMIT"),
+                git_dirty: env!("HASHRING_BUILD_GIT_DIRTY"),
+                profile: env!("HASHRING_BUILD_PROFILE"),
+                target: env!("HASHRING_BUILD_TARGET"),
+                rustc_version: env!("HASHRING_BUILD_RUSTC"),
+                source_tree_blake3: env!("HASHRING_BUILD_SOURCE_TREE_BLAKE3"),
+            },
+            source_reproducible,
+            system: command_output(None, "uname", &["-a"]),
+        },
         executable_path: executable.display().to_string(),
         executable_blake3: file_digest(&executable)?,
-        config: &config,
-        build: BuildIdentity {
-            git_commit: env!("HASHRING_BUILD_GIT_COMMIT"),
-            git_dirty: env!("HASHRING_BUILD_GIT_DIRTY"),
-            profile: env!("HASHRING_BUILD_PROFILE"),
-            target: env!("HASHRING_BUILD_TARGET"),
-            rustc_version: env!("HASHRING_BUILD_RUSTC"),
-            source_tree_blake3: env!("HASHRING_BUILD_SOURCE_TREE_BLAKE3"),
-        },
         runtime_source: RuntimeSource {
             root: env!("HASHRING_BUILD_SOURCE_ROOT"),
             git_commit: runtime_git_commit,
@@ -603,10 +616,9 @@ pub async fn run_experiment(
             ),
             source_tree_blake3: runtime_tree_hash,
         },
-        source_reproducible,
-        system: command_output(None, "uname", &["-a"]),
     };
     write_json(&config.output_dir.join("manifest.json"), &manifest)?;
+    write_json(&config.output_dir.join("run-metadata.json"), &manifest.metadata)?;
     events.record("experiment_started", json!({ "config": config }))?;
     if config.require_clean_source && !source_reproducible {
         let summary = summarize(
@@ -946,6 +958,15 @@ async fn run_cluster(
     )?;
 
     {
+        let sampler = if matches!(
+            config.mode,
+            ExperimentMode::Availability | ExperimentMode::Scaling | ExperimentMode::Fault
+        ) {
+            let sampler = node_load::NodeOperationSampler::new(&members)?;
+            Some(tokio::spawn(sampler.record(workload_client.clone(), events.clone())))
+        } else {
+            None
+        };
         let context = RunContext {
             config,
             members: &members,
@@ -959,17 +980,19 @@ async fn run_cluster(
             measurements,
             observations,
         };
-        if matches!(context.config.mode, ExperimentMode::Availability) {
-            return run_availability(context).await;
+        let result = match config.mode {
+            ExperimentMode::Availability => Some(run_availability(context).await),
+            ExperimentMode::Latency => Some(run_latency(context).await),
+            ExperimentMode::Scaling => Some(scaling::run(context).await),
+            ExperimentMode::Fault => Some(fault::run(context).await),
+            ExperimentMode::Correctness | ExperimentMode::Performance => None,
+        };
+        if let Some(sampler) = sampler {
+            sampler.abort();
+            let _ = sampler.await;
         }
-        if matches!(context.config.mode, ExperimentMode::Latency) {
-            return run_latency(context).await;
-        }
-        if matches!(context.config.mode, ExperimentMode::Scaling) {
-            return scaling::run(context).await;
-        }
-        if matches!(context.config.mode, ExperimentMode::Fault) {
-            return fault::run(context).await;
+        if let Some(result) = result {
+            return result;
         }
     }
 
@@ -1494,6 +1517,7 @@ async fn run_availability(context: RunContext<'_>) -> Result<u64> {
             {
                 let seconds = failed_at.elapsed().as_secs_f64();
                 published_seconds = Some(seconds);
+                write_topology_snapshot(events, &current)?;
                 events.record(
                     "failover_published",
                     json!({ "round": round, "seconds": seconds, "epoch": current.epoch }),
@@ -1729,10 +1753,11 @@ async fn run_availability(context: RunContext<'_>) -> Result<u64> {
                 measurement(1, restore_started.elapsed()),
             );
         }
+        write_topology_snapshot(events, &completed.target_topology)?;
         events.record(
             "full_rf_restored",
             json!({ "round": round, "epoch": completed.target_topology.epoch,
-        "replacement_to_full_rf_seconds": restored_seconds }),
+            "replacement": spare.node_id, "replacement_to_full_rf_seconds": restored_seconds }),
         )?;
         final_epoch = completed.target_topology.epoch;
 
@@ -1854,8 +1879,12 @@ async fn record_topology(events: &EventLog, client: &HashringClient) -> Result<T
             client.topology().await
         }
     };
-    events.record("topology_published", serde_json::to_value(&topology)?)?;
+    write_topology_snapshot(events, &topology)?;
     Ok(topology)
+}
+
+fn write_topology_snapshot(events: &EventLog, topology: &TopologySnapshot) -> Result<()> {
+    events.record("topology_published", serde_json::to_value(topology)?)
 }
 
 /// The counters one node reports, and the CPU it used.
@@ -1923,8 +1952,15 @@ async fn run_latency(context: RunContext<'_>) -> Result<u64> {
 
     let topology = admin_client.refresh_topology().await?;
     let owned_keys = owned_key_counts(&topology, key_space);
-    let runner = latency::LoadRunner::new(workload_client.clone(), plan.clone())?;
     let pids = processes.pids();
+    let node_pids = members
+        .iter()
+        .filter_map(|member| {
+            pids.get(&member.node_id)
+                .map(|pid| (member.node_id.clone(), *pid))
+        })
+        .collect();
+    let runner = latency::LoadRunner::new(workload_client.clone(), plan.clone(), node_pids, members)?;
     let mut saturated_windows = serde_json::Map::new();
     for (index, rate) in config.target_rates.iter().enumerate() {
         let stage = latency::StageSettings {
@@ -2007,6 +2043,19 @@ fn highest_latency_micros(config: &ExperimentConfig) -> u64 {
         .saturating_mul(1_000)
         .saturating_add(1_000_000)
         .min(600_000_000)
+}
+
+/// Reconstruct the initial experiment key set's placement in a recorded topology.
+pub fn snapshot_owned_keys(
+    topology: &TopologySnapshot,
+    key_space: u64,
+) -> Result<BTreeMap<String, u64>> {
+    ensure!(
+        (1..=MAX_KEY_COUNT).contains(&key_space),
+        "invalid experiment key count"
+    );
+    topology.validate()?;
+    Ok(owned_key_counts(topology, key_space))
 }
 
 /// The number of keys each node owns.
@@ -2270,6 +2319,7 @@ async fn migrate_while_mutating(
         )?;
     }
     let duration = started.elapsed();
+    write_topology_snapshot(events, &completed.target_topology)?;
     events.record(
         "migration_complete",
         json!({

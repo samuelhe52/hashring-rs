@@ -45,6 +45,8 @@ non-empty one. It writes:
 - `manifest.json`: the actual configuration, the build-time revision, toolchain,
   and profile, the runtime source status and diff, and a BLAKE3 digest of the
   executable
+- `run-metadata.json` contains the configuration, start time, build identity, and
+  system metadata for the Dashboard. The complete source evidence is in `manifest.json`.
 - `events.jsonl`: the event log
 - stdout and stderr for each process
 - `coordinator.redb`: the coordinator database

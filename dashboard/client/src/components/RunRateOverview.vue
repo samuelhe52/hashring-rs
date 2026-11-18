@@ -1,29 +1,52 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import DataChart from './DataChart.vue'
+import LatencyMetricSelector from './LatencyMetricSelector.vue'
 import RunFacts from './RunFacts.vue'
 import RunReadings from './RunReadings.vue'
 import { formatNumber as fmt, number, object, operations } from '../data'
-import { hasLatencyCurve, latencyCurveOption, loadLabels, nodeLoadOption, nodeLoadRows, nodeLoadValue } from '../loadCharts'
-import type { Measurement, RunDetail } from '../types'
+import { availableLatencyCurveMetrics, latencyCurveLabel, latencyCurveOption,
+  loadLabels, nodeLoadOption, nodeLoadRows, nodeLoadValue, visibleLatencyCurveMetrics, type LatencyCurveMetric } from '../loadCharts'
+import type { Latency, Measurement, RunDetail } from '../types'
 
 const props = defineProps<{ run: RunDetail; rows: [string, Measurement][] }>()
 const emit = defineEmits<{ details: [panel: 'latency' | 'nodes'] }>()
 const stage = defineModel<string>('stage', { required: true })
 const loadMetric = defineModel<string>('loadMetric', { required: true })
 const operation = defineModel<string>('operation', { required: true })
+const selectedMetrics = defineModel<LatencyCurveMetric[]>('latencyMetrics', { required: true })
 const selected = computed(() => props.rows.find(([name]) => name === stage.value) ?? props.rows[0])
 const current = computed(() => selected.value?.[1])
-const currentLatency = computed(() => current.value?.latency_us?.[operation.value])
-const curve = computed(() => latencyCurveOption(props.rows, operation.value, number(current.value?.achieved_rate)))
+const operationRate = computed(() => {
+  const completed = number(current.value?.ops?.[operation.value])
+  const seconds = number(current.value?.seconds)
+  return completed !== null && seconds !== null && seconds > 0 ? completed / seconds : null
+})
+const currentLatency = computed<Latency | undefined>(() => {
+  const stats = current.value?.latency_us?.[operation.value]
+  return stats?.samples === 0 ? { samples: 0 } : stats
+})
+const mean = computed(() => number(currentLatency.value?.mean))
+const availableMetrics = computed(() => availableLatencyCurveMetrics(props.rows, operation.value))
+const visibleMetrics = computed(() => visibleLatencyCurveMetrics(availableMetrics.value, selectedMetrics.value))
+const curve = computed(() => {
+  const option = latencyCurveOption(props.rows, operation.value, number(current.value?.achieved_rate), visibleMetrics.value)
+  return { ...option, grid: { ...option.grid, top: 27 }, legend: { show: false } }
+})
+const curveLabel = computed(() => latencyCurveLabel(operation.value, visibleMetrics.value))
 const nodes = computed(() => nodeLoadRows(current.value))
 const nodeBars = computed(() => nodeLoadOption(nodes.value, loadMetric.value))
 const counts = computed(() => Object.values(object(current.value?.errors)).filter(value => number(value) !== null).reduce<number>((sum, count) => sum + Number(count), 0))
+const late = computed(() => number(current.value?.late) ?? 0)
 const readings = computed(() => [
   {
-    label: '实际成功速率', value: reading(current.value?.achieved_rate), unit: 'ops/s', tone: 'ok',
-    note: '目标 ' + fmt(current.value?.target_rate) + ' ops/s · 正式 ' + fmt(current.value?.seconds, 2) + ' s',
+    label: '总成功速率', value: reading(current.value?.achieved_rate), unit: 'ops/s', tone: 'ok',
+    detail: operationRate.value === null ? undefined : '其中 ' + operation.value.toUpperCase() + ' ' + fmt(operationRate.value, 2) + ' ops/s',
   },
+  ...(mean.value === null ? [] : [{
+    label: operation.value.toUpperCase() + ' 平均延迟', value: fmt(mean.value / 1000, 3), unit: 'ms', tone: 'neutral',
+    note: '正式阶段算术平均',
+  }]),
   {
     label: operation.value.toUpperCase() + ' p50', value: reading(currentLatency.value?.p50), unit: 'µs', tone: 'neutral',
     note: '正式阶段中位延迟',
@@ -40,6 +63,7 @@ const balance = computed(() => {
   return nodes.value.length ? nodes.value.length + ' 个节点有记录' : '本阶段未采集节点数据'
 })
 function reading(value: unknown) { return number(value) === null ? '未记录' : fmt(value, 2) }
+
 </script>
 
 <template>
@@ -52,8 +76,9 @@ function reading(value: unknown) { return number(value) === null ? '未记录' :
       </label>
     </RunFacts>
     <RunReadings :items="readings" label="当前负载档位读数" />
-    <div v-if="current?.sender_saturated || counts > 0" class="notice warning dashboard-stage-warning" role="status">
-      <p v-if="current?.sender_saturated">发送端未跟上计划。本阶段的实际速率为 {{ fmt(current.achieved_rate, 2) }} ops/s。</p>
+    <div v-if="current?.sender_saturated || late > 0 || counts > 0" class="notice warning dashboard-stage-warning" role="status">
+      <p v-if="current?.sender_saturated">发送端未跟上计划。本阶段的总成功速率为 {{ fmt(current.achieved_rate, 2) }} ops/s。</p>
+      <p v-if="late > 0">本档有 {{ fmt(late) }} 个请求未按时发出。</p>
       <p v-if="counts > 0">本阶段记录 {{ fmt(counts) }} 次错误。</p>
     </div>
     <div class="dashboard-pair">
@@ -64,8 +89,9 @@ function reading(value: unknown) { return number(value) === null ? '未记录' :
             <button v-for="op in operations" :key="op" :aria-pressed="operation === op" @click="operation = op">{{ op.toUpperCase() }}</button>
           </nav>
         </header>
+        <LatencyMetricSelector v-model="selectedMetrics" :available="availableMetrics" />
         <div class="dashboard-chart-body">
-          <DataChart v-if="hasLatencyCurve(rows, operation)" :option="curve" :label="operation.toUpperCase() + ' p50、p99 延迟与实际速率曲线'" />
+          <DataChart v-if="visibleMetrics.length" :option="curve" :label="curveLabel" />
           <p v-else class="empty-inline">本场未记录所选操作的负载曲线。</p>
         </div>
         <footer class="dashboard-card-footer">

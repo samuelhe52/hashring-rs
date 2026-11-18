@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from 'vue'
 import DetailWindow from './components/DetailWindow.vue'
 import FloatingIndex from './components/FloatingIndex.vue'
 import ReferenceResults from './components/ReferenceResults.vue'
@@ -18,13 +18,15 @@ import { sceneFor, scenes } from './caseReplay'
 import { canonical } from './compare.ts'
 import { formatNumber as fmt, formatTime, modeLabels, number, object, request, stages, statusLabels, text } from './data'
 import { absoluteEventTime, eventName } from './events'
+import { defaultLatencyCurveMetrics, type LatencyCurveMetric } from './loadCharts'
 import { directory, type DirectoryEntry, type Panel, type ReferenceView } from './navigation'
-import type { RunDetail, RunEvent, RunListItem } from './types'
+import type { ReplayStart, RunDetail, RunEvent, RunListItem } from './types'
 
 const runs = ref<RunListItem[]>([])
 const run = ref<RunDetail | null>(null)
 const selectedId = ref('')
 const selectedStage = ref('')
+const latencyMetrics = ref<LatencyCurveMetric[]>([...defaultLatencyCurveMetrics])
 const search = ref('')
 const mode = ref('all')
 const status = ref('all')
@@ -38,6 +40,8 @@ const unavailableId = ref('')
 const panel = ref<Panel | null>(null)
 const sourceEvent = ref<RunEvent>()
 const snapshotLine = ref<number>()
+const caseView = ref<InstanceType<typeof RunCase> | null>(null)
+const replayStart = shallowRef<ReplayStart>()
 const fileKind = ref<'raw' | 'logs'>('raw')
 const referenceView = ref<ReferenceView>('load')
 const views = reactive({ latency: 'curve', operation: 'get', nodes: 'owned_keys', observations: 'throughput', config: 'parameters', compare: 'latency', topology: 'range', case: 'stages', replay: 'metrics' })
@@ -178,7 +182,8 @@ async function navigate(entry: DirectoryEntry, keyboard: boolean) {
     if (!section || !body.contains(section)) return
     anchorObserver?.disconnect()
     if (entry.anchor === 'playback-source') section.querySelector('details')?.setAttribute('open', '')
-    body.scrollTo({ top: body.scrollTop + section.getBoundingClientRect().top - body.getBoundingClientRect().top - 12, behavior })
+    const transportHeight = section.closest('.playback-stage')?.querySelector<HTMLElement>('.playback-transport')?.offsetHeight ?? 0
+    body.scrollTo({ top: body.scrollTop + section.getBoundingClientRect().top - body.getBoundingClientRect().top - transportHeight - 12, behavior })
     if (keyboard) section.focus({ preventScroll: true })
   }
   anchorObserver = new MutationObserver(go)
@@ -186,7 +191,12 @@ async function navigate(entry: DirectoryEntry, keyboard: boolean) {
   go()
 }
 
-watch(panel, () => { anchorObserver?.disconnect(); directoryAnchor.value = '' })
+watch(panel, next => {
+  anchorObserver?.disconnect()
+  directoryAnchor.value = ''
+  replayStart.value = next === 'replay' ? caseView.value?.replayStart() : undefined
+  if (replayStart.value) views.replay = 'metrics'
+})
 watch(() => Object.values(views), () => { directoryAnchor.value = '' })
 
 async function selectRun(id: string, refresh = false) {
@@ -195,9 +205,12 @@ async function selectRun(id: string, refresh = false) {
   detailController?.abort()
   detailController = new AbortController()
   const signal = detailController.signal
+  if (selectedId.value !== id) {
+    selectedStage.value = ''
+    views.operation = 'get'
+    latencyMetrics.value = [...defaultLatencyCurveMetrics]
+  }
   selectedId.value = id
-  selectedStage.value = ''
-  views.operation = 'get'
   run.value = null
   detailError.value = ''
   detailLoading.value = true
@@ -207,6 +220,7 @@ async function selectRun(id: string, refresh = false) {
   try {
     const data = await request<RunDetail>('/api/runs/' + encodeURIComponent(id), signal)
     if (signal.aborted) return
+    if (selectedStage.value && !stages(data.summary).some(([name]) => name === selectedStage.value)) selectedStage.value = ''
     run.value = data
     sessionStorage.setItem('hashring.dashboard.run', id)
     views.case = 'stages'
@@ -295,9 +309,10 @@ onBeforeUnmount(() => { listController?.abort(); detailController?.abort(); anch
           <div v-if="run.status === 'failed' || run.summary?.error" class="notice error" role="alert"><p><strong>实验失败</strong><span>{{ run.summary?.error || '未记录失败原因。' }}</span></p></div>
           <p v-else-if="run.status === 'incomplete'" class="notice neutral">运行结果尚不完整，已记录的数据仍可查看。</p>
 
-          <RunCase v-if="scene" :key="run.id" :run="run" :scene="scene" :modal-open="!!panel" @inspect="inspectEvent" @topology="openTopology" />
+          <RunCase v-if="scene" :key="run.id" ref="caseView" :run="run" :scene="scene" :modal-open="!!panel" @inspect="inspectEvent" @topology="openTopology" />
           <RunRateOverview v-else-if="rateStages.length" :key="run.id" :run="run" :rows="rateStages"
-            v-model:stage="selectedStage" v-model:load-metric="views.nodes" v-model:operation="views.operation" @details="panel = $event" />
+            v-model:stage="selectedStage" v-model:load-metric="views.nodes" v-model:operation="views.operation"
+            v-model:latency-metrics="latencyMetrics" @details="panel = $event" />
           <RunGeneralOverview v-else :key="run.id" :run="run" @observations="openObservations" />
 
           <nav class="dashboard-resources" aria-label="运行分析">
@@ -321,6 +336,7 @@ onBeforeUnmount(() => { listController?.abort(); detailController?.abort(); anch
     </main>
 
     <DetailWindow v-if="panel" :page-key="panel" :title="modalTitle" :subtitle="modalSubtitle"
+      :class="{ 'monitor-window': ['experiment', 'replay'].includes(panel) }"
       :compact="panel === 'runs' || panel === 'event'" :wide="['replay', 'case', 'experiment', 'compare'].includes(panel)" @close="panel = null">
       <template #navigation><FloatingIndex :groups="pageIndex" :active="directoryActive" :has-run="!!run" @navigate="navigate" /></template>
 
@@ -364,11 +380,11 @@ onBeforeUnmount(() => { listController?.abort(); detailController?.abort(); anch
         <details class="data-disclosure"><summary>JSONL 本行原文</summary><pre class="source-view" tabindex="0">{{ sourceEvent.raw }}</pre></details>
       </section>
       <template v-else-if="run">
-        <RunReplay v-if="panel === 'replay' || panel === 'case'" v-model:view="views[panel]" :run="run" :case-study="panel === 'case'" />
+        <RunReplay v-if="panel === 'replay' || panel === 'case'" :key="panel" v-model:view="views[panel]" :run="run" :case-study="panel === 'case'" :initial="replayStart" />
         <RunTopology v-else-if="panel === 'topology'" v-model:view="views.topology" :run="run" :initial-line="snapshotLine" />
         <RunOverview v-else-if="panel === 'latency' || panel === 'nodes' || panel === 'observations'"
           v-model:view="views.latency" v-model:observation-view="views.observations" v-model:load-metric="views.nodes" v-model:operation="views.operation"
-          :run="run" :section="panel" :stage="selectedStage" @select-stage="selectedStage = $event" />
+          v-model:latency-metrics="latencyMetrics" :run="run" :section="panel" :stage="selectedStage" @select-stage="selectedStage = $event" />
         <RunTimeline v-else-if="panel === 'events'" :run="run" />
         <template v-else-if="panel === 'config'">
           <details v-if="sampleCommand" class="data-disclosure dashboard-replay-command"><summary>样例复跑命令</summary><pre class="source-view" tabindex="0">{{ sampleCommand }}</pre></details>

@@ -1,20 +1,32 @@
-import { readdir, readFile, realpath } from 'node:fs/promises'
+import { readdir, readFile, realpath, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { parseEventLog, parseRecordedJson } from './events.mjs'
 
-// 目录中不存在 summary 是正常情况：实验可能尚未结束。
+async function parseJsonFile(file) {
+  const value = parseRecordedJson(await readFile(file, 'utf8'))
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('文件内容应为 JSON 对象')
+  return value
+}
+
+function unreadableJson(name, error) {
+  // 目录中不存在 summary 是正常情况：实验可能尚未结束。
+  if (error.code === 'ENOENT') return { value: null }
+  return { value: null, warning: `${name} 读取失败：${error.message}` }
+}
+
 async function readJson(dir, name) {
   try {
-    const file = await containedFile(dir, name)
-    const value = parseRecordedJson(await readFile(file, 'utf8'))
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
-      throw new Error('文件内容应为 JSON 对象')
-    }
-    return { value }
+    return { value: await parseJsonFile(await containedFile(dir, name)) }
+  } catch (error) {
+    return unreadableJson(name, error)
   }
-  catch (error) {
-    if (error.code === 'ENOENT') return { value: null }
-    return { value: null, warning: `${name} 读取失败：${error.message}` }
+}
+
+function manifestFields(manifest) {
+  return {
+    schema_version: manifest.schema_version, started_unix_ms: manifest.started_unix_ms,
+    config: manifest.config, build: manifest.build, system: manifest.system,
+    source_reproducible: manifest.source_reproducible,
   }
 }
 
@@ -33,6 +45,7 @@ async function containedFile(dir, name) {
 
 export function createStore(resultsRoot) {
   const root = path.resolve(resultsRoot)
+  const manifestCache = new Map()
   async function directory(id) {
     const base = await realpath(root)
     const target = await realpath(path.resolve(root, id))
@@ -42,24 +55,37 @@ export function createStore(resultsRoot) {
     return target
   }
 
+  async function readManifest(dir) {
+    const metadata = await readJson(dir, 'run-metadata.json')
+    if (metadata.value) return { value: manifestFields(metadata.value) }
+
+    // 导入的结果可以只有完整清单；仅缓存页面使用的小段字段。
+    const name = 'manifest.json'
+    try {
+      const file = await containedFile(dir, name)
+      const { ino, size, mtimeNs, ctimeNs } = await stat(file, { bigint: true })
+      const revision = `${ino}:${size}:${mtimeNs}:${ctimeNs}`
+      const cached = manifestCache.get(dir)
+      if (cached?.file === file && cached.revision === revision) return { value: cached.value }
+      const value = manifestFields(await parseJsonFile(file))
+      manifestCache.set(dir, { file, revision, value })
+      return { value }
+    } catch (error) {
+      manifestCache.delete(dir)
+      return unreadableJson(name, error)
+    }
+  }
+
   async function readRun(id) {
     const dir = await directory(id)
     const [manifest, summary] = await Promise.all([
-      readJson(dir, 'manifest.json'), readJson(dir, 'summary.json'),
+      readManifest(dir), readJson(dir, 'summary.json'),
     ])
     const warnings = [manifest.warning, summary.warning].filter(Boolean)
-    const m = manifest.value
     const s = summary.value
     const status = s?.success === true ? 'success' : s?.success === false ? 'failed' : 'incomplete'
     return {
-      id, name: id, status, warnings,
-      // 清单可能包含很大的源码快照；常规页面只传展示所需字段，原文按需读取。
-      manifest: m ? {
-        schema_version: m.schema_version, started_unix_ms: m.started_unix_ms,
-        config: m.config, build: m.build, system: m.system,
-        source_reproducible: m.source_reproducible,
-      } : null,
-      summary: s,
+      id, name: id, status, warnings, manifest: manifest.value, summary: s,
     }
   }
 
