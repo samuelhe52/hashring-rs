@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import RunReplay from './RunReplay.vue'
-import type { EventLog, ExperimentFeed, ExperimentSession, JsonObject, RunDetail } from '../types'
-import { formatNumber as fmt, formatTime, object, request, text } from '../data'
+import type { EventLog, ExperimentFeed, ExperimentSession, RunDetail } from '../types'
+import { formatNumber as fmt, formatTime, request, text } from '../data'
 import { downloadBlob } from '../download'
 
 const emit = defineEmits<{ result: [id: string] }>()
@@ -60,10 +60,17 @@ let launchedId: string | null = null
 const input = computed(() => kind.value === 'yaml' ? { kind: kind.value, name: name.value, yaml: yaml.value } : { kind: kind.value, name: name.value, ...form })
 const copied = ref(false)
 const pollTopology = ref(false)
-const observed = ref<{ observedAt: number; ring: JsonObject; replicas: JsonObject } | null>(null)
+const observed = ref<{
+  observedAt: number
+  ring: { epoch: number | string }
+  replicas: {
+    topology_epoch: number | string
+    range_count: number
+    under_replicated_count: number
+    nodes: { node_id: string; leased: boolean; suspected: boolean; fenced: boolean }[]
+  }
+} | null>(null)
 const topologyError = ref('')
-const replicaNodes = computed(() => Array.isArray(observed.value?.replicas.nodes) ? observed.value.replicas.nodes.map(object) : [])
-const replicaRanges = computed(() => Array.isArray(observed.value?.replicas.ranges) ? observed.value.replicas.ranges.map(object) : [])
 const elapsed = computed(() => session.value ? Math.max(0, ((session.value.endedAt ?? now.value) - session.value.startedAt) / 1000) : 0)
 let source: EventSource | undefined
 let clock: ReturnType<typeof setInterval> | undefined
@@ -129,10 +136,6 @@ function connect() {
       streamError: data.streamError,
     }
     if (active.value) editing.value = false
-    if (data.session?.phase === 'succeeded' && data.session.id === launchedId) {
-      launchedId = null
-      if (autoOpen.value && data.session.hasResult) emit('result', data.session.id)
-    }
   })
   source.onerror = () => { connected.value = false; connectionError.value = '实时连接中断，正在重新连接。实验仍由本地服务管理。' }
 }
@@ -212,6 +215,11 @@ function editNew() {
 }
 
 watch(input, () => { prepared.value = null; copied.value = false })
+watch(session, run => {
+  if (run?.phase !== 'succeeded' || run.id !== launchedId) return
+  launchedId = null
+  if (autoOpen.value && run.hasResult) emit('result', run.id)
+})
 watch(completedId, async (id, _, onCleanup) => {
   completedRun.value = undefined
   if (!id) return
@@ -260,8 +268,8 @@ onBeforeUnmount(() => { source?.close(); clearInterval(clock); endTopologyPollin
             <p v-if="topologyError" class="text-warning">{{ topologyError }}</p>
             <template v-if="observed">
               <p>拓扑 epoch {{ text(observed.ring.epoch) }} · 副本状态 epoch {{ text(observed.replicas.topology_epoch) }}</p>
-              <p class="footnote">{{ formatTime(observed.observedAt) }} · {{ replicaRanges.length }} 个区间 · {{ replicaRanges.filter(range => range.under_replicated === true).length }} 个副本不足</p>
-              <div v-if="replicaNodes.length" class="table-scroll"><table><thead><tr><th>节点</th><th>租约</th><th>疑似故障</th><th>隔离</th></tr></thead><tbody><tr v-for="node in replicaNodes" :key="text(node.node_id)"><th scope="row">{{ text(node.node_id) }}</th><td>{{ text(node.leased) }}</td><td>{{ text(node.suspected) }}</td><td>{{ text(node.fenced) }}</td></tr></tbody></table></div>
+              <p class="footnote">{{ formatTime(observed.observedAt) }} · {{ observed.replicas.range_count }} 个区间 · {{ observed.replicas.under_replicated_count }} 个副本不足</p>
+              <div v-if="observed.replicas.nodes.length" class="table-scroll"><table><thead><tr><th>节点</th><th>租约</th><th>疑似故障</th><th>隔离</th></tr></thead><tbody><tr v-for="node in observed.replicas.nodes" :key="node.node_id"><th scope="row">{{ node.node_id }}</th><td>{{ text(node.leased) }}</td><td>{{ text(node.suspected) }}</td><td>{{ text(node.fenced) }}</td></tr></tbody></table></div>
             </template>
           </div>
         </template>

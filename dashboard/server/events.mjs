@@ -4,6 +4,10 @@ export function parseRecordedJson(raw) {
     typeof value === 'number' && Math.abs(value) > Number.MAX_SAFE_INTEGER ? context.source : value)
 }
 
+export function compareEvents(a, b) {
+  return a.unix_ms - b.unix_ms || a.line - b.line
+}
+
 export function parseEventLog(content, lineOffset = 0) {
   const events = []
   const issues = []
@@ -24,6 +28,6 @@ export function parseEventLog(content, lineOffset = 0) {
     }
   }
   // 同一毫秒的事件保持文件顺序；不因名称或内容相同而去重。
-  events.sort((a, b) => a.unix_ms - b.unix_ms || a.line - b.line)
+  events.sort(compareEvents)
   return { events, issues }
 }

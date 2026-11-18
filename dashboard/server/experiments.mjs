@@ -1,10 +1,10 @@
 import { execFile, spawn } from 'node:child_process'
 import { constants } from 'node:fs'
-import { access, mkdir, open, readFile, readdir, writeFile } from 'node:fs/promises'
+import { access, mkdir, open, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
-import { promisify } from 'node:util'
-import { parseEventLog, parseRecordedJson } from './events.mjs'
+import { promisify, stripVTControlCharacters } from 'node:util'
+import { compareEvents, parseEventLog, parseRecordedJson } from './events.mjs'
 
 const execute = promisify(execFile)
 const modes = ['correctness', 'performance', 'availability', 'latency', 'scaling', 'fault']
@@ -133,25 +133,12 @@ function followEvents(filename) {
 
 async function coordinatorAddress(run) {
   if (run.coordinator) return run.coordinator
-  // 旧实验二进制默认不写 INFO 日志，Linux/WSL 可从本次进程的子进程读取监听参数。
-  if (process.platform === 'linux' && run.child.pid) {
-    const tasks = `/proc/${run.child.pid}/task`
-    const threads = await readdir(tasks).catch(() => [])
-    const lists = await Promise.all(threads.map(tid => readFile(`${tasks}/${tid}/children`, 'utf8').catch(() => '')))
-    const children = new Set(lists.join(' ').match(/\d+/g) ?? [])
-    for (const pid of children) {
-      const argv = (await readFile(`/proc/${pid}/cmdline`, 'utf8').catch(() => '')).split('\0')
-      if (argv[1] !== 'coordinator' || argv[argv.indexOf('--state') + 1] !== path.join(run.output, 'coordinator.redb')) continue
-      const address = argv[argv.indexOf('--listen') + 1]
-      if (/^127\.0\.0\.1:\d{1,5}$/.test(address ?? '')) return address
-    }
-  }
-  const log = await open(path.join(run.output, 'process-logs/coordinator.stderr.log'), 'r').catch(() => null)
+  const log = await open(path.join(run.output, 'process-logs/coordinator.stdout.log'), 'r').catch(() => null)
   if (!log) return null
   try {
     const buffer = Buffer.alloc(8192)
     const { bytesRead } = await log.read(buffer)
-    return /coordinator ready listen=(127\.0\.0\.1:\d{1,5})\b/.exec(buffer.toString('utf8', 0, bytesRead))?.[1]
+    return /coordinator ready listen=(127\.0\.0\.1:\d{1,5})\b/.exec(stripVTControlCharacters(buffer.toString('utf8', 0, bytesRead)))?.[1]
   } finally { await log.close() }
 }
 
@@ -282,7 +269,8 @@ export function createExperiments(options) {
       'X-Content-Type-Options': 'nosniff',
     })
     clients.add(res)
-    const snapshot = { session: current?.session ?? null, log: current?.log ?? emptyLog(), stderr: current?.stderr ?? '', streamError: current?.streamError ?? '' }
+    const log = current ? { ...current.log, events: current.log.events.toSorted(compareEvents) } : emptyLog()
+    const snapshot = { session: current?.session ?? null, log, stderr: current?.stderr ?? '', streamError: current?.streamError ?? '' }
     res.write(`event: snapshot\ndata: ${JSON.stringify(snapshot)}\n\n`)
     const heartbeat = setInterval(() => { if (!res.writableNeedDrain) res.write(': ping\n\n') }, 15000)
     res.once('close', () => { clearInterval(heartbeat); clients.delete(res) })
@@ -293,12 +281,12 @@ export function createExperiments(options) {
     if (!active() || run.session.id !== id) throw problem(409, '当前没有可查询的运行中集群')
     const address = await coordinatorAddress(run)
     if (!address) throw problem(409, '等待协调器监听地址')
-    const args = ['--coordinator', 'http://' + address, '--deadline-ms', '1500']
+    const args = ['experiment-live-status', '--coordinator', 'http://' + address, '--deadline-ms', '1500']
     try {
-      const [ring, replicas] = await Promise.all(['topology', 'replica-status'].map(command =>
-        execute(binary, [command, ...args], { cwd: repoRoot, timeout: 2400, maxBuffer: 8 * 1024 * 1024 }).then(result => parseRecordedJson(result.stdout))))
+      const { stdout } = await execute(binary, args, { cwd: repoRoot, timeout: 3500 })
+      const status = parseRecordedJson(stdout)
       run.coordinator = address
-      return { observedAt: Date.now(), ring, replicas }
+      return { ...status, observedAt: Date.now() }
     } catch {
       run.coordinator = undefined
       throw problem(503, '暂时无法查询协调器，请稍后重试')
