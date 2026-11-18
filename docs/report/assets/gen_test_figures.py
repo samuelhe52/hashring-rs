@@ -60,8 +60,8 @@ def failover_timeline():
 
     rows = [
         ('OwnerOnly（3 次运行的中位数）',
-         [('发布新拓扑 5.61 s', 5.61, BLUE),
-          ('首个成功读/写 5.79 s', 5.79, GREEN),
+         [('发布新拓扑 5.63 s', 5.63, BLUE),
+          ('首个成功读/写 5.80 s', 5.80, GREEN),
           ('恢复到满 RF 15.97 s', 15.97, ORANGE)], 96),
         ('FirstSuccessor（1 次运行）',
          [('发布新拓扑 5.05 s', 5.05, BLUE),

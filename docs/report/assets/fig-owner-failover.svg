@@ -4,12 +4,12 @@
 <line x1="370.2" y1="44.0" x2="370.2" y2="258.0" stroke="#5d6874" stroke-width="1.2" stroke-dasharray="4 4"/>
 <text x="201.0" y="101.0" font-size="13" font-weight="600" fill="#1b2430" text-anchor="end" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >OwnerOnly（3 次运行的中位数）</text>
 <line x1="215.0" y1="96.0" x2="960.0" y2="96.0" stroke="#e3dfd7" stroke-width="3" stroke-linecap="round"/>
-<line x1="389.1" y1="87.0" x2="389.1" y2="105.0" stroke="#1f6f8b" stroke-width="2" />
-<circle cx="389.1" cy="96.0" r="5.5" fill="#1f6f8b"/>
-<text x="389.1" y="74.0" font-size="12.5" font-weight="600" fill="#1b2430" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >发布新拓扑 5.61 s</text>
-<line x1="394.7" y1="87.0" x2="394.7" y2="105.0" stroke="#3d7d4f" stroke-width="2" />
-<circle cx="394.7" cy="96.0" r="5.5" fill="#3d7d4f"/>
-<text x="394.7" y="126.0" font-size="12.5" font-weight="600" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >首个成功读/写 5.79 s</text>
+<line x1="389.8" y1="87.0" x2="389.8" y2="105.0" stroke="#1f6f8b" stroke-width="2" />
+<circle cx="389.8" cy="96.0" r="5.5" fill="#1f6f8b"/>
+<text x="389.8" y="74.0" font-size="12.5" font-weight="600" fill="#1b2430" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >发布新拓扑 5.63 s</text>
+<line x1="395.0" y1="87.0" x2="395.0" y2="105.0" stroke="#3d7d4f" stroke-width="2" />
+<circle cx="395.0" cy="96.0" r="5.5" fill="#3d7d4f"/>
+<text x="395.0" y="126.0" font-size="12.5" font-weight="600" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >首个成功读/写 5.80 s</text>
 <line x1="710.7" y1="87.0" x2="710.7" y2="105.0" stroke="#c0532b" stroke-width="2" />
 <circle cx="710.7" cy="96.0" r="5.5" fill="#c0532b"/>
 <text x="710.7" y="74.0" font-size="12.5" font-weight="600" fill="#1b2430" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >恢复到满 RF 15.97 s</text>
