@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 330" width="1000" height="330" role="img" aria-label="虚拟节点数与节点份额的均衡度">
+<line x1="95.0" y1="227.3" x2="940.0" y2="227.3" stroke="#e3dfd7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="83.0" y="231.3" font-size="12" font-weight="500" fill="#5d6874" text-anchor="end" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >0.05</text>
+<line x1="95.0" y1="193.7" x2="940.0" y2="193.7" stroke="#e3dfd7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="83.0" y="197.7" font-size="12" font-weight="500" fill="#5d6874" text-anchor="end" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >0.1</text>
+<line x1="95.0" y1="160.1" x2="940.0" y2="160.1" stroke="#e3dfd7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="83.0" y="164.1" font-size="12" font-weight="500" fill="#5d6874" text-anchor="end" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >0.2</text>
+<line x1="95.0" y1="115.8" x2="940.0" y2="115.8" stroke="#e3dfd7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="83.0" y="119.8" font-size="12" font-weight="500" fill="#5d6874" text-anchor="end" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >0.5</text>
+<line x1="95.0" y1="82.2" x2="940.0" y2="82.2" stroke="#e3dfd7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="83.0" y="86.2" font-size="12" font-weight="500" fill="#5d6874" text-anchor="end" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >1</text>
+<line x1="95.0" y1="48.6" x2="940.0" y2="48.6" stroke="#e3dfd7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="83.0" y="52.6" font-size="12" font-weight="500" fill="#5d6874" text-anchor="end" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >2</text>
+<line x1="95.0" y1="44.0" x2="95.0" y2="252.0" stroke="#e3dfd7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="95.0" y="276.0" font-size="12" font-weight="500" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >1</text>
+<line x1="290.5" y1="44.0" x2="290.5" y2="252.0" stroke="#e3dfd7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="290.5" y="276.0" font-size="12" font-weight="500" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >4</text>
+<line x1="486.0" y1="44.0" x2="486.0" y2="252.0" stroke="#e3dfd7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="486.0" y="276.0" font-size="12" font-weight="500" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >16</text>
+<line x1="681.5" y1="44.0" x2="681.5" y2="252.0" stroke="#e3dfd7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="681.5" y="276.0" font-size="12" font-weight="500" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >64</text>
+<line x1="877.1" y1="44.0" x2="877.1" y2="252.0" stroke="#e3dfd7" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="877.1" y="276.0" font-size="12" font-weight="500" fill="#5d6874" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >256</text>
+<text x="517.5" y="304.0" font-size="12.5" font-weight="600" fill="#1b2430" text-anchor="middle" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >每个物理节点的虚拟节点数 V</text>
+<text x="33.0" y="148.0" font-size="12.5" font-weight="600" fill="#1b2430" text-anchor="start" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" transform="rotate(-90 33.0 148.0)">拥有键数的变异系数 CV</text>
+<line x1="95.0" y1="227.3" x2="940.0" y2="227.3" stroke="#c0532b" stroke-width="1.6" stroke-dasharray="6 4"/>
+<text x="107.0" y="217.3" font-size="12" font-weight="600" fill="#c0532b" text-anchor="start" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >CV = 0.05（阶段 3 的目标按 CV 口径约需 V ≈ 400）</text>
+<polyline points="95.0,82.2 290.5,115.8 486.0,149.3 681.5,182.9 779.3,199.7 877.1,216.5" fill="none" stroke="#5d6874" stroke-width="1.6" stroke-dasharray="6 4"/>
+<text x="404.9" y="139.4" font-size="12" font-weight="600" fill="#5d6874" text-anchor="start" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >理论 1/√V</text>
+<polyline points="95.0,65.5 486.0,165.8 681.5,177.7 779.3,199.9 842.2,216.8 877.1,229.2" fill="none" stroke="#1f6f8b" stroke-width="2"/>
+<circle cx="95.0" cy="65.5" r="5" fill="#1f6f8b"/>
+<circle cx="486.0" cy="165.8" r="5" fill="#1f6f8b"/>
+<circle cx="681.5" cy="177.7" r="5" fill="#1f6f8b"/>
+<circle cx="779.3" cy="199.9" r="5" fill="#1f6f8b"/>
+<circle cx="842.2" cy="216.8" r="5" fill="#1f6f8b"/>
+<circle cx="877.1" cy="229.2" r="5" fill="#1f6f8b"/>
+<text x="107.0" y="57.5" font-size="12" font-weight="600" fill="#1b2430" text-anchor="start" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >V = 1，CV = 1.412</text>
+<text x="765.3" y="217.9" font-size="12" font-weight="600" fill="#1b2430" text-anchor="end" font-family="PingFang SC, Noto Sans SC, Microsoft YaHei, system-ui, sans-serif" >V = 128，CV = 0.088</text>
+</svg>
