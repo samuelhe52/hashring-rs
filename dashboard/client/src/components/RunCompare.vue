@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import DataChart from './DataChart.vue'
 import type { Measurement, RunDetail, RunListItem } from '../types'
-import { colors, errorsText, fieldNames, formatNumber as fmt, number, object, operations, request, shortName, stages, statusLabels, text } from '../data'
+import { colors, errorsText, fieldNames, formatNumber as fmt, latencyStatistic, number, object, operations, request, shortName, stages, statusLabels, text } from '../data'
 import { canonical, comparisonRates, configRows, numericFields, recordedMetrics, repeatStats, sameExperimentConfig, stagesAtRate } from '../compare.ts'
 
 const props = defineProps<{ runs: RunListItem[]; initialId: string; initialSelection?: string[] }>()
@@ -33,7 +33,7 @@ function label(run: RunDetail, index: number) {
   const name = shortName(run.name)
   return `${index + 1}. ${name.length > 26 ? name.slice(0, 23) + '…' : name}`
 }
-const latency = (stage: Measurement | undefined, key: string) => number(object(object(stage?.latency_us)[operation.value])[key])
+const latency = (stage: Measurement | undefined, key: string) => latencyStatistic(stage?.latency_us?.[operation.value], key)
 const pending = computed(() => canonical(selected.value) !== canonical(applied.value))
 const percentiles = ['p50', 'p95', 'p99', 'max'] as const
 const stageValues = computed(() => current.value.map(entry => latency(entry?.[1], percentile.value)))

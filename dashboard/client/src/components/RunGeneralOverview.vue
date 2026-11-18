@@ -2,7 +2,7 @@
 import { computed } from 'vue'
 import RunFacts from './RunFacts.vue'
 import RunReadings from './RunReadings.vue'
-import { fieldNames, formatNumber as fmt, number, object, throughputRows } from '../data'
+import { fieldNames, formatNumber as fmt, latencyStatistic, number, object, throughputRows } from '../data'
 import type { RunDetail } from '../types'
 
 const props = defineProps<{ run: RunDetail }>()
@@ -49,7 +49,7 @@ function reading(value: unknown) { return number(value) === null ? '未记录' :
           <table>
             <thead><tr><th scope="col">路径</th><th scope="col">p50</th><th scope="col">p95</th><th scope="col">p99</th></tr></thead>
             <tbody><tr v-for="row in idle" :key="row.path">
-              <th scope="row">{{ row.path }}</th><td>{{ fmt(row.stats.p50) }}</td><td>{{ fmt(row.stats.p95) }}</td><td>{{ fmt(row.stats.p99) }}</td>
+              <th scope="row">{{ row.path }}</th><td>{{ fmt(latencyStatistic(row.stats, 'p50')) }}</td><td>{{ fmt(latencyStatistic(row.stats, 'p95')) }}</td><td>{{ fmt(latencyStatistic(row.stats, 'p99')) }}</td>
             </tr></tbody>
           </table>
         </div>

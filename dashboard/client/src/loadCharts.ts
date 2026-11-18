@@ -1,4 +1,4 @@
-import { colors, formatNumber as fmt, number } from './data'
+import { colors, formatNumber as fmt, latencyStatistic, number } from './data'
 import { nodeColor, nodePalette } from './topology.ts'
 import type { Measurement, NodeLoad } from './types'
 
@@ -32,8 +32,7 @@ const axis = {
 }
 
 function latencyValue(stage: Measurement, operation: string, metric: LatencyCurveMetric) {
-  const stats = stage.latency_us?.[operation]
-  return stats?.samples === 0 ? null : number(stats?.[metric])
+  return latencyStatistic(stage.latency_us?.[operation], metric)
 }
 
 export function availableLatencyCurveMetrics(rows: [string, Measurement][], operation: string) {

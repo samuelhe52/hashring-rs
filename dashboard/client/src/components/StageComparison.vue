@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import DataChart from './DataChart.vue'
-import { colors, formatNumber as fmt, number, operations, stages } from '../data'
+import { colors, formatNumber as fmt, latencyStatistic, number, operations, stages } from '../data'
 import type { RunDetail } from '../types'
 
 const props = defineProps<{ run: RunDetail }>()
@@ -10,7 +10,7 @@ const operation = ref('get')
 const rows = computed(() => stages(props.run.summary))
 const unit = computed(() => metric.value === 'rate' ? 'ops/s' : 'µs')
 const title = computed(() => metric.value === 'rate' ? '各阶段实际成功速率（ops/s）' : `${operation.value.toUpperCase()} ${metric.value} 阶段对比（µs）`)
-const values = computed(() => rows.value.map(([, stage]) => number(metric.value === 'rate' ? stage.achieved_rate : stage.latency_us?.[operation.value]?.p99)))
+const values = computed(() => rows.value.map(([, stage]) => metric.value === 'rate' ? number(stage.achieved_rate) : latencyStatistic(stage.latency_us?.[operation.value], 'p99')))
 const first = computed(() => values.value[0] ?? null)
 const last = computed(() => values.value.at(-1) ?? null)
 const delta = computed(() => first.value !== null && last.value !== null ? last.value - first.value : null)

@@ -427,8 +427,12 @@ impl EventLog {
     }
 
     fn record(&self, event: &str, fields: Value) -> Result<()> {
+        self.record_at(event, fields, unix_ms())
+    }
+
+    fn record_at(&self, event: &str, fields: Value, unix_ms: u128) -> Result<()> {
         let value = json!({
-            "unix_ms": unix_ms(),
+            "unix_ms": unix_ms,
             "event": event,
             "fields": fields,
         });
@@ -618,7 +622,10 @@ pub async fn run_experiment(
         },
     };
     write_json(&config.output_dir.join("manifest.json"), &manifest)?;
-    write_json(&config.output_dir.join("run-metadata.json"), &manifest.metadata)?;
+    write_json(
+        &config.output_dir.join("run-metadata.json"),
+        &manifest.metadata,
+    )?;
     events.record("experiment_started", json!({ "config": config }))?;
     if config.require_clean_source && !source_reproducible {
         let summary = summarize(
@@ -876,9 +883,8 @@ async fn run_cluster(
             .await?;
         latencies_us.push(started.elapsed().as_micros() as u64);
     }
-    // The workload is over and the cluster is idle, so these figures are the
-    // latency of an idle cluster and not the latency under load. The name
-    // says so, and the `latency` mode measures the other one.
+    // Sample idle PUT latency after the initial batch and verification,
+    // before running the remaining mode-specific steps.
     observations.insert(
         "idle_client_put_latency_us".into(),
         latency_summary(&mut latencies_us),
@@ -963,7 +969,9 @@ async fn run_cluster(
             ExperimentMode::Availability | ExperimentMode::Scaling | ExperimentMode::Fault
         ) {
             let sampler = node_load::NodeOperationSampler::new(&members)?;
-            Some(tokio::spawn(sampler.record(workload_client.clone(), events.clone())))
+            Some(tokio::spawn(
+                sampler.record(workload_client.clone(), events.clone()),
+            ))
         } else {
             None
         };
@@ -1960,7 +1968,8 @@ async fn run_latency(context: RunContext<'_>) -> Result<u64> {
                 .map(|pid| (member.node_id.clone(), *pid))
         })
         .collect();
-    let runner = latency::LoadRunner::new(workload_client.clone(), plan.clone(), node_pids, members)?;
+    let runner =
+        latency::LoadRunner::new(workload_client.clone(), plan.clone(), node_pids, members)?;
     let mut saturated_windows = serde_json::Map::new();
     for (index, rate) in config.target_rates.iter().enumerate() {
         let stage = latency::StageSettings {

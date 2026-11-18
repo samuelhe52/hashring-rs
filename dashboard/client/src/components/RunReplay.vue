@@ -6,9 +6,9 @@ import ReplayEventList from './ReplayEventList.vue'
 import StageComparison from './StageComparison.vue'
 import TopologyView from './TopologyView.vue'
 import type { EventLog, ExperimentFeed, ReplayStart, RunDetail, RunEvent } from '../types'
-import { colors, errorsText, formatNumber as fmt, number, object, operations, request, stages, text } from '../data'
+import { colors, errorsText, formatNumber as fmt, latencyStatistic, number, object, operations, request, stages, text } from '../data'
 import { absoluteEventTime, eventCategory, eventName, eventSummary, isKeyEvent, relativeEventTime } from '../events'
-import { nodeOperationSample, replayBounds, sampledSeries, visibleCount, warmupIntervals, windowLatency, windowSuccessRate } from '../history.ts'
+import { nodeOperationSample, replayBounds, sampledSeries, scalingIssueRate, visibleCount, warmupIntervals, windowLatency, windowSuccessRate } from '../history.ts'
 import { defaultLatencyCurveMetrics, latencyCurveMetricKeys, latencyCurveMetrics, visibleLatencyCurveMetrics, type LatencyCurveMetric } from '../loadCharts'
 import { useReplayClock } from '../useReplayClock'
 
@@ -149,7 +149,7 @@ const seriesDefs = computed<{ name: string; value: (event: RunEvent) => number |
   if (plot.value === 'rate') return [
     { name: '目标速率', value: (event: RunEvent) => number(event.fields.target_rate) },
     { name: '窗口成功速率', value: windowSuccessRate },
-    { name: '窗口发出速率（扩缩容）', value: (event: RunEvent) => event.fields.mode === 'scaling' ? number(event.fields.achieved_rate) : null },
+    { name: '窗口发出速率（扩缩容）', value: scalingIssueRate },
   ].filter(series => allSamples.value.some(event => series.value(event) !== null))
   if (plot.value === 'counts') return Object.entries({ issued: '发出', late: '未按时发出', retries: '重试' }).map(([key, name]) => ({ name, value: event => number(event.fields[key]) }))
   const names = [...new Set(allSamples.value.flatMap(event => Object.keys(object(event.fields.errors))))]
@@ -287,7 +287,7 @@ onBeforeUnmount(() => controller?.abort())
               <p class="case-question">提高目标速率后，实际速率和尾延迟各变了多少？</p>
               <div class="table-scroll case-table"><table>
                 <thead><tr><th scope="col">目标 ops/s</th><th scope="col">实际 ops/s</th><th scope="col">GET p99 µs</th><th scope="col">GET 样本</th></tr></thead>
-                <tbody><tr v-for="[name, stage] in stageRows" :key="name"><th scope="row">{{ fmt(stage.target_rate) }}<span v-if="stage.sender_saturated" class="text-warning"> · 发送端饱和</span></th><td>{{ fmt(stage.achieved_rate, 2) }}</td><td>{{ fmt(stage.latency_us?.get?.p99, 2) }}</td><td>{{ fmt(stage.latency_us?.get?.samples) }}</td></tr></tbody>
+                <tbody><tr v-for="[name, stage] in stageRows" :key="name"><th scope="row">{{ fmt(stage.target_rate) }}<span v-if="stage.sender_saturated" class="text-warning"> · 发送端饱和</span></th><td>{{ fmt(stage.achieved_rate, 2) }}</td><td>{{ fmt(latencyStatistic(stage.latency_us?.get, 'p99'), 2) }}</td><td>{{ fmt(stage.latency_us?.get?.samples) }}</td></tr></tbody>
               </table></div>
               <p class="footnote">阶段成绩来自 summary，只描述本次运行。</p>
             </template>

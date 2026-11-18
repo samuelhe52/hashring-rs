@@ -20,6 +20,12 @@ export function number(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
 }
 
+export function latencyStatistic(value: unknown, metric: string): number | null {
+  const stats = object(value)
+  if (stats.samples === 0 && metric !== 'samples' && metric !== 'over_range') return null
+  return number(stats[metric])
+}
+
 export function formatNumber(value: unknown, decimals = 0): string {
   const n = number(value)
   return n === null ? '—' : n.toLocaleString('en-US', { maximumFractionDigits: decimals })

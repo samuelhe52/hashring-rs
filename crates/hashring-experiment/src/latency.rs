@@ -873,9 +873,7 @@ async fn sample_windows(
     let node_cpu_totals = || -> BTreeMap<_, _> {
         node_pids
             .iter()
-            .filter_map(|(id, pid)| {
-                process_cpu_seconds(*pid).map(|seconds| (id.as_str(), seconds))
-            })
+            .filter_map(|(id, pid)| process_cpu_seconds(*pid).map(|seconds| (id.as_str(), seconds)))
             .collect()
     };
     let mut cpu_before = node_cpu_totals();
@@ -885,7 +883,7 @@ async fn sample_windows(
     while window_start < end {
         let window_end = window_start + Duration::from_secs(1);
         tokio::time::sleep_until(window_end.into()).await;
-        let (issued, late, completed, errors, latency_us) = {
+        let (issued, late, completed, errors, latency_us, sampled_at) = {
             let mut state = metrics
                 .state
                 .lock()
@@ -894,7 +892,14 @@ async fn sample_windows(
             state.fold();
             let issued = metrics.issued.swap(0, Ordering::AcqRel);
             let late = metrics.late.swap(0, Ordering::AcqRel);
-            (issued, late, completed, errors, latency_us)
+            (
+                issued,
+                late,
+                completed,
+                errors,
+                latency_us,
+                crate::unix_ms(),
+            )
         };
         // Dropped requests count as scheduled; only unscheduled requests are behind.
         let length = window_end.min(end).saturating_duration_since(window_start);
@@ -937,7 +942,10 @@ async fn sample_windows(
             "node_ops_per_second": node_ops_per_second,
             "node_cpu_percent": node_cpu_percent,
         });
-        if events.record("metrics_sampled", fields).is_err() {
+        if events
+            .record_at("metrics_sampled", fields, sampled_at)
+            .is_err()
+        {
             return;
         }
         window_start = window_end;

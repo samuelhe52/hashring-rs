@@ -46,9 +46,10 @@ impl NodeOperationSampler {
     }
 
     pub(super) async fn sample(&mut self, topology: &TopologySnapshot) -> BTreeMap<String, f64> {
-        let clients = topology.members.iter().filter_map(|member| {
-            self.clients.get(&member.node_id).cloned()
-        });
+        let clients = topology
+            .members
+            .iter()
+            .filter_map(|member| self.clients.get(&member.node_id).cloned());
         // An unavailable node leaves a gap for that node while the other requests complete.
         let current: BTreeMap<_, _> = join_all(clients.map(|mut client| async move {
             let info = tokio::time::timeout(
@@ -76,10 +77,17 @@ impl NodeOperationSampler {
         let mut rates = BTreeMap::new();
         if self.epoch == Some(topology.epoch) {
             for (id, reading) in &current {
-                let Some(previous) = self.previous.get(id).filter(|before| before.instance == reading.instance) else {
+                let Some(previous) = self
+                    .previous
+                    .get(id)
+                    .filter(|before| before.instance == reading.instance)
+                else {
                     continue;
                 };
-                let seconds = reading.observed_at.duration_since(previous.observed_at).as_secs_f64();
+                let seconds = reading
+                    .observed_at
+                    .duration_since(previous.observed_at)
+                    .as_secs_f64();
                 if let Some(operations) = reading.operations.checked_sub(previous.operations)
                     && seconds > 0.0
                 {
@@ -102,10 +110,16 @@ impl NodeOperationSampler {
             if rates.is_empty() || client.epoch().await != topology.epoch {
                 continue;
             }
-            if events.record("node_load_sampled", json!({
-                "epoch": topology.epoch,
-                "node_ops_per_second": rates,
-            })).is_err() {
+            if events
+                .record(
+                    "node_load_sampled",
+                    json!({
+                        "epoch": topology.epoch,
+                        "node_ops_per_second": rates,
+                    }),
+                )
+                .is_err()
+            {
                 break;
             }
         }

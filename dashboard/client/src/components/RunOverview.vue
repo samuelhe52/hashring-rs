@@ -3,8 +3,8 @@ import { computed, ref } from 'vue'
 import DataChart from './DataChart.vue'
 import LatencyMetricSelector from './LatencyMetricSelector.vue'
 import ModeResults from './ModeResults.vue'
-import type { Latency, Measurement, RunDetail } from '../types'
-import { colors, errorsText, fieldNames, formatNumber as fmt, latencyRows, number, object, operations, stages, text, throughputRows } from '../data'
+import type { RunDetail } from '../types'
+import { colors, errorsText, fieldNames, formatNumber as fmt, latencyRows, latencyStatistic, number, object, operations, stages, text, throughputRows } from '../data'
 import { availableLatencyCurveMetrics, latencyCurveLabel, latencyCurveOption, loadLabels, nodeLoadOption, nodeLoadRows,
   nodeLoadValue, visibleLatencyCurveMetrics, type LatencyCurveMetric } from '../loadCharts'
 
@@ -39,13 +39,10 @@ const idleRows = computed(() => [
 const pressure = computed(() => Object.entries(object(observations.value.node_pressure_after_initial_put)))
 const pressureColumn = computed(() => pressureColumns.find(column => column.key === pressureMetric.value) ?? pressureColumns[0])
 const pressureValues = computed(() => pressure.value.map(([, value]) => number(object(value)[pressureMetric.value])))
-const hasIdleChart = computed(() => idleRows.value.some(({ stats }) => percentiles.some(key => number(stats[key]) !== null)))
+const hasIdleChart = computed(() => idleRows.value.some(({ stats }) => percentiles.some(key => latencyStatistic(stats, key) !== null)))
 const scalarObservations = computed(() => Object.entries(observations.value)
   .filter(([, value]) => value !== null && typeof value !== 'object'))
 
-function latency(stage: Measurement | undefined, operation: string): Latency {
-  return object(object(stage?.latency_us)[operation]) as Latency
-}
 
 const axisStyle = { axisLine: { show: false }, axisTick: { show: false }, axisLabel: { color: '#736f65', fontSize: 11 }, splitLine: { lineStyle: { color: '#eee9e1', type: 'dashed' } } }
 const availableMetrics = computed(() => availableLatencyCurveMetrics(rateStages.value, curveOperation.value))
@@ -62,7 +59,7 @@ function latencyBars(rows: { label: string; stats: Record<string, unknown> }[]) 
     yAxis: { ...axisStyle, type: 'value', name: 'µs' },
     series: rows.map(({ label, stats }) => ({
       name: label, type: 'bar', barMaxWidth: 18,
-      itemStyle: { borderRadius: [3, 3, 0, 0] }, data: percentiles.map(key => number(stats[key])),
+      itemStyle: { borderRadius: [3, 3, 0, 0] }, data: percentiles.map(key => latencyStatistic(stats, key)),
     })),
   }
 }
@@ -89,15 +86,15 @@ const loadOption = computed(() => nodeLoadOption(nodeLoads.value, loadMetric.val
       <div v-if="current?.sender_saturated === true" class="notice warning" role="status">发送端未跟上计划。本阶段不能按目标负载解释为集群表现。</div>
       <template v-if="section === 'latency'">
         <nav class="view-switch" aria-label="延迟内容"><button :aria-pressed="view === 'curve'" @click="view = 'curve'">负载曲线</button><button :aria-pressed="view === 'distribution'" @click="view = 'distribution'">延迟分布</button><button :aria-pressed="view === 'numbers'" @click="view = 'numbers'">数值明细</button></nav>
-        <div class="metric-strip latency-metrics"><div v-for="op in operations" :key="op" class="metric"><span>{{ op.toUpperCase() }} p99</span><strong>{{ fmt(latency(current, op).p99, 2) }}<small>µs</small></strong><span>{{ fmt(latency(current, op).samples) }} 个样本</span></div></div>
+        <div class="metric-strip latency-metrics"><div v-for="op in operations" :key="op" class="metric"><span>{{ op.toUpperCase() }} p99</span><strong>{{ fmt(latencyStatistic(current?.latency_us?.[op], 'p99'), 2) }}<small>µs</small></strong><span>{{ fmt(current?.latency_us?.[op]?.samples) }} 个样本</span></div></div>
         <section v-if="view === 'curve'" class="panel curve-panel">
           <div class="section-heading"><div><h3>延迟随负载的变化</h3><p>横轴为各阶段的总成功速率。</p></div><div class="segmented" aria-label="曲线操作类型"><button v-for="op in operations" :key="op" :aria-pressed="curveOperation === op" @click="curveOperation = op">{{ op.toUpperCase() }}</button></div></div>
           <LatencyMetricSelector v-model="selectedMetrics" :available="availableMetrics" />
           <DataChart v-if="visibleMetrics.length" :option="curveOption" :label="curveLabel" :source="run.id" exportable /><p v-else class="empty-inline">所选操作没有可绘制的阶段延迟数据。</p>
-          <details class="data-disclosure"><summary>各阶段计数与错误 · 展开核对</summary><div class="table-scroll"><table class="stage-table"><caption class="sr-only">各阶段速率、计数和所选操作延迟</caption><thead><tr><th>阶段</th><th>目标 / 实际 ops/s</th><th>{{ curveOperation.toUpperCase() }} p50 / p99 µs</th><th>issued / late</th><th>重试</th><th>错误</th><th>发送端</th></tr></thead><tbody><tr v-for="[name, stage] in rateStages" :key="name" :class="{ 'selected-row': currentEntry?.[0] === name }"><th scope="row"><button class="table-link" :aria-pressed="currentEntry?.[0] === name" @click="emit('selectStage', name)">{{ name }}</button></th><td>{{ fmt(stage.target_rate) }} / {{ fmt(stage.achieved_rate, 2) }}</td><td>{{ fmt(latency(stage, curveOperation).p50) }} / {{ fmt(latency(stage, curveOperation).p99) }}</td><td>{{ fmt(stage.issued) }} / {{ fmt(stage.late) }}</td><td>{{ fmt(stage.retries) }}</td><td class="wrap-cell">{{ errorsText(stage.errors) }}</td><td>{{ stage.sender_saturated === true ? '饱和' : stage.sender_saturated === false ? '正常' : '未提供' }}</td></tr></tbody></table></div></details>
+          <details class="data-disclosure"><summary>各阶段计数与错误 · 展开核对</summary><div class="table-scroll"><table class="stage-table"><caption class="sr-only">各阶段速率、计数和所选操作延迟</caption><thead><tr><th>阶段</th><th>目标 / 实际 ops/s</th><th>{{ curveOperation.toUpperCase() }} p50 / p99 µs</th><th>issued / late</th><th>重试</th><th>错误</th><th>发送端</th></tr></thead><tbody><tr v-for="[name, stage] in rateStages" :key="name" :class="{ 'selected-row': currentEntry?.[0] === name }"><th scope="row"><button class="table-link" :aria-pressed="currentEntry?.[0] === name" @click="emit('selectStage', name)">{{ name }}</button></th><td>{{ fmt(stage.target_rate) }} / {{ fmt(stage.achieved_rate, 2) }}</td><td>{{ fmt(latencyStatistic(stage.latency_us?.[curveOperation], 'p50')) }} / {{ fmt(latencyStatistic(stage.latency_us?.[curveOperation], 'p99')) }}</td><td>{{ fmt(stage.issued) }} / {{ fmt(stage.late) }}</td><td>{{ fmt(stage.retries) }}</td><td class="wrap-cell">{{ errorsText(stage.errors) }}</td><td>{{ stage.sender_saturated === true ? '饱和' : stage.sender_saturated === false ? '正常' : '未提供' }}</td></tr></tbody></table></div></details>
         </section>
         <section v-else-if="view === 'distribution'" class="panel"><div class="section-heading"><div><h3>延迟分布</h3><p>{{ currentEntry?.[0] }} · 客户端端到端延迟，单位 µs。</p></div></div><DataChart v-if="distribution.length" :option="distributionOption" label="各操作的 p50、p95、p99 和 max 延迟（µs）" :source="run.id + ' / ' + currentEntry?.[0]" exportable /><p v-else class="empty-inline">该阶段未提供延迟分布。</p></section>
-        <section v-else class="panel"><div class="table-scroll"><table><caption class="sr-only">当前阶段延迟、成功操作数与样本数</caption><thead><tr><th>操作</th><th>p50</th><th>p95</th><th>p99</th><th>p999</th><th>max</th><th>max_observed</th><th>超量程</th><th>样本数</th><th>成功操作数</th></tr></thead><tbody><tr v-for="[name, stats] in distribution" :key="name"><th scope="row">{{ name.toUpperCase() }}</th><td v-for="key in (['p50', 'p95', 'p99', 'p999', 'max', 'max_observed', 'over_range', 'samples'] as const)" :key="key">{{ fmt(stats[key]) }}</td><td>{{ fmt(current?.ops?.[name]) }}</td></tr><tr v-if="!distribution.length"><td colspan="10">未提供延迟数据</td></tr></tbody></table></div><p class="footnote">单位 µs；max 为直方图桶上界。“—”表示未提供。样本包含返回的失败请求；成功操作数单列。</p></section>
+        <section v-else class="panel"><div class="table-scroll"><table><caption class="sr-only">当前阶段延迟、成功操作数与样本数</caption><thead><tr><th>操作</th><th>p50</th><th>p95</th><th>p99</th><th>p999</th><th>max</th><th>max_observed</th><th>超量程</th><th>样本数</th><th>成功操作数</th></tr></thead><tbody><tr v-for="[name, stats] in distribution" :key="name"><th scope="row">{{ name.toUpperCase() }}</th><td v-for="key in (['p50', 'p95', 'p99', 'p999', 'max', 'max_observed', 'over_range', 'samples'] as const)" :key="key">{{ fmt(latencyStatistic(stats, key)) }}</td><td>{{ fmt(current?.ops?.[name]) }}</td></tr><tr v-if="!distribution.length"><td colspan="10">未提供延迟数据</td></tr></tbody></table></div><p class="footnote">单位 µs；max 为直方图桶上界。“—”表示未提供。样本包含返回的失败请求；成功操作数单列。</p></section>
       </template>
       <section v-else class="panel">
         <div class="section-heading"><div><h3>节点负载</h3><p>{{ currentEntry?.[0] }} · {{ loadLabels[loadMetric] }}</p></div><select v-model="loadMetric" aria-label="节点负载指标"><option v-for="(label, metric) in loadLabels" :key="metric" :value="metric">{{ label }}</option></select></div>
@@ -117,7 +114,7 @@ const loadOption = computed(() => nodeLoadOption(nodeLoads.value, loadMetric.val
       <nav class="view-switch" aria-label="观测内容"><button :aria-pressed="observationView === 'throughput'" @click="observationView = 'throughput'">批量吞吐</button><button :aria-pressed="observationView === 'idle'" @click="observationView = 'idle'">空闲基线</button><button :aria-pressed="observationView === 'pressure'" @click="observationView = 'pressure'">节点压力</button><button :aria-pressed="observationView === 'other'" @click="observationView = 'other'">其他记录</button><button :aria-pressed="observationView === 'structured'" @click="observationView = 'structured'">模式记录</button></nav>
       <section v-if="observationView === 'throughput'" class="panel"><div class="section-heading"><div><h3>批量步骤吞吐</h3><p>预加载、校验等步骤，与固定速率负载分别记录。</p></div></div><div v-if="throughput.length" class="table-scroll"><table><caption class="sr-only">批量操作吞吐</caption><thead><tr><th>步骤</th><th>操作数</th><th>耗时 s</th><th>吞吐 ops/s</th></tr></thead><tbody><tr v-for="[name, value] in throughput" :key="name"><th scope="row">{{ fieldNames[name] || name }}</th><td>{{ fmt(value.operations) }}</td><td>{{ fmt(value.seconds, 4) }}</td><td>{{ fmt(value.operations_per_second, 2) }}</td></tr></tbody></table></div><p v-else class="empty-inline">未提供批量吞吐。</p></section>
       <section v-else-if="observationView === 'idle'" class="panel">
-        <div class="section-heading"><div><h3>空闲基线</h3><p>负载结束后，在空闲集群测得的 PUT 延迟（µs）。</p></div></div>
+        <div class="section-heading"><div><h3>空闲基线</h3><p>初始写入和读校验完成后，在空闲集群测得的 PUT 延迟（µs）。</p></div></div>
         <DataChart v-if="hasIdleChart" :option="idleOption" label="空闲基线 PUT 延迟分位数（µs）" :source="run.id" exportable />
         <div v-if="idleRows.length" class="table-scroll">
           <table>
@@ -126,7 +123,7 @@ const loadOption = computed(() => nodeLoadOption(nodeLoads.value, loadMetric.val
             <tbody>
               <tr v-for="{ label, stats } in idleRows" :key="label">
                 <th scope="row">{{ label }}</th>
-                <td v-for="key in percentiles" :key="key">{{ fmt(stats[key]) }}</td>
+                <td v-for="key in percentiles" :key="key">{{ fmt(latencyStatistic(stats, key)) }}</td>
                 <td>{{ fmt(stats.samples) }}</td>
               </tr>
             </tbody>
