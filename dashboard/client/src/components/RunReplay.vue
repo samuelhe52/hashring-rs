@@ -30,6 +30,8 @@ const selectedMetrics = ref<LatencyCurveMetric[]>([...defaultLatencyCurveMetrics
 const inspectLine = ref<number | null>(null)
 const chart = ref<InstanceType<typeof DataChart> | null>(null)
 const layoutVersion = ref(0)
+const fullRange = { start: 0, end: 100 }
+const chartRange = shallowRef(fullRange)
 let controller: AbortController | undefined
 const bounds = computed(() => replayBounds(log.value.events, props.run?.manifest?.started_unix_ms ?? props.live?.session?.startedAt))
 const { playing, speed, cursor, boundaryLine, pause, seek, toggle } = useReplayClock(() => bounds.value)
@@ -116,10 +118,21 @@ const scenarioFacts = computed(() => {
 })
 const sourceIssues = computed(() => log.value.issues.length)
 const duration = computed(() => bounds.value.end - bounds.value.start)
+const zoomable = computed(() => !followLive.value && duration.value > 0)
+const chartEnd = computed(() => followLive.value
+  ? Math.max(10, Math.ceil(duration.value / 10000) * 10)
+  : Math.max(1, duration.value / 1000))
+const rangeStart = computed(() => chartEnd.value * chartRange.value.start / 100)
+const rangeEnd = computed(() => chartEnd.value * chartRange.value.end / 100)
+const zoomed = computed(() => chartRange.value.start > 0 || chartRange.value.end < 100)
 const unit = computed(() => plot.value === 'latency' ? 'µs' : plot.value === 'rate' ? 'ops/s' : '次／窗口')
 const seconds = computed(() => (time.value - bounds.value.start) / 1000)
 const progress = computed(() => duration.value ? (time.value - bounds.value.start) / duration.value : 0)
-const playhead = computed(() => { void layoutVersion.value; return chart.value?.pixelAt(seconds.value) ?? null })
+const playhead = computed(() => {
+  void layoutVersion.value
+  if (seconds.value < rangeStart.value || seconds.value > rangeEnd.value) return null
+  return chart.value?.pixelAt(seconds.value) ?? null
+})
 const plottedOperations = computed(() => [...new Set<string>([
   ...operations,
   ...allSamples.value.flatMap(event => Object.keys(object(event.fields.metrics))),
@@ -157,10 +170,18 @@ const seriesDefs = computed<{ name: string; value: (event: RunEvent) => number |
 })
 const chartOption = computed(() => ({
   color: plot.value === 'latency' ? visibleMetrics.value.map(metric => latencyCurveMetrics[metric].color) : colors,
-  grid: { top: 20, left: 64, right: 22, bottom: 42, outerBoundsMode: 'none' },
+  grid: { top: 20, left: 64, right: 22, bottom: zoomable.value ? 76 : 42, outerBoundsMode: 'none' },
   tooltip: { trigger: 'axis', valueFormatter: (value: unknown) => `${fmt(Array.isArray(value) ? value.at(-1) : value, 2)} ${unit.value}` },
-  xAxis: { type: 'value', min: 0, max: followLive.value ? Math.max(10, Math.ceil(duration.value / 10000) * 10) : Math.max(1, duration.value / 1000), name: '记录时间（s）', nameLocation: 'middle', nameGap: 22, axisLabel: { hideOverlap: true } },
+  xAxis: { type: 'value', min: 0, max: chartEnd.value, name: '记录时间（s）', nameLocation: 'middle', nameGap: 22, axisLabel: { hideOverlap: true } },
   yAxis: { type: 'value', min: 0, name: unit.value, nameGap: 6, splitNumber: 4, axisLabel: { fontSize: 11, hideOverlap: true }, splitLine: { lineStyle: { color: '#e5e0d7', type: 'dashed' } } },
+  ...(zoomable.value ? { dataZoom: [{
+    id: 'replay-time-range', type: 'slider', xAxisIndex: 0, filterMode: 'filter', minValueSpan: .1,
+    bottom: 8, height: 20, borderRadius: 4, borderColor: '#d8d0c2', backgroundColor: '#f1ede5',
+    fillerColor: '#b4532a26', handleSize: '115%', handleStyle: { color: '#fffdf9', borderColor: '#b4532a' },
+    dataBackground: { lineStyle: { color: '#8a8171' }, areaStyle: { color: '#ccc6bb' } },
+    selectedDataBackground: { lineStyle: { color: '#a84924' }, areaStyle: { color: '#d6a48a' } },
+    brushSelect: false, showDetail: false,
+  }] } : {}),
   series: seriesDefs.value.map((series, index) => {
     const style = series.metric ? latencyCurveMetrics[series.metric] : undefined
     return {
@@ -174,7 +195,16 @@ const chartOption = computed(() => ({
     }
   }),
 }))
-const hasPlottedValue = computed(() => seriesDefs.value.some(series => samples.value.some(event => series.value(event) !== null)))
+const hasPlottedValue = computed(() => samples.value.some(event => {
+  const elapsed = (event.unix_ms - bounds.value.start) / 1000
+  return elapsed >= rangeStart.value && elapsed <= rangeEnd.value
+    && seriesDefs.value.some(series => series.value(event) !== null)
+}))
+
+function updateChartRange(range: { start: number; end: number }) {
+  chartRange.value = range
+  if (playing.value) pause()
+}
 
 function jump(line: number) {
   if (followLive.value) { inspectLine.value = line; return }
@@ -205,6 +235,7 @@ watch(() => props.live?.session?.endedAt, endedAt => {
   inspectLine.value = null
   seek(bounds.value.end)
 }, { immediate: true })
+watch(chart, instance => { if (!instance) chartRange.value = fullRange })
 onMounted(() => { if (!props.live && !props.initial) void load() })
 onBeforeUnmount(() => controller?.abort())
 </script>
@@ -263,10 +294,15 @@ onBeforeUnmount(() => controller?.abort())
                   </div>
                   <LatencyMetricSelector v-if="plot === 'latency'" v-model="selectedMetrics" :available="availableMetrics" class="playback-percentiles" />
                 </div>
-                <div class="replay-chart">
-                  <DataChart ref="chart" :option="chartOption" :motion="false" :label="(followLive ? '实时' : '回放') + '窗口记录曲线'" @layout="layoutVersion++" />
+                <div class="replay-chart" :class="{ 'has-chart-range': zoomable }">
+                  <DataChart ref="chart" :option="chartOption" :motion="false" :label="(followLive ? '实时' : '回放') + '窗口记录曲线'"
+                    @layout="layoutVersion++" @zoom="updateChartRange" />
                   <div v-if="playhead !== null" class="chart-playhead" :style="{ transform: 'translateX(' + playhead + 'px)' }" aria-hidden="true"></div>
-                  <p v-if="!hasPlottedValue" class="chart-empty-label">{{ samples.length ? '所选指标没有记录' : '等待首个采样窗口' }}</p>
+                  <p v-if="!hasPlottedValue" class="chart-empty-label">{{ zoomed ? '当前范围内暂无可显示的采样' : samples.length ? '所选指标没有记录' : '等待首个采样窗口' }}</p>
+                </div>
+                <div v-if="zoomable" class="replay-chart-range">
+                  <span>显示范围 {{ fmt(rangeStart, 2) }}–{{ fmt(rangeEnd, 2) }} s</span>
+                  <button v-if="zoomed" class="table-link" @click="chart?.resetZoom()">恢复全程</button>
                 </div>
               </template>
               <p v-else class="empty-inline playback-wait">{{ followLive ? '等待指标采样。' : '本次运行没有指标采样。' }}</p>

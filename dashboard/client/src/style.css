@@ -404,7 +404,11 @@ html { scrollbar-gutter: stable; }
 .playback-transport .replay-controls .button, .playback-transport select { min-height: 32px; padding: 4px 9px; }
 .playback-transport .replay-controls .table-link { margin: 0 2px; }
 .playback-transport .replay-seek { display: block; margin: 1px 0 0; }
-.window-body .playback-plot .data-chart { height: clamp(124px, 21dvh, 230px); }
+.playback-plot .replay-chart.has-chart-range { --replay-range-height: 34px; }
+.playback-plot .data-chart { height: calc(258px + var(--replay-range-height, 0px)); }
+.window-body .playback-plot .data-chart { height: calc(clamp(124px, 21dvh, 230px) + var(--replay-range-height, 0px)); }
+.playback-plot .chart-playhead { bottom: calc(45px + var(--replay-range-height, 0px)); }
+.replay-chart-range { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-inline: 64px 22px; color: var(--muted); font-size: 11px; }
 .playback-plot .playback-panel-heading { margin-bottom: 2px; }
 .replay-plot-key { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 8px; }
 .replay-plot-key .playback-percentiles { max-width: 100%; margin-inline-start: auto; padding: 0; gap: 2px; }

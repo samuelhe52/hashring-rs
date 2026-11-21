@@ -2,14 +2,14 @@
 import { onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { init, use, type EChartsCoreOption, type EChartsType } from 'echarts/core'
 import { BarChart, LineChart } from 'echarts/charts'
-import { GridComponent, LegendComponent, TooltipComponent, AriaComponent, MarkAreaComponent, MarkLineComponent } from 'echarts/components'
+import { GridComponent, LegendComponent, TooltipComponent, AriaComponent, MarkAreaComponent, MarkLineComponent, DataZoomSliderComponent } from 'echarts/components'
 import { SVGRenderer } from 'echarts/renderers'
 import { object } from '../data'
 import { downloadBlob, svgToPng } from '../download'
 
-use([BarChart, LineChart, GridComponent, LegendComponent, TooltipComponent, AriaComponent, MarkAreaComponent, MarkLineComponent, SVGRenderer])
+use([BarChart, LineChart, GridComponent, LegendComponent, TooltipComponent, AriaComponent, MarkAreaComponent, MarkLineComponent, DataZoomSliderComponent, SVGRenderer])
 const props = withDefaults(defineProps<{ option: EChartsCoreOption; label: string; animateUpdates?: boolean; motion?: boolean; exportable?: boolean; source?: string }>(), { motion: true, animateUpdates: false })
-const emit = defineEmits<{ layout: [] }>()
+const emit = defineEmits<{ layout: []; zoom: [range: { start: number; end: number }] }>()
 const container = ref<HTMLDivElement | null>(null)
 const exportError = ref('')
 const exporting = ref(false)
@@ -21,6 +21,9 @@ const chartText = { fontFamily: 'system-ui, Microsoft YaHei, sans-serif', color:
 function update() {
   const first = !painted
   const interpolate = !first && props.animateUpdates
+  // Replay updates the series as the cursor moves. Keep the slider's selected range.
+  const merge = props.option.dataZoom ? { replaceMerge: ['series', 'dataZoom'] }
+    : interpolate ? { replaceMerge: ['series'] } : { notMerge: true }
   chart?.setOption({
     backgroundColor: 'transparent',
     textStyle: chartText,
@@ -34,7 +37,7 @@ function update() {
     animationEasingUpdate: 'cubicOut',
     animationDelayUpdate: (index: number) => Math.min(index * 28, 112),
     tooltip: { confine: true, ...object(props.option.tooltip) },
-  }, interpolate ? { replaceMerge: ['series'] } : { notMerge: true })
+  }, merge)
   painted = true
   emit('layout')
 }
@@ -118,6 +121,11 @@ async function exportChart(format: 'svg' | 'png') {
 onMounted(() => {
   if (!container.value) return
   chart = init(container.value, undefined, { renderer: 'svg' })
+  chart.on('datazoom', event => {
+    const { start, end } = object(event)
+    if (typeof start === 'number' && typeof end === 'number') emit('zoom', { start, end })
+    emit('layout')
+  })
   update()
   let width = container.value.clientWidth
   let height = container.value.clientHeight
@@ -131,7 +139,13 @@ onMounted(() => {
 })
 watch(() => props.option, update, { deep: true })
 onBeforeUnmount(() => { resizeObserver?.disconnect(); chart?.dispose() })
-defineExpose({ pixelAt(value: number): number | null { const pixel = chart?.convertToPixel({ xAxisIndex: 0 }, value); return typeof pixel === 'number' && Number.isFinite(pixel) ? pixel : null } })
+defineExpose({
+  pixelAt(value: number): number | null {
+    const pixel = chart?.convertToPixel({ xAxisIndex: 0 }, value)
+    return typeof pixel === 'number' && Number.isFinite(pixel) ? pixel : null
+  },
+  resetZoom() { chart?.dispatchAction({ type: 'dataZoom', start: 0, end: 100 }) },
+})
 </script>
 
 <template>
